@@ -28,7 +28,7 @@ use std::sync::Arc;
 use shiso_core::Backend;
 use shiso_cuda::{CudaBackend, CudaOptions};
 use shiso_kerneltest::Gpu;
-use shiso_kerneltest::generic::{glu, norm, plane, product};
+use shiso_kerneltest::generic::{glu, norm, plane, product, rows_q8};
 
 /// Opens device 0, or says on stderr why the cases did not run.
 #[expect(
@@ -144,4 +144,16 @@ fn the_f16_gather_matches_the_table() {
 fn the_staged_plane_matches_the_weight_at_every_codec() {
     let Some(gpu) = open() else { return };
     plane::the_staged_plane_matches_the_weight_at_every_codec(&gpu);
+}
+
+// The `q8_0` gather has a CUDA entry (`kernel_get_rows_q8_0_f32`, instantiated
+// in `kernels/cuda/generic/get_rows_block.cuh`). The extended matvec case
+// beside it in `rows_q8` has no wrapper here on purpose: it is Metal-only,
+// because CUDA specializes its matvecs by entry name and has no `q8_0`
+// extended table to grade.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_q8_0_gather_dequantizes_the_rows_the_ids_name() {
+    let Some(gpu) = open() else { return };
+    rows_q8::the_q8_0_gather_dequantizes_the_rows_the_ids_name(&gpu);
 }

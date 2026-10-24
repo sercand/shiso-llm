@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use crate::boot_error::{BootContext as _, BootError, refuse};
+use crate::device::{DeviceKind, OpenedDevice, Purpose, on_device, open_device, warm_up_model};
 use crate::options::ServeOptions;
 use crate::state::AppState;
 use crate::{
@@ -31,17 +32,20 @@ pub fn boot_audio(args: &ServeOptions) -> Result<Option<audio::AudioService>, Bo
     let Some(asr) = args.asr_model.as_deref() else {
         return Ok(None);
     };
-    let backend = open_audio_backend(args)?;
+    let OpenedDevice { backend, kind } = open_device(args, Purpose::Audio)?;
     let started = std::time::Instant::now();
-    let recognizer = shiso_models::audio_registry::open_speech_recognizer(
-        asr,
-        &shiso_models::audio_registry::RecognizerDesc {
-            mmproj: args.asr_mmproj.as_deref(),
-            offline_batch: args.asr_batch,
-        },
-        &backend,
-    )
-    .with_context(|| format!("opening the speech recognizer at {}", asr.display()))?;
+    let recognizer = on_device(
+        kind,
+        shiso_models::audio_registry::open_speech_recognizer(
+            asr,
+            &shiso_models::audio_registry::RecognizerDesc {
+                mmproj: args.asr_mmproj.as_deref(),
+                offline_batch: args.asr_batch,
+            },
+            &backend,
+        )
+        .with_context(|| format!("opening the speech recognizer at {}", asr.display())),
+    )?;
     if recognizer.lookaheads().is_empty() {
         // A recognizer without lookahead has nothing to check the flag
         // against; its streams ignore it.
@@ -61,9 +65,13 @@ pub fn boot_audio(args: &ServeOptions) -> Result<Option<audio::AudioService>, Bo
     // of the recognizer would wait behind the diarizer's queued encoder work.
     let diarizer = match args.diarization_model.as_deref() {
         Some(path) => {
-            let own = open_audio_backend(args)?;
-            let diarizer = shiso_models::audio_registry::open_diarizer(path, &own)
-                .with_context(|| format!("opening the diarizer at {}", path.display()))?;
+            let own = open_device(args, Purpose::Audio)?;
+            let diarizer = on_device(
+                own.kind,
+                shiso_models::audio_registry::open_diarizer(path, &own.backend)
+                    .with_context(|| format!("opening the diarizer at {}", path.display())),
+            )?;
+            let own = own.backend;
             own.finish_imports();
             Some(diarizer)
         }
@@ -130,7 +138,7 @@ pub fn boot_image(args: &ServeOptions) -> Result<Option<image::ImageService>, Bo
     let Some(path) = args.image_model.as_deref() else {
         return Ok(None);
     };
-    let backend = open_image_backend(args)?;
+    let OpenedDevice { backend, kind } = open_device(args, Purpose::Image)?;
     let started = std::time::Instant::now();
     let desc = shiso_models::image_registry::ImageModelDesc {
         model_path: path.to_path_buf(),
@@ -143,8 +151,11 @@ pub fn boot_image(args: &ServeOptions) -> Result<Option<image::ImageService>, Bo
         draft_steps: args.image_draft_steps,
         final_reuse: args.image_final_reuse.map(|r| (r.start, r.end)),
     };
-    let generator = shiso_models::image_registry::open_image_generator(&desc, &backend)
-        .with_context(|| format!("loading image model at {}", path.display()))?;
+    let generator = on_device(
+        kind,
+        shiso_models::image_registry::open_image_generator(&desc, &backend)
+            .with_context(|| format!("loading image model at {}", path.display())),
+    )?;
     // Every weight this process will read for generation is resident now, so
     // whatever the backend kept to make those imports fast can go.
     backend.finish_imports();
@@ -195,22 +206,25 @@ pub fn boot_embedding(
     args: &ServeOptions,
     model: &std::path::Path,
 ) -> Result<embed::EmbeddingService, BootError> {
-    let backend = open_backend(args)?;
+    let OpenedDevice { backend, kind } = open_device(args, Purpose::Language)?;
     mark_memory(backend.as_ref(), "before_load");
     let started = std::time::Instant::now();
     let sidecar = args
         .config_path()
         .parent()
         .map(std::path::Path::to_path_buf);
-    let embedder = shiso_models::embedder::open_embedder(
-        &shiso_models::embedder::EmbedderDesc {
-            model,
-            mmproj: args.vision.as_deref(),
-            sidecar: sidecar.as_deref(),
-        },
-        &backend,
-    )
-    .with_context(|| format!("opening the embedding model at {}", model.display()))?;
+    let embedder = on_device(
+        kind,
+        shiso_models::embedder::open_embedder(
+            &shiso_models::embedder::EmbedderDesc {
+                model,
+                mmproj: args.vision.as_deref(),
+                sidecar: sidecar.as_deref(),
+            },
+            &backend,
+        )
+        .with_context(|| format!("opening the embedding model at {}", model.display())),
+    )?;
     backend.finish_imports();
     let tokenizer = args.tokenizer_path();
     let vocabulary = Arc::new(
@@ -305,7 +319,7 @@ pub fn boot_language_model(
     args: &ServeOptions,
     model_path: &std::path::Path,
 ) -> Result<(AppState, EngineThread), BootError> {
-    let backend = open_backend(args)?;
+    let OpenedDevice { backend, kind } = open_device(args, Purpose::Language)?;
     // The first mark: whatever is in use now belongs to the driver and the
     // rest of the machine, and the ledger's unaccounted figure is measured
     // from here.
@@ -327,7 +341,7 @@ pub fn boot_language_model(
         open_audio,
         placement,
         defaults,
-    } = load_checkpoint(&backend, &config, args, model_path)?;
+    } = load_checkpoint(&backend, kind, &config, args, model_path)?;
     // Before anything stands on a session: the tier is a property of the cache
     // the sessions draw their pages from, so it is chosen while there are none.
     let tier = open_checkpoint_tier(model.as_mut(), args);
@@ -487,6 +501,18 @@ fn scheduler_config(args: &ServeOptions) -> Result<scheduler::SchedulerConfig, B
 /// whatever it leaves unlabelled is still a weight.
 fn load_checkpoint(
     backend: &Arc<dyn shiso_core::Backend>,
+    kind: DeviceKind,
+    config: &shiso_core::HfConfig,
+    args: &ServeOptions,
+    model: &std::path::Path,
+) -> Result<model_factory::Loaded, BootError> {
+    on_device(kind, load_and_warm(backend, kind, config, args, model))
+}
+
+/// [`load_checkpoint`] before the device's own refusals are worded.
+fn load_and_warm(
+    backend: &Arc<dyn shiso_core::Backend>,
+    kind: DeviceKind,
     config: &shiso_core::HfConfig,
     args: &ServeOptions,
     model: &std::path::Path,
@@ -503,12 +529,18 @@ fn load_checkpoint(
     }
     let _tag = shiso_core::ledger::scope(shiso_core::MemTag::WeightsOther);
     let started = std::time::Instant::now();
-    let loaded = model_factory::load_model(backend, model, config, args)
+    let mut loaded = model_factory::load_model(backend, model, config, args)
         .with_context(|| format!("loading the checkpoint at {}", model.display()))?;
     tracing::info!(
         seconds = started.elapsed().as_secs_f64(),
         "the checkpoint is loaded"
     );
+    // Loaders import weights and launch nothing, so only a pass over the
+    // model finds a kernel the CPU backend has not ported. Metal and CUDA
+    // cover their kernel sets at build time and boot without it.
+    if kind == DeviceKind::Cpu {
+        warm_up_model(loaded.model.as_mut())?;
+    }
     Ok(loaded)
 }
 
@@ -713,10 +745,10 @@ fn open_checkpoint_tier(
     }
 }
 
-/// A build that named two devices, refused at compile time.
+/// A build that named two GPUs, refused at compile time.
 ///
-/// One binary serves one device: the backend is opened once at startup and
-/// every model holds it for the process's life, so "both features on" has no
+/// One GPU per build: `--device` picks between that GPU and the CPU backend,
+/// which rides along in every build, but "metal and cuda both on" has no
 /// meaning that is not a precedence rule invented here. Saying so with the
 /// compiler is better than picking one and logging about it.
 #[cfg(all(feature = "metal", feature = "cuda"))]
@@ -778,85 +810,6 @@ pub fn log_media_decoders(args: &ServeOptions) {
 #[cfg(not(feature = "decode-ffmpeg"))]
 pub fn log_media_decoders(_args: &ServeOptions) {
     tracing::info!("this build decodes media without ffmpeg");
-}
-
-/// Opens the compute device this build was compiled with.
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
-fn open_backend(_args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
-    let backend = shiso_metal::MetalBackend::new().context("opening the Metal device")?;
-    Ok(backend)
-}
-
-/// Opens the backend instance the speech models run on: the same device, a
-/// command stream of its own, and no launch recording.
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
-fn open_audio_backend(args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
-    open_backend(args)
-}
-
-/// Opens the backend instance the speech models run on. Decode graphs stay
-/// off here: the speech models' launches are never replayed.
-#[cfg(all(feature = "cuda", not(feature = "metal")))]
-fn open_audio_backend(_args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
-    let options = shiso_cuda::CudaOptions::default().with_decode_graphs(false);
-    let backend = shiso_cuda::CudaBackend::new(0, options)
-        .context("opening the CUDA device for the speech models")?;
-    Ok(backend)
-}
-
-/// As [`open_backend`]: this build has no device for the speech models.
-#[cfg(not(any(feature = "metal", feature = "cuda")))]
-fn open_audio_backend(args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
-    open_backend(args)
-}
-
-/// Opens the backend instance the image generation model runs on: the same
-/// device, a command stream of its own, and no launch recording.
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
-fn open_image_backend(args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
-    open_backend(args)
-}
-
-/// Opens the backend instance the image generation model runs on. Decode
-/// graphs stay off here: a diffusion step is never replayed.
-#[cfg(all(feature = "cuda", not(feature = "metal")))]
-fn open_image_backend(_args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
-    let options = shiso_cuda::CudaOptions::default().with_decode_graphs(false);
-    let backend = shiso_cuda::CudaBackend::new(0, options)
-        .context("opening the CUDA device for the image generation model")?;
-    Ok(backend)
-}
-
-/// As [`open_backend`]: this build has no device for the image generation model.
-#[cfg(not(any(feature = "metal", feature = "cuda")))]
-fn open_image_backend(args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
-    open_backend(args)
-}
-
-/// Opens the NVIDIA device.
-///
-/// Ordinal zero and the default options: which device to run on is a placement
-/// decision that belongs outside the process (`CUDA_VISIBLE_DEVICES`), not a
-/// flag this server would then have to keep meaningful across a multi-device
-/// box it does not otherwise model.
-#[cfg(all(feature = "cuda", not(feature = "metal")))]
-fn open_backend(args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
-    let options = shiso_cuda::CudaOptions::default().with_decode_graphs(!args.no_decode_graphs);
-    let backend = shiso_cuda::CudaBackend::new(0, options).context("opening the CUDA device")?;
-    Ok(backend)
-}
-
-/// Refuses to serve, because this build has no compute device.
-///
-/// A typed failure at the one place a device is needed, rather than a
-/// feature-gated router or a build that does not compile: the whole crate type
-/// checks without a backend, which is what lets every test above this line run
-/// on a machine with no device at all.
-#[cfg(not(any(feature = "metal", feature = "cuda")))]
-fn open_backend(_args: &ServeOptions) -> Result<Arc<dyn shiso_core::Backend>, BootError> {
-    Err(refuse!(
-        "this build has no compute backend; rebuild with --features metal or --features cuda"
-    ))
 }
 
 /// How the server writes `tojson` in every chat template it renders.

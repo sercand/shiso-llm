@@ -35,7 +35,9 @@ use shiso_core::{CoreError, CoreResult, DeviceView, RawBuffer};
 
 use crate::CudaBackend;
 use crate::sys::nvidia;
-use crate::sys::{CuContext, CuDevice, CuEvent, CuStream, DevicePtr, SysResult, host_error};
+use crate::sys::{
+    CuContext, CuDevice, CuEvent, CuStream, DevicePtr, SysError, SysResult, host_error,
+};
 
 /// The ordinal this process bound to, once anything has bound one.
 ///
@@ -182,6 +184,11 @@ impl DeviceCtx {
     /// the one every driverless host gets, where the initialisation itself is
     /// refused.
     pub(crate) fn open(ordinal: u32) -> CoreResult<Self> {
+        // `cuInit` panics inside cudarc when libcuda is absent, so the library
+        // is probed first and a driverless host gets an `Err`.
+        if !nvidia::library_present() {
+            return Err(SysError::no_driver("libcuda").into());
+        }
         nvidia::init()?;
         bind_ordinal(&mut BOUND_ORDINAL.lock(), ordinal)?;
         let device = nvidia::device_get(ordinal)?;

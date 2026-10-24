@@ -20,11 +20,14 @@ use std::time::Duration;
 use shiso_hub::Backend;
 use shiso_hub::{
     BlobStore, Downloader, HostProfile, HubConfig, HubError, InstalledVariantSummary, ModelName,
-    ModelRef, ProgressEvent, Recipe, RegistryClient, Role, Sha256, Variant, VariantKey,
-    select_variant,
+    ModelRef, ProgressEvent, Recipe, RegistryClient, Role, ServingDevice, Sha256, Variant,
+    VariantKey, select_variant,
 };
 use tokio::sync::mpsc;
 
+use crate::device::{
+    Decision, DeviceChoice, DeviceError, GpuState, Want, resolve as resolve_device,
+};
 use crate::options::{ExplicitlySet, ServeOptions};
 use crate::private_runtime::PrivateRuntime;
 use crate::recipe_defaults::apply_recipe_defaults_unless_set;
@@ -110,7 +113,7 @@ pub enum PullError {
 }
 
 /// Why a build with no backend cannot pull for an embedder.
-const NO_BACKEND: &str = "no device can run the model: this build has no compute backend; rebuild with the `metal` or `cuda` feature";
+const NO_BACKEND: &str = "no device can run the model: this build has no compute backend; rebuild with the `cpu`, `metal` or `cuda` feature";
 
 /// Whether [`pull_observed`] asks the registry about a model that is already
 /// installed.
@@ -168,16 +171,50 @@ pub fn config_for_home(home: &Path) -> HubConfig {
     config
 }
 
-/// Builds a [`HostProfile`] from compile-time backend features and the
-/// devices behind them (spec §5.2).
+/// Builds a [`HostProfile`] from compile-time backend features, the devices
+/// behind them (spec §5.2) and the device `choice` resolves to.
+///
+/// Only the cheap probes run (is the driver there, does a device exist); no
+/// backend is opened, so `shiso pull` costs the same as before.
+///
+/// # Errors
+///
+/// [`DeviceError`] when `choice` cannot be honoured: a named GPU that is
+/// absent, or a build with no device. Callers refuse with its reason rather
+/// than letting a pull report a missing backend that is really a missing GPU.
+pub fn probe_host_profile(choice: DeviceChoice) -> Result<HostProfile, DeviceError> {
+    let (host, gpu) = probe_facts();
+    with_device(host, gpu, choice, cfg!(feature = "cpu"))
+}
+
+/// The pure part of [`probe_host_profile`]: `host` serving on the device
+/// `choice` resolves to given what the build and the GPU offer.
+fn with_device(
+    host: HostProfile,
+    gpu: GpuState,
+    choice: DeviceChoice,
+    cpu_compiled: bool,
+) -> Result<HostProfile, DeviceError> {
+    let device = match resolve_device(Want::from(choice), cpu_compiled, gpu)? {
+        Decision::Cpu { .. } => ServingDevice::Cpu,
+        Decision::Gpu => ServingDevice::Gpu,
+    };
+    Ok(host.on(device))
+}
+
+/// The host's hardware facts with no device chosen (the GPU profile), for
+/// display paths that must not fail on a device choice.
 #[must_use]
-pub fn probe_host_profile() -> HostProfile {
-    let backends = vec![
-        #[cfg(feature = "metal")]
-        Backend::Metal,
-        #[cfg(feature = "cuda")]
-        Backend::Cuda,
-    ];
+pub fn host_facts() -> HostProfile {
+    probe_facts().0
+}
+
+/// [`probe_host_profile`] for a caller that reports a refusal as a [`PullError`].
+fn host_for(choice: DeviceChoice) -> Result<HostProfile, PullError> {
+    probe_host_profile(choice).map_err(|error| PullError::NoDevice(error.to_string()))
+}
+
+fn probe_facts() -> (HostProfile, GpuState) {
     #[cfg(feature = "cuda")]
     let cuda = shiso_cuda::cuda_available().then_some(shiso_hub::CudaInfo {
         // The server's own stand-in until the CUDA backend reports facts.
@@ -185,7 +222,7 @@ pub fn probe_host_profile() -> HostProfile {
         vram_bytes: 16 * 1024 * 1024 * 1024,
     });
     #[cfg(not(feature = "cuda"))]
-    let cuda = None;
+    let cuda: Option<shiso_hub::CudaInfo> = None;
     #[cfg(feature = "metal")]
     let metal = shiso_metal::device_facts().map(|facts| shiso_hub::MetalInfo {
         name: facts.name,
@@ -193,8 +230,38 @@ pub fn probe_host_profile() -> HostProfile {
         working_set_bytes: facts.working_set_bytes,
     });
     #[cfg(not(feature = "metal"))]
-    let metal = None;
-    HostProfile::probe(backends, cuda, metal)
+    let metal: Option<shiso_hub::MetalInfo> = None;
+    // A backend is listed only when its device is there: a CUDA build on a
+    // host without the driver has no CUDA variant to run.
+    #[cfg_attr(
+        not(any(feature = "metal", feature = "cuda")),
+        expect(unused_mut, reason = "a build with no GPU backend lists none")
+    )]
+    let mut backends = Vec::new();
+    #[cfg(feature = "metal")]
+    if metal.is_some() {
+        backends.push(Backend::Metal);
+    }
+    #[cfg(feature = "cuda")]
+    if cuda.is_some() {
+        backends.push(Backend::Cuda);
+    }
+    let gpu = if cfg!(feature = "cuda") {
+        if cuda.is_some() {
+            GpuState::Present
+        } else {
+            GpuState::Absent("no CUDA device found".to_owned())
+        }
+    } else if cfg!(feature = "metal") {
+        if metal.is_some() {
+            GpuState::Present
+        } else {
+            GpuState::Absent("no Metal device found".to_owned())
+        }
+    } else {
+        GpuState::NotCompiled
+    };
+    (HostProfile::probe(backends, cuda, metal), gpu)
 }
 
 /// The installed variant `model_ref` names, when it is on disk and complete.
@@ -210,7 +277,11 @@ pub fn probe_host_profile() -> HostProfile {
 /// [`PullError::Hub`] when the model home cannot be read or locked.
 pub fn resolve(model_ref: &str, config: &HubConfig) -> Result<Option<InstalledModel>, PullError> {
     // The registry's spelling is lowercase; an embedder need not know that.
-    resolve_on(&probe_host_profile(), &model_ref.to_lowercase(), config)
+    resolve_on(
+        &host_for(DeviceChoice::Auto)?,
+        &model_ref.to_lowercase(),
+        config,
+    )
 }
 
 // None is not a refusal: the model is not in the home (or not complete), which the caller answers by pulling.
@@ -271,7 +342,22 @@ pub fn pull(
     config: &HubConfig,
     progress: &mut dyn FnMut(u64, u64) -> bool,
 ) -> Result<InstalledModel, PullError> {
-    pull_on(&probe_host_profile(), model_ref, config, progress)
+    pull_for(DeviceChoice::Auto, model_ref, config, progress)
+}
+
+/// [`pull`] for the device `choice` names, so a process that will serve with
+/// `--device cpu` fetches the variant the CPU runs.
+///
+/// # Errors
+///
+/// As [`pull`].
+pub fn pull_for(
+    choice: DeviceChoice,
+    model_ref: &str,
+    config: &HubConfig,
+    progress: &mut dyn FnMut(u64, u64) -> bool,
+) -> Result<InstalledModel, PullError> {
+    pull_on(&host_for(choice)?, model_ref, config, progress)
 }
 
 fn pull_on(
@@ -282,7 +368,7 @@ fn pull_on(
 ) -> Result<InstalledModel, PullError> {
     // The device comes first: an embedder whose build cannot run a model must
     // not spend a request, let alone gigabytes of bandwidth, on one.
-    if host.backends.is_empty() {
+    if host.backends.is_empty() && host.device == ServingDevice::Gpu {
         return Err(PullError::NoDevice(NO_BACKEND.to_owned()));
     }
     let mut tally = Tally::default();
@@ -333,7 +419,13 @@ pub fn pull_observed(
     policy: PullPolicy,
     observer: &mut dyn FnMut(&PullEvent) -> bool,
 ) -> Result<InstalledModel, PullError> {
-    pull_observed_on(&probe_host_profile(), model_ref, config, policy, observer)
+    pull_observed_on(
+        &host_for(DeviceChoice::Auto)?,
+        model_ref,
+        config,
+        policy,
+        observer,
+    )
 }
 
 /// [`pull_observed`] for an explicit host profile, as an embedder or a test
@@ -809,7 +901,13 @@ pub fn resolve_serve_model(
     explicit: &ExplicitlySet,
     config: &HubConfig,
 ) -> Result<Option<InstalledModel>, PullError> {
-    resolve_serve_model_on(&probe_host_profile(), model_ref, options, explicit, config)
+    let host = match host_for(options.device) {
+        Ok(host) => host,
+        // A path boots no registry model, so the device is not this call's to judge.
+        Err(_) if matches!(classify_model_arg(model_ref), ModelArgKind::Path(_)) => host_facts(),
+        Err(error) => return Err(error),
+    };
+    resolve_serve_model_on(&host, model_ref, options, explicit, config)
 }
 
 // None is not a refusal: a path was given, so nothing was installed or locked.
@@ -835,7 +933,12 @@ fn resolve_serve_model_on(
 
     let store = BlobStore::new(config.clone());
     let installed = store.list_installed()?;
-    let chosen = find_installed_serve_variant(host, &installed, &parsed, &ref_str)?;
+    let chosen = find_installed_serve_variant(
+        host,
+        &installed,
+        &parsed,
+        &pull_command(&ref_str, options.device),
+    )?;
 
     let key = &chosen.variant;
     let vdir = store.variant_dir(&parsed.model, key);
@@ -942,11 +1045,24 @@ fn check_component_flag_conflicts(options: &ServeOptions, ref_str: &str) -> Resu
     Ok(())
 }
 
+/// The `shiso pull` an operator should run for `ref_str`: the device flag is
+/// included when it is not the default, since it decides which variant is pulled.
+fn pull_command(ref_str: &str, choice: DeviceChoice) -> String {
+    if choice == DeviceChoice::Auto {
+        format!("shiso pull {ref_str}")
+    } else {
+        format!(
+            "shiso pull {ref_str} --device {}",
+            format!("{choice:?}").to_lowercase()
+        )
+    }
+}
+
 fn find_installed_serve_variant<'a>(
     host: &HostProfile,
     installed: &'a [InstalledVariantSummary],
     parsed_ref: &ModelRef,
-    ref_str: &str,
+    pull_cmd: &str,
 ) -> Result<&'a InstalledVariantSummary, PullError> {
     let matching: Vec<_> = installed
         .iter()
@@ -955,7 +1071,7 @@ fn find_installed_serve_variant<'a>(
 
     if matching.is_empty() {
         return Err(PullError::NotInstalled(format!(
-            "model '{}' is not installed. Run 'shiso pull {ref_str}' first.",
+            "model '{}' is not installed. Run '{pull_cmd}' first.",
             parsed_ref.model
         )));
     }
