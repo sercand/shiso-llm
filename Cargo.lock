@@ -2735,6 +2735,7 @@ dependencies = [
  "parking_lot",
  "serde_json",
  "shiso-core",
+ "shiso-cpu",
  "shiso-kvstore",
  "shiso-metal",
  "shiso-modelfile",

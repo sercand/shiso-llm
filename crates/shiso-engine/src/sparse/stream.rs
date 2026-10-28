@@ -57,9 +57,15 @@ pub trait ExpertSource: Send + Sync + fmt::Debug {
     /// block-scaled one.
     fn parts(&self) -> &'static [WeightPart];
 
+    /// Projections one expert holds. Three - gate, up and down - unless the
+    /// container's experts are ungated, which hold only up and down.
+    fn matrices(&self) -> usize {
+        EXPERT_MATRICES
+    }
+
     /// Bytes one expert occupies in each array, the same for every layer:
-    /// [`ExpertSource::parts`] for the gate, then for the up, then for the
-    /// down projection.
+    /// [`ExpertSource::parts`] for each projection in turn, gate (when there
+    /// is one), up, then down.
     fn layout(&self) -> Vec<u64>;
 
     /// Reads array `array` (an index into [`ExpertSource::layout`]) of expert
@@ -172,10 +178,11 @@ impl ExpertStream {
         }
         let layout = source.layout();
         let parts = source.parts();
-        if layout.len() != parts.len() * EXPERT_MATRICES {
+        let matrices = source.matrices();
+        if layout.len() != parts.len() * matrices {
             return Err(CoreError::ShapeMismatch {
                 field: "expert source arrays",
-                expected: (parts.len() * EXPERT_MATRICES) as u64,
+                expected: (parts.len() * matrices) as u64,
                 got: layout.len() as u64,
             });
         }
@@ -272,6 +279,32 @@ impl ExpertStream {
                     backend: "engine",
                 })?;
         Ok(self.pools[matrix * self.parts.len() + array].view())
+    }
+
+    /// The pool array of projection `matrix` (in the source's order) and
+    /// part `part`: what a stage over a streamed bank reads through the map.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Unsupported`] for a projection past the source's last or a
+    /// part its format does not have.
+    pub fn pool(&self, matrix: usize, part: WeightPart) -> CoreResult<DeviceView<'_>> {
+        let array = self
+            .parts
+            .iter()
+            .position(|have| *have == part)
+            .filter(|_| matrix < self.layout.len() / self.parts.len())
+            .ok_or(CoreError::Unsupported {
+                what: "a projection or part the streamed bank does not have",
+                backend: "engine",
+            })?;
+        Ok(self.pools[matrix * self.parts.len() + array].view())
+    }
+
+    /// Bytes one slot occupies in each array, in the source's order.
+    #[must_use]
+    pub fn slot_layout(&self) -> &[u64] {
+        &self.layout
     }
 
     /// One layer's slice of the device map.
