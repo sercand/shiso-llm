@@ -815,7 +815,7 @@ impl EmbedKernel {
 
 /// Every activation buffer the pass writes, sized once for the widest chunk.
 ///
-/// Scratch is allocated for [`crate::MAX_PREFILL_CHUNK`] rows and reused by
+/// Scratch is allocated for [`crate::EngineOptions::prefill_rows`] rows and reused by
 /// every layer: the alternative is per-layer allocation, which for the
 /// feed-forward's inner width alone would be tens of mebibytes multiplied by the
 /// layer count, for buffers that never outlive a launch.

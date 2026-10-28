@@ -114,6 +114,27 @@ fn iq4nl_expert_stage_relu2_is_fused() {
 
 #[test]
 #[ignore = "requires a Metal device"]
+fn iq4nl_expert_gemm_matches_host_dequant() {
+    let Some(gpu) = open() else { return };
+    routed::iq4nl_expert_gemm_matches_host_dequant(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn iq4nl_expert_gemm_reads_through_the_slot_map() {
+    let Some(gpu) = open() else { return };
+    routed::iq4nl_expert_gemm_reads_through_the_slot_map(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn iq4nl_expert_gemm_column_is_independent_of_its_neighbours() {
+    let Some(gpu) = open() else { return };
+    routed::iq4nl_expert_gemm_column_is_independent_of_its_neighbours(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
 fn relu2_squares_the_rectified_value() {
     let Some(gpu) = open() else { return };
     routed::relu2_squares_the_rectified_value(&gpu);

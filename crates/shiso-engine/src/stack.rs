@@ -20,7 +20,8 @@
 //!
 //! # Chunking is this file's, not the caller's
 //!
-//! Scratch is sized for [`MAX_PREFILL_CHUNK`] rows. A prompt longer than that is
+//! Scratch is sized for [`EngineOptions::prefill_rows`] rows - [`MAX_PREFILL_CHUNK`]
+//! unless a family asks for wider passes. A prompt longer than that is
 //! split here rather than refused, because the split is invisible in the result:
 //! each sub-chunk advances the session by its own rows and the recurrent state and
 //! the cache carry the prefix across the boundary exactly as they carry it across a
@@ -59,6 +60,26 @@ use crate::vision::{MediaChunk, Streams, VisionPrefill, Walk};
 /// that decides the scratch bill. A prompt longer than this is split rather than
 /// refused.
 pub const MAX_PREFILL_CHUNK: u32 = 512;
+
+/// The widest prefill pass [`EngineOptions::prefill_rows`] may ask for.
+///
+/// Sixteen default chunks: wide enough that ten minutes of audio prompt is one
+/// pass, and a cap so a mistyped width is refused rather than allocated.
+pub const MAX_PREFILL_ROWS: u32 = 8192;
+
+/// Refuses a prefill width [`EngineOptions::prefill_rows`] does not allow.
+fn check_prefill_rows(rows: u32) -> CoreResult<()> {
+    if rows == 0 || rows > MAX_PREFILL_ROWS || !rows.is_multiple_of(MAX_PREFILL_CHUNK) {
+        return Err(CoreError::InvalidValue {
+            key: "prefill rows",
+            value: format!(
+                "{rows} is not a whole number of {MAX_PREFILL_CHUNK}-row chunks up to \
+                 {MAX_PREFILL_ROWS}"
+            ),
+        });
+    }
+    Ok(())
+}
 
 /// Sessions one decode step may carry, which is also the height of the logits
 /// block.
@@ -648,10 +669,11 @@ impl HybridStack {
         let geometry = Geometry::new(&shape, embed)?;
         validate_ple(&geometry, ple.as_ref())?;
         let recurrent_slots = usize::try_from(shape.recurrent_count()).unwrap_or(0);
+        check_prefill_rows(opts.prefill_rows)?;
         let scratch = Scratch::new(
             backend,
             &geometry,
-            MAX_PREFILL_CHUNK,
+            opts.prefill_rows,
             MAX_DECODE_BATCH.max(MAX_PROMPT_RUNS),
         )?;
         let rows = RowPages::new(backend, opts.ctx, MAX_DECODE_BATCH)?;
@@ -1433,7 +1455,7 @@ impl HybridStack {
             prefill: *prefill,
             walk: Walk::new(prefill.grids(), prefill.pads(), start, positions).at_rotary(rotary),
         });
-        let width = usize::try_from(MAX_PREFILL_CHUNK).unwrap_or(usize::MAX);
+        let width = usize::try_from(self.opts.prefill_rows).unwrap_or(usize::MAX);
         let mut last = 0;
         let mut rest = tokens;
         while !rest.is_empty() {
@@ -2297,7 +2319,7 @@ impl HybridStack {
             // Measured on the layout rather than the runs: a trunk read once
             // is what lets several prompts of a few hundred tokens share one
             // pass at all.
-            if layout.rows() > MAX_PREFILL_CHUNK {
+            if layout.rows() > self.opts.prefill_rows {
                 return Err(CoreError::Unsupported {
                     what: "a batched prompt pass wider than one prefill chunk",
                     backend: "engine",

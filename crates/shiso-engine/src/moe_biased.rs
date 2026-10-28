@@ -34,6 +34,9 @@ use crate::sparse::weights::WeightPart;
 /// Output rows one expert-stage threadgroup covers: four simdgroups of four.
 const EXPERT_ROWS_PER_GROUP: u32 = 16;
 
+/// Output rows one tiled `IQ4_NL` threadgroup covers.
+const IQ4NL_TILE_ROWS: u32 = 64;
+
 /// Threads an expert-stage threadgroup runs.
 const EXPERT_THREADS: u32 = 128;
 
@@ -250,6 +253,7 @@ pub fn run(
         stream.fetch(backend, layer, scratch.ids.view(), columns)?;
     }
     let active = columns.min(shape.experts);
+    let tiled = n_tok > crate::MAX_DECODE_BATCH;
     let stage = |stack: &ExpertStack, first: bool, input: DeviceView<'_>, out: DeviceView<'_>| {
         let args = ExpertArgs {
             in_dim: stack.in_dim(),
@@ -276,6 +280,7 @@ pub fn run(
                     stack,
                     args,
                     active,
+                    tiled,
                     [blocks.view(), scratch.bounds.view()],
                     routing,
                 ),
@@ -288,6 +293,7 @@ pub fn run(
                     stack,
                     ExpertArgs { mapped: 1, ..args },
                     active,
+                    tiled,
                     [
                         stream.pool(*matrix, WeightPart::Whole)?,
                         stream.map(*layer)?,
@@ -451,21 +457,33 @@ fn expert_stage(
 /// `weights[0]` - the whole stack, or a slot pool - with `weights[1]` the slot
 /// map the entry reads when `args.mapped` is set (any buffer otherwise; it is
 /// not read).
+///
+/// A pass wider than a decode batch takes the tiled entry, which dequantizes
+/// a band of an expert's weights once for sixteen of its columns: measured on
+/// an M4, the 802-row prompt of a one-minute recording spent 10.0 s of its
+/// 11.6 s of kernel time in the one-column entry. A decode step and a verify
+/// pass stay on the one-column entry, so a verified row is summed in the
+/// order the serial step that it checks would sum it.
 fn iq4nl_stage(
     backend: &dyn Backend,
     stack: &RowIq4NlStack,
     args: ExpertArgs,
     active: u32,
+    tiled: bool,
     weights: [DeviceView<'_>; 2],
     views: [DeviceView<'_>; 5],
 ) -> CoreResult<()> {
-    const NAME: &str = "kernel_dense_experts_iq4nl_f32";
+    let (name, rows_per_group) = if tiled {
+        ("kernel_dense_experts_iq4nl_gemm_f32", IQ4NL_TILE_ROWS)
+    } else {
+        ("kernel_dense_experts_iq4nl_f32", EXPERT_ROWS_PER_GROUP)
+    };
     let [blocks, map] = weights;
     let [input, sorted, bounds, active_list, out] = views;
     launch::run(
         backend,
-        KernelRef::new(DENSE, NAME),
-        Extent3::new(stack.out_dim.div_ceil(EXPERT_ROWS_PER_GROUP), active, 1),
+        KernelRef::new(DENSE, name),
+        Extent3::new(stack.out_dim.div_ceil(rows_per_group), active, 1),
         Extent3::linear(EXPERT_THREADS),
         0,
         &[
@@ -479,7 +497,7 @@ fn iq4nl_stage(
             KernelArg::Buffer(out),
         ],
     )
-    .map_err(|err| launch::launch_failure(NAME, err))
+    .map_err(|err| launch::launch_failure(name, err))
 }
 
 /// Refuses stacks whose widths the stage kernel cannot walk.

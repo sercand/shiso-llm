@@ -64,6 +64,8 @@ disagree, the kernel is right and this file is the bug.
 | `kernel_dense_affine_qmm_4_f32` | `w, scales, biases, x, y`, then the args block LAST | `(out_dim, n_tok)` | 32 | 0 |
 | `kernel_dense_affine_qmm_8_f32` | `w, scales, biases, x, y`, then the args block LAST | `(out_dim, n_tok)` | 32 | 0 |
 | `kernel_dense_embed_affine4_f32` | `out, words, scales, biases, ids` | `(ceil(hidden/64), n_tok)` | 64 | 0 |
+| `kernel_dense_experts_iq4nl_f32` | `blocks, map, input, sorted, bounds, active, out` | `(ceil(out_dim/16), min(columns, n_expert))` | 128 | 0 |
+| `kernel_dense_experts_iq4nl_gemm_f32` | `blocks, map, input, sorted, bounds, active, out` | `(ceil(out_dim/64), min(columns, n_expert))` | 128 | 0 (static, 11.5 KiB) |
 | `kernel_dense_ple_prepare_affine4` | `out, proj, norm_w, rows, ids` | `(n_layers, n_tok)` | 128 | 1156 |
 
 The four attention entries take their threadgroup memory from the compile-time

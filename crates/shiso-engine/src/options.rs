@@ -78,6 +78,16 @@ pub struct EngineOptions {
     /// storing f16 under a different name: the pool it sized and the pages it
     /// files on disk would both be the wrong size.
     pub kv_elem: KvElem,
+    /// Rows one prefill pass of a hybrid stack carries, which sizes every
+    /// activation buffer of its scratch.
+    ///
+    /// [`crate::MAX_PREFILL_CHUNK`], the default, is the narrow width whose
+    /// scratch every family can afford. A stack that streams its routed
+    /// experts from disk reads every expert once per pass, so a wide pass is
+    /// fewer reads of the same bytes; it costs scratch linear in the width.
+    /// A whole multiple of [`crate::MAX_PREFILL_CHUNK`] up to
+    /// [`crate::MAX_PREFILL_ROWS`], refused otherwise when the stack is built.
+    pub prefill_rows: u32,
 }
 
 impl EngineOptions {
@@ -96,6 +106,7 @@ impl EngineOptions {
             kv_fit: None,
             kv_check: None,
             kv_elem: KvElem::F16,
+            prefill_rows: crate::MAX_PREFILL_CHUNK,
         }
     }
 
