@@ -37,6 +37,8 @@ pub mod qwen35moe;
 pub mod qwen3_asr;
 pub mod qwen4exp;
 pub(crate) mod qwen_image21;
+#[cfg(test)]
+mod test_gguf;
 
 pub use catalog::FamilyFacts;
 
