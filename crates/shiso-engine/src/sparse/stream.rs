@@ -377,6 +377,34 @@ impl ExpertStream {
         })
     }
 
+    /// Unmaps `missing` from `layer` and frees `victims`, on both maps.
+    fn forget(
+        &self,
+        backend: &dyn Backend,
+        layer: u32,
+        missing: &[u32],
+        victims: &[u32],
+    ) -> CoreResult<()> {
+        let mut state = self.state.lock();
+        let base = layer as usize * self.experts as usize;
+        for (&expert, &slot) in missing.iter().zip(victims) {
+            state.host_map[base + expert as usize] = EMPTY;
+            state.owner[slot as usize] = None;
+            state.last_use[slot as usize] = 0;
+        }
+        drop(state);
+        for &expert in missing {
+            backend.copy_h2d(
+                self.map.slice(
+                    (u64::from(layer) * u64::from(self.experts) + u64::from(expert)) * 4,
+                    4,
+                )?,
+                &EMPTY.to_le_bytes(),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Fills a pool that holds every expert of every layer, once: expert `e`
     /// of layer `l` in slot `l * experts + e`, so no fetch ever reads again.
     ///
@@ -519,7 +547,15 @@ impl ExpertStream {
 
         drop(state);
         let started = std::time::Instant::now();
-        self.fill(backend, layer, &missing, &victims)?;
+        if let Err(err) = self.fill(backend, layer, &missing, &victims) {
+            // The maps were pointed at the victims before the reads ran. A
+            // read that failed leaves its slot holding neither the old expert
+            // nor the new one, so every expert of this batch is forgotten on
+            // both maps: a later fetch reads it again instead of counting a
+            // hit on bytes that never arrived.
+            self.forget(backend, layer, &missing, &victims)?;
+            return Err(err);
+        }
         let mut state = self.state.lock();
         state.stats.reads += missing.len() as u64;
         state.stats.read_bytes += missing.len() as u64 * self.slot_bytes();

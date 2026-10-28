@@ -117,3 +117,37 @@ fn stream_with_two_matrices_fetches_and_maps() {
         }
     }
 }
+
+#[test]
+fn failed_read_leaves_map_consistent() {
+    let backend = backend();
+    let stream = ExpertStream::open(
+        &backend,
+        Arc::new(FakeSource { failing: Some(5) }),
+        4,
+        16,
+        8,
+        6,
+    )
+    .expect("open");
+    let five = ids(&backend, &[5]);
+    let err = stream
+        .fetch(backend.as_ref(), 1, five.view(), 1)
+        .expect_err("expert 5 cannot be read");
+    assert!(matches!(err, CoreError::Io(_)), "{err:?}");
+    // Neither map may claim expert 5 is in a slot: a stage would multiply by
+    // whatever the slot last held.
+    assert_eq!(map_of(&backend, &stream, 1)[5], u32::MAX);
+    let again = stream
+        .fetch(backend.as_ref(), 1, five.view(), 1)
+        .expect_err("a second fetch reads again rather than taking a hit");
+    assert!(matches!(again, CoreError::Io(_)), "{again:?}");
+    assert_eq!(stream.stats().hits, 0);
+    let three = ids(&backend, &[3]);
+    stream
+        .fetch(backend.as_ref(), 1, three.view(), 1)
+        .expect("a readable expert still fetches");
+    let map = map_of(&backend, &stream, 1);
+    assert_ne!(map[3], u32::MAX);
+    assert_eq!(map[5], u32::MAX);
+}
