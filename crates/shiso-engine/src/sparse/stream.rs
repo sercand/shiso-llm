@@ -31,7 +31,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::mpsc;
+
+use parking_lot::{Condvar, Mutex};
 use shiso_core::backend::Backend;
 use shiso_core::buffer::{DeviceBuffer, DeviceView, alloc_tagged};
 use shiso_core::error::{CoreError, CoreResult};
@@ -97,7 +100,25 @@ pub struct StreamStats {
     /// Seconds spent draining the device before reading the routed ids, which
     /// is the device's own work up to the fetch plus one round trip.
     pub drain_seconds: f64,
+    /// Guessed experts a [`ExpertStream::prefetch`] started reading ahead of
+    /// their layer's fetch.
+    pub prefetch_reads: u64,
+    /// Of the experts a fetch found missing, those a prefetch had already
+    /// read, so the fetch only copied them in.
+    pub prefetched: u64,
 }
+
+/// One guessed expert's bytes, read off the fetch path by a prefetch worker.
+#[derive(Debug, Default)]
+struct Staged {
+    /// Every array of the expert, in layout order, once the read is done.
+    bytes: Mutex<Option<CoreResult<Vec<u8>>>>,
+    /// Signalled when `bytes` is filled.
+    ready: Condvar,
+}
+
+/// A guess handed to the prefetch workers.
+type PrefetchJob = (u32, u32, Arc<Staged>);
 
 /// The mutable half of a stream.
 #[derive(Debug)]
@@ -133,6 +154,12 @@ pub struct ExpertStream {
     /// the routed ids back, which a captured step cannot do and which cost a
     /// host round trip per layer per step.
     complete: AtomicBool,
+    /// Guesses read or being read ahead of their layer's fetch, by
+    /// `(layer, expert)`.
+    staged: Mutex<HashMap<(u32, u32), Arc<Staged>>>,
+    /// Where guesses go to be read, once the first prefetch started the
+    /// workers.
+    jobs: Mutex<Option<mpsc::Sender<PrefetchJob>>>,
 }
 
 impl fmt::Debug for ExpertStream {
@@ -150,6 +177,13 @@ impl fmt::Debug for ExpertStream {
 /// Concurrent reads one fetch may run: enough to keep a fast solid-state
 /// device's queue busy with reads of a few hundred kilobytes each.
 const READERS: usize = 16;
+
+/// Threads that read guessed experts while the device computes.
+const PREFETCHERS: usize = 4;
+
+/// Guesses that may be staged at once: a bound on the host memory the
+/// prefetch holds, a few layers' worth of a decode step's misses.
+const PREFETCH_CAP: usize = 48;
 
 impl ExpertStream {
     /// Opens a pool of `slots` expert slots over `source`, for `layers`
@@ -231,6 +265,8 @@ impl ExpertStream {
                 stats: StreamStats::default(),
             }),
             complete: AtomicBool::new(false),
+            staged: Mutex::new(HashMap::new()),
+            jobs: Mutex::new(None),
         })
     }
 
@@ -325,19 +361,29 @@ impl ExpertStream {
         layer: u32,
         missing: &[u32],
         victims: &[u32],
+        staged: &[Option<Vec<u8>>],
     ) -> CoreResult<()> {
         // Every array of every missing expert, and its map entry, in one
         // batch of writable ranges: the reads land where the stages read
         // them, and they run side by side because a fast solid-state device
         // only reaches its bandwidth with many reads in flight.
         let mut views = Vec::with_capacity(missing.len() * (self.layout.len() + 1));
-        let mut jobs: Vec<(u32, usize)> = Vec::with_capacity(missing.len() * self.layout.len());
-        for (&expert, &slot) in missing.iter().zip(victims) {
+        let mut jobs: Vec<(usize, usize)> = Vec::with_capacity(missing.len() * self.layout.len());
+        for (index, &slot) in victims.iter().enumerate().take(missing.len()) {
             for (array, (pool, &bytes)) in self.pools.iter().zip(&self.layout).enumerate() {
                 views.push(pool.slice(u64::from(slot) * bytes, bytes)?);
-                jobs.push((expert, array));
+                jobs.push((index, array));
             }
         }
+        let offsets: Vec<usize> = self
+            .layout
+            .iter()
+            .scan(0usize, |at, &bytes| {
+                let here = *at;
+                *at += usize::try_from(bytes).unwrap_or(usize::MAX);
+                Some(here)
+            })
+            .collect();
         let arrays = views.len();
         for (&expert, _) in missing.iter().zip(victims) {
             views.push(self.map.slice(
@@ -345,7 +391,7 @@ impl ExpertStream {
                 4,
             )?);
         }
-        let source = &self.source;
+        let (source, offsets) = (&self.source, &offsets);
         backend.write_host(&views, &mut |slices| {
             let (data, entries) = slices.split_at_mut(arrays);
             for (entry, &slot) in entries.iter_mut().zip(victims) {
@@ -358,8 +404,15 @@ impl ExpertStream {
                     .zip(jobs.chunks(per))
                     .map(|(bufs, work)| {
                         scope.spawn(move || -> CoreResult<()> {
-                            for (buf, &(expert, array)) in bufs.iter_mut().zip(work) {
-                                source.read(layer, expert, array, buf)?;
+                            for (buf, &(index, array)) in bufs.iter_mut().zip(work) {
+                                match staged.get(index).and_then(Option::as_ref) {
+                                    // A guess already read it: copy, do not read.
+                                    Some(bytes) => {
+                                        let at = offsets[array];
+                                        buf.copy_from_slice(&bytes[at..at + buf.len()]);
+                                    }
+                                    None => source.read(layer, missing[index], array, buf)?,
+                                }
                             }
                             Ok(())
                         })
@@ -375,6 +428,114 @@ impl ExpertStream {
                 Ok(())
             })
         })
+    }
+
+    /// Starts reading `guess`'s experts of `layer` that are in no slot, off
+    /// the fetch path, so the layer's fetch only copies the ones it then
+    /// wants.
+    ///
+    /// A guess is advice: one the fetch does not want is dropped when that
+    /// fetch runs, never mapped, and a read that fails is retried by the
+    /// fetch itself. Returns at once; at most [`PREFETCH_CAP`] guesses are
+    /// staged at a time, the rest are not read ahead.
+    pub fn prefetch(&self, layer: u32, guess: &[u32]) {
+        if self.complete.load(Ordering::Acquire) || layer >= self.layers {
+            return;
+        }
+        let wanted: Vec<u32> = {
+            let state = self.state.lock();
+            let base = layer as usize * self.experts as usize;
+            guess
+                .iter()
+                .copied()
+                .filter(|&e| e < self.experts && state.host_map[base + e as usize] == EMPTY)
+                .collect()
+        };
+        if wanted.is_empty() {
+            return;
+        }
+        let mut issued = 0u64;
+        {
+            let mut staged = self.staged.lock();
+            let mut jobs = self.jobs.lock();
+            let sender = jobs.get_or_insert_with(|| self.start_prefetchers());
+            for expert in wanted {
+                if staged.len() >= PREFETCH_CAP || staged.contains_key(&(layer, expert)) {
+                    continue;
+                }
+                let entry = Arc::new(Staged::default());
+                if sender.send((layer, expert, Arc::clone(&entry))).is_ok() {
+                    staged.insert((layer, expert), entry);
+                    issued += 1;
+                }
+            }
+        }
+        self.state.lock().stats.prefetch_reads += issued;
+    }
+
+    /// The prefetch workers, sharing one queue; they stop when the stream,
+    /// and with it the queue's sender, is dropped.
+    fn start_prefetchers(&self) -> mpsc::Sender<PrefetchJob> {
+        let (sender, receiver) = mpsc::channel::<PrefetchJob>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        for _ in 0..PREFETCHERS {
+            let receiver = Arc::clone(&receiver);
+            let source = Arc::clone(&self.source);
+            let layout = self.layout.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let job = receiver.lock().recv();
+                    let Ok((layer, expert, staged)) = job else {
+                        return;
+                    };
+                    let total = layout
+                        .iter()
+                        .map(|&b| usize::try_from(b).unwrap_or(0))
+                        .sum();
+                    let mut bytes = vec![0u8; total];
+                    let mut at = 0usize;
+                    let mut result = Ok(());
+                    for (array, &len) in layout.iter().enumerate() {
+                        let len = usize::try_from(len).unwrap_or(0);
+                        result = source.read(layer, expert, array, &mut bytes[at..at + len]);
+                        if result.is_err() {
+                            break;
+                        }
+                        at += len;
+                    }
+                    *staged.bytes.lock() = Some(result.map(|()| bytes));
+                    staged.ready.notify_all();
+                }
+            });
+        }
+        sender
+    }
+
+    /// The staged bytes of each of `missing`, waiting for reads still in
+    /// flight, and drops every other guess for `layer`: its fetch is now, so
+    /// a guess it did not want is a guess that was wrong.
+    fn take_staged(&self, layer: u32, missing: &[u32]) -> Vec<Option<Vec<u8>>> {
+        let taken: Vec<Option<Arc<Staged>>> = {
+            let mut staged = self.staged.lock();
+            let taken = missing
+                .iter()
+                .map(|e| staged.remove(&(layer, *e)))
+                .collect();
+            staged.retain(|(l, _), _| *l != layer);
+            taken
+        };
+        taken
+            .into_iter()
+            .map(|entry| {
+                let entry = entry?;
+                let mut bytes = entry.bytes.lock();
+                while bytes.is_none() {
+                    entry.ready.wait(&mut bytes);
+                }
+                // A failed guess is read again by the fetch.
+                bytes.take().and_then(Result::ok)
+            })
+            .collect()
     }
 
     /// Unmaps `missing` from `layer` and frees `victims`, on both maps.
@@ -425,7 +586,7 @@ impl ExpertStream {
         let experts: Vec<u32> = (0..self.experts).collect();
         for layer in 0..self.layers {
             let slots: Vec<u32> = experts.iter().map(|e| layer * self.experts + e).collect();
-            self.fill(backend, layer, &experts, &slots)?;
+            self.fill(backend, layer, &experts, &slots, &[])?;
             let mut state = self.state.lock();
             for (&e, &slot) in experts.iter().zip(&slots) {
                 state.host_map[(layer * self.experts + e) as usize] = slot;
@@ -546,8 +707,10 @@ impl ExpertStream {
         }
 
         drop(state);
+        let staged = self.take_staged(layer, &missing);
+        let from_disk = staged.iter().filter(|s| s.is_none()).count() as u64;
         let started = std::time::Instant::now();
-        if let Err(err) = self.fill(backend, layer, &missing, &victims) {
+        if let Err(err) = self.fill(backend, layer, &missing, &victims, &staged) {
             // The maps were pointed at the victims before the reads ran. A
             // read that failed leaves its slot holding neither the old expert
             // nor the new one, so every expert of this batch is forgotten on
@@ -557,8 +720,9 @@ impl ExpertStream {
             return Err(err);
         }
         let mut state = self.state.lock();
-        state.stats.reads += missing.len() as u64;
-        state.stats.read_bytes += missing.len() as u64 * self.slot_bytes();
+        state.stats.reads += from_disk;
+        state.stats.prefetched += missing.len() as u64 - from_disk;
+        state.stats.read_bytes += from_disk * self.slot_bytes();
         state.stats.read_seconds += started.elapsed().as_secs_f64();
         Ok(())
     }

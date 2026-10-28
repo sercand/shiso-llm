@@ -473,6 +473,18 @@ pub struct ServeOptions {
         arg(long, env = "SHISO_EXPERT_SLOTS", default_value_t = 0)
     )]
     pub expert_slots: u32,
+    /// Guess each routed layer's experts from the layer before it and read
+    /// them while the device computes, for a family that streams its banks.
+    ///
+    /// A guess never changes an answer: what it missed, the layer's own fetch
+    /// reads. It costs a read nobody uses when it is wrong.
+    #[cfg_attr(feature = "clap", arg(
+        long,
+        env = "SHISO_EXPERT_PREFETCH",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    ))]
+    pub expert_prefetch: bool,
 
     /// The per-layer n-gram embedding table, for a checkpoint that keeps it in
     /// a file of its own: the sparse family's trellis export.
@@ -982,6 +994,7 @@ impl Default for ServeOptions {
             expert_residency: ExpertResidencyChoice::Auto,
             expert_reserve_gb: 6,
             expert_slots: 0,
+            expert_prefetch: true,
             ngram: None,
             vision: None,
             vision_max_pixels: DEFAULT_VISION_MAX_PIXELS,

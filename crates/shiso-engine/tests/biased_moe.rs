@@ -15,7 +15,9 @@ use std::sync::Arc;
 use shiso_core::{Backend, DType, DeviceBuffer, alloc};
 use shiso_engine::ffn::Ffn;
 use shiso_engine::moe::{MoeIo, MoeScratch};
-use shiso_engine::moe_biased::{self, BiasedMoe, ExpertStack, RowIq4NlStack, StackStore};
+use shiso_engine::moe_biased::{
+    self, BiasedMoe, ExpertStack, RouterGuess, RowIq4NlStack, StackStore,
+};
 use shiso_engine::projection::Weight;
 use shiso_engine::shape::MoeShape;
 use shiso_engine::sparse::weights::WeightPart;
@@ -129,6 +131,7 @@ fn biased_moe_iq4nl_matches_host_reference() {
             in_dim: WIDTH as u32,
             out_dim: HIDDEN as u32,
         }),
+        guess: None,
     };
     moe_biased::check_stack(&moe.up).expect("up stack");
     moe_biased::check_stack(&moe.down).expect("down stack");
@@ -312,6 +315,13 @@ fn streamed_biased_moe_equals_resident() {
         };
         let router = signal(S_EXPERTS * HIDDEN, 300 + l as u32);
         let bias: Vec<f32> = (0..S_EXPERTS).map(|e| (e % 5) as f32 * 0.01).collect();
+        // A streamed layer guesses the next one's experts; the guess must not
+        // change a result.
+        let guess = (streamed && l + 1 < S_LAYERS).then(|| RouterGuess {
+            layer: l as u32 + 1,
+            weights: signal(S_EXPERTS * HIDDEN, 301 + l as u32).into(),
+            bias: bias.clone().into(),
+        });
         let moe = BiasedMoe {
             router: f32_weight(&backend, &router, HIDDEN, S_EXPERTS),
             bias: upload(&backend, bytemuck::cast_slice(&bias)),
@@ -327,6 +337,7 @@ fn streamed_biased_moe_equals_resident() {
                 in_dim: WIDTH as u32,
                 out_dim: HIDDEN as u32,
             }),
+            guess,
         };
         moe_biased::check_stack(&moe.up).expect("up stack");
         moe_biased::check_stack(&moe.down).expect("down stack");
@@ -389,4 +400,8 @@ fn streamed_biased_moe_equals_resident() {
             assert!(stream.stats().hits > 0, "a repeated step hits the pool");
         }
     }
+    assert!(
+        stream.stats().prefetch_reads > 0,
+        "the decode steps guessed ahead"
+    );
 }

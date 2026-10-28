@@ -33,7 +33,9 @@ use shiso_core::ids::LayerIdx;
 use shiso_engine::attn::Attn;
 use shiso_engine::ffn::Ffn;
 use shiso_engine::layers::{Block, LayerWeights, Routed, Weights};
-use shiso_engine::moe_biased::{self, BiasedMoe, ExpertStack, RowIq4NlStack, StackStore};
+use shiso_engine::moe_biased::{
+    self, BiasedMoe, ExpertStack, RouterGuess, RowIq4NlStack, StackStore,
+};
 use shiso_engine::projection::Weight;
 use shiso_engine::sparse::weights::WeightPart;
 use shiso_engine::sparse::{ExpertSource, ExpertStream};
@@ -147,7 +149,13 @@ pub enum ExpertPlacement {
     /// Imported whole: every expert resident.
     Resident,
     /// Read through this stream, one routed layer per stream layer in order.
-    Streamed(Arc<ExpertStream>),
+    Streamed {
+        /// The stream.
+        stream: Arc<ExpertStream>,
+        /// Whether each routed layer guesses the next one's experts and reads
+        /// them while the device computes.
+        prefetch: bool,
+    },
 }
 
 /// Every resident weight of a GGUF export, slot by slot.
@@ -165,6 +173,24 @@ pub(crate) fn weights_gguf(
 ) -> CoreResult<Weights> {
     let loader = Loader { file, backend };
     let shape = config.shape();
+    // Every routed layer's router on the host, for the layer before it to
+    // guess with, when the banks are streamed and guessing is on.
+    let routers: Vec<HostRouter> = match placement {
+        ExpertPlacement::Streamed { prefetch: true, .. } => routed_blocks(config)
+            .iter()
+            .map(|block| {
+                Ok((
+                    loader
+                        .floats(&format!("blk.{block}.ffn_gate_inp.weight"))?
+                        .into(),
+                    loader
+                        .floats(&format!("blk.{block}.exp_probs_b.bias"))?
+                        .into(),
+                ))
+            })
+            .collect::<CoreResult<_>>()?,
+        _ => Vec::new(),
+    };
     let hidden = shape.hidden;
     let mut layers = Vec::with_capacity(config.slots().len());
     let (mut ssm_rank, mut attn_rank, mut routed_rank) = (0u32, 0u32, 0u32);
@@ -191,7 +217,14 @@ pub(crate) fn weights_gguf(
             None => (None, None, None),
             Some(block) => {
                 let at = format!("blk.{block}");
-                let (shared, routed) = loader.moe(&at, config, placement, routed_rank)?;
+                let (shared, mut routed) = loader.moe(&at, config, placement, routed_rank)?;
+                routed.guess = routers
+                    .get(routed_rank as usize + 1)
+                    .map(|(weights, bias)| RouterGuess {
+                        layer: routed_rank + 1,
+                        weights: Arc::clone(weights),
+                        bias: Arc::clone(bias),
+                    });
                 routed_rank += 1;
                 (
                     Some(loader.vector(&format!("{at}.attn_norm.weight"))?),
@@ -223,6 +256,9 @@ pub(crate) fn weights_gguf(
         layers,
     })
 }
+
+/// One routed layer's router weights and selection bias, on the host.
+type HostRouter = (Arc<[f32]>, Arc<[f32]>);
 
 /// The routed blocks of a stack, in the order the stream numbers them.
 #[must_use]
@@ -381,7 +417,7 @@ impl Loader<'_> {
                         self.file.range_of(desc),
                     )?)
                 }
-                ExpertPlacement::Streamed(stream) => StackStore::Streamed {
+                ExpertPlacement::Streamed { stream, .. } => StackStore::Streamed {
                     stream: Arc::clone(stream),
                     matrix,
                     layer: rank,
@@ -404,6 +440,7 @@ impl Loader<'_> {
                 renormalize: config.renormalize(),
                 up: stack("ffn_up_exps.weight", 0, hidden, moe.intermediate)?,
                 down: stack("ffn_down_exps.weight", 1, moe.intermediate, hidden)?,
+                guess: None,
             },
         ))
     }

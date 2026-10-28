@@ -112,7 +112,8 @@ impl NemotronHModel {
     }
 
     /// Opens a GGUF export and puts it on the device, its routed experts
-    /// resident or streamed from the file as `residency` says.
+    /// resident or streamed from the file as `residency` says; streamed ones
+    /// are guessed and read ahead one layer when `prefetch` is set.
     ///
     /// # Errors
     ///
@@ -127,6 +128,7 @@ impl NemotronHModel {
         config: &NemotronHConfig,
         opts: EngineOptions,
         residency: GgufResidency,
+        prefetch: bool,
     ) -> CoreResult<Self> {
         let file = GgufFile::open_shared(path).map_err(|err| CoreError::InvalidValue {
             key: "nemotron_h gguf",
@@ -183,7 +185,13 @@ impl NemotronHModel {
                     slots,
                     moe.experts,
                 )?);
-                (ExpertPlacement::Streamed(Arc::clone(&stream)), Some(stream))
+                (
+                    ExpertPlacement::Streamed {
+                        stream: Arc::clone(&stream),
+                        prefetch,
+                    },
+                    Some(stream),
+                )
             }
         };
         let weights = gguf::weights_gguf(backend, &file, config, &placement)?;
@@ -401,6 +409,7 @@ impl Loader<'_> {
                 renormalize: config.renormalize(),
                 up,
                 down,
+                guess: None,
             },
         ))
     }

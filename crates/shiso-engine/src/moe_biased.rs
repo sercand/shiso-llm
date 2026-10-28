@@ -160,7 +160,58 @@ pub struct BiasedMoe {
     pub up: ExpertStack,
     /// `expert width -> hidden`.
     pub down: ExpertStack,
+    /// The next routed layer's router, on the host, when the banks are
+    /// streamed and the experts that layer will want are guessed ahead.
+    pub guess: Option<RouterGuess>,
 }
+
+/// The next routed layer's router, held on the host so the experts it is
+/// likely to choose can be read while the device computes.
+///
+/// The guess scores this layer's normalized input rows with the next layer's
+/// router: the residual stream moves little across one mixing block, so the
+/// next layer's choice is mostly the one it would make on these rows. A wrong
+/// guess costs a read nobody uses; it never changes a result, because the next
+/// layer's own fetch reads whatever the guess missed.
+#[derive(Debug, Clone)]
+pub struct RouterGuess {
+    /// The stream layer the guesses are for.
+    pub layer: u32,
+    /// `[experts][hidden]` router weights.
+    pub weights: Arc<[f32]>,
+    /// `[experts]` selection bias.
+    pub bias: Arc<[f32]>,
+}
+
+impl RouterGuess {
+    /// The experts the router would choose, `used` a row, for any of `rows`
+    /// (`n` rows of `hidden` values).
+    #[must_use]
+    pub fn choose(&self, rows: &[f32], hidden: usize, used: usize) -> Vec<u32> {
+        let experts = self.bias.len();
+        let mut chosen: Vec<u32> = Vec::new();
+        let mut scored: Vec<(f32, u32)> = Vec::with_capacity(experts);
+        for row in rows.chunks_exact(hidden.max(1)) {
+            scored.clear();
+            for (e, w) in self.weights.chunks_exact(hidden.max(1)).enumerate() {
+                let logit: f32 = w.iter().zip(row).map(|(a, b)| a * b).sum();
+                let score = 1.0 / (1.0 + (-logit).exp()) + self.bias[e];
+                scored.push((score, u32::try_from(e).unwrap_or(u32::MAX)));
+            }
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            for &(_, e) in scored.iter().take(used) {
+                if !chosen.contains(&e) {
+                    chosen.push(e);
+                }
+            }
+        }
+        chosen
+    }
+}
+
+/// Rows a pass may carry and still guess the next layer's experts: a decode
+/// step or a verify pass. A prompt pass wants nearly every expert anyway.
+const GUESS_MAX_ROWS: u32 = 16;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -249,9 +300,7 @@ pub fn run(
     // chosen ids back and fills the slots the layer's map then points at. The
     // up and down banks of a layer are one stream layer, so one fetch serves
     // both.
-    if let Some((stream, layer)) = streamed(&moe.up).or_else(|| streamed(&moe.down)) {
-        stream.fetch(backend, layer, scratch.ids.view(), columns)?;
-    }
+    fetch_streamed(backend, moe, shape, scratch, io, n_tok, columns)?;
     let active = columns.min(shape.experts);
     let tiled = n_tok > crate::MAX_DECODE_BATCH;
     let stage = |stack: &ExpertStack, first: bool, input: DeviceView<'_>, out: DeviceView<'_>| {
@@ -306,6 +355,44 @@ pub fn run(
     stage(&moe.up, true, io.input, scratch.up.view())?;
     stage(&moe.down, false, scratch.up.view(), scratch.down.view())?;
     combine_add(backend, moe, shape, scratch, io.block_out, hidden, n_tok)
+}
+
+/// Brings a streamed bank's chosen experts in, after the router chose them and
+/// before a stage reads them, and guesses the next layer's.
+///
+/// The fetch drains the device, reads the chosen ids back and fills the slots
+/// the layer's map then points at. The up and down banks of a layer are one
+/// stream layer, so one fetch serves both. With the device drained this
+/// pass's normalized rows are final, so the next layer's likely experts can be
+/// read while it computes.
+fn fetch_streamed(
+    backend: &dyn Backend,
+    moe: &BiasedMoe,
+    shape: MoeShape,
+    scratch: &MoeScratch,
+    io: MoeIo<'_>,
+    n_tok: u32,
+    columns: u32,
+) -> CoreResult<()> {
+    let Some((stream, layer)) = streamed(&moe.up).or_else(|| streamed(&moe.down)) else {
+        return Ok(());
+    };
+    stream.fetch(backend, layer, scratch.ids.view(), columns)?;
+    if let Some(guess) = moe.guess.as_ref()
+        && n_tok <= GUESS_MAX_ROWS
+    {
+        let width = usize::try_from(moe.router.in_dim).unwrap_or(usize::MAX);
+        let mut rows = vec![0f32; width * n_tok as usize];
+        backend.copy_d2h(
+            io.input.slice(0, rows.len() as u64 * F32_BYTES)?,
+            bytemuck::cast_slice_mut(&mut rows),
+        )?;
+        stream.prefetch(
+            guess.layer,
+            &guess.choose(&rows, width, shape.used as usize),
+        );
+    }
+    Ok(())
 }
 
 /// The stream and stream layer a stack reads through, when it is streamed.

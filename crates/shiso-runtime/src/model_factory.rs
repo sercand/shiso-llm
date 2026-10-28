@@ -794,8 +794,15 @@ fn load_nemotron_h(
             },
             _ => GgufResidency::Auto { reserve },
         };
-        NemotronHModel::load_gguf(backend, path, &family, opts, residency)
-            .map_err(FactoryError::Load)?
+        NemotronHModel::load_gguf(
+            backend,
+            path,
+            &family,
+            opts,
+            residency,
+            args.expert_prefetch,
+        )
+        .map_err(FactoryError::Load)?
     } else {
         let family = NemotronHConfig::from_dir(path).map_err(FactoryError::Load)?;
         NemotronHModel::load(backend, path, &family, opts).map_err(FactoryError::Load)?

@@ -62,6 +62,7 @@ fn load_with(
         &config,
         opts,
         GgufResidency::Streamed { slots: SLOTS },
+        std::env::var("SHISO_TEST_PREFETCH").map_or(true, |v| v != "0"),
     )
     .expect("the export loads with its experts streamed")
 }
@@ -314,6 +315,14 @@ fn decode_rate() {
         before.drain_seconds,
         before.fetches
     );
+    let region = std::env::var_os("SHISO_TEST_PROFILE").map(|_| {
+        shiso_core::profile::ProfileRegion::open(
+            backend
+                .as_profiler()
+                .expect("the Metal device times launches"),
+        )
+        .expect("a profile region opens")
+    });
     let started = std::time::Instant::now();
     for _ in 0..steps {
         let logits = model
@@ -325,12 +334,16 @@ fn decode_rate() {
         last = argmax_row(&backend, logits.row(0).expect("row"));
     }
     let decode = started.elapsed().as_secs_f64();
+    if let Some(region) = region {
+        eprintln!("{}", region.finish().expect("the region closes").table(25));
+    }
     let after = model.expert_stats().unwrap_or_default();
     let wanted = after.wanted - before.wanted;
     let hits = after.hits - before.hits;
     eprintln!(
         "prefill {} tokens in {prefill:.2} s ({:.0} tok/s); decode {steps} in {decode:.2} s ({:.2} tok/s); \
-         hit rate {:.3}; {:.0} MiB read per token; read {:.2} s, drain {:.2} s",
+         hit rate {:.3}; {:.0} MiB read per token; read {:.2} s, drain {:.2} s; \
+         {} guessed, {} of them used",
         tokens.len(),
         tokens.len() as f64 / prefill,
         steps as f64 / decode,
@@ -338,6 +351,8 @@ fn decode_rate() {
         (after.read_bytes - before.read_bytes) as f64 / steps as f64 / 1_048_576.0,
         after.read_seconds - before.read_seconds,
         after.drain_seconds - before.drain_seconds,
+        after.prefetch_reads - before.prefetch_reads,
+        after.prefetched - before.prefetched,
     );
 }
 

@@ -151,3 +151,47 @@ fn failed_read_leaves_map_consistent() {
     assert_ne!(map[3], u32::MAX);
     assert_eq!(map[5], u32::MAX);
 }
+
+#[test]
+fn prefetched_experts_are_used_and_wrong_guesses_cost_nothing() {
+    let backend = backend();
+    let stream = ExpertStream::open(
+        &backend,
+        Arc::new(FakeSource { failing: None }),
+        4,
+        16,
+        8,
+        6,
+    )
+    .expect("open");
+    stream.prefetch(2, &[1, 2]);
+    let routed = ids(&backend, &[2, 7]);
+    stream
+        .fetch(backend.as_ref(), 2, routed.view(), 2)
+        .expect("fetch");
+    let stats = stream.stats();
+    // Expert 2 came from the staged read; only 7 was read on the fetch path.
+    assert_eq!(stats.reads, 1);
+    assert_eq!(stats.prefetched, 1);
+    assert_eq!(stats.prefetch_reads, 2);
+    let map = map_of(&backend, &stream, 2);
+    assert_eq!(map[1], u32::MAX, "an unused guess is never mapped");
+    for expert in [2u32, 7] {
+        for (matrix, &bytes) in LAYOUT.iter().enumerate() {
+            let want: Vec<u8> = (0..bytes as usize)
+                .map(|i| byte(2, expert, matrix, i))
+                .collect();
+            assert_eq!(
+                slot_bytes(&backend, &stream, matrix, map[expert as usize]),
+                want
+            );
+        }
+    }
+    // A guess for a layer whose fetch already ran is dropped, not kept: the
+    // next fetch of that layer reads 1 itself.
+    let one = ids(&backend, &[1]);
+    stream
+        .fetch(backend.as_ref(), 2, one.view(), 1)
+        .expect("fetch");
+    assert_eq!(stream.stats().reads, 2);
+}
