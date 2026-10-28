@@ -499,6 +499,11 @@ struct dense_args_moe_route {
 /// `by_token` non-zero reads the TOKEN's row of the input (`col / n_used`),
 /// which is the first projection; zero reads the column's own row, which is the
 /// second. `act` 1 squares the rectified output; 0 writes it as it is.
+///
+/// `mapped` non-zero reads expert `e` from slot `map[layer_base + e]` of the
+/// weight array instead of from position `e`: the array is then a pool of
+/// streamed expert slots and the map is every layer's expert-to-slot table.
+/// Only the IQ4_NL stage reads these two; the affine stage ignores them.
 struct dense_args_experts {
     uint32_t in_dim;
     uint32_t out_dim;
@@ -506,8 +511,8 @@ struct dense_args_experts {
     uint32_t n_used;
     uint32_t by_token;
     uint32_t act;
-    uint32_t pad0;
-    uint32_t pad1;
+    uint32_t mapped;
+    uint32_t layer_base;
 };
 
 /// A flat elementwise launch over `n` floats.

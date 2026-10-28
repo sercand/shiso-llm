@@ -333,6 +333,93 @@ kernel void kernel_dense_experts_affine4_f32(
     }
 }
 
+/// One routed stage over row-major IQ4_NL stacks, optionally through a slot
+/// map.
+///
+/// The same grid and column walk as the affine stage. A row is `in_dim / 32`
+/// blocks of 18 bytes - an f16 scale, then sixteen bytes whose low nibbles are
+/// the block's first sixteen values and whose high nibbles are its last
+/// sixteen, each an index into the `IQ4NL` table - so expert `e`'s row `r`
+/// starts at block `(slot * out_dim + r) * in_dim / 32`, where `slot` is `e`
+/// itself or, for a streamed bank, `map[layer_base + e]`. A lane takes whole
+/// blocks, strided by the simdgroup width, and dots each against every row the
+/// simdgroup owns, so a width of 84 blocks (2688 inputs) needs no padding.
+///
+/// Buffers: args, blocks, map, input, sorted, bounds, active, out.
+kernel void kernel_dense_experts_iq4nl_f32(
+        constant dense_args_experts & args [[buffer(0)]],
+        device const uchar * w [[buffer(1)]],
+        device const int * map [[buffer(2)]],
+        device const float * x [[buffer(3)]],
+        device const int * sorted [[buffer(4)]],
+        device const int * bounds [[buffer(5)]],
+        device const int * active [[buffer(6)]],
+        device float * out [[buffer(7)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]],
+        uint n_sg [[simdgroups_per_threadgroup]]) {
+    constexpr uint R = DENSE_EXPERT_ROWS;
+    constexpr uint BLOCK_BYTES = 18u;
+    if (int(tgpig.y) >= active[args.n_expert]) {
+        return;
+    }
+    const uint expert = uint(active[tgpig.y]);
+    const int c0 = bounds[expert];
+    const int c1 = bounds[expert + 1u];
+    const uint in_dim = args.in_dim;
+    const uint out_dim = args.out_dim;
+    const uint blocks = in_dim / 32u;
+    const uint row0 = (tgpig.x * n_sg + sg) * R;
+    if (row0 >= out_dim) {
+        return;
+    }
+    const uint slot = args.mapped != 0u ? uint(map[args.layer_base + expert]) : expert;
+    device const uchar * wr[R];
+    for (uint r = 0; r < R; ++r) {
+        const uint64_t at = (uint64_t) slot * out_dim + min(row0 + r, out_dim - 1u);
+        wr[r] = w + at * blocks * BLOCK_BYTES;
+    }
+    for (int c = c0; c < c1; ++c) {
+        const uint col = uint(sorted[c]);
+        const uint xr = args.by_token != 0u ? col / args.n_used : col;
+        device const float4 * xrow = (device const float4 *) (x + (uint64_t) xr * in_dim);
+        float acc[R] = {};
+        for (uint b = lane; b < blocks; b += 32u) {
+            float4 xv[8];
+            for (uint q = 0; q < 8u; ++q) {
+                xv[q] = xrow[b * 8u + q];
+            }
+            for (uint r = 0; r < R; ++r) {
+                device const uchar * blk = wr[r] + b * BLOCK_BYTES;
+                const float d = float(*((device const half *) blk));
+                device const uchar * qs = blk + 2u;
+                float s = 0.0f;
+                for (uint q = 0; q < 4u; ++q) {
+                    const uchar b0 = qs[4u * q];
+                    const uchar b1 = qs[4u * q + 1u];
+                    const uchar b2 = qs[4u * q + 2u];
+                    const uchar b3 = qs[4u * q + 3u];
+                    const float4 lo = xv[q];
+                    const float4 hi = xv[q + 4u];
+                    s += float(IQ4NL[b0 & 0xfu]) * lo.x + float(IQ4NL[b1 & 0xfu]) * lo.y
+                        + float(IQ4NL[b2 & 0xfu]) * lo.z + float(IQ4NL[b3 & 0xfu]) * lo.w
+                        + float(IQ4NL[b0 >> 4u]) * hi.x + float(IQ4NL[b1 >> 4u]) * hi.y
+                        + float(IQ4NL[b2 >> 4u]) * hi.z + float(IQ4NL[b3 >> 4u]) * hi.w;
+                }
+                acc[r] += d * s;
+            }
+        }
+        for (uint r = 0; r < R; ++r) {
+            const float v = simd_sum(acc[r]);
+            if (lane == 0u && row0 + r < out_dim) {
+                out[(uint64_t) col * out_dim + row0 + r] =
+                        args.act != 0u ? max(v, 0.0f) * max(v, 0.0f) : v;
+            }
+        }
+    }
+}
+
 /// `out[i] = max(in[i], 0)^2` over `n` floats.
 kernel void kernel_dense_relu2_f32(
         constant dense_args_flat & args [[buffer(0)]],
