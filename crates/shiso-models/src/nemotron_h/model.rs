@@ -23,6 +23,7 @@ use shiso_core::backend::Backend;
 use shiso_core::buffer::DeviceBuffer;
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{LayerIdx, SessionId, TokenId};
+use shiso_core::media::{MediaModel, VisionPrefill};
 use shiso_core::model::{DecodeStep, Logits, Model, ModelInfo, StopTokens};
 use shiso_engine::attn::Attn;
 use shiso_engine::dense::DenseKernels;
@@ -465,6 +466,19 @@ impl Loader<'_> {
     fn vector(&self, name: &str, shape: &[u64]) -> CoreResult<DeviceBuffer> {
         let values = self.ck.floats(name, shape)?;
         upload(self.backend, f32_bytes(&values))
+    }
+}
+
+/// The media path: audio rows from the speech encoder spliced over the
+/// prompt's placeholder run, in one call as the other families state it.
+impl MediaModel for NemotronHModel {
+    fn prefill_media(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        media: &VisionPrefill<'_>,
+    ) -> CoreResult<Logits<'_>> {
+        self.stack_mut().prefill_last_media(session, tokens, media)
     }
 }
 
