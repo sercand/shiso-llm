@@ -28,7 +28,7 @@ use shiso_engine::attn::Attn;
 use shiso_engine::dense::DenseKernels;
 use shiso_engine::ffn::Ffn;
 use shiso_engine::layers::{Block, LayerWeights, Routed, Weights};
-use shiso_engine::moe_biased::{self, BiasedMoe, RowAffine4Stack};
+use shiso_engine::moe_biased::{self, BiasedMoe, ExpertStack, RowAffine4Stack};
 use shiso_engine::projection::Weight;
 use shiso_engine::ssm::Ssm;
 use shiso_engine::{EngineOptions, HybridStack};
@@ -242,8 +242,18 @@ impl Loader<'_> {
             "F32",
             &[u64::from(moe.experts)],
         )?;
-        let up = self.stack(&at("switch_mlp.fc1"), moe.experts, hidden, moe.intermediate)?;
-        let down = self.stack(&at("switch_mlp.fc2"), moe.experts, moe.intermediate, hidden)?;
+        let up = ExpertStack::Affine4(self.stack(
+            &at("switch_mlp.fc1"),
+            moe.experts,
+            hidden,
+            moe.intermediate,
+        )?);
+        let down = ExpertStack::Affine4(self.stack(
+            &at("switch_mlp.fc2"),
+            moe.experts,
+            moe.intermediate,
+            hidden,
+        )?);
         moe_biased::check_stack(&up)?;
         moe_biased::check_stack(&down)?;
         Ok((
