@@ -29,6 +29,7 @@ use crate::moe::{MoeIo, MoeScratch};
 use crate::projection::{self, Weight};
 use crate::shape::{Activation, MoeShape};
 use crate::sparse::ExpertStream;
+use crate::sparse::weights::WeightPart;
 
 /// Output rows one expert-stage threadgroup covers: four simdgroups of four.
 const EXPERT_ROWS_PER_GROUP: u32 = 16;
@@ -240,6 +241,14 @@ pub fn run(
         route(backend, moe, shape, scratch, n_tok)?;
         crate::moe::sort(backend, shape, scratch, columns)?;
     }
+    // A streamed bank's experts are read in now, after the router chose them
+    // and before a stage reads them: the fetch drains the device, reads the
+    // chosen ids back and fills the slots the layer's map then points at. The
+    // up and down banks of a layer are one stream layer, so one fetch serves
+    // both.
+    if let Some((stream, layer)) = streamed(&moe.up).or_else(|| streamed(&moe.down)) {
+        stream.fetch(backend, layer, scratch.ids.view(), columns)?;
+    }
     let active = columns.min(shape.experts);
     let stage = |stack: &ExpertStack, first: bool, input: DeviceView<'_>, out: DeviceView<'_>| {
         let args = ExpertArgs {
@@ -270,16 +279,38 @@ pub fn run(
                     [blocks.view(), scratch.bounds.view()],
                     routing,
                 ),
-                StackStore::Streamed { .. } => Err(CoreError::Unsupported {
-                    what: "a streamed routed stack",
-                    backend: "engine",
-                }),
+                StackStore::Streamed {
+                    stream,
+                    matrix,
+                    layer,
+                } => iq4nl_stage(
+                    backend,
+                    stack,
+                    ExpertArgs { mapped: 1, ..args },
+                    active,
+                    [
+                        stream.pool(*matrix, WeightPart::Whole)?,
+                        stream.map(*layer)?,
+                    ],
+                    routing,
+                ),
             },
         }
     };
     stage(&moe.up, true, io.input, scratch.up.view())?;
     stage(&moe.down, false, scratch.up.view(), scratch.down.view())?;
     combine_add(backend, moe, shape, scratch, io.block_out, hidden, n_tok)
+}
+
+/// The stream and stream layer a stack reads through, when it is streamed.
+fn streamed(stack: &ExpertStack) -> Option<(&ExpertStream, u32)> {
+    match stack {
+        ExpertStack::Iq4Nl(RowIq4NlStack {
+            store: StackStore::Streamed { stream, layer, .. },
+            ..
+        }) => Some((stream.as_ref(), *layer)),
+        _ => None,
+    }
 }
 
 fn route_args(moe: &BiasedMoe, shape: MoeShape) -> RouteArgs {

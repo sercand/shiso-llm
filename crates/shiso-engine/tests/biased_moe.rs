@@ -18,6 +18,8 @@ use shiso_engine::moe::{MoeIo, MoeScratch};
 use shiso_engine::moe_biased::{self, BiasedMoe, ExpertStack, RowIq4NlStack, StackStore};
 use shiso_engine::projection::Weight;
 use shiso_engine::shape::MoeShape;
+use shiso_engine::sparse::weights::WeightPart;
+use shiso_engine::sparse::{ExpertSource, ExpertStream};
 use shiso_modelfile::quant::BlockIq4Nl;
 use shiso_modelfile::quant_tables::IQ4NL_VALUES;
 
@@ -198,4 +200,193 @@ fn biased_moe_iq4nl_matches_host_reference() {
         worst <= 1e-3 * peak,
         "worst error {worst} against a peak of {peak}"
     );
+}
+
+/// Routed layers, experts and slots of the streamed case: the pool holds
+/// little more than one layer, so later layers evict earlier ones.
+const S_LAYERS: usize = 3;
+const S_EXPERTS: usize = 32;
+const S_SLOTS: u32 = 40;
+
+/// Every layer's up and down banks, served from host memory.
+#[derive(Debug)]
+struct HostBanks {
+    /// `[layer][matrix]` bytes, experts contiguous.
+    banks: Vec<[Vec<u8>; 2]>,
+    expert_bytes: [u64; 2],
+}
+
+impl ExpertSource for HostBanks {
+    fn parts(&self) -> &'static [WeightPart] {
+        &[WeightPart::Whole]
+    }
+
+    fn matrices(&self) -> usize {
+        2
+    }
+
+    fn layout(&self) -> Vec<u64> {
+        self.expert_bytes.to_vec()
+    }
+
+    fn read(
+        &self,
+        layer: u32,
+        expert: u32,
+        array: usize,
+        dst: &mut [u8],
+    ) -> shiso_core::CoreResult<()> {
+        let per = self.expert_bytes[array] as usize;
+        let at = expert as usize * per;
+        dst.copy_from_slice(&self.banks[layer as usize][array][at..at + per]);
+        Ok(())
+    }
+}
+
+fn blocks(n: usize, seed: u32) -> Vec<u8> {
+    let scales = signal(n, seed);
+    let blocks: Vec<BlockIq4Nl> = (0..n)
+        .map(|b| {
+            let mut qs = [0u8; 16];
+            for (j, q) in qs.iter_mut().enumerate() {
+                *q = (((b * 16 + j) as u32 ^ seed).wrapping_mul(2_654_435_761) >> 13) as u8;
+            }
+            BlockIq4Nl {
+                d: half::f16::from_f32(scales[b] * 0.004).to_bits(),
+                qs,
+            }
+        })
+        .collect();
+    bytemuck::cast_slice(&blocks).to_vec()
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+#[expect(
+    clippy::print_stderr,
+    reason = "a machine with no Metal device says why it skipped"
+)]
+#[expect(clippy::too_many_lines, reason = "one fixture run two ways")]
+fn streamed_biased_moe_equals_resident() {
+    if !shiso_metal::metal_available() {
+        eprintln!("note: no Metal device on this machine, skipping");
+        return;
+    }
+    let backend: Arc<dyn Backend> =
+        shiso_metal::MetalBackend::new().expect("the embedded kernel library compiles");
+    let up_blocks = S_EXPERTS * WIDTH * HIDDEN / 32;
+    let down_blocks = S_EXPERTS * HIDDEN * WIDTH / 32;
+    let banks: Vec<[Vec<u8>; 2]> = (0..S_LAYERS as u32)
+        .map(|l| [blocks(up_blocks, 100 + l), blocks(down_blocks, 200 + l)])
+        .collect();
+    let per = [
+        (WIDTH * HIDDEN / 32 * 18) as u64,
+        (HIDDEN * WIDTH / 32 * 18) as u64,
+    ];
+    let stream = Arc::new(
+        ExpertStream::open(
+            &backend,
+            Arc::new(HostBanks {
+                banks: banks.clone(),
+                expert_bytes: per,
+            }),
+            S_LAYERS as u32,
+            S_EXPERTS as u32,
+            S_SLOTS,
+            S_EXPERTS as u32,
+        )
+        .expect("stream"),
+    );
+    let shape = MoeShape::new(S_EXPERTS as u32, USED as u32, 1, WIDTH as u32);
+    let layer = |l: usize, streamed: bool| {
+        let store = |matrix: usize| {
+            if streamed {
+                StackStore::Streamed {
+                    stream: Arc::clone(&stream),
+                    matrix,
+                    layer: l as u32,
+                }
+            } else {
+                StackStore::Resident(upload(&backend, &banks[l][matrix]))
+            }
+        };
+        let router = signal(S_EXPERTS * HIDDEN, 300 + l as u32);
+        let bias: Vec<f32> = (0..S_EXPERTS).map(|e| (e % 5) as f32 * 0.01).collect();
+        let moe = BiasedMoe {
+            router: f32_weight(&backend, &router, HIDDEN, S_EXPERTS),
+            bias: upload(&backend, bytemuck::cast_slice(&bias)),
+            scale: SCALE,
+            renormalize: true,
+            up: ExpertStack::Iq4Nl(RowIq4NlStack {
+                store: store(0),
+                in_dim: HIDDEN as u32,
+                out_dim: WIDTH as u32,
+            }),
+            down: ExpertStack::Iq4Nl(RowIq4NlStack {
+                store: store(1),
+                in_dim: WIDTH as u32,
+                out_dim: HIDDEN as u32,
+            }),
+        };
+        moe_biased::check_stack(&moe.up).expect("up stack");
+        moe_biased::check_stack(&moe.down).expect("down stack");
+        let shared = Ffn {
+            gate: None,
+            up: f32_weight(
+                &backend,
+                &signal(SHARED * HIDDEN, 400 + l as u32),
+                HIDDEN,
+                SHARED,
+            ),
+            down: f32_weight(
+                &backend,
+                &signal(HIDDEN * SHARED, 500 + l as u32),
+                SHARED,
+                HIDDEN,
+            ),
+        };
+        (moe, shared)
+    };
+    let resident: Vec<_> = (0..S_LAYERS).map(|l| layer(l, false)).collect();
+    let streamed: Vec<_> = (0..S_LAYERS).map(|l| layer(l, true)).collect();
+    let scratch = MoeScratch::new(&backend, shape, HIDDEN as u32, 64).expect("scratch");
+    // Four one-row steps, then a 64-row chunk, through every layer in turn.
+    let passes: Vec<(usize, u32)> = (0..4)
+        .map(|i| (1usize, 900 + i))
+        .chain([(64, 999)])
+        .collect();
+    let run = |layers: &[(BiasedMoe, Ffn)], rows: usize, seed: u32| -> Vec<Vec<u8>> {
+        let mut outs = Vec::new();
+        for (l, (moe, shared)) in layers.iter().enumerate() {
+            let x = signal(rows * HIDDEN, seed + l as u32);
+            let input = upload(&backend, bytemuck::cast_slice(&x));
+            let out = alloc(&backend, (rows * HIDDEN * 4) as u64).expect("alloc");
+            moe_biased::run(
+                backend.as_ref(),
+                moe,
+                shared,
+                shape,
+                &scratch,
+                MoeIo {
+                    input: input.view(),
+                    block_out: out.view(),
+                },
+                rows as u32,
+            )
+            .expect("run");
+            backend.sync().expect("sync");
+            let mut raw = vec![0u8; rows * HIDDEN * 4];
+            backend.copy_d2h(out.view(), &mut raw).expect("d2h");
+            outs.push(raw);
+        }
+        outs
+    };
+    for (i, &(rows, seed)) in passes.iter().enumerate() {
+        let want = run(&resident, rows, seed);
+        let got = run(&streamed, rows, seed);
+        assert_eq!(want, got, "pass {i} ({rows} rows) differs when streamed");
+        if i == 1 {
+            assert!(stream.stats().hits > 0, "a repeated step hits the pool");
+        }
+    }
 }
