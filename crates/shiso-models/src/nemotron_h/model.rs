@@ -33,7 +33,11 @@ use shiso_engine::projection::Weight;
 use shiso_engine::ssm::Ssm;
 use shiso_engine::{EngineOptions, HybridStack};
 
+use shiso_engine::sparse::{ExpertSource, ExpertStream, StreamStats};
+use shiso_modelfile::GgufFile;
+
 use crate::nemotron_h::config::{Mixer, NemotronHConfig};
+use crate::nemotron_h::gguf::{self, ExpertPlacement, GgufExperts};
 use crate::qwen4exp::mlx::{MlxCheckpoint, f32_bytes, upload};
 
 /// The producer tag this container's shard headers carry.
@@ -47,6 +51,8 @@ const GROUP: u32 = 64;
 pub struct NemotronHModel {
     stack: HybridStack,
     info: ModelInfo,
+    /// The routed expert stream, when the banks are not resident.
+    stream: Option<Arc<ExpertStream>>,
 }
 
 impl NemotronHModel {
@@ -100,8 +106,137 @@ impl NemotronHModel {
                 stop_tokens: StopTokens::new(config.stop_tokens())?,
             },
             stack,
+            stream: None,
         })
     }
+
+    /// Opens a GGUF export and puts it on the device, its routed experts
+    /// resident or streamed from the file as `residency` says.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ConfigMissing`] naming the first tensor the export does
+    /// not hold, [`CoreError::InvalidValue`] for one in a format this loader
+    /// does not take, [`CoreError::Unsupported`] for a device that cannot hold
+    /// one layer's experts beside the other weights, and whatever the device
+    /// or the stack reports.
+    pub fn load_gguf(
+        backend: &Arc<dyn Backend>,
+        path: &Path,
+        config: &NemotronHConfig,
+        opts: EngineOptions,
+        residency: GgufResidency,
+    ) -> CoreResult<Self> {
+        let file = GgufFile::open_shared(path).map_err(|err| CoreError::InvalidValue {
+            key: "nemotron_h gguf",
+            value: format!("{}: {err}", path.display()),
+        })?;
+        let shape = config.shape();
+        let moe = shape.moe.ok_or(CoreError::ShapeMismatch {
+            field: "router geometry",
+            expected: 1,
+            got: 0,
+        })?;
+        let blocks = gguf::routed_blocks(config);
+        let source = Arc::new(GgufExperts::open(path, &file, &blocks, moe.experts)?);
+        let layers = source.layers();
+        let slot_bytes: u64 = source.layout().iter().sum();
+        let banks = slot_bytes * u64::from(moe.experts) * u64::from(layers);
+        let slots = match residency {
+            GgufResidency::Resident => None,
+            GgufResidency::Streamed { slots } => Some(slots),
+            GgufResidency::Auto { reserve } => {
+                let total = backend.memory_info().map_or(u64::MAX, |info| info.total);
+                let rest = file
+                    .tensors()
+                    .iter()
+                    .map(|t| t.bytes)
+                    .sum::<u64>()
+                    .saturating_sub(banks);
+                let fixed = rest.saturating_add(reserve);
+                if fixed.saturating_add(banks) <= total {
+                    None
+                } else {
+                    let room = total.saturating_sub(fixed);
+                    let fit = u32::try_from(room / slot_bytes.max(1)).unwrap_or(u32::MAX);
+                    tracing::info!(
+                        total_gib = total >> 30,
+                        other_weights_gib = rest >> 30,
+                        reserve_gib = reserve >> 30,
+                        banks_gib = banks >> 30,
+                        slots = fit,
+                        "the routed banks do not fit; streaming them from disk"
+                    );
+                    Some(fit.min(moe.experts * layers))
+                }
+            }
+        };
+        let (placement, stream) = match slots {
+            None => (ExpertPlacement::Resident, None),
+            Some(slots) => {
+                let stream = Arc::new(ExpertStream::open(
+                    backend,
+                    source,
+                    layers,
+                    moe.experts,
+                    slots,
+                    moe.experts,
+                )?);
+                (ExpertPlacement::Streamed(Arc::clone(&stream)), Some(stream))
+            }
+        };
+        let weights = gguf::weights_gguf(backend, &file, config, &placement)?;
+        let embed = file
+            .find("token_embd.weight")
+            .map(|desc| desc.dtype)
+            .ok_or_else(|| CoreError::ConfigMissing {
+                key: "token_embd.weight".to_owned(),
+            })?;
+        let stack = HybridStack::new(
+            backend,
+            shape.clone(),
+            weights,
+            embed,
+            Arc::new(DenseKernels),
+            None,
+            opts,
+        )?;
+        Ok(Self {
+            info: ModelInfo {
+                context_capacity: stack.context_capacity(),
+                vocab: shape.vocab,
+                hidden: shape.hidden,
+                n_layers: shape.n_layers(),
+                stop_tokens: StopTokens::new(config.stop_tokens())?,
+            },
+            stack,
+            stream,
+        })
+    }
+
+    /// What the routed expert stream has done, when the banks are streamed.
+    #[must_use]
+    pub fn expert_stats(&self) -> Option<StreamStats> {
+        self.stream.as_ref().map(|s| s.stats())
+    }
+}
+
+/// How a GGUF load places the routed expert banks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GgufResidency {
+    /// Resident when every weight fits in the device's working set with
+    /// `reserve` bytes to spare, streamed into as many slots as fit otherwise.
+    Auto {
+        /// Bytes left free beside the weights.
+        reserve: u64,
+    },
+    /// Every expert imported, whatever the device says.
+    Resident,
+    /// Streamed into exactly this many slots.
+    Streamed {
+        /// Expert slots in the pool.
+        slots: u32,
+    },
 }
 
 /// The checkpoint and the device, for the imports below.

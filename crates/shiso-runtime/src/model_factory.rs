@@ -51,7 +51,7 @@ use shiso_models::gemma4::{
 };
 use shiso_models::lfm2::{Lfm2Config, Lfm2Model, Lfm2Tower};
 use shiso_models::llama::{LlamaConfig, LlamaModel};
-use shiso_models::nemotron_h::{NemotronHConfig, NemotronHModel};
+use shiso_models::nemotron_h::{GgufResidency, NemotronHConfig, NemotronHModel};
 use shiso_models::qwen4exp::{Qwen4ExpConfig, Qwen4ExpModel};
 use shiso_models::qwen35::mtp::{self, AffineQuant, MtpManifest};
 use shiso_models::qwen35::{Qwen35Config, Qwen35Model, Qwen35Tower};
@@ -653,7 +653,7 @@ pub fn load_model(
         Err(other) => return Err(FactoryError::Load(other)),
     }
 
-    load_last_arms(backend, path, config, opts, defaults)
+    load_last_arms(backend, path, config, args, opts, defaults)
 }
 
 /// Refuses `--kv-cache-dtype` other than f16 for every family but the sparse
@@ -733,14 +733,16 @@ fn load_last_arms(
     backend: &Arc<dyn Backend>,
     path: &Path,
     config: &HfConfig,
+    args: &ServeOptions,
     opts: EngineOptions,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
     // The hybrid state-space family: a directory of MLX shards whose geometry
     // is its own `config.json`, read again here because the parsed document
-    // carries no typed view of it.
+    // carries no typed view of it, or a GGUF export whose geometry is its
+    // metadata.
     if NemotronHConfig::describes_type(config.model_type()) {
-        return load_nemotron_h(backend, path, opts, defaults);
+        return load_nemotron_h(backend, path, args, opts, defaults);
     }
 
     // The LFM2 hybrid reads every width out of its container and checks the
@@ -778,11 +780,26 @@ fn load_last_arms(
 fn load_nemotron_h(
     backend: &Arc<dyn Backend>,
     path: &Path,
+    args: &ServeOptions,
     opts: EngineOptions,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
-    let family = NemotronHConfig::from_dir(path).map_err(FactoryError::Load)?;
-    let model = NemotronHModel::load(backend, path, &family, opts).map_err(FactoryError::Load)?;
+    let model = if path.extension().is_some_and(|ext| ext == "gguf") {
+        let family = NemotronHConfig::from_gguf_path(path).map_err(FactoryError::Load)?;
+        let reserve = args.expert_reserve_gb.saturating_mul(1 << 30);
+        let residency = match args.expert_residency {
+            crate::options::ExpertResidencyChoice::Resident => GgufResidency::Resident,
+            _ if args.expert_slots > 0 => GgufResidency::Streamed {
+                slots: args.expert_slots,
+            },
+            _ => GgufResidency::Auto { reserve },
+        };
+        NemotronHModel::load_gguf(backend, path, &family, opts, residency)
+            .map_err(FactoryError::Load)?
+    } else {
+        let family = NemotronHConfig::from_dir(path).map_err(FactoryError::Load)?;
+        NemotronHModel::load(backend, path, &family, opts).map_err(FactoryError::Load)?
+    };
     Ok(Loaded {
         model: Box::new(model),
         open_tower: open_no_tower,

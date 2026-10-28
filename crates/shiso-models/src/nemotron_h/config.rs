@@ -293,6 +293,20 @@ impl NemotronHConfig {
         Self::build(&geometry, mixers, vec![TokenId::new(eos)], mtp_block)
     }
 
+    /// Opens the GGUF export at `path` and reads its geometry.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] when the file does not parse as GGUF, and
+    /// whatever [`NemotronHConfig::from_gguf`] reports.
+    pub fn from_gguf_path(path: &Path) -> CoreResult<Self> {
+        let file = GgufFile::open(path).map_err(|err| CoreError::InvalidValue {
+            key: "nemotron_h gguf",
+            value: format!("{}: {err}", path.display()),
+        })?;
+        Self::from_gguf(&file)
+    }
+
     /// Pairs the layers into slots and builds the stack shape.
     fn build(
         g: &Geometry,
