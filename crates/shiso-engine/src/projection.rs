@@ -948,13 +948,14 @@ fn dispatch(
     if n_tok >= GEMM_MIN_TOKENS && mm_name(weight.dtype).is_some() {
         return mm_projection(backend, weight, n_tok, src, dst);
     }
-    // Two to eight `q8_0` rows - a verify pass, a small decode batch - read
-    // every block once for all of them; the extended family's row blocking
-    // reached a third of the bandwidth on this format. A row-exact weight
-    // sends one row here too, so a verify pass's rows sum exactly as the
-    // serial steps they check and speculation cannot change a greedy answer.
-    let rows_from = if weight.row_exact { 1 } else { 2 };
-    if weight.dtype == DType::Q8_0 && (rows_from..=Q8_ROWS_MAX).contains(&n_tok) {
+    // One to eight rows of a row-exact `q8_0` weight - a decode step, a verify
+    // pass - read every block once for all of them; the extended family's row
+    // blocking reached a third of the bandwidth on this format. One kernel
+    // for every row count is what makes a verify pass's rows sum exactly as
+    // the serial steps they check, so speculation cannot change a greedy
+    // answer. Weights not marked row-exact keep the extended family, and with
+    // it the answers their families were checked against.
+    if weight.row_exact && weight.dtype == DType::Q8_0 && (1..=Q8_ROWS_MAX).contains(&n_tok) {
         return q8_rows_projection(backend, weight, n_tok, src, dst);
     }
     let r1ptg = ext_r1ptg(n_tok);
