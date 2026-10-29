@@ -12,6 +12,7 @@
 
 pub mod align;
 pub mod config;
+pub mod ctc;
 pub mod diar;
 pub mod encoder;
 pub mod frontend;

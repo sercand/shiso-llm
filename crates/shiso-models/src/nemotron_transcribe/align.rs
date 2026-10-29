@@ -1306,4 +1306,4 @@ pub fn align(desc: &AlignDesc<'_>, upsampling: usize) -> Result<Vec<Word>, Align
 
 #[cfg(test)]
 #[path = "align_tests.rs"]
-mod tests;
+pub(crate) mod tests;
