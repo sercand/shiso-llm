@@ -18,6 +18,13 @@
 // build default is restored at the end of the file.
 #pragma METAL fp math_mode(safe)
 
+/// One `q8_0` block as stored: the struct tells the compiler the quants are
+/// two-byte aligned, which a byte pointer into the row does not.
+struct dense_q8_block {
+    half d;
+    char qs[32];
+};
+
 /// `dense_args_q8_rows`.
 struct dense_args_q8_rows {
     uint32_t in_dim;
@@ -57,10 +64,11 @@ kernel void kernel_dense_q8_0_rows_f32(
     const uint row0 = tg * NR0;
     const uint ix = lane / 4u;
     const uint il = lane % 4u;
-    device const uchar * wr[NR0];
+    device const dense_q8_block * wr[NR0];
     _Pragma("clang loop unroll(full)")
     for (uint r = 0; r < NR0; ++r) {
-        wr[r] = w + (uint64_t) min(row0 + r, args.out_dim - 1u) * blocks * BLOCK_BYTES;
+        wr[r] = (device const dense_q8_block *) (w
+                + (uint64_t) min(row0 + r, args.out_dim - 1u) * blocks * BLOCK_BYTES);
     }
     float acc[NR0][R];
     _Pragma("clang loop unroll(full)")
@@ -83,13 +91,12 @@ kernel void kernel_dense_q8_0_rows_f32(
         }
         _Pragma("clang loop unroll(full)")
         for (uint r = 0; r < NR0; ++r) {
-            device const uchar * blk = wr[r] + b * BLOCK_BYTES;
-            const float d = float(*((device const half *) blk));
-            device const char * qs = (device const char *) (blk + 2u + il * 8u);
+            device const dense_q8_block * blk = wr[r] + b;
+            const float d = float(blk->d);
             float q[8];
             _Pragma("clang loop unroll(full)")
             for (short i = 0; i < 8; ++i) {
-                q[i] = float(qs[i]);
+                q[i] = float(blk->qs[il * 8u + i]);
             }
             _Pragma("clang loop unroll(full)")
             for (short t = 0; t < R; ++t) {
