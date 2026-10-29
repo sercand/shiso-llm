@@ -341,6 +341,7 @@ pub fn boot_language_model(
         open_audio,
         placement,
         defaults,
+        speech,
     } = load_checkpoint(&backend, kind, &config, args, model_path)?;
     // Before anything stands on a session: the tier is a property of the cache
     // the sessions draw their pages from, so it is chosen while there are none.
@@ -360,7 +361,7 @@ pub fn boot_language_model(
     // rather than a failure: the ids still reach the caller, and a checkpoint
     // whose vocabulary lives somewhere this flag was not pointed at is an
     // operator mistake that should be reported, not a reason to refuse to run.
-    let vocabulary = load_vocabulary(args);
+    let vocabulary = load_vocabulary(args, speech.is_none());
 
     // Before the listener binds, and only when the operator named one. A tower
     // that will not load, or that does not pair with this checkpoint, ends the
@@ -371,7 +372,12 @@ pub fn boot_language_model(
     // server without one falls back to what the checkpoint's config declares.
     let vision_spec = vision.as_ref().map(|tower| tower.preprocess().clone());
     // The same container, asked for the other tower it may carry.
-    let audio = open_audio_tower(&backend, args, model.as_mut(), open_audio)?;
+    let audio = open_audio_tower(
+        &backend,
+        audio_container(speech.as_ref(), args),
+        model.as_mut(),
+        open_audio,
+    )?;
     // Every weight this process will read is resident now, the tower's too, so
     // whatever the backend kept to make those imports fast can go.
     backend.finish_imports();
@@ -387,14 +393,7 @@ pub fn boot_language_model(
         .transpose()?;
     // The renderer reads the store the scheduler writes.
     let turn_replay = scheduler.turn_replay.clone();
-    let reasoning_scheme = args.reasoning_parser.reasoning(defaults.reasoning);
-    let tool_call_scheme = args.tool_call_parser.tools(defaults.tools);
-    tracing::info!(
-        reasoning = ?reasoning_scheme,
-        tools = ?tool_call_scheme,
-        thinking_default = defaults.thinking_default,
-        "output parsers configured"
-    );
+    let (reasoning_scheme, tool_call_scheme) = output_schemes(args, defaults);
     // Before the engine thread exists, so no pass ever runs without it.
     scheduler.suppressed = suppress_control_tokens(
         model.as_mut(),
@@ -646,7 +645,38 @@ fn open_vision_tower(
     Ok(Some(tower))
 }
 
-/// Opens the audio tower from the `--vision` container, when it carries one.
+/// The output parsers the flags and the family's defaults settle on.
+fn output_schemes(
+    args: &ServeOptions,
+    defaults: model_factory::FamilyDefaults,
+) -> (
+    shiso_parsers::ReasoningScheme,
+    shiso_parsers::ToolCallScheme,
+) {
+    let reasoning_scheme = args.reasoning_parser.reasoning(defaults.reasoning);
+    let tool_call_scheme = args.tool_call_parser.tools(defaults.tools);
+    tracing::info!(
+        reasoning = ?reasoning_scheme,
+        tools = ?tool_call_scheme,
+        thinking_default = defaults.thinking_default,
+        "output parsers configured"
+    );
+    (reasoning_scheme, tool_call_scheme)
+}
+
+/// Where the audio tower is read from: a speech decoder's paired encoder, or
+/// for any other family the `--vision` container.
+fn audio_container<'a>(
+    speech: Option<&'a model_factory::SpeechPairing>,
+    args: &'a ServeOptions,
+) -> Option<&'a std::path::Path> {
+    speech
+        .map(|pairing| pairing.encoder.as_path())
+        .or(args.vision.as_deref())
+}
+
+/// Opens the audio tower from `container` (the `--vision` container, or a
+/// speech decoder's paired encoder), when it carries one.
 ///
 /// # Errors
 ///
@@ -657,11 +687,11 @@ fn open_vision_tower(
 // or a container exported without the tower. Each is logged.
 pub fn open_audio_tower(
     backend: &Arc<dyn shiso_core::Backend>,
-    args: &ServeOptions,
+    container: Option<&std::path::Path>,
     model: &mut dyn shiso_engine::ckpt::Checkpointed,
     open: model_factory::AudioTowerOpener,
 ) -> Result<Option<Arc<dyn shiso_audio::AudioTower>>, BootError> {
-    let Some(path) = args.vision.as_ref() else {
+    let Some(path) = container else {
         return Ok(None);
     };
     let _tag = shiso_core::ledger::scope(shiso_core::MemTag::VisionWeights);
@@ -968,10 +998,15 @@ fn load_chat_template(args: &ServeOptions) -> Option<String> {
 }
 
 /// Loads the vocabulary, reporting rather than failing when it is absent.
-fn load_vocabulary(args: &ServeOptions) -> Option<Arc<tokenizer::Vocabulary>> {
+///
+/// `opening_token: false` drops the opening token the tokenizer config names:
+/// a speech decoder was trained on prompts that open straight on the turn
+/// marker, and its tokenizer config names one all the same.
+fn load_vocabulary(args: &ServeOptions, opening_token: bool) -> Option<Arc<tokenizer::Vocabulary>> {
     let path = args.tokenizer_path();
     match tokenizer::Vocabulary::from_file(&path) {
-        Ok(vocabulary) => Some(Arc::new(vocabulary)),
+        Ok(vocabulary) if opening_token => Some(Arc::new(vocabulary)),
+        Ok(vocabulary) => Some(Arc::new(vocabulary.with_bos(None))),
         Err(error) => {
             tracing::warn!(
                 path = %path.display(),

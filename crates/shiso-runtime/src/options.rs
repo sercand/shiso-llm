@@ -501,6 +501,13 @@ pub struct ServeOptions {
     /// Absent means text only, and the encoder is never loaded.
     #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VISION"))]
     pub vision: Option<PathBuf>,
+    /// The speech encoder export of a speech decoder, overriding the file the
+    /// decoder's own metadata names beside it.
+    ///
+    /// Only a decoder that is paired with an encoder reads it; the pairing is
+    /// refused at boot when the file is missing, before the decoder loads.
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_SPEECH_ENCODER"))]
+    pub speech_encoder: Option<PathBuf>,
     /// Pixel ceiling one image may occupy after resizing.
     #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VISION_MAX_PIXELS"))]
     #[cfg_attr(feature = "clap", arg(default_value_t = DEFAULT_VISION_MAX_PIXELS))]
@@ -997,6 +1004,7 @@ impl Default for ServeOptions {
             expert_prefetch: true,
             ngram: None,
             vision: None,
+            speech_encoder: None,
             vision_max_pixels: DEFAULT_VISION_MAX_PIXELS,
             vision_allow_remote_images: false,
             video_allow_decode: false,

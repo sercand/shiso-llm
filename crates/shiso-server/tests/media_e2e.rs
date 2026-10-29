@@ -380,6 +380,7 @@ impl Stack {
             open_audio,
             placement,
             defaults,
+            ..
         } = shiso_server::model_factory::load_model(
             &backend,
             args.model.as_deref().expect("this test passes --model"),
@@ -407,9 +408,10 @@ impl Stack {
             tower.device_bytes()
         ));
 
+        let vision = args.vision.as_deref();
         // The binary's own opener, width and media-path checks included: a copy
         // here would pass while the shipped one drifted.
-        let audio = shiso_server::open_audio_tower(&backend, &args, loaded.as_mut(), open_audio)
+        let audio = shiso_server::open_audio_tower(&backend, vision, loaded.as_mut(), open_audio)
             .expect("the audio tower opens or is absent");
         note(&format!("audio tower resident: {}", audio.is_some()));
 

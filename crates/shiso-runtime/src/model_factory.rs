@@ -35,7 +35,7 @@
 //! A family that genuinely cannot checkpoint is a reason to widen this into an
 //! enum of the two, not a reason to narrow every arm to the weaker contract.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use shiso_audio::{AudioError, AudioTower};
@@ -52,6 +52,9 @@ use shiso_models::gemma4::{
 use shiso_models::lfm2::{Lfm2Config, Lfm2Model, Lfm2Tower};
 use shiso_models::llama::{LlamaConfig, LlamaModel};
 use shiso_models::nemotron_h::{GgufResidency, NemotronHConfig, NemotronHModel};
+use shiso_models::nemotron_transcribe::{
+    NemotronTranscribeTower, PLACEMENT as TRANSCRIBE_PLACEMENT, speech_encoder_for,
+};
 use shiso_models::qwen4exp::{Qwen4ExpConfig, Qwen4ExpModel};
 use shiso_models::qwen35::mtp::{self, AffineQuant, MtpManifest};
 use shiso_models::qwen35::{Qwen35Config, Qwen35Model, Qwen35Tower};
@@ -396,6 +399,22 @@ pub struct Loaded {
     pub placement: MediaPlacement,
     /// What this family defaults to for output parsing and thinking.
     pub defaults: FamilyDefaults,
+    /// The encoder export a speech decoder is paired with, when this
+    /// checkpoint is one.
+    pub speech: Option<SpeechPairing>,
+}
+
+/// A speech decoder's pairing with its encoder export.
+///
+/// Set, it says three things the boot path acts on: the audio tower opens
+/// from [`SpeechPairing::encoder`] rather than from `--vision`; the prompt
+/// carries no opening token, because the decoder was trained on prompts with
+/// none and its tokenizer config names one anyway; and transcription requests
+/// are answered by this model when no separate recognizer is loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeechPairing {
+    /// The encoder export the audio tower opens from.
+    pub encoder: PathBuf,
 }
 
 impl std::fmt::Debug for Loaded {
@@ -403,6 +422,7 @@ impl std::fmt::Debug for Loaded {
         f.debug_struct("Loaded")
             .field("placement", &self.placement)
             .field("defaults", &self.defaults)
+            .field("speech", &self.speech)
             .finish_non_exhaustive()
     }
 }
@@ -457,6 +477,20 @@ fn open_gemma4_audio(
     Ok(AudioTowerFound::Tower(Arc::new(Gemma4AudioTower::open(
         backend, path,
     )?)))
+}
+
+/// The speech decoder's audio opener: the encoder export the pairing found.
+///
+/// The width check against the decoder is the boot path's, which every audio
+/// tower passes through: the encoder's fused rows must be exactly the
+/// decoder's residual width.
+fn open_transcribe_audio(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+) -> Result<AudioTowerFound, AudioError> {
+    Ok(AudioTowerFound::Tower(Arc::new(
+        NemotronTranscribeTower::open(backend, path)?,
+    )))
 }
 
 /// The Gemma 4 family's opener.
@@ -553,6 +587,7 @@ pub fn load_model(
                 open_audio: no_audio_tower,
                 placement: Qwen35Tower::PLACEMENT,
                 defaults,
+                speech: None,
             });
         }
         Err(CoreError::UnknownArch { .. }) => {}
@@ -618,6 +653,7 @@ pub fn load_model(
                 open_audio: no_audio_tower,
                 placement: Qwen35Tower::PLACEMENT,
                 defaults,
+                speech: None,
             });
         }
         Err(CoreError::UnknownArch { .. }) => {}
@@ -647,6 +683,7 @@ pub fn load_model(
                 open_audio: open_gemma4_audio,
                 placement: MediaPlacement::GEMMA4,
                 defaults,
+                speech: None,
             });
         }
         Err(CoreError::UnknownArch { .. }) => {}
@@ -764,6 +801,7 @@ fn load_last_arms(
             // a renderer is configured with.
             placement: MediaPlacement::QWEN35,
             defaults,
+            speech: None,
         });
     }
 
@@ -784,7 +822,26 @@ fn load_nemotron_h(
     opts: EngineOptions,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
-    let model = if path.extension().is_some_and(|ext| ext == "gguf") {
+    let gguf = path.extension().is_some_and(|ext| ext == "gguf");
+    // Before any weight moves: a decoder that names an encoder it cannot find
+    // is refused here, by the path it looked for.
+    let speech = if gguf {
+        speech_encoder_for(path, args.speech_encoder.as_deref())
+            .map_err(FactoryError::Load)?
+            .map(|encoder| SpeechPairing { encoder })
+    } else if let Some(named) = args.speech_encoder.as_deref() {
+        return Err(FactoryError::Load(CoreError::InvalidValue {
+            key: "--speech-encoder",
+            value: format!(
+                "{} was named, but {} is not a speech decoder export",
+                named.display(),
+                path.display()
+            ),
+        }));
+    } else {
+        None
+    };
+    let model = if gguf {
         // One prediction block, reusable up to eight draft steps.
         if args.spec_k > MAX_NEMOTRON_H_SPEC_K {
             return Err(FactoryError::Load(CoreError::InvalidValue {
@@ -826,6 +883,16 @@ fn load_nemotron_h(
         let family = NemotronHConfig::from_dir(path).map_err(FactoryError::Load)?;
         NemotronHModel::load(backend, path, &family, opts).map_err(FactoryError::Load)?
     };
+    if speech.is_some() {
+        return Ok(Loaded {
+            model: Box::new(model),
+            open_tower: open_no_tower,
+            open_audio: open_transcribe_audio,
+            placement: TRANSCRIBE_PLACEMENT,
+            defaults,
+            speech,
+        });
+    }
     Ok(Loaded {
         model: Box::new(model),
         open_tower: open_no_tower,
@@ -834,6 +901,7 @@ fn load_nemotron_h(
         // renderer is configured with.
         placement: MediaPlacement::QWEN35,
         defaults,
+        speech: None,
     })
 }
 
@@ -860,6 +928,7 @@ fn load_lfm2(
         open_audio: no_audio_tower,
         placement: Lfm2Tower::PLACEMENT,
         defaults,
+        speech: None,
     })
 }
 
@@ -896,6 +965,7 @@ fn load_qwen35_block(
         open_audio: no_audio_tower,
         placement: Qwen35Tower::PLACEMENT,
         defaults,
+        speech: None,
     })
 }
 
@@ -1011,6 +1081,7 @@ fn load_qwen35moe(
         open_audio: no_audio_tower,
         placement: Qwen35Tower::PLACEMENT,
         defaults,
+        speech: None,
     })
 }
 
@@ -1329,6 +1400,7 @@ fn load_qwen4exp_streamed(
         open_audio: no_audio_tower,
         placement: Qwen35Tower::PLACEMENT,
         defaults,
+        speech: None,
     })
 }
 
@@ -1377,6 +1449,7 @@ fn load_qwen4exp_exl3(
         open_audio: no_audio_tower,
         placement: Qwen35Tower::PLACEMENT,
         defaults,
+        speech: None,
     })
 }
 
@@ -1436,6 +1509,7 @@ fn load_qwen4exp_mlx(
             open_audio: no_audio_tower,
             placement: Qwen35Tower::PLACEMENT,
             defaults,
+            speech: None,
         });
     }
     let model = Qwen4ExpModel::load_mlx(
@@ -1453,6 +1527,7 @@ fn load_qwen4exp_mlx(
         open_audio: no_audio_tower,
         placement: Qwen35Tower::PLACEMENT,
         defaults,
+        speech: None,
     })
 }
 

@@ -456,11 +456,21 @@ fn prefill_capture(
     model: &mut NemotronHModel,
     cap: &Capture,
 ) -> (shiso_core::SessionId, u32) {
+    prefill_capture_with(backend, model, cap, 0)
+}
+
+/// [`prefill_capture`] with the audio run written as `pad`.
+fn prefill_capture_with(
+    backend: &Arc<dyn Backend>,
+    model: &mut NemotronHModel,
+    cap: &Capture,
+    pad: u32,
+) -> (shiso_core::SessionId, u32) {
     use shiso_core::media::{MediaModel, PadTokens, VisionGrid, VisionPrefill};
     use shiso_core::{TokenId, alloc};
 
     let n_rows = u32::try_from(cap.rows.len() / 2688).expect("fits");
-    let pad = TokenId::new(0);
+    let pad = TokenId::new(pad);
     let mut tokens: Vec<TokenId> = cap.prefix.iter().map(|&t| TokenId::new(t)).collect();
     tokens.extend(std::iter::repeat_n(pad, n_rows as usize));
     tokens.extend(cap.suffix.iter().map(|&t| TokenId::new(t)));
@@ -595,4 +605,57 @@ fn speculative_greedy_equals_plain_greedy() {
         );
         assert_eq!(spec, plain, "{clip}: speculation changed the greedy answer");
     }
+}
+
+/// The marker id the vocabulary gives `<|audio|>`: one past the embedding
+/// table.
+const AUDIO_MARKER: u32 = 131_072;
+
+#[test]
+#[ignore = "requires a Metal device, the speech decoder export and the reference captures"]
+fn placeholder_past_vocab_is_never_gathered() {
+    use shiso_core::TokenId;
+
+    let Some(path) = decoder() else { return };
+    let refs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test-vectors/references/nemotron_transcribe/short_en/verbatim");
+    let Some(cap) = capture(&refs) else {
+        #[expect(clippy::print_stderr, reason = "a skipped device test says why")]
+        {
+            eprintln!("SKIP: no reference capture at {}", refs.display());
+        }
+        return;
+    };
+    let backend = metal();
+    // Speculating, so the draft head's warm pass over the prompt runs too:
+    // it embeds the prompt's ids on its own.
+    let mut model = load_with(&backend, &path, |opts| {
+        opts.spec = shiso_engine::sparse::mtp::SpecDepth::new(3);
+    });
+    let mut run = |pad: u32| {
+        let (session, first) = prefill_capture_with(&backend, &mut model, &cap, pad);
+        let mut trace = vec![(first, 0, 0)];
+        let mut last = first;
+        for _ in 0..8 {
+            let step = model
+                .spec_mut()
+                .expect("a bound head")
+                .speculate(session, TokenId::new(last))
+                .expect("speculate");
+            last = step.produced.last().expect("a step produces").get();
+            trace.extend(
+                step.produced
+                    .iter()
+                    .map(|t| (t.get(), step.accepted, step.drafted)),
+            );
+        }
+        model.close_session(session).expect("closes");
+        trace
+    };
+    let as_zero = run(0);
+    let as_marker = run(AUDIO_MARKER);
+    assert_eq!(
+        as_marker, as_zero,
+        "a placeholder past the vocabulary reached an embedding gather"
+    );
 }

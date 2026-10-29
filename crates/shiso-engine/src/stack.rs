@@ -1494,7 +1494,21 @@ impl HybridStack {
             // whatever was last at those addresses, so the only thing that
             // shows is a draft the target rarely agrees with: a build that is
             // slower for speculating and correct either way.
-            self.warm_draft(session, head, start)?;
+            //
+            // A placeholder id is not a row of the head's embedding table
+            // either - a family may give its marker an id past the table -
+            // so the head reads id 0 there, as the target's gather did.
+            match run.as_ref() {
+                Some(run) => {
+                    let pads = run.prefill.pads();
+                    let gathered: Vec<TokenId> = head
+                        .iter()
+                        .map(|&t| if pads.matches(t) { TokenId::new(0) } else { t })
+                        .collect();
+                    self.warm_draft(session, &gathered, start)?;
+                }
+                None => self.warm_draft(session, head, start)?,
+            }
             last = n_tok.saturating_sub(1);
             let final_chunk = tail.is_empty();
             let row = (final_chunk && with_logits).then_some(0);

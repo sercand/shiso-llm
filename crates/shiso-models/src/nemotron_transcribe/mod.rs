@@ -14,6 +14,7 @@ pub mod config;
 pub mod diar;
 pub mod encoder;
 pub mod frontend;
+pub mod pairing;
 pub mod postprocess;
 pub mod presets;
 pub mod tower;
@@ -22,6 +23,7 @@ pub mod weights;
 
 pub use config::{BlockDims, PeeConfig};
 pub use encoder::{Encoded, encode};
+pub use pairing::{PLACEMENT, SPEECH_MODEL_KEY, speech_encoder_for};
 pub use postprocess::{collapse_loops, speaker_turns, strip_tags};
 pub use presets::{Preset, PresetError, parse_preset};
 pub use tower::NemotronTranscribeTower;
