@@ -432,7 +432,7 @@ kernel void kernel_dense_experts_iq4nl_f32(
 
 /// Activation columns and weight rows one tile of the tiled `IQ4_NL` stage
 /// covers, and the contraction one staged slice spans: one 32-value block.
-constant constexpr uint DENSE_IQ4_TILE_COLS = 16u;
+constant constexpr uint DENSE_IQ4_TILE_COLS = 32u;
 constant constexpr uint DENSE_IQ4_TILE_ROWS = 64u;
 constant constexpr uint DENSE_IQ4_TILE_K = 32u;
 /// Row pitch of a staged slice, padded off the bank stride.
@@ -441,13 +441,13 @@ constant constexpr uint DENSE_IQ4_TILE_LD = DENSE_IQ4_TILE_K + 4u;
 /// The `IQ4_NL` routed stage for a prompt pass, on the matrix units.
 ///
 /// The contract of `kernel_dense_experts_iq4nl_f32` - same buffers, same grid
-/// height, same slot map - with an expert's columns taken sixteen at a time as
+/// height, same slot map - with an expert's columns taken 32 at a time as
 /// the rows of one tile, so a 64-row band of its weights is dequantized once a
 /// tile instead of being re-read once a column. Each slice of the contraction
 /// is one block: thread `t` dequantizes half of block `k / 32` of weight row
 /// `t / 2` (the low nibbles for the first half, the high for the second) and
-/// stages four activations of column `t / 8`; the four simdgroups each
-/// multiply a 16 x 16 quarter of the 16 x 64 tile out of 8 x 8 fragments.
+/// stages eight activations of column `t / 4`; the four simdgroups each
+/// multiply a 16 x 32 quarter of the 32 x 64 tile out of 8 x 8 fragments.
 ///
 /// A column's sum runs over the blocks in order and over each block's
 /// fragments in order, so it depends on the shape alone and never on which
@@ -488,30 +488,33 @@ kernel void kernel_dense_experts_iq4nl_gemm_f32(
     const uint slot = args.mapped != 0u ? uint(map[args.layer_base + expert]) : expert;
     const uint n0 = tgpig.x * BN;
     // Staging roles: weight row `wr`, half `wh`; activation column `xr`,
-    // values `xc .. xc + 4` of each slice.
+    // values `xc .. xc + 8` of each slice.
     const uint wr = tid / 2u;
     const uint wh = tid % 2u;
-    const uint xr = tid / 8u;
-    const uint xc = (tid % 8u) * 4u;
+    const uint xr = tid / 4u;
+    const uint xc = (tid % 4u) * 8u;
     const bool w_live = n0 + wr < out_dim;
     device const uchar * wrow =
             w + ((uint64_t) slot * out_dim + (w_live ? n0 + wr : 0u)) * blocks * BLOCK_BYTES;
-    // Simdgroup `simd` owns output rows `16 simd .. + 16` of the tile.
-    const uint sn = simd * 16u;
+    // Simdgroup `simd` owns columns `sm .. sm + 16` and output rows
+    // `sn .. sn + 32` of the tile.
+    const uint sm = (simd / 2u) * 16u;
+    const uint sn = (simd % 2u) * 32u;
     for (int t0 = c0; t0 < c1; t0 += int(BM)) {
         const bool x_live = t0 + int(xr) < c1;
         const uint col = x_live ? uint(sorted[t0 + int(xr)]) : 0u;
         const uint xrow_at = args.by_token != 0u ? col / args.n_used : col;
         device const float * xrow = x + (uint64_t) xrow_at * in_dim + xc;
-        simdgroup_float8x8 acc[2][2];
+        simdgroup_float8x8 acc[2][4];
         _Pragma("clang loop unroll(full)")
         for (uint i = 0; i < 2u; ++i) {
             _Pragma("clang loop unroll(full)")
-            for (uint j = 0; j < 2u; ++j) {
+            for (uint j = 0; j < 4u; ++j) {
                 acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
             }
         }
         float4 xv = x_live ? *(device const float4 *) xrow : float4(0.0f);
+        float4 xw = x_live ? *(device const float4 *) (xrow + 4u) : float4(0.0f);
         float d = w_live ? float(*((device const half *) wrow)) : 0.0f;
         uchar qs[16];
         _Pragma("clang loop unroll(full)")
@@ -521,6 +524,7 @@ kernel void kernel_dense_experts_iq4nl_gemm_f32(
         for (uint b = 0; b < blocks; ++b) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
             *(threadgroup float4 *) (xs + xr * LD + xc) = xv;
+            *(threadgroup float4 *) (xs + xr * LD + xc + 4u) = xw;
             threadgroup float * wd = ws + wr * LD + wh * 16u;
             _Pragma("clang loop unroll(full)")
             for (uint q = 0; q < 4u; ++q) {
@@ -537,6 +541,7 @@ kernel void kernel_dense_experts_iq4nl_gemm_f32(
             if (b + 1u < blocks) {
                 if (x_live) {
                     xv = *(device const float4 *) (xrow + (b + 1u) * DENSE_IQ4_TILE_K);
+                    xw = *(device const float4 *) (xrow + (b + 1u) * DENSE_IQ4_TILE_K + 4u);
                 }
                 if (w_live) {
                     device const uchar * blk = wrow + (b + 1u) * BLOCK_BYTES;
@@ -550,16 +555,19 @@ kernel void kernel_dense_experts_iq4nl_gemm_f32(
             _Pragma("clang loop unroll(full)")
             for (uint kk = 0; kk < DENSE_IQ4_TILE_K; kk += 8u) {
                 simdgroup_float8x8 a[2];
-                simdgroup_float8x8 bm[2];
+                simdgroup_float8x8 bm[4];
                 _Pragma("clang loop unroll(full)")
                 for (uint i = 0; i < 2u; ++i) {
-                    simdgroup_load(a[i], xs + (8u * i) * LD + kk, LD);
-                    simdgroup_load(bm[i], ws + (sn + 8u * i) * LD + kk, LD, ulong2(0, 0), true);
+                    simdgroup_load(a[i], xs + (sm + 8u * i) * LD + kk, LD);
+                }
+                _Pragma("clang loop unroll(full)")
+                for (uint j = 0; j < 4u; ++j) {
+                    simdgroup_load(bm[j], ws + (sn + 8u * j) * LD + kk, LD, ulong2(0, 0), true);
                 }
                 _Pragma("clang loop unroll(full)")
                 for (uint i = 0; i < 2u; ++i) {
                     _Pragma("clang loop unroll(full)")
-                    for (uint j = 0; j < 2u; ++j) {
+                    for (uint j = 0; j < 4u; ++j) {
                         simdgroup_multiply_accumulate(acc[i][j], a[i], bm[j], acc[i][j]);
                     }
                 }
@@ -571,8 +579,8 @@ kernel void kernel_dense_experts_iq4nl_gemm_f32(
         _Pragma("clang loop unroll(full)")
         for (uint i = 0; i < 2u; ++i) {
             _Pragma("clang loop unroll(full)")
-            for (uint j = 0; j < 2u; ++j) {
-                simdgroup_store(acc[i][j], cs + (8u * i) * (BN + 4u) + sn + 8u * j, BN + 4u);
+            for (uint j = 0; j < 4u; ++j) {
+                simdgroup_store(acc[i][j], cs + (sm + 8u * i) * (BN + 4u) + sn + 8u * j, BN + 4u);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
