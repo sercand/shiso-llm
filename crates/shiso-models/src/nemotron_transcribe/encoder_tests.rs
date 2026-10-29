@@ -198,3 +198,43 @@ fn meeting_60s_stages_match_reference() {
 fn meeting_10m_stages_match_reference() {
     stages_match("meeting_10m");
 }
+
+/// A tower that loads its weights only while it encodes holds none between
+/// calls, and answers exactly what a resident one does.
+#[test]
+#[ignore = "needs a Metal device and the speech encoder export"]
+fn a_lazy_tower_encodes_what_a_resident_one_does() {
+    use shiso_audio::{AudioClip, AudioTower};
+
+    use super::tower::NemotronTranscribeTower;
+
+    let Some(path) = std::env::var_os("SHISO_TEST_MODEL_NEMOTRON_TRANSCRIBE_ENCODER") else {
+        return;
+    };
+    let Some(backend) = crate::audio_ops::testing::device() else {
+        return;
+    };
+    let path = Path::new(&path);
+    let lazy = NemotronTranscribeTower::open(&backend, path, false).expect("opens lazily");
+    assert!(
+        !lazy.is_resident(),
+        "a lazy tower holds no weights after opening"
+    );
+    let resident = NemotronTranscribeTower::open(&backend, path, true).expect("opens resident");
+    let mel = MelFrontend::new(lazy.mel_spec().clone())
+        .expect("spec")
+        .compute(clip_pcm("short_en").samples());
+    let tokens = lazy.tokens_for(mel.valid()).expect("tokens");
+    let clips = [AudioClip::new(mel, tokens).expect("clip")];
+    let ops = Ops::new(std::sync::Arc::clone(&backend));
+    let read = |rows: &shiso_vision::EncodedRows| {
+        crate::audio_ops::load::download_f32(&ops, rows.rows.view(), tokens * 2688).expect("reads")
+    };
+    let a = read(&lazy.encode(&backend, &clips).expect("lazy encodes"));
+    let b = read(&resident.encode(&backend, &clips).expect("resident encodes"));
+    assert!(
+        !lazy.is_resident(),
+        "the weights are dropped after the call"
+    );
+    assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
+}

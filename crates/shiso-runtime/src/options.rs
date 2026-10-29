@@ -508,6 +508,16 @@ pub struct ServeOptions {
     /// refused at boot when the file is missing, before the decoder loads.
     #[cfg_attr(feature = "clap", arg(long, env = "SHISO_SPEECH_ENCODER"))]
     pub speech_encoder: Option<PathBuf>,
+    /// Keep the speech encoder's weights on the device between requests.
+    ///
+    /// Off, they are loaded for each recording and dropped when it is
+    /// encoded, which leaves their 1.7 GB to the decoder's expert pool; a
+    /// server taking many short requests keeps them.
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_SPEECH_ENCODER_RESIDENT", default_value_t = false)
+    )]
+    pub speech_encoder_resident: bool,
     /// Pixel ceiling one image may occupy after resizing.
     #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VISION_MAX_PIXELS"))]
     #[cfg_attr(feature = "clap", arg(default_value_t = DEFAULT_VISION_MAX_PIXELS))]
@@ -1005,6 +1015,7 @@ impl Default for ServeOptions {
             ngram: None,
             vision: None,
             speech_encoder: None,
+            speech_encoder_resident: false,
             vision_max_pixels: DEFAULT_VISION_MAX_PIXELS,
             vision_allow_remote_images: false,
             video_allow_decode: false,

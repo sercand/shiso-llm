@@ -489,7 +489,18 @@ fn open_transcribe_audio(
     path: &Path,
 ) -> Result<AudioTowerFound, AudioError> {
     Ok(AudioTowerFound::Tower(Arc::new(
-        NemotronTranscribeTower::open(backend, path)?,
+        NemotronTranscribeTower::open(backend, path, false)?,
+    )))
+}
+
+/// [`open_transcribe_audio`] with the encoder's weights kept on the device
+/// between requests (`--speech-encoder-resident`).
+fn open_transcribe_audio_resident(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+) -> Result<AudioTowerFound, AudioError> {
+    Ok(AudioTowerFound::Tower(Arc::new(
+        NemotronTranscribeTower::open(backend, path, true)?,
     )))
 }
 
@@ -887,7 +898,11 @@ fn load_nemotron_h(
         return Ok(Loaded {
             model: Box::new(model),
             open_tower: open_no_tower,
-            open_audio: open_transcribe_audio,
+            open_audio: if args.speech_encoder_resident {
+                open_transcribe_audio_resident
+            } else {
+                open_transcribe_audio
+            },
             placement: TRANSCRIBE_PLACEMENT,
             defaults,
             speech,

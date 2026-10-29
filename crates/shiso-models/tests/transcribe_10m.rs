@@ -97,7 +97,8 @@ fn ten_minutes_transcribe_inside_two_minutes() {
         shiso_metal::MetalBackend::new().expect("the embedded kernel library compiles");
 
     let t0 = Instant::now();
-    let tower = NemotronTranscribeTower::open(&backend, &encoder).expect("the encoder loads");
+    let tower =
+        NemotronTranscribeTower::open(&backend, &encoder, false).expect("the encoder loads");
     let config = NemotronHConfig::from_gguf_path(&decoder).expect("the decoder reads");
     let mut opts = EngineOptions::default();
     opts.ctx = 16_384;
