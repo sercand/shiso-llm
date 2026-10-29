@@ -147,6 +147,10 @@ pub(crate) struct State {
     commits: usize,
     /// The value the completion event was last asked to reach.
     signaled: u64,
+    /// The last command buffer committed without a signal, kept until a
+    /// drain has seen it finish: its work is outstanding, and a fault inside
+    /// it must reach the caller rather than vanish.
+    submitted: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     /// Samples of the open profile region; `None` when no region is open,
     /// which is the only state in which launches batch.
     profile: Option<Vec<LaunchSample>>,
@@ -300,6 +304,7 @@ impl MetalBackend {
                 pipelines: PipelineCache::default(),
                 commits: 0,
                 signaled: 0,
+                submitted: None,
                 profile: None,
             }),
         }))
@@ -424,11 +429,16 @@ impl MetalBackend {
         state: &mut State,
         op: &'static str,
     ) -> CoreResult<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>> {
+        let submitted = state.submitted.take();
         let Batch::Open {
             command_buffer,
             encoder,
         } = std::mem::take(&mut state.batch)
         else {
+            if let Some(submitted) = submitted {
+                submitted.waitUntilCompleted();
+                failed(&submitted, op)?;
+            }
             return Ok(None);
         };
         match encoder {
@@ -450,18 +460,19 @@ impl MetalBackend {
             .done
             .waitUntilSignaledValue_timeoutMS(value, DRAIN_SLICE_MS)
         {
-            if command_buffer.status() == MTLCommandBufferStatus::Error {
+            let earlier = submitted
+                .as_ref()
+                .is_some_and(|cb| cb.status() == MTLCommandBufferStatus::Error);
+            if earlier || command_buffer.status() == MTLCommandBufferStatus::Error {
                 break;
             }
         }
-        let status = command_buffer.status();
-        if status == MTLCommandBufferStatus::Error {
-            let detail = command_buffer.error().map_or_else(
-                || format!("{status:?}"),
-                |err| format!("{status:?}: {}", err.localizedDescription()),
-            );
-            return Err(MetalError::backend(op, detail));
+        // The queue ran a submitted buffer before this one, so its status is
+        // final by now unless it faulted, which is what it is checked for.
+        if let Some(submitted) = &submitted {
+            failed(submitted, op)?;
         }
+        failed(&command_buffer, op)?;
         Ok(Some(command_buffer))
     }
 
@@ -771,8 +782,16 @@ impl Backend for MetalBackend {
         }
         state.commits += 1;
         // No signal: the queue runs its command buffers in order, so the next
-        // drain's signal is reached only after this one has run.
+        // drain's signal is reached only after this one has run. The buffer
+        // is kept for that drain, which also waits for it when nothing else
+        // was queued and reports it if it faulted.
         command_buffer.commit();
+        if let Some(earlier) = state.submitted.replace(command_buffer) {
+            // Only the newest submitted buffer is kept; an older one that
+            // faulted would go unseen, so it is checked here.
+            earlier.waitUntilCompleted();
+            failed(&earlier, "submit")?;
+        }
         Ok(())
     }
 
@@ -1062,3 +1081,20 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<MetalBackend>();
 };
+
+/// Refuses a command buffer that ended in an error, naming `op` and the
+/// driver's description.
+fn failed(
+    command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    op: &'static str,
+) -> CoreResult<()> {
+    let status = command_buffer.status();
+    if status != MTLCommandBufferStatus::Error {
+        return Ok(());
+    }
+    let detail = command_buffer.error().map_or_else(
+        || format!("{status:?}"),
+        |err| format!("{status:?}: {}", err.localizedDescription()),
+    );
+    Err(MetalError::backend(op, detail))
+}

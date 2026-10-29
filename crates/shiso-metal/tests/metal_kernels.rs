@@ -1611,3 +1611,26 @@ fn q4_k_packers_match_the_kernel_unpack() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires Metal GPU"]
+fn sync_waits_for_submitted_work() {
+    const BYTES: usize = 256 << 20;
+    let Some(gpu) = Gpu::open() else { return };
+    let buffer = gpu.upload(&vec![0xFFu8; BYTES]);
+    gpu.device.fill_zero(buffer.view()).expect("fill");
+    gpu.device.submit().expect("submit");
+    gpu.device.sync().expect("sync");
+    // The tail is the last part the clear reaches; read straight after the
+    // sync, it shows whether the sync waited for the submitted buffer.
+    let tail = buffer
+        .view()
+        .slice((BYTES - 4096) as u64, 4096)
+        .expect("tail");
+    let mut out = vec![0xAAu8; 4096];
+    gpu.device.copy_d2h(tail, &mut out).expect("d2h");
+    assert!(
+        out.iter().all(|&b| b == 0),
+        "sync returned before the clear ran"
+    );
+}
