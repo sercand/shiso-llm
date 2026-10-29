@@ -219,8 +219,8 @@ struct Span<'a> {
 ///
 /// # Errors
 ///
-/// [`CoreError::Unsupported`] for a pass that asks for a per-row trail, which
-/// this block does not record; [`CoreError::ShapeMismatch`] when a batch's
+/// [`CoreError::OutOfBounds`] for a recording pass wider than its trail;
+/// [`CoreError::ShapeMismatch`] when a batch's
 /// state list is not as long as the pass; whatever [`projection::projection`]
 /// reports for either projection; and [`CoreError::Backend`] naming the entry
 /// when a launch fails.
@@ -232,16 +232,46 @@ pub fn run(
     io: GdnIo<'_>,
     n_tok: u32,
 ) -> CoreResult<()> {
-    if io.trail.is_some() {
-        // Accepting a trail and leaving it unwritten would let a rollback
-        // restore whatever the allocator last left there.
-        return Err(CoreError::Unsupported {
-            what: "a per-row state trail on a state-space block",
-            backend: "engine",
-        });
-    }
     projection::projection(backend, &ssm.in_proj, n_tok, io.input, scratch.proj.view())?;
     match io.states {
+        // A verify pass: the two sequential stages a row at a time, the state
+        // copied out after each, as `StateTrail` describes. Both kernels carry
+        // their state across rows in registers and write it back at the end,
+        // so splitting the loop is the same arithmetic.
+        GdnStates::Chunk(state) if io.trail.is_some() => {
+            let trail = io.trail.ok_or(CoreError::ShapeMismatch {
+                field: "state-space trail",
+                expected: 1,
+                got: 0,
+            })?;
+            let (conv_bytes, state_bytes) = (state.conv.len(), state.state.len());
+            for row in 0..n_tok {
+                sequential(
+                    backend,
+                    ssm,
+                    geometry,
+                    scratch,
+                    Span {
+                        first: row,
+                        rows: 1,
+                        state,
+                    },
+                )?;
+                // Past the trail's rows this slice is refused, which is the
+                // safe direction: a row whose record was never written is not
+                // one a rollback may name.
+                backend.copy_d2d(
+                    trail.conv.slice(u64::from(row) * conv_bytes, conv_bytes)?,
+                    state.conv,
+                )?;
+                backend.copy_d2d(
+                    trail
+                        .state
+                        .slice(u64::from(row) * state_bytes, state_bytes)?,
+                    state.state,
+                )?;
+            }
+        }
         GdnStates::Chunk(state) => sequential(
             backend,
             ssm,
