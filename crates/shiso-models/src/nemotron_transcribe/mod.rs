@@ -10,6 +10,7 @@
 //! ([`encoder`]), and on the text side the card's instructions ([`presets`])
 //! and the cleanup of what the decoder wrote ([`postprocess`]).
 
+pub mod align;
 pub mod config;
 pub mod diar;
 pub mod encoder;
@@ -17,6 +18,7 @@ pub mod frontend;
 pub mod pairing;
 pub mod postprocess;
 pub mod presets;
+pub mod spm;
 pub mod tower;
 pub mod transformer;
 pub mod weights;
