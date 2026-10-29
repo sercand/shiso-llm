@@ -85,7 +85,7 @@ pub use ckpt::{
     ResumeInfo, ResumeSource, SaveOutcome,
 };
 pub use ckpt_layout::CkptIdentity;
-pub use draft::{DraftHead, DraftParts};
+pub use draft::{DraftHead, DraftParts, HeadNorm};
 pub use options::{EngineOptions, KvCheck, KvFit, PoolCost};
 pub use sampling::{argmax, keyed_sample, rng_f32, rng_next, sample_logits, suppress};
 pub use sampling_probs::{build_probabilities, sample_probabilities};

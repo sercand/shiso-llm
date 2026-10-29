@@ -118,6 +118,12 @@ struct dense_args_scale {
     float s;
 };
 
+/// A per-row layer norm with a weight and no bias (`dense_misc.metal`).
+struct dense_args_layer_norm {
+    uint32_t dim;
+    float eps;
+};
+
 /// x[i] = cap * tanh(x[i] / cap) over the first `n` elements.
 struct dense_args_softcap {
     uint32_t n;

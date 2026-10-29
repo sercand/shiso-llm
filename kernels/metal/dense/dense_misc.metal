@@ -131,3 +131,37 @@ kernel void kernel_dense_scale_f32(
     if (i >= args.n) return;
     x[i] = x[i] * args.s;
 }
+
+/// `dst[r] = (src[r] - mean(src[r])) / sqrt(var(src[r]) + eps) * w`, the
+/// variance biased, one threadgroup a row. Both sums go through
+/// `dense_block_sum`, so a row's result is the same whatever else the launch
+/// carries.
+///
+/// Buffers: args, src, w, dst. Grid `rows`, 256 threads.
+kernel void kernel_dense_layer_norm_mul_f32(
+        constant dense_args_layer_norm & args [[buffer(0)]],
+        device const float * src [[buffer(1)]],
+        device const float * w [[buffer(2)]],
+        device float * dst [[buffer(3)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint nt [[threads_per_threadgroup]]) {
+    threadgroup float scratch[DENSE_BLOCK_SUM_SLOTS];
+    device const float * x = src + (uint64_t) row * args.dim;
+    device float * y = dst + (uint64_t) row * args.dim;
+    float sum = 0.0f;
+    for (uint i = tid; i < args.dim; i += nt) {
+        sum += x[i];
+    }
+    const float mean = dense_block_sum(sum, scratch, tid, nt) / (float) args.dim;
+    float sq = 0.0f;
+    for (uint i = tid; i < args.dim; i += nt) {
+        const float d = x[i] - mean;
+        sq += d * d;
+    }
+    const float var = dense_block_sum(sq, scratch, tid, nt) / (float) args.dim;
+    const float inv = rsqrt(var + args.eps);
+    for (uint i = tid; i < args.dim; i += nt) {
+        y[i] = (x[i] - mean) * inv * w[i];
+    }
+}

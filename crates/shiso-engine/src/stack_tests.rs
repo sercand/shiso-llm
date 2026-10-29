@@ -435,6 +435,8 @@ fn fixture_with_draft(count: u32) -> (HybridStack, Vec<SessionId>) {
         input_norm: norm(&backend, HIDDEN),
         ffn_norm: norm(&backend, HIDDEN),
         output_norm: norm(&backend, HIDDEN),
+        head_norm: crate::draft::HeadNorm::Rms,
+        hidden_prenorm: None,
         attn: crate::attn::Attn {
             q: weight(&backend, HIDDEN, Q_HEADS * HEAD_DIM),
             k: Some(weight(&backend, HIDDEN, KV_HEADS * HEAD_DIM)),

@@ -83,3 +83,10 @@ fn the_row_scale_multiplies_in_place_and_stops_at_its_bound() {
     let Some(gpu) = open() else { return };
     misc::the_row_scale_multiplies_in_place_and_stops_at_its_bound(&gpu);
 }
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn the_layer_norm_centres_scales_and_weights_each_row() {
+    let Some(gpu) = open() else { return };
+    misc::the_layer_norm_centres_scales_and_weights_each_row(&gpu);
+}

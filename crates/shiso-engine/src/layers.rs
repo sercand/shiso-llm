@@ -238,6 +238,40 @@ pub(crate) fn rms_norm_mul(
     .map_err(|err| launch::launch_failure("kernel_rms_norm_mul_f32_4", err))
 }
 
+/// `dst = layer_norm(x) * weight` over `n_tok` rows of `hidden`, the variance
+/// biased and no offset: a draft head whose output norm centres its rows.
+pub(crate) fn layer_norm_mul(
+    backend: &dyn Backend,
+    x: DeviceView<'_>,
+    weight: DeviceView<'_>,
+    dst: DeviceView<'_>,
+    hidden: u32,
+    n_tok: u32,
+    eps: f32,
+) -> CoreResult<()> {
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct Args {
+        dim: u32,
+        eps: f32,
+    }
+    const NAME: &str = "kernel_dense_layer_norm_mul_f32";
+    launch::run(
+        backend,
+        KernelRef::new(launch::DENSE, NAME),
+        Extent3::new(n_tok, 1, 1),
+        Extent3::new(256, 1, 1),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&Args { dim: hidden, eps })),
+            KernelArg::Buffer(x),
+            KernelArg::Buffer(weight),
+            KernelArg::Buffer(dst),
+        ],
+    )
+    .map_err(|err| launch::launch_failure(NAME, err))
+}
+
 // ---------------------------------------------------------------------------------------
 // The layer stack
 // ---------------------------------------------------------------------------------------

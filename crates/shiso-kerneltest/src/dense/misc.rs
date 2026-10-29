@@ -45,11 +45,12 @@ const NORM_SMEM: u32 = NORM_BLOCK * 4;
 const NORM_VEC: usize = 4;
 
 /// Every entry point this module's cases launch.
-pub const ENTRIES: [&str; 4] = [
+pub const ENTRIES: [&str; 5] = [
     "kernel_dense_geglu_flat_f32",
     "kernel_dense_add_scale_rms_norm_mul_f32_4",
     "kernel_dense_softcap_f32",
     "kernel_dense_scale_f32",
+    "kernel_dense_layer_norm_mul_f32",
 ];
 
 // -- argument blocks --------------------------------------------------------
@@ -499,4 +500,62 @@ pub fn the_row_scale_multiplies_in_place_and_stops_at_its_bound(gpu: &Gpu) {
         .map(|(i, &v)| if i < SCALE_N { v * s } else { v })
         .collect();
     close(&gpu.read_f32(&d_x), &want, "scale");
+}
+
+/// `dense_args_layer_norm`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct LayerNormArgs {
+    dim: u32,
+    eps: f32,
+}
+
+const _: () = assert!(size_of::<LayerNormArgs>() == 8);
+
+/// `dst[r] = (src[r] - mean) / sqrt(var + eps) * w`, the variance biased,
+/// over every row on its own.
+pub fn the_layer_norm_centres_scales_and_weights_each_row(gpu: &Gpu) {
+    let (rows, dim, eps) = (3usize, 2688usize, 1e-5f32);
+    let src: Vec<f32> = crate::oracle::signal(rows * dim, 61)
+        .iter()
+        .enumerate()
+        .map(|(i, v)| v * 3.0 + (i / dim) as f32)
+        .collect();
+    let w = crate::oracle::signal(dim, 62);
+    let d_src = gpu.upload(&f32_bytes(&src));
+    let d_w = gpu.upload(&f32_bytes(&w));
+    let d_dst = zeros(gpu, rows * dim);
+    let args = LayerNormArgs {
+        dim: dim as u32,
+        eps,
+    };
+    launch(
+        gpu,
+        "kernel_dense_layer_norm_mul_f32",
+        Extent3::linear(rows as u32),
+        Extent3::new(256, 1, 1),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(d_src.view()),
+            KernelArg::Buffer(d_w.view()),
+            KernelArg::Buffer(d_dst.view()),
+        ],
+    );
+    drain(gpu);
+    let mut want = vec![0.0f32; rows * dim];
+    for r in 0..rows {
+        let row = &src[r * dim..(r + 1) * dim];
+        let mean = row.iter().map(|v| f64::from(*v)).sum::<f64>() / dim as f64;
+        let var = row
+            .iter()
+            .map(|v| (f64::from(*v) - mean).powi(2))
+            .sum::<f64>()
+            / dim as f64;
+        let inv = 1.0 / (var + f64::from(eps)).sqrt();
+        for i in 0..dim {
+            want[r * dim + i] = ((f64::from(row[i]) - mean) * inv * f64::from(w[i])) as f32;
+        }
+    }
+    close(&gpu.read_f32(&d_dst), &want, "layer norm");
 }
