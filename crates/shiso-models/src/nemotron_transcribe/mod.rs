@@ -7,18 +7,23 @@
 //! encoder export beside it ([`config`], [`weights`]), the frontend and window
 //! plan ([`frontend`]), the shared rotary transformer ([`transformer`]), the
 //! speaker branch with its cross-window cache ([`diar`]) and the fusion
-//! ([`encoder`]).
+//! ([`encoder`]), and on the text side the card's instructions ([`presets`])
+//! and the cleanup of what the decoder wrote ([`postprocess`]).
 
 pub mod config;
 pub mod diar;
 pub mod encoder;
 pub mod frontend;
+pub mod postprocess;
+pub mod presets;
 pub mod tower;
 pub mod transformer;
 pub mod weights;
 
 pub use config::{BlockDims, PeeConfig};
 pub use encoder::{Encoded, encode};
+pub use postprocess::{collapse_loops, speaker_turns, strip_tags};
+pub use presets::{Preset, PresetError, parse_preset};
 pub use tower::NemotronTranscribeTower;
 pub use weights::PeeWeights;
 
