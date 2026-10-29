@@ -145,6 +145,14 @@ fn ten_minutes_transcribe_inside_two_minutes() {
     )
     .expect("the rows match the run");
     let session = model.open_session().expect("session");
+    let region = std::env::var_os("SHISO_TEST_PROFILE_PREFILL").map(|_| {
+        shiso_core::profile::ProfileRegion::open(
+            backend
+                .as_profiler()
+                .expect("the Metal device times launches"),
+        )
+        .expect("a profile region opens")
+    });
     let t1 = Instant::now();
     let mut last = {
         let logits = model
@@ -164,6 +172,21 @@ fn ten_minutes_transcribe_inside_two_minutes() {
         .expect("fits")
     };
     let prefill = t1.elapsed().as_secs_f64();
+    if let Some(region) = region {
+        eprintln!("{}", region.finish().expect("the region closes").table(16));
+        let s = model.expert_stats().unwrap_or_default();
+        eprintln!(
+            "prefill reads {} MiB in {:.1} s, drain {:.1} s, {} fetches, {} read ahead, {} used, {:.1} s wall",
+            s.read_bytes >> 20,
+            s.read_seconds,
+            s.drain_seconds,
+            s.fetches,
+            s.prefetch_reads,
+            s.prefetched,
+            prefill
+        );
+        return;
+    }
     let before = model.expert_stats().unwrap_or_default();
 
     let t2 = Instant::now();
@@ -198,6 +221,10 @@ fn ten_minutes_transcribe_inside_two_minutes() {
         .zip(&reference)
         .take_while(|(a, b)| a == b)
         .count();
+    if let Some(path) = env_path("SHISO_TEST_DUMP_IDS") {
+        let text: String = out.iter().map(|t| format!("{t}\n")).collect();
+        std::fs::write(path, text).expect("the ids write");
+    }
     eprintln!(
         "load {load:.1} s | request {total:.1} s = encode {encode:.1} s + prefill {prefill:.1} s ({} rows) \\
          + decode {decode:.1} s ({} tokens, {:.1} tok/s, accepted {accepted} of {drafted}) | \\

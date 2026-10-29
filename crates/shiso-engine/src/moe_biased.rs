@@ -394,6 +394,10 @@ fn fetch_streamed(
         return Ok(());
     };
     stream.fetch(backend, layer, scratch.ids.view(), columns)?;
+    // A prompt pass is not guessed for: it wants nearly every expert, and
+    // reading a whole next layer ahead (measured on an M4, ten minutes of
+    // audio) bought no wall time - the prompt pass is bound by the device,
+    // and the staging copy doubles the traffic on unified memory.
     if let Some(guess) = moe.guess.as_ref()
         && n_tok <= GUESS_MAX_ROWS
     {
