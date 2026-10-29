@@ -156,35 +156,8 @@ impl NemotronHModel {
         let layers = source.layers();
         let slot_bytes: u64 = source.layout().iter().sum();
         let banks = slot_bytes * u64::from(moe.experts) * u64::from(layers);
-        let slots = match residency {
-            GgufResidency::Resident => None,
-            GgufResidency::Streamed { slots } => Some(slots),
-            GgufResidency::Auto { reserve } => {
-                let total = backend.memory_info().map_or(u64::MAX, |info| info.total);
-                let rest = file
-                    .tensors()
-                    .iter()
-                    .map(|t| t.bytes)
-                    .sum::<u64>()
-                    .saturating_sub(banks);
-                let fixed = rest.saturating_add(reserve);
-                if fixed.saturating_add(banks) <= total {
-                    None
-                } else {
-                    let room = total.saturating_sub(fixed);
-                    let fit = u32::try_from(room / slot_bytes.max(1)).unwrap_or(u32::MAX);
-                    tracing::info!(
-                        total_gib = total >> 30,
-                        other_weights_gib = rest >> 30,
-                        reserve_gib = reserve >> 30,
-                        banks_gib = banks >> 30,
-                        slots = fit,
-                        "the routed banks do not fit; streaming them from disk"
-                    );
-                    Some(fit.min(moe.experts * layers))
-                }
-            }
-        };
+        let slots = stream_slots(backend.as_ref(), &file, residency, banks, slot_bytes)
+            .map(|slots| slots.min(moe.experts * layers));
         let (placement, stream) = match slots {
             None => (ExpertPlacement::Resident, None),
             Some(slots) => {
@@ -270,6 +243,47 @@ pub enum GgufResidency {
         /// Expert slots in the pool.
         slots: u32,
     },
+}
+
+/// Slots the routed banks stream into, or `None` when they stay resident.
+///
+/// `Auto` keeps them resident when every weight fits in the device's working
+/// set with `reserve` to spare, and otherwise sizes the pool to what is left.
+fn stream_slots(
+    backend: &dyn Backend,
+    file: &GgufFile,
+    residency: GgufResidency,
+    banks: u64,
+    slot_bytes: u64,
+) -> Option<u32> {
+    match residency {
+        GgufResidency::Resident => None,
+        GgufResidency::Streamed { slots } => Some(slots),
+        GgufResidency::Auto { reserve } => {
+            let total = backend.memory_info().map_or(u64::MAX, |info| info.total);
+            let rest = file
+                .tensors()
+                .iter()
+                .map(|t| t.bytes)
+                .sum::<u64>()
+                .saturating_sub(banks);
+            let fixed = rest.saturating_add(reserve);
+            if fixed.saturating_add(banks) <= total {
+                return None;
+            }
+            let fit =
+                u32::try_from(total.saturating_sub(fixed) / slot_bytes.max(1)).unwrap_or(u32::MAX);
+            tracing::info!(
+                total_gib = total >> 30,
+                other_weights_gib = rest >> 30,
+                reserve_gib = reserve >> 30,
+                banks_gib = banks >> 30,
+                slots = fit,
+                "the routed banks do not fit; streaming them from disk"
+            );
+            Some(fit)
+        }
+    }
 }
 
 /// The checkpoint and the device, for the imports below.
