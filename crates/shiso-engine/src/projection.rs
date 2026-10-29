@@ -352,6 +352,9 @@ pub struct Weight {
     /// Boxed: most weights carry none, and a weight is a field of several
     /// enums whose variants would otherwise all grow by it.
     rotation: Option<Box<InputRotation>>,
+    /// Whether a one-row product must sum exactly as a row of a few-row one;
+    /// see [`Weight::row_exact`].
+    row_exact: bool,
 }
 
 impl Weight {
@@ -404,6 +407,7 @@ impl Weight {
             buffer,
             aux: None,
             rotation: None,
+            row_exact: false,
         })
     }
 
@@ -433,6 +437,7 @@ impl Weight {
             buffer,
             aux: Some(WeightAux::Affine(AffineAux { scales, biases })),
             rotation: None,
+            row_exact: false,
         })
     }
 
@@ -484,6 +489,7 @@ impl Weight {
                 biases: b_buf,
             })),
             rotation: None,
+            row_exact: false,
         })
     }
     /// Imports an FP8 weight and the scale that decodes it.
@@ -578,7 +584,19 @@ impl Weight {
             buffer,
             aux: None,
             rotation: None,
+            row_exact: false,
         }
+    }
+
+    /// Marks this weight as one whose one-row products must sum exactly as
+    /// the rows of a few-row product do: a speculating family's, whose verify
+    /// pass checks a draft against what the serial step would have answered.
+    /// Unmarked, a one-row `q8_0` product takes the generic one-row kernel,
+    /// which is faster on wide matrices but sums in another order.
+    #[must_use]
+    pub const fn row_exact(mut self) -> Self {
+        self.row_exact = true;
+        self
     }
 
     /// Attaches the rotation this weight's stored basis was folded under.
@@ -930,6 +948,15 @@ fn dispatch(
     if n_tok >= GEMM_MIN_TOKENS && mm_name(weight.dtype).is_some() {
         return mm_projection(backend, weight, n_tok, src, dst);
     }
+    // Two to eight `q8_0` rows - a verify pass, a small decode batch - read
+    // every block once for all of them; the extended family's row blocking
+    // reached a third of the bandwidth on this format. A row-exact weight
+    // sends one row here too, so a verify pass's rows sum exactly as the
+    // serial steps they check and speculation cannot change a greedy answer.
+    let rows_from = if weight.row_exact { 1 } else { 2 };
+    if weight.dtype == DType::Q8_0 && (rows_from..=Q8_ROWS_MAX).contains(&n_tok) {
+        return q8_rows_projection(backend, weight, n_tok, src, dst);
+    }
     let r1ptg = ext_r1ptg(n_tok);
     let nxpsg = ext_nxpsg(u64::from(weight.in_dim), n_tok);
     // The lane split is a pipeline constant on one backend and part of the
@@ -963,6 +990,54 @@ fn dispatch(
         );
     }
     plain_projection(backend, weight, n_tok, src, dst)
+}
+
+/// Widest row count the `q8_0` row kernel is instantiated for.
+const Q8_ROWS_MAX: u32 = 8;
+
+/// `dst = src · Wᵀ` over 1 to [`Q8_ROWS_MAX`] rows of a `q8_0` weight, each
+/// block read once. Measured on an M4 over the 131072 x 2688 vocabulary
+/// projection at four rows: 10.4 ms through the extended family.
+fn q8_rows_projection(
+    backend: &dyn Backend,
+    weight: &Weight,
+    n_tok: u32,
+    src: DeviceView<'_>,
+    dst: DeviceView<'_>,
+) -> CoreResult<()> {
+    const NAMES: [&str; 8] = [
+        "kernel_dense_q8_0_rows_f32_r1",
+        "kernel_dense_q8_0_rows_f32_r2",
+        "kernel_dense_q8_0_rows_f32_r3",
+        "kernel_dense_q8_0_rows_f32_r4",
+        "kernel_dense_q8_0_rows_f32_r5",
+        "kernel_dense_q8_0_rows_f32_r6",
+        "kernel_dense_q8_0_rows_f32_r7",
+        "kernel_dense_q8_0_rows_f32_r8",
+    ];
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct Args {
+        in_dim: u32,
+        out_dim: u32,
+    }
+    let name = NAMES[(n_tok - 1) as usize];
+    run(
+        backend,
+        KernelRef::new(crate::launch::DENSE, name),
+        Extent3::linear(weight.out_dim.div_ceil(2)),
+        Extent3::linear(128),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&Args {
+                in_dim: weight.in_dim,
+                out_dim: weight.out_dim,
+            })),
+            KernelArg::Buffer(weight.view()),
+            KernelArg::Buffer(src),
+            KernelArg::Buffer(dst),
+        ],
+    )
 }
 
 /// Rows from which the tiled GEMM is worth its tile staging.

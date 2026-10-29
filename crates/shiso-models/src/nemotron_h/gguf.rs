@@ -328,7 +328,8 @@ impl Loader<'_> {
     }
 
     /// A stored matrix `[out_dim, in_dim]`, wrapped from the mapping in its own
-    /// format.
+    /// format. Row-exact: this family speculates, and a verify pass's rows
+    /// must sum exactly as the serial steps they check.
     fn matrix(&self, name: &str, in_dim: u32, out_dim: u32) -> CoreResult<Weight> {
         let desc = self.desc(name)?;
         Weight::import(
@@ -339,6 +340,7 @@ impl Loader<'_> {
             self.file.mapping(),
             self.file.range_of(desc),
         )
+        .map(Weight::row_exact)
     }
 
     /// An `f32` tensor's values.

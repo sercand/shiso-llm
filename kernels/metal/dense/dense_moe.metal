@@ -341,9 +341,9 @@ kernel void kernel_dense_experts_affine4_f32(
 /// the block's first sixteen values and whose high nibbles are its last
 /// sixteen, each an index into the `IQ4NL` table - so expert `e`'s row `r`
 /// starts at block `(slot * out_dim + r) * in_dim / 32`, where `slot` is `e`
-/// itself or, for a streamed bank, `map[layer_base + e]`. A lane takes whole
-/// blocks, strided by the simdgroup width, and dots each against every row the
-/// simdgroup owns, so a width of 84 blocks (2688 inputs) needs no padding.
+/// itself or, for a streamed bank, `map[layer_base + e]`. Four lanes share a
+/// block and a simdgroup sweeps eight blocks a step, dotting each against
+/// every row it owns, so a width of 84 blocks (2688 inputs) needs no padding.
 ///
 /// Buffers: args, blocks, map, input, sorted, bounds, active, out.
 kernel void kernel_dense_experts_iq4nl_f32(
@@ -356,11 +356,19 @@ kernel void kernel_dense_experts_iq4nl_f32(
         device const int * active [[buffer(6)]],
         device float * out [[buffer(7)]],
         uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
         uint lane [[thread_index_in_simdgroup]],
         uint sg [[simdgroup_index_in_threadgroup]],
         uint n_sg [[simdgroups_per_threadgroup]]) {
     constexpr uint R = DENSE_EXPERT_ROWS;
     constexpr uint BLOCK_BYTES = 18u;
+    // The value table in threadgroup memory: lanes index it with different
+    // codes, which constant memory serves one address at a time.
+    threadgroup float table[16];
+    if (tid < 16u) {
+        table[tid] = float(IQ4NL[tid]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (int(tgpig.y) >= active[args.n_expert]) {
         return;
     }
@@ -380,38 +388,40 @@ kernel void kernel_dense_experts_iq4nl_f32(
         const uint64_t at = (uint64_t) slot * out_dim + min(row0 + r, out_dim - 1u);
         wr[r] = w + at * blocks * BLOCK_BYTES;
     }
+    // Four lanes share a block: lane `il` takes packed bytes `4 il .. 4 il + 4`,
+    // whose low nibbles are values `4 il ..` and high nibbles `16 + 4 il ..`,
+    // so a simdgroup sweeps eight whole blocks a step and every lane stays
+    // busy on an 84-block row. Measured on an M4: the step that had one lane
+    // per block ran a speculative verify's experts at about 45 GB/s.
+    const uint ix = lane / 4u;
+    const uint il = lane % 4u;
     for (int c = c0; c < c1; ++c) {
         const uint col = uint(sorted[c]);
         const uint xr = args.by_token != 0u ? col / args.n_used : col;
-        device const float4 * xrow = (device const float4 *) (x + (uint64_t) xr * in_dim);
+        device const float * xrow = x + (uint64_t) xr * in_dim;
         float acc[R] = {};
-        for (uint b = lane; b < blocks; b += 32u) {
-            float4 xv[8];
-            for (uint q = 0; q < 8u; ++q) {
-                xv[q] = xrow[b * 8u + q];
-            }
+        for (uint b = ix; b < blocks; b += 8u) {
+            device const float4 * xb = (device const float4 *) (xrow + b * 32u);
+            const float4 lo = xb[il];
+            const float4 hi = xb[4u + il];
+            _Pragma("clang loop unroll(full)")
             for (uint r = 0; r < R; ++r) {
                 device const uchar * blk = wr[r] + b * BLOCK_BYTES;
                 const float d = float(*((device const half *) blk));
-                device const uchar * qs = blk + 2u;
-                float s = 0.0f;
-                for (uint q = 0; q < 4u; ++q) {
-                    const uchar b0 = qs[4u * q];
-                    const uchar b1 = qs[4u * q + 1u];
-                    const uchar b2 = qs[4u * q + 2u];
-                    const uchar b3 = qs[4u * q + 3u];
-                    const float4 lo = xv[q];
-                    const float4 hi = xv[q + 4u];
-                    s += float(IQ4NL[b0 & 0xfu]) * lo.x + float(IQ4NL[b1 & 0xfu]) * lo.y
-                        + float(IQ4NL[b2 & 0xfu]) * lo.z + float(IQ4NL[b3 & 0xfu]) * lo.w
-                        + float(IQ4NL[b0 >> 4u]) * hi.x + float(IQ4NL[b1 >> 4u]) * hi.y
-                        + float(IQ4NL[b2 >> 4u]) * hi.z + float(IQ4NL[b3 >> 4u]) * hi.w;
-                }
+                device const uchar * qs = blk + 2u + 4u * il;
+                const uchar b0 = qs[0];
+                const uchar b1 = qs[1];
+                const uchar b2 = qs[2];
+                const uchar b3 = qs[3];
+                const float s = table[b0 & 0xfu] * lo.x + table[b1 & 0xfu] * lo.y
+                        + table[b2 & 0xfu] * lo.z + table[b3 & 0xfu] * lo.w
+                        + table[b0 >> 4u] * hi.x + table[b1 >> 4u] * hi.y
+                        + table[b2 >> 4u] * hi.z + table[b3 >> 4u] * hi.w;
                 acc[r] += d * s;
             }
         }
         for (uint r = 0; r < R; ++r) {
-            const float v = simd_sum(acc[r]);
+            const float v = dense_warp_sum(acc[r]);
             if (lane == 0u && row0 + r < out_dim) {
                 out[(uint64_t) col * out_dim + row0 + r] =
                         args.act != 0u ? max(v, 0.0f) * max(v, 0.0f) : v;

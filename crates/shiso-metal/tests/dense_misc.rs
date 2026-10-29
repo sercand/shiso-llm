@@ -90,3 +90,17 @@ fn the_layer_norm_centres_scales_and_weights_each_row() {
     let Some(gpu) = open() else { return };
     misc::the_layer_norm_centres_scales_and_weights_each_row(&gpu);
 }
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn q8_rows_matches_the_host_product() {
+    let Some(gpu) = open() else { return };
+    shiso_kerneltest::dense::q8_rows::q8_rows_matches_the_host_product(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn q8_rows_answer_does_not_depend_on_the_row_count() {
+    let Some(gpu) = open() else { return };
+    shiso_kerneltest::dense::q8_rows::q8_rows_answer_does_not_depend_on_the_row_count(&gpu);
+}
