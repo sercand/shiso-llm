@@ -77,6 +77,20 @@ fn one_hour_is_accepted_and_one_second_more_is_refused() {
     assert!(matches!(err, AudioError::TooLong { .. }), "{err:?}");
 }
 
+/// A clip with no whole mel frame makes no row and is refused as empty; the
+/// first 10 ms frame makes one row, as the reference's ceiling division of
+/// mel frames by eight does, so 50 ms is one row rather than none.
+#[test]
+fn tower_refuses_a_clip_under_one_token() {
+    let tower = super::super::tower::limits_for_tests();
+    let spec = mel_spec(&config(), &vec![0.0; 128 * 257]);
+    let pcm = |samples: usize| Pcm::new(vec![0.01; samples], 16_000).expect("pcm");
+    let err = shiso_audio::clip_for(&tower(spec.clone()), &pcm(0)).expect_err("no samples");
+    assert!(matches!(err, AudioError::Empty), "{err:?}");
+    let clip = shiso_audio::clip_for(&tower(spec), &pcm(800)).expect("50 ms");
+    assert_eq!(clip.tokens(), 1);
+}
+
 #[test]
 #[ignore = "needs the speech encoder export and the reference captures"]
 #[expect(

@@ -6,18 +6,30 @@
 //! larger on a machine whose working set the pool otherwise fills, and the
 //! export is read back from the page cache or the disk in well under a
 //! second. A server taking many short requests opens it resident instead.
+//!
+//! The tower is also the decoder's word timer. The timestamp head reads the
+//! speech branch's rows, which only exist while a clip is encoded, so a clip
+//! whose words will be timed is registered first, and its encode keeps the
+//! head's output and the speaker activity until the request is done with
+//! them.
 
+use std::hash::Hasher as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use shiso_audio::{AudioClip, AudioError, AudioTower, MelSpec};
+use shiso_audio::{
+    AudioClip, AudioError, AudioTower, MelSpec, TimingKey, TimingTicket, WordTimer, WordTiming,
+};
 use shiso_core::Backend;
 use shiso_core::media::VisionGrid;
 use shiso_vision::EncodedRows;
 
+use super::align::{Activity, AlignDesc, align, targets};
 use super::config::PeeConfig;
-use super::encoder::encode;
+use super::ctc::{ClassRows, CtcEvidence, evidence};
+use super::encoder::{Encoded, encode};
 use super::frontend::{audio_tokens, mel_spec};
+use super::spm::CtcTokenizer;
 use super::weights::PeeWeights;
 use crate::audio_ops::Ops;
 use crate::audio_ops::store::{TensorStore, dequant};
@@ -36,6 +48,44 @@ pub struct NemotronTranscribeTower {
     resident: bool,
     mel: MelSpec,
     bytes: u64,
+    /// The timestamp head's tokenizer.
+    tokenizer: CtcTokenizer,
+    /// Clips registered for word timing, and what their encodes kept.
+    timings: Arc<Mutex<Timings>>,
+}
+
+/// What an encode keeps for timing one clip's words.
+#[derive(Debug)]
+struct Kept {
+    head: CtcEvidence,
+    /// `[frames][speakers]`, 80 ms.
+    activity: Vec<f32>,
+    /// `[mel frames][speakers]`, 10 ms.
+    activity10: Vec<f32>,
+}
+
+/// One registered clip.
+#[derive(Debug)]
+struct Timing {
+    key: TimingKey,
+    fingerprint: u64,
+    kept: Option<Arc<Kept>>,
+}
+
+/// The registrations, oldest first.
+#[derive(Debug, Default)]
+struct Timings {
+    next: u64,
+    entries: Vec<Timing>,
+}
+
+/// A digest of what the tower is handed for `clip`, to recognise it at
+/// encode.
+fn fingerprint(clip: &AudioClip) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write_usize(clip.tokens());
+    h.write(bytemuck::cast_slice(clip.mel().as_slice()));
+    h.finish()
 }
 
 impl NemotronTranscribeTower {
@@ -67,6 +117,23 @@ impl NemotronTranscribeTower {
         } else {
             None
         };
+        let spm = gguf
+            .metadata()
+            .get_str("ctc.tokenizer.spm_model")
+            .ok_or_else(|| AudioError::Checkpoint {
+                what: "the speech encoder export has no ctc.tokenizer.spm_model".into(),
+            })?;
+        let tokenizer = CtcTokenizer::from_base64(spm)?;
+        if tokenizer.len() + 1 != config.ctc_vocab {
+            return Err(AudioError::Checkpoint {
+                what: format!(
+                    "the timestamp tokenizer has {} pieces; its {}-class head needs one fewer \
+                     than its classes",
+                    tokenizer.len(),
+                    config.ctc_vocab
+                ),
+            });
+        }
         let bytes = std::fs::metadata(path).map_or(0, |m| m.len());
         Ok(Self {
             path: path.to_path_buf(),
@@ -75,6 +142,8 @@ impl NemotronTranscribeTower {
             resident,
             mel,
             bytes,
+            tokenizer,
+            timings: Arc::default(),
         })
     }
 
@@ -95,6 +164,132 @@ impl NemotronTranscribeTower {
     #[must_use]
     pub const fn config(&self) -> &PeeConfig {
         &self.config
+    }
+
+    /// The registrations; a poisoned lock is a refusal, not a panic.
+    fn timings(&self) -> Result<MutexGuard<'_, Timings>, AudioError> {
+        self.timings.lock().map_err(|_| AudioError::BadSpec {
+            reason: "the word timings were left mid-update by a failed request".into(),
+        })
+    }
+
+    /// Keeps what timing needs from `e`, the encode of `clip`, when a
+    /// registration is waiting for it.
+    fn keep_for_timing(
+        &self,
+        ops: &Ops,
+        weights: &PeeWeights,
+        clip: &AudioClip,
+        e: &Encoded,
+    ) -> Result<(), AudioError> {
+        if !self.timings()?.entries.iter().any(|t| t.kept.is_none()) {
+            return Ok(());
+        }
+        let print = fingerprint(clip);
+        if !self
+            .timings()?
+            .entries
+            .iter()
+            .any(|t| t.kept.is_none() && t.fingerprint == print)
+        {
+            return Ok(());
+        }
+        let kept = Arc::new(Kept {
+            head: evidence(ops, &weights.ctc, &self.config, &e.speech)?,
+            activity: e.activity.clone(),
+            activity10: e.activity10.clone(),
+        });
+        if let Some(t) = self
+            .timings()?
+            .entries
+            .iter_mut()
+            .find(|t| t.kept.is_none() && t.fingerprint == print)
+        {
+            t.kept = Some(kept);
+        }
+        Ok(())
+    }
+}
+
+/// An event or style tag: the reference times it like a word, but the
+/// transcript the caller reads has none.
+fn is_tag(word: &str) -> bool {
+    (word.starts_with("<ev:") || word.starts_with("<sty:")) && word.ends_with('>')
+}
+
+impl WordTimer for NemotronTranscribeTower {
+    fn want(&self, clip: &AudioClip) -> TimingTicket {
+        let fingerprint = fingerprint(clip);
+        let mut timings = self.timings.lock().unwrap_or_else(|poisoned| {
+            // The registrations are plain data; one left behind by a failed
+            // request is still a valid list.
+            poisoned.into_inner()
+        });
+        let key = TimingKey(timings.next);
+        timings.next += 1;
+        timings.entries.push(Timing {
+            key,
+            fingerprint,
+            kept: None,
+        });
+        let registry = Arc::downgrade(&self.timings);
+        TimingTicket::new(key, move |key| {
+            if let Some(registry) = registry.upgrade() {
+                let mut timings = registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                timings.entries.retain(|t| t.key != key);
+            }
+        })
+    }
+
+    fn words(
+        &self,
+        ticket: &TimingTicket,
+        transcript: &str,
+        seconds: f64,
+    ) -> Result<WordTiming, AudioError> {
+        let kept = self
+            .timings()?
+            .entries
+            .iter()
+            .find(|t| t.key == ticket.key())
+            .and_then(|t| t.kept.clone());
+        let Some(kept) = kept else {
+            return Ok(WordTiming::Untimed {
+                reason: "the clip was not encoded after it was registered".into(),
+            });
+        };
+        let untimed = |e: super::align::AlignError| WordTiming::Untimed {
+            reason: e.to_string(),
+        };
+        let t = match targets(&self.tokenizer, transcript, kept.head.frames()) {
+            Ok(t) => t,
+            Err(e) => return Ok(untimed(e)),
+        };
+        let store = TensorStore::open_gguf(&self.path)?;
+        let classes = ClassRows::read(&store, &t.columns, self.config.ctc.d_model)?;
+        let log_probs = kept.head.log_probs(&classes);
+        let words = align(
+            &AlignDesc {
+                targets: &t,
+                log_probs: &log_probs,
+                frames: kept.head.frames(),
+                activity: Some(Activity {
+                    rows80: &kept.activity,
+                    rows10: &kept.activity10,
+                    speakers: self.config.speakers,
+                }),
+                duration: seconds,
+            },
+            self.config.ctc_upsample,
+        );
+        Ok(match words {
+            Ok(words) => {
+                WordTiming::Timed(words.into_iter().filter(|w| !is_tag(&w.text)).collect())
+            }
+            Err(e) => untimed(e),
+        })
     }
 }
 
@@ -119,6 +314,10 @@ impl AudioTower for NemotronTranscribeTower {
         self.bytes
     }
 
+    fn word_timer(&self) -> Option<&dyn WordTimer> {
+        Some(self)
+    }
+
     fn encode(
         &self,
         backend: &Arc<dyn Backend>,
@@ -136,6 +335,7 @@ impl AudioTower for NemotronTranscribeTower {
         let mut parts = Vec::with_capacity(clips.len());
         for clip in clips {
             let e = encode(&ops, weights, &self.config, clip.mel())?;
+            self.keep_for_timing(&ops, weights, clip, &e)?;
             grids.push(VisionGrid::new(
                 1,
                 1,
@@ -210,3 +410,7 @@ impl AudioTower for Limits {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "tower_tests.rs"]
+mod tests;

@@ -190,10 +190,21 @@ fn head(
     Ok(p)
 }
 
-/// Every window's speaker activity over its encoder rows, `[rows][speakers]`
-/// for each window in `plan` (rows `left_drop .. left_drop + core` filled),
-/// at 80 ms: each row the mean of its eight 10 ms frames that lie inside the
-/// recording.
+/// One window's speaker activity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowActivity {
+    /// `[rows][speakers]` over the window's encoder rows (rows `left_drop ..
+    /// left_drop + core` filled), at 80 ms: each row the mean of its eight
+    /// 10 ms frames, only those inside the recording for a clip of one
+    /// window.
+    pub rows80: Vec<f32>,
+    /// `[core · stack][speakers]`: the core rows' own 10 ms frames, which
+    /// the word-time refinement reads.
+    pub core10: Vec<f32>,
+}
+
+/// Every window's speaker activity, one [`WindowActivity`] for each window
+/// in `plan`.
 ///
 /// # Errors
 ///
@@ -205,12 +216,13 @@ pub fn speaker_activity(
     raw_mel: &[f32],
     mel_frames: usize,
     plan: &[ChunkSpan],
-) -> Result<Vec<Vec<f32>>, AudioError> {
+) -> Result<Vec<WindowActivity>, AudioError> {
     let d = c.diar.d_model;
     let n_spk = c.speakers;
     let sub = c.stack;
     let mut state = State::default();
     let mut out = Vec::with_capacity(plan.len());
+    let streaming = plan.len() > 1;
     for (wi, win) in plan.iter().enumerate() {
         let tb = win.len().div_ceil(sub);
         let stacked = stack_rows(raw_mel, c.mels, win.enc_start, win.len(), sub);
@@ -228,7 +240,10 @@ pub fn speaker_activity(
         let hidden = w.diar.forward(ops, &upload_f32(ops, &input)?, l)?;
         let p10 = head(ops, w, c, &hidden, l)?;
         // 80 ms rows: the mean of each row's 10 ms frames inside the
-        // recording (the cache and FIFO rows' all count).
+        // recording (the cache and FIFO rows' all count). A clip of several
+        // windows averages all eight, padding included, as the reference's
+        // streaming steps do; only its last row has padding, and the word
+        // times are what read it.
         let mut p80 = vec![0.0f32; l * n_spk];
         for r in 0..l {
             let first = if r >= s_rows + f_rows {
@@ -237,7 +252,7 @@ pub fn speaker_activity(
                 0
             };
             let live = (0..sub)
-                .filter(|j| r < s_rows + f_rows || first + j < mel_frames)
+                .filter(|j| streaming || r < s_rows + f_rows || first + j < mel_frames)
                 .collect::<Vec<_>>();
             let denom = (live.len() as f32).max(1e-6);
             for s in 0..n_spk {
@@ -249,14 +264,20 @@ pub fn speaker_activity(
         let rc = win.right().div_ceil(sub);
         let core = tb.saturating_sub(lc + rc);
         let mut rows = vec![0.0f32; tb * n_spk];
+        let mut core10 = vec![0.0f32; win.core * sub * n_spk];
         if core > 0 {
             for t in 0..win.core {
                 let src = s_rows + f_rows + lc + t.min(core - 1);
                 rows[(lc + t) * n_spk..(lc + t + 1) * n_spk]
                     .copy_from_slice(&p80[src * n_spk..(src + 1) * n_spk]);
+                core10[t * sub * n_spk..(t + 1) * sub * n_spk]
+                    .copy_from_slice(&p10[src * sub * n_spk..(src + 1) * sub * n_spk]);
             }
         }
-        out.push(rows);
+        out.push(WindowActivity {
+            rows80: rows,
+            core10,
+        });
         if wi + 1 == plan.len() {
             break;
         }

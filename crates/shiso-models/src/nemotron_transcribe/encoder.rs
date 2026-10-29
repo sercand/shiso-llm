@@ -30,6 +30,8 @@ pub struct Encoded {
     pub speech: Vec<f32>,
     /// Speaker activity `[frames][speakers]`.
     pub activity: Vec<f32>,
+    /// Speaker activity every 10 ms, `[mel frames][speakers]`.
+    pub activity10: Vec<f32>,
 }
 
 /// The speech branch over every window of `plan`, its core rows joined.
@@ -121,19 +123,24 @@ pub fn encode(
     let speech = speech(ops, w, c, &normed, &plan)?;
     let frames = speech.len() / c.asr.d_model;
     let mut activity = Vec::with_capacity(frames * c.speakers);
-    for (win, rows) in plan
+    let mut activity10 = Vec::with_capacity(frames * c.stack * c.speakers);
+    for (win, a) in plan
         .iter()
         .zip(speaker_activity(ops, w, c, raw, t_mel, &plan)?)
     {
         activity.extend_from_slice(
-            &rows[win.left_drop * c.speakers..(win.left_drop + win.core) * c.speakers],
+            &a.rows80[win.left_drop * c.speakers..(win.left_drop + win.core) * c.speakers],
         );
+        activity10.extend_from_slice(&a.core10);
     }
+    // The last row's frames past the recording are not frames.
+    activity10.truncate(t_mel * c.speakers);
     let rows = fuse(ops, w, c, &speech, &activity, frames)?;
     Ok(Encoded {
         rows,
         frames,
         speech,
         activity,
+        activity10,
     })
 }

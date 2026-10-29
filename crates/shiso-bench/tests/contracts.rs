@@ -291,6 +291,13 @@ const _: Option<&dyn shiso_audio::RecognizerStream> = None;
 const _: Option<&dyn shiso_audio::Diarizer> = None;
 const _: Option<&dyn shiso_audio::DiarizationPass> = None;
 const _: Option<&dyn shiso_audio::AudioTower> = None;
+const _: Option<&dyn shiso_audio::WordTimer> = None;
+// A speech decoder's tower times the decoder's words against the clip it
+// encoded: the transcription core asks the tower for its timer.
+type TowerTimer = for<'a> fn(
+    &'a (dyn shiso_audio::AudioTower + 'static),
+) -> Option<&'a dyn shiso_audio::WordTimer>;
+const _: TowerTimer = <dyn shiso_audio::AudioTower>::word_timer;
 
 /// A recognized token is the one `TokenId`, at an encoder frame.
 fn token_event_fields(event: shiso_audio::TokenEvent) -> (TokenId, u32) {
