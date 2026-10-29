@@ -162,9 +162,9 @@ fn preset_error(error: &PresetError) -> AppError {
 
 /// Refuses what a speech decoder's transcript cannot carry.
 ///
-/// It has text and nothing else: no word or segment times (its timestamp head
-/// is not wired yet), so the formats built from them are refused by name
-/// rather than answered with empty timings.
+/// It has text and, when asked, word times from its timestamp head; it has
+/// no segments, so the formats built from them are refused by name rather
+/// than answered with empty timings.
 fn check_speech_form(form: &TranscriptionForm, model_id: &str) -> Result<(), AppError> {
     let refuse = |param: &str, message: &str| {
         Err(AppError::bad_request(
@@ -178,26 +178,43 @@ fn check_speech_form(form: &TranscriptionForm, model_id: &str) -> Result<(), App
             model: form.model.clone(),
         });
     }
-    if form.granularities.contains(&Granularity::Word) {
+    if form.granularities.contains(&Granularity::Segment) {
         return refuse(
             "timestamp_granularities",
-            "word timestamps are not produced by this speech decoder yet",
+            "segment timestamps are not produced by this speech decoder; ask for word",
         );
     }
-    if !form.granularities.is_empty() {
-        return refuse(
-            "timestamp_granularities",
-            "segment timestamps are not produced by this speech decoder",
-        );
-    }
-    if !matches!(
-        form.response_format,
-        ResponseFormat::Json | ResponseFormat::Text
-    ) {
-        return refuse(
-            "response_format",
-            "this speech decoder answers json or text; the other formats need timestamps",
-        );
+    let words = form.granularities.contains(&Granularity::Word);
+    match form.response_format {
+        ResponseFormat::Json | ResponseFormat::Text if words => {
+            return refuse(
+                "timestamp_granularities",
+                "word timestamps are answered in response_format=verbose_json",
+            );
+        }
+        ResponseFormat::Json | ResponseFormat::Text => {}
+        ResponseFormat::VerboseJson if !words => {
+            return refuse(
+                "response_format",
+                "verbose_json from this speech decoder carries words, not segments; ask \
+                 timestamp_granularities[]=word",
+            );
+        }
+        ResponseFormat::VerboseJson => {
+            if form.stream {
+                return refuse(
+                    "stream",
+                    "verbose_json is a whole-file format and cannot be streamed",
+                );
+            }
+        }
+        ResponseFormat::Srt | ResponseFormat::Vtt | ResponseFormat::DiarizedJson => {
+            return refuse(
+                "response_format",
+                "this speech decoder answers json, text, or verbose_json with word timestamps; \
+                 the other formats need segments",
+            );
+        }
     }
     if !form.context.keywords.is_empty() {
         return refuse(
@@ -229,12 +246,13 @@ async fn answer_speech(
         .await
         .map_err(decode_error)?;
     let duration = pcm.duration_secs();
-    let out = transcribe(state, TranscribeRequest { pcm, preset }).await?;
+    let words = form.granularities.contains(&Granularity::Word);
+    let out = transcribe(state, TranscribeRequest { pcm, preset, words }).await?;
     let transcript = Transcript {
         text: out.text,
         language: None,
         duration,
-        words: Vec::new(),
+        words: out.words.unwrap_or_default(),
         segments: Vec::new(),
         diarized: false,
     };
@@ -246,7 +264,7 @@ async fn answer_speech(
         drop(tx);
         return Ok(stream(TranscriptEvent::Delta(transcript.text), rx, false));
     }
-    let (content_type, text) = body(form.response_format, &transcript, &[]);
+    let (content_type, text) = body(form.response_format, &transcript, &form.granularities);
     Ok(([(header::CONTENT_TYPE, content_type)], text).into_response())
 }
 
@@ -314,16 +332,43 @@ mod speech_tests {
     }
 
     #[test]
-    fn word_timestamps_are_refused_by_name() {
+    fn word_timestamps_are_served_in_verbose_json() {
+        let mut f = form();
+        f.granularities.push(Granularity::Word);
+        f.response_format = ResponseFormat::VerboseJson;
+        assert!(check_speech_form(&f, "speech").is_ok());
+    }
+
+    #[test]
+    fn word_timestamps_outside_verbose_json_are_refused_by_name() {
         let mut f = form();
         f.granularities.push(Granularity::Word);
         let error = refused_param(&f);
         assert!(error.contains("timestamp_granularities"), "{error}");
-        assert!(error.contains("word timestamps"), "{error}");
+        assert!(error.contains("verbose_json"), "{error}");
     }
 
     #[test]
-    fn formats_built_from_timestamps_are_refused() {
+    fn segment_timestamps_are_refused_by_name() {
+        let mut f = form();
+        f.response_format = ResponseFormat::VerboseJson;
+        f.granularities = vec![Granularity::Word, Granularity::Segment];
+        let error = refused_param(&f);
+        assert!(error.contains("timestamp_granularities"), "{error}");
+        assert!(error.contains("segment"), "{error}");
+    }
+
+    #[test]
+    fn a_streamed_verbose_json_is_refused() {
+        let mut f = form();
+        f.response_format = ResponseFormat::VerboseJson;
+        f.granularities.push(Granularity::Word);
+        f.stream = true;
+        assert!(refused_param(&f).contains("stream"));
+    }
+
+    #[test]
+    fn formats_built_from_segments_are_refused() {
         for format in [
             ResponseFormat::VerboseJson,
             ResponseFormat::Srt,

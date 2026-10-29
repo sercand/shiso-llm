@@ -38,9 +38,58 @@ fn reference_text(clip: &str, preset: &str) -> String {
     json["text"].as_str().expect("a text field").to_owned()
 }
 
-fn transcribe(rt: &Runtime, pcm: Pcm, preset: Preset) -> TranscribeOutput {
-    futures::executor::block_on(rt.transcribe(TranscribeRequest { pcm, preset }))
+/// The reference runtime's words for `clip` under `preset`: text, start, end.
+fn reference_words(clip: &str, preset: &str) -> Vec<(String, f64, f64)> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "../../test-vectors/references/nemotron_transcribe/{clip}/{preset}/transcript.json"
+    ));
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("the transcript reads"))
+            .expect("parses");
+    json["words"]
+        .as_array()
+        .expect("a words field")
+        .iter()
+        .map(|w| {
+            (
+                w["word"].as_str().expect("a word").to_owned(),
+                w["start"].as_f64().expect("a start"),
+                w["end"].as_f64().expect("an end"),
+            )
+        })
+        .collect()
+}
+
+fn transcribe(rt: &Runtime, pcm: Pcm, preset: Preset, words: bool) -> TranscribeOutput {
+    futures::executor::block_on(rt.transcribe(TranscribeRequest { pcm, preset, words }))
         .expect("transcribes")
+}
+
+/// Word times on `short_en`: the decoder's own words, timed by the tower's
+/// head. The comma the decoder leaves out is part of the word it follows, so
+/// words are compared without commas; one 40 ms frame is the budget.
+#[expect(clippy::print_stderr, reason = "the run reports how close it came")]
+fn short_en_words_match(solo: &TranscribeOutput) {
+    let words = solo.words.as_ref().expect("words were asked for");
+    let want = reference_words("short_en", "verbatim");
+    assert_eq!(words.len(), want.len(), "word count");
+    let mut exact = 0;
+    let mut worst = 0.0f64;
+    for (got, want) in words.iter().zip(&want) {
+        assert_eq!(got.text.replace(',', ""), want.0.replace(',', ""));
+        let off = (got.start - want.1).abs().max((got.end - want.2).abs());
+        if off == 0.0 {
+            exact += 1;
+        } else {
+            eprintln!("  {got:?} against the reference's {want:?}");
+        }
+        worst = worst.max(off);
+    }
+    eprintln!(
+        "short_en words: {exact} of {} timed exactly, worst {worst:.3} s off",
+        want.len()
+    );
+    assert!(worst <= 0.0405, "a word is {worst} s off");
 }
 
 #[test]
@@ -78,7 +127,7 @@ fn transcripts_match_the_reference() {
     let rt = Runtime::from_state(state, Some(join)).expect("a runtime");
 
     let short = pcm(&clips.join("short_en.wav"));
-    let solo = transcribe(&rt, short.clone(), Preset::Verbatim);
+    let solo = transcribe(&rt, short.clone(), Preset::Verbatim, true);
     eprintln!("short_en verbatim: {:?}", solo.text);
     // The reference's CPU path quantizes activations before every quantized
     // multiply; on this clip that flips one near-tie (0.13 nats) between a
@@ -90,10 +139,12 @@ fn transcripts_match_the_reference() {
     assert!(commas(&solo.text).abs_diff(commas(&reference)) <= 1);
     assert!(solo.turns.is_empty());
 
+    short_en_words_match(&solo);
+
     // Review Focus 1: two requests at once share the scheduler and the
     // expert stream, and each answers what it answers alone.
     let meeting = pcm(&clips.join("meeting_60s.wav"));
-    let speakers = transcribe(&rt, meeting.clone(), Preset::Speakers);
+    let speakers = transcribe(&rt, meeting.clone(), Preset::Speakers, false);
     eprintln!("meeting_60s speakers: {:?}", speakers.text);
     assert!(
         !speakers.turns.is_empty(),
@@ -103,10 +154,12 @@ fn transcripts_match_the_reference() {
         rt.transcribe(TranscribeRequest {
             pcm: short,
             preset: Preset::Verbatim,
+            words: true,
         }),
         rt.transcribe(TranscribeRequest {
             pcm: meeting,
             preset: Preset::Speakers,
+            words: false,
         }),
     ));
     assert_eq!(a.expect("transcribes"), solo);
@@ -159,5 +212,7 @@ fn transcripts_match_the_reference() {
 
     // Silence is answered empty, without encoding.
     let silence = Pcm::new(vec![0.0; 32_000], 16_000).expect("pcm");
-    assert_eq!(transcribe(&rt, silence, Preset::Verbatim).text, "");
+    let quiet = transcribe(&rt, silence, Preset::Verbatim, true);
+    assert_eq!(quiet.text, "");
+    assert_eq!(quiet.words, Some(Vec::new()), "silence has no words");
 }

@@ -11,17 +11,22 @@
 //!
 //! Decoding is greedy and the output passes the loop guard and the tag
 //! handling of [`shiso_models::nemotron_transcribe::postprocess`].
+//!
+//! Word times come from the tower: the clip is registered with its word
+//! timer before the turn, so the encode keeps what timing needs, and once the
+//! turn is done the timer aligns the transcript, tags and all, against it.
 
 use std::sync::Arc;
 
-use shiso_audio::{AudioDecodePolicy, AudioError, AudioTower, DecodeLimits, Pcm};
+use shiso_audio::transcript::Word;
+use shiso_audio::{AudioDecodePolicy, AudioError, AudioTower, DecodeLimits, Pcm, WordTiming};
 use shiso_core::TokenId;
 use shiso_ir::Request;
 use shiso_models::nemotron_transcribe::{PLACEMENT, collapse_loops, speaker_turns, strip_tags};
 pub use shiso_models::nemotron_transcribe::{Preset, PresetError, parse_preset};
 
 use crate::api::blocking::collect_response;
-use crate::api::pipeline::{PromptField, start_with_prompt};
+use crate::api::pipeline::{PromptField, start_with_fresh_media, start_with_prompt};
 use crate::error::AppError;
 use crate::media::MediaItem;
 use crate::state::AppState;
@@ -99,10 +104,12 @@ pub struct TranscribeRequest {
     pub pcm: Pcm,
     /// What to ask for.
     pub preset: Preset,
+    /// Whether to time the transcript's words.
+    pub words: bool,
 }
 
 /// What a transcription produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscribeOutput {
     /// The transcript: loops collapsed, event and style tags removed, and
     /// speaker tags removed unless the preset asked for them.
@@ -112,6 +119,9 @@ pub struct TranscribeOutput {
     pub turns: Vec<(Option<u8>, String)>,
     /// Tokens the decoder generated.
     pub completion_tokens: u64,
+    /// The words and their times, when they were asked for: empty for
+    /// silence, or for a transcript the timer could not align (logged).
+    pub words: Option<Vec<Word>>,
 }
 
 /// The prompt's ids: the instruction `preset` spells, `rows` copies of
@@ -227,11 +237,23 @@ pub async fn transcribe(
     let vocabulary = state.vocabulary.as_ref().ok_or(AppError::NotReady {
         what: "the speech decoder's vocabulary",
     })?;
+    let timer = if request.words {
+        Some(tower.word_timer().ok_or_else(|| {
+            AppError::bad_request(
+                "this speech decoder's encoder does not time words",
+                Some("timestamp_granularities"),
+                "invalid_request",
+            )
+        })?)
+    } else {
+        None
+    };
     if is_silence(&request.pcm) {
         return Ok(TranscribeOutput {
             text: String::new(),
             turns: Vec::new(),
             completion_tokens: 0,
+            words: timer.map(|_| Vec::new()),
         });
     }
     let marker = vocabulary
@@ -241,14 +263,26 @@ pub async fn transcribe(
             what: "an audio marker in the speech decoder's vocabulary",
         })?;
     let clip = shiso_audio::clip_for(tower.as_ref(), &request.pcm).map_err(clip_error)?;
+    let ticket = timer.map(|timer| timer.want(&clip));
     let item = MediaItem::Audio(clip);
     let ids = prompt_ids(vocabulary, &request.preset, item.pad_count(1), marker)?;
     let mut generate = Request::new(state.model_id.clone(), Vec::new());
     generate.sampling.temperature = Some(0.0);
-    generate.max_tokens = token_budget(request.pcm.duration_secs());
-    let started = start_with_prompt(state, &generate, ids, vec![item], PromptField::File).await?;
+    let seconds = request.pcm.duration_secs();
+    generate.max_tokens = token_budget(seconds);
+    let started = if ticket.is_some() {
+        // The timer keeps its evidence only from an encode, so rows cached
+        // by an earlier request must not stand in for one.
+        start_with_fresh_media(state, &generate, ids, vec![item], PromptField::File).await?
+    } else {
+        start_with_prompt(state, &generate, ids, vec![item], PromptField::File).await?
+    };
     let response = collect_response(started.events).await?;
     let raw = collapse_loops(&response.message.text());
+    let words = match ticket {
+        Some(ticket) => Some(time_words(Arc::clone(tower), ticket, raw.clone(), seconds).await?),
+        None => None,
+    };
     let keep = request.preset.keeps_speakers();
     Ok(TranscribeOutput {
         text: strip_tags(&raw, keep),
@@ -258,6 +292,42 @@ pub async fn transcribe(
             Vec::new()
         },
         completion_tokens: response.usage.completion_tokens,
+        words,
+    })
+}
+
+/// `transcript`'s words timed by `tower`'s timer against the clip `ticket`
+/// registered, off the async workers: a long clip's alignment is seconds of
+/// arithmetic.
+async fn time_words(
+    tower: Arc<dyn AudioTower>,
+    ticket: shiso_audio::TimingTicket,
+    transcript: String,
+    seconds: f64,
+) -> Result<Vec<Word>, AppError> {
+    let timed = tokio::task::spawn_blocking(move || {
+        let timer = tower.word_timer().ok_or(AudioError::BadSpec {
+            reason: "the tower stopped timing words".into(),
+        })?;
+        timer.words(&ticket, &transcript, seconds)
+    })
+    .await
+    .map_err(|error| {
+        AppError::internal(
+            "timing the words",
+            AudioError::Io {
+                what: "running the word alignment",
+                source: std::io::Error::other(error),
+            },
+        )
+    })?
+    .map_err(|error| AppError::internal("timing the words", error))?;
+    Ok(match timed {
+        WordTiming::Timed(words) => words,
+        WordTiming::Untimed { reason } => {
+            tracing::warn!(%reason, "the transcript's words could not be timed");
+            Vec::new()
+        }
     })
 }
 

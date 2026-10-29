@@ -7,8 +7,10 @@
 //! encoder export beside it ([`config`], [`weights`]), the frontend and window
 //! plan ([`frontend`]), the shared rotary transformer ([`transformer`]), the
 //! speaker branch with its cross-window cache ([`diar`]) and the fusion
-//! ([`encoder`]), and on the text side the card's instructions ([`presets`])
-//! and the cleanup of what the decoder wrote ([`postprocess`]).
+//! ([`encoder`]), the timestamp head ([`ctc`]) with its tokenizer ([`spm`])
+//! and the alignment that times the decoder's words with it ([`align`]), and
+//! on the text side the card's instructions ([`presets`]) and the cleanup of
+//! what the decoder wrote ([`postprocess`]).
 
 pub mod align;
 pub mod config;

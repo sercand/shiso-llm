@@ -278,6 +278,34 @@ pub async fn start_with_prompt(
     .await
 }
 
+/// [`start_with_prompt`] with the media encoded even when an earlier
+/// request's rows for it are cached: no digest files it, so neither the
+/// media cache nor a stored prefix stands in for the tower.
+///
+/// For a request whose tower keeps something from the encode itself, as a
+/// word timer keeps the timestamp head's output.
+///
+/// # Errors
+///
+/// As [`start_with_prompt`].
+pub async fn start_with_fresh_media(
+    state: &AppState,
+    request: &Request,
+    tokens: Vec<TokenId>,
+    media: Vec<crate::media::MediaItem>,
+    field: PromptField,
+) -> Result<Started, AppError> {
+    queue(
+        state,
+        request,
+        tokens,
+        (media, Vec::new()),
+        Arc::from(""),
+        field,
+    )
+    .await
+}
+
 /// The half both entries share: the context guard, the budget, the preset.
 async fn queue(
     state: &AppState,
