@@ -442,7 +442,8 @@ pub struct ServeOptions {
     /// Where a sparse checkpoint's routed expert banks live: imported beside
     /// the other weights, or streamed from disk into a pool of expert slots.
     ///
-    /// Read only by the sparse family's MLX directory. `auto` imports them
+    /// Read by the sparse family's MLX directory and the hybrid family's GGUF
+    /// file. `auto` imports them
     /// when every weight fits in the device's working set with
     /// `--expert-reserve-gb` to spare, and streams them otherwise; the other
     /// two insist, and `resident` on a device that cannot hold them fails at

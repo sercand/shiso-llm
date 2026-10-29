@@ -867,14 +867,11 @@ fn load_nemotron_h(
         let mut opts = opts;
         opts.spec = SpecDepth::new(args.spec_k);
         let family = NemotronHConfig::from_gguf_path(path).map_err(FactoryError::Load)?;
-        let reserve = args.expert_reserve_gb.saturating_mul(1 << 30);
-        let residency = match args.expert_residency {
-            crate::options::ExpertResidencyChoice::Resident => GgufResidency::Resident,
-            _ if args.expert_slots > 0 => GgufResidency::Streamed {
-                slots: args.expert_slots,
-            },
-            _ => GgufResidency::Auto { reserve },
-        };
+        let residency = gguf_residency(
+            args.expert_residency,
+            args.expert_slots,
+            args.expert_reserve_gb.saturating_mul(1 << 30),
+        );
         NemotronHModel::load_gguf(
             backend,
             path,
@@ -1563,16 +1560,57 @@ pub fn recognises(config: &HfConfig) -> bool {
         || LlamaConfig::describes(config)
 }
 
+/// Where a GGUF load puts the routed banks: `--expert-residency` decides,
+/// and `--expert-slots`, when set, fixes the pool a streamed load reads into.
+/// `stream` without a slot count still streams, into as many slots as fit.
+fn gguf_residency(
+    choice: crate::options::ExpertResidencyChoice,
+    slots: u32,
+    reserve: u64,
+) -> GgufResidency {
+    use crate::options::ExpertResidencyChoice;
+    match choice {
+        ExpertResidencyChoice::Resident => GgufResidency::Resident,
+        _ if slots > 0 => GgufResidency::Streamed { slots },
+        ExpertResidencyChoice::Stream => GgufResidency::Fit { reserve },
+        ExpertResidencyChoice::Auto => GgufResidency::Auto { reserve },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        FactoryError, FamilyDefaults, recognises, refuse_clef_mismatch, sparse_prefill_rows,
+        FactoryError, FamilyDefaults, gguf_residency, recognises, refuse_clef_mismatch,
+        sparse_prefill_rows,
     };
+    use crate::options::ExpertResidencyChoice;
     use shiso_core::{CoreError, HfConfig};
+    use shiso_models::nemotron_h::GgufResidency;
 
     fn document(model_type: &str) -> HfConfig {
         HfConfig::from_json_str(&format!(r#"{{"model_type":"{model_type}"}}"#))
             .expect("the document parses")
+    }
+
+    #[test]
+    fn stream_without_a_slot_count_still_streams() {
+        let reserve = 1 << 30;
+        assert_eq!(
+            gguf_residency(ExpertResidencyChoice::Stream, 0, reserve),
+            GgufResidency::Fit { reserve }
+        );
+        assert_eq!(
+            gguf_residency(ExpertResidencyChoice::Stream, 900, reserve),
+            GgufResidency::Streamed { slots: 900 }
+        );
+        assert_eq!(
+            gguf_residency(ExpertResidencyChoice::Auto, 0, reserve),
+            GgufResidency::Auto { reserve }
+        );
+        assert_eq!(
+            gguf_residency(ExpertResidencyChoice::Resident, 900, reserve),
+            GgufResidency::Resident
+        );
     }
 
     #[test]

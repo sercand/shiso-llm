@@ -238,6 +238,12 @@ pub enum GgufResidency {
     },
     /// Every expert imported, whatever the device says.
     Resident,
+    /// Streamed whatever the device says, into as many slots as fit beside
+    /// the other weights with `reserve` bytes to spare.
+    Fit {
+        /// Bytes left free beside the weights.
+        reserve: u64,
+    },
     /// Streamed into exactly this many slots.
     Streamed {
         /// Expert slots in the pool.
@@ -248,7 +254,8 @@ pub enum GgufResidency {
 /// Slots the routed banks stream into, or `None` when they stay resident.
 ///
 /// `Auto` keeps them resident when every weight fits in the device's working
-/// set with `reserve` to spare, and otherwise sizes the pool to what is left.
+/// set with `reserve` to spare, and otherwise sizes the pool to what is left;
+/// `Fit` sizes the pool that way without the resident case.
 fn stream_slots(
     backend: &dyn Backend,
     file: &GgufFile,
@@ -259,7 +266,7 @@ fn stream_slots(
     match residency {
         GgufResidency::Resident => None,
         GgufResidency::Streamed { slots } => Some(slots),
-        GgufResidency::Auto { reserve } => {
+        GgufResidency::Fit { reserve } | GgufResidency::Auto { reserve } => {
             let total = backend.memory_info().map_or(u64::MAX, |info| info.total);
             let rest = file
                 .tensors()
@@ -268,11 +275,17 @@ fn stream_slots(
                 .sum::<u64>()
                 .saturating_sub(banks);
             let fixed = rest.saturating_add(reserve);
-            if fixed.saturating_add(banks) <= total {
+            if matches!(residency, GgufResidency::Auto { .. })
+                && fixed.saturating_add(banks) <= total
+            {
                 return None;
             }
+            // Never more slots than the banks hold experts: a pool that large
+            // is the banks themselves, and a device that reports no working
+            // set would otherwise ask for every slot a u32 counts.
             let fit =
-                u32::try_from(total.saturating_sub(fixed) / slot_bytes.max(1)).unwrap_or(u32::MAX);
+                (total.saturating_sub(fixed) / slot_bytes.max(1)).min(banks / slot_bytes.max(1));
+            let fit = u32::try_from(fit).unwrap_or(u32::MAX);
             tracing::info!(
                 total_gib = total >> 30,
                 other_weights_gib = rest >> 30,
