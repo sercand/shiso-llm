@@ -92,6 +92,45 @@ fn short_en_words_match(solo: &TranscribeOutput) {
     assert!(worst <= 0.0405, "a word is {worst} s off");
 }
 
+/// Review Focus 5: `short_en` as a 44.1 kHz stereo MP3 is downmixed and
+/// resampled to the same 16 kHz mono and answers what the WAV answered.
+#[expect(
+    clippy::print_stderr,
+    reason = "a skipped case says why, and the run reports"
+)]
+fn stereo_mp3_matches(rt: &Runtime, clips: &Path, solo: &TranscribeOutput) {
+    let mp3 = std::env::temp_dir().join(format!("shiso-short-en-{}.mp3", std::process::id()));
+    let encoded = std::process::Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-i"])
+        .arg(clips.join("short_en.wav"))
+        .args(["-ac", "2", "-ar", "44100", "-b:a", "192k"])
+        .arg(&mp3)
+        .status();
+    if encoded.is_ok_and(|status| status.success()) {
+        // The build's MP3 step is the ffmpeg subprocess a server is given
+        // with `--ffmpeg-path`.
+        let policy = ServeOptions {
+            ffmpeg_path: Some(PathBuf::from("ffmpeg")),
+            ..ServeOptions::default()
+        }
+        .audio_decode_policy();
+        let bytes = std::fs::read(&mp3).expect("the mp3 reads");
+        let limits = DecodeLimits::new(NonZeroU32::new(3600).expect("non-zero"));
+        let stereo = shiso_audio::decode_audio(&bytes, &limits, &policy).expect("decodes");
+        std::fs::remove_file(&mp3).expect("the temporary clip goes");
+        let from_mp3 = transcribe(rt, stereo, Preset::Verbatim, false);
+        eprintln!("short_en from a stereo mp3: {:?}", from_mp3.text);
+        // The comma after "so" is a near-tie the WAV is graded with too;
+        // the lossy round trip may land on either side of it, and nothing
+        // else may move.
+        let commas = |s: &str| s.matches(',').count();
+        assert_eq!(from_mp3.text.replace(',', ""), solo.text.replace(',', ""));
+        assert!(commas(&from_mp3.text).abs_diff(commas(&solo.text)) <= 1);
+    } else {
+        eprintln!("SKIP: no ffmpeg to encode the stereo mp3");
+    }
+}
+
 #[test]
 #[ignore = "requires a Metal device, both speech exports, the reference captures and the clips"]
 #[expect(
@@ -209,6 +248,8 @@ fn transcripts_match_the_reference() {
         .parse()
         .expect("the answer is one number");
     assert!(count >= 1);
+
+    stereo_mp3_matches(&rt, &clips, &solo);
 
     // Silence is answered empty, without encoding.
     let silence = Pcm::new(vec![0.0; 32_000], 16_000).expect("pcm");
