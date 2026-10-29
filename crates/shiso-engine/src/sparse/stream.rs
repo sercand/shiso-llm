@@ -505,10 +505,12 @@ impl ExpertStream {
         if self.complete.load(Ordering::Acquire) || layer >= self.layers {
             return;
         }
+        // Orphaned reads still hold slots, so they count against the cap.
+        let orphaned = self.orphans.lock().len();
         let mut inflight = self.inflight.lock();
         let mut state = self.state.lock();
         let base = layer as usize * self.experts as usize;
-        let room = PREFETCH_CAP.saturating_sub(inflight.len());
+        let room = PREFETCH_CAP.saturating_sub(inflight.len() + orphaned);
         let wanted: Vec<u32> = guess
             .iter()
             .copied()
@@ -655,6 +657,23 @@ impl ExpertStream {
                 true
             }
         });
+    }
+
+    /// Takes every read-ahead off the books, waits for each to land and
+    /// frees its slot: the last resort of a fetch the pool cannot otherwise
+    /// serve.
+    fn settle_read_aheads(&self) {
+        let pending: Vec<Reading> = self.inflight.lock().drain().map(|(_, r)| r).collect();
+        let mut orphans = self.orphans.lock();
+        orphans.extend(pending);
+        for reading in orphans.iter() {
+            // A failed read-ahead frees its slot as surely as a landed one.
+            let _ = reading.landing.wait();
+        }
+        let mut state = self.state.lock();
+        for reading in orphans.drain(..) {
+            state.reserved[reading.slot as usize] = false;
+        }
     }
 
     /// Unmaps `missing` from `layer` and frees `victims`, on both maps.
@@ -816,16 +835,7 @@ impl ExpertStream {
             }
         }
         drop(state);
-        let mut landed: Vec<(u32, u32)> = Vec::new();
-        let mut failed: Vec<u32> = Vec::new();
-        for (expert, reading) in landing {
-            if reading.landing.wait().is_ok() {
-                landed.push((expert, reading.slot));
-            } else {
-                failed.push(reading.slot);
-                plan.missing.push(expert);
-            }
-        }
+        let (landed, failed) = land(landing, &mut plan.missing);
         {
             let mut orphans = self.orphans.lock();
             orphans.extend(taken.into_values());
@@ -841,8 +851,21 @@ impl ExpertStream {
             state.stats.prefetched += 1;
             plan.ready.push(expert);
         }
-        let victims = self.victims(&state, plan.missing.len(), clock);
+        let mut victims = self.victims(&state, plan.missing.len(), clock);
         if victims.len() < plan.missing.len() {
+            // Read-aheads still hold their slots. Every one is waited for and
+            // given back before the pool counts as too small for the layer.
+            drop(state);
+            self.settle_read_aheads();
+            state = self.state.lock();
+            victims = self.victims(&state, plan.missing.len(), clock);
+        }
+        if victims.len() < plan.missing.len() {
+            drop(state);
+            // The landed experts are on the host map already; the device map
+            // has to agree before the refusal, or a later fetch counts a hit
+            // on an entry no stage can read.
+            self.write_landed(backend, layer, &landed)?;
             return Err(CoreError::ShapeMismatch {
                 field: "expert stream slots free for one layer",
                 expected: plan.missing.len() as u64,
@@ -892,4 +915,21 @@ impl ExpertStream {
         state.stats.read_seconds += started.elapsed().as_secs_f64();
         Ok(())
     }
+}
+
+/// Waits for each read-ahead of `landing`: those that landed come back as
+/// `(expert, slot)`, the slots of those that failed come back on their own,
+/// and their experts join `missing` to be read again.
+fn land(landing: Vec<(u32, Reading)>, missing: &mut Vec<u32>) -> (Vec<(u32, u32)>, Vec<u32>) {
+    let mut landed = Vec::new();
+    let mut failed = Vec::new();
+    for (expert, reading) in landing {
+        if reading.landing.wait().is_ok() {
+            landed.push((expert, reading.slot));
+        } else {
+            failed.push(reading.slot);
+            missing.push(expert);
+        }
+    }
+    (landed, failed)
 }

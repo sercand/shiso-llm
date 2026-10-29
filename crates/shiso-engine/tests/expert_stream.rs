@@ -195,3 +195,33 @@ fn prefetched_experts_are_used_and_wrong_guesses_cost_nothing() {
         .expect("fetch");
     assert_eq!(stream.stats().reads, 2);
 }
+
+#[test]
+fn a_pool_full_of_read_aheads_still_serves_the_next_fetch() {
+    let backend = backend();
+    let stream = ExpertStream::open(
+        &backend,
+        Arc::new(FakeSource { failing: None }),
+        4,
+        16,
+        8,
+        6,
+    )
+    .expect("open");
+    // Read-aheads reserve every slot; only expert 1 of them is then wanted.
+    stream.prefetch(2, &[1, 2, 3, 4, 5, 6, 7, 8]);
+    let routed = ids(&backend, &[1, 9]);
+    stream
+        .fetch(backend.as_ref(), 2, routed.view(), 2)
+        .expect("the unwanted read-aheads give their slots back");
+    let map = map_of(&backend, &stream, 2);
+    for expert in [1u32, 9] {
+        assert_ne!(map[expert as usize], u32::MAX, "expert {expert} unmapped");
+        assert_eq!(
+            slot_bytes(&backend, &stream, 0, map[expert as usize]),
+            (0..LAYOUT[0] as usize)
+                .map(|i| byte(2, expert, 0, i))
+                .collect::<Vec<_>>()
+        );
+    }
+}
