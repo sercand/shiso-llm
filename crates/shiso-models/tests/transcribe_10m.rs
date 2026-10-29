@@ -113,6 +113,13 @@ fn ten_minutes_transcribe_inside_two_minutes() {
     )
     .expect("the decoder loads");
     let load = t0.elapsed().as_secs_f64();
+    if let Some(info) = backend.memory_info() {
+        eprintln!(
+            "device memory after load: {:.1} GiB free of {:.1} GiB",
+            info.free as f64 / f64::from(1u32 << 30),
+            info.total as f64 / f64::from(1u32 << 30)
+        );
+    }
 
     // The request: decode, frame, encode, prefill, decode.
     let started = Instant::now();
