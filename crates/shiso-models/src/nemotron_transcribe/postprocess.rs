@@ -9,6 +9,11 @@
 //! The transcript can carry three kinds of tag the vocabulary holds as single
 //! tokens: `<spk:N>` speaker turns, `<ev:*>` events and `<sty:*>` styles.
 
+/// The spellings every transcript tag starts with: speaker turns, events and
+/// styles. The vocabulary holds each tag as one special token, and a server
+/// that kept the model off its special tokens would keep it off these too.
+pub const TAG_PREFIXES: [&str; 3] = ["<spk:", "<ev:", "<sty:"];
+
 /// Times one character must repeat back to back before it is a loop.
 const CHAR_LOOP: usize = 21;
 /// Times a block of two or more characters must repeat before it is a loop.

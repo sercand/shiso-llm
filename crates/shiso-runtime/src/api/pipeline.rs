@@ -69,6 +69,8 @@ pub enum PromptField {
     Prompt,
     /// The Responses input.
     Input,
+    /// The transcription upload.
+    File,
 }
 
 impl PromptField {
@@ -79,6 +81,7 @@ impl PromptField {
             Self::Messages => "messages",
             Self::Prompt => "prompt",
             Self::Input => "input",
+            Self::File => "file",
         }
     }
 }

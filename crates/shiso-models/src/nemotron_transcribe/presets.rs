@@ -118,6 +118,18 @@ impl Preset {
         matches!(self, Self::Speakers)
     }
 
+    /// The part of [`Self::instruction`] the caller wrote, when there is
+    /// one: it is text even where it spells one of the vocabulary's markers.
+    #[must_use]
+    pub fn caller_text(&self) -> Option<String> {
+        match self {
+            Self::Context(terms) => Some(terms.clone()),
+            Self::Translate(language) => Some(language.clone()),
+            Self::LangId(labels) => Some(labels.join(", ")),
+            _ => None,
+        }
+    }
+
     /// The preset's request name.
     #[must_use]
     pub const fn name(&self) -> &'static str {

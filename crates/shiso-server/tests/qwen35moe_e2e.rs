@@ -248,6 +248,7 @@ impl Stack {
                 vision: tower,
                 audio: None,
                 cache: None,
+                placement: None,
             },
             Some(Arc::clone(&vocabulary)),
             &model_id,

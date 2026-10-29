@@ -328,6 +328,7 @@ fn towers(
         vision: Some(vision),
         audio,
         cache: None,
+        placement: None,
     }
 }
 
