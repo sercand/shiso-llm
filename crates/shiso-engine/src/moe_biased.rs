@@ -28,8 +28,8 @@ use crate::launch::{self, DENSE, F32_BYTES};
 use crate::moe::{MoeIo, MoeScratch};
 use crate::projection::{self, Weight};
 use crate::shape::{Activation, MoeShape};
-use crate::sparse::ExpertStream;
 use crate::sparse::weights::WeightPart;
+use crate::sparse::{ExpertStream, FetchPlan};
 
 /// Output rows one expert-stage threadgroup covers: four simdgroups of four.
 const EXPERT_ROWS_PER_GROUP: u32 = 16;
@@ -316,10 +316,55 @@ pub fn run(
     // chosen ids back and fills the slots the layer's map then points at. The
     // up and down banks of a layer are one stream layer, so one fetch serves
     // both.
-    fetch_streamed(backend, moe, shape, scratch, io, n_tok, columns)?;
-    let active = columns.min(shape.experts);
+    let plan = fetch_streamed(backend, moe, shape, scratch, io, n_tok, columns)?;
+    routed_stages(
+        backend,
+        &StagesDesc {
+            moe,
+            shape,
+            scratch,
+            io,
+            n_tok,
+            columns,
+        },
+        plan,
+    )?;
+    combine_add(backend, moe, shape, scratch, io.block_out, hidden, n_tok)
+}
+
+/// The operands of one block's expert stages.
+#[derive(Clone, Copy)]
+struct StagesDesc<'a> {
+    moe: &'a BiasedMoe,
+    shape: MoeShape,
+    scratch: &'a MoeScratch,
+    io: MoeIo<'a>,
+    n_tok: u32,
+    columns: u32,
+}
+
+/// Both expert stages over a pass's routed columns: in one launch each when
+/// every chosen expert is in a slot, otherwise the ready experts first, handed
+/// to the device while the missing ones are read, then the missing ones.
+fn routed_stages(
+    backend: &dyn Backend,
+    d: &StagesDesc<'_>,
+    plan: Option<(&ExpertStream, FetchPlan)>,
+) -> CoreResult<()> {
+    let StagesDesc {
+        moe,
+        shape,
+        scratch,
+        io,
+        n_tok,
+        columns,
+    } = *d;
     let tiled = n_tok > crate::MAX_DECODE_BATCH;
-    let stage = |stack: &ExpertStack, first: bool, input: DeviceView<'_>, out: DeviceView<'_>| {
+    let stage = |stack: &ExpertStack,
+                 first: bool,
+                 input: DeviceView<'_>,
+                 out: DeviceView<'_>,
+                 (list, active): (DeviceView<'_>, u32)| {
         let args = ExpertArgs {
             in_dim: stack.in_dim(),
             out_dim: stack.out_dim(),
@@ -334,7 +379,7 @@ pub fn run(
             input,
             scratch.sorted.view(),
             scratch.bounds.view(),
-            scratch.active.view(),
+            list,
             out,
         ];
         match stack {
@@ -368,32 +413,69 @@ pub fn run(
             },
         }
     };
-    stage(&moe.up, true, io.input, scratch.up.view())?;
-    stage(&moe.down, false, scratch.up.view(), scratch.down.view())?;
-    combine_add(backend, moe, shape, scratch, io.block_out, hidden, n_tok)
+    let both = |list: (DeviceView<'_>, u32)| -> CoreResult<()> {
+        stage(&moe.up, true, io.input, scratch.up.view(), list)?;
+        stage(
+            &moe.down,
+            false,
+            scratch.up.view(),
+            scratch.down.view(),
+            list,
+        )
+    };
+    match plan {
+        // Some of the layer's experts are still to be read: the ones in their
+        // slots run first and the device is handed them, the missing ones are
+        // read meanwhile into slots nothing queued touches, and then they run.
+        Some((stream, plan)) if !plan.missing.is_empty() => {
+            let width = shape.experts as usize + 1;
+            let list = |experts: &[u32]| {
+                let mut words = vec![0i32; width];
+                for (word, &expert) in words.iter_mut().zip(experts) {
+                    *word = i32::try_from(expert).unwrap_or(i32::MAX);
+                }
+                words[width - 1] = i32::try_from(experts.len()).unwrap_or(i32::MAX);
+                words
+            };
+            let mut words = list(&plan.ready);
+            words.extend(list(&plan.missing));
+            backend.copy_h2d(scratch.split.view(), bytemuck::cast_slice(&words))?;
+            let row = width as u64 * 4;
+            let count = |experts: &[u32]| u32::try_from(experts.len()).unwrap_or(u32::MAX);
+            if !plan.ready.is_empty() {
+                both((scratch.split.slice(0, row)?, count(&plan.ready)))?;
+            }
+            backend.submit()?;
+            stream.complete(backend, &plan)?;
+            both((scratch.split.slice(row, row)?, count(&plan.missing)))?;
+        }
+        _ => both((scratch.active.view(), columns.min(shape.experts)))?,
+    }
+    Ok(())
 }
 
-/// Brings a streamed bank's chosen experts in, after the router chose them and
-/// before a stage reads them, and guesses the next layer's.
+/// Plans a streamed bank's fetch after the router chose its experts, and
+/// guesses the next layer's.
 ///
-/// The fetch drains the device, reads the chosen ids back and fills the slots
-/// the layer's map then points at. The up and down banks of a layer are one
-/// stream layer, so one fetch serves both. With the device drained this
-/// pass's normalized rows are final, so the next layer's likely experts can be
-/// read while it computes.
-fn fetch_streamed(
+/// The plan drains the device, reads the chosen ids back, and gives the
+/// missing experts slots; [`run`] multiplies the ready ones while the missing
+/// ones are read. The up and down banks of a layer are one stream layer, so
+/// one plan serves both. With the device drained this pass's normalized rows
+/// are final, so the next layer's likely experts are guessed now - before any
+/// stage is queued, since reading the rows back would wait for it.
+fn fetch_streamed<'a>(
     backend: &dyn Backend,
-    moe: &BiasedMoe,
+    moe: &'a BiasedMoe,
     shape: MoeShape,
     scratch: &MoeScratch,
     io: MoeIo<'_>,
     n_tok: u32,
     columns: u32,
-) -> CoreResult<()> {
+) -> CoreResult<Option<(&'a ExpertStream, FetchPlan)>> {
     let Some((stream, layer)) = streamed(&moe.up).or_else(|| streamed(&moe.down)) else {
-        return Ok(());
+        return Ok(None);
     };
-    stream.fetch(backend, layer, scratch.ids.view(), columns)?;
+    let plan = stream.plan(backend, layer, scratch.ids.view(), columns)?;
     // A prompt pass is not guessed for: it wants nearly every expert, and
     // reading a whole next layer ahead (measured on an M4, ten minutes of
     // audio) bought no wall time - the prompt pass is bound by the device,
@@ -412,7 +494,7 @@ fn fetch_streamed(
             &guess.choose(&rows, width, shape.used as usize),
         );
     }
-    Ok(())
+    Ok(Some((stream, plan)))
 }
 
 /// The stream and stream layer a stack reads through, when it is streamed.

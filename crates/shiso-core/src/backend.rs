@@ -461,6 +461,39 @@ pub trait Backend: Send + Sync + fmt::Debug {
         Ok(())
     }
 
+    /// [`Backend::write_host`] into ranges no queued or running work reads,
+    /// without draining the device first.
+    ///
+    /// The caller's promise is the whole of the safety argument: nothing the
+    /// device has been given, or will be given before `fill` returns, reads
+    /// or writes `dsts`. A backend that cannot write without draining falls
+    /// back to [`Backend::write_host`], which is always correct.
+    ///
+    /// # Errors
+    ///
+    /// As [`Backend::write_host`].
+    fn write_host_live(
+        &self,
+        dsts: &[DeviceView<'_>],
+        fill: &mut dyn FnMut(&mut [&mut [u8]]) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        self.write_host(dsts, fill)
+    }
+
+    /// Hands the device whatever has been queued, without waiting for it.
+    ///
+    /// A batching backend otherwise holds launches until the next
+    /// [`Backend::sync`]; this lets the device start on them while the host
+    /// does other work. The default does nothing, which is correct for a
+    /// backend that runs each launch as it is issued.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CoreError::Backend`] when the device refuses the submission.
+    fn submit(&self) -> CoreResult<()> {
+        Ok(())
+    }
+
     /// Device-to-device copy. Requires `dst.len() == src.len()`.
     ///
     /// # Errors

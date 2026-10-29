@@ -708,6 +708,74 @@ impl Backend for MetalBackend {
         fill(&mut slices)
     }
 
+    fn write_host_live(
+        &self,
+        dsts: &[DeviceView<'_>],
+        fill: &mut dyn FnMut(&mut [&mut [u8]]) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        // The spans are resolved under the lock and filled outside it, so a
+        // long read into them does not hold up the thread encoding launches.
+        let spans: Vec<(usize, usize)> = {
+            let state = self.inner.lock();
+            dsts.iter()
+                .map(|view| {
+                    let entry = state.view(*view)?;
+                    let offset = usize::try_from(view.offset()).unwrap_or(usize::MAX);
+                    Ok((
+                        Self::contents(entry) as usize + offset,
+                        usize::try_from(view.len()).unwrap_or(usize::MAX),
+                    ))
+                })
+                .collect::<CoreResult<_>>()?
+        };
+        let mut sorted = spans.clone();
+        sorted.sort_unstable();
+        if sorted
+            .windows(2)
+            .any(|pair| pair[0].0.saturating_add(pair[0].1) > pair[1].0)
+        {
+            return Err(CoreError::InvalidValue {
+                key: "write_host_live views",
+                value: "two of the ranges overlap".to_owned(),
+            });
+        }
+        let mut slices: Vec<&mut [u8]> = spans
+            .iter()
+            .map(|&(start, len)| {
+                // SAFETY: each span lies inside a live buffer (checked by
+                // `view` under the lock); the views borrow the buffers that
+                // own them for this whole call, so none can be freed while the
+                // slices exist; the spans were just shown to be pairwise
+                // disjoint; and the caller's contract is that no work the
+                // device has been or will be given before this returns touches
+                // these bytes, so nothing else reads or writes them meanwhile.
+                unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len) }
+            })
+            .collect();
+        fill(&mut slices)
+    }
+
+    fn submit(&self) -> CoreResult<()> {
+        let mut state = self.inner.lock();
+        let Batch::Open {
+            command_buffer,
+            encoder,
+        } = std::mem::take(&mut state.batch)
+        else {
+            return Ok(());
+        };
+        match encoder {
+            Encoder::Compute(encoder) => encoder.endEncoding(),
+            Encoder::Blit(encoder) => encoder.endEncoding(),
+            Encoder::None => {}
+        }
+        state.commits += 1;
+        // No signal: the queue runs its command buffers in order, so the next
+        // drain's signal is reached only after this one has run.
+        command_buffer.commit();
+        Ok(())
+    }
+
     fn copy_d2h(&self, src: DeviceView<'_>, dst: &mut [u8]) -> CoreResult<()> {
         if dst.len() as u64 != src.len() {
             return Err(CoreError::OutOfBounds {

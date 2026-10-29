@@ -108,17 +108,58 @@ pub struct StreamStats {
     pub prefetched: u64,
 }
 
-/// One guessed expert's bytes, read off the fetch path by a prefetch worker.
+/// Where a read-ahead's outcome lands, once its worker has written the slot.
 #[derive(Debug, Default)]
-struct Staged {
-    /// Every array of the expert, in layout order, once the read is done.
-    bytes: Mutex<Option<CoreResult<Vec<u8>>>>,
-    /// Signalled when `bytes` is filled.
+struct Landing {
+    /// `Some` once the read is over.
+    result: Mutex<Option<CoreResult<()>>>,
+    /// Signalled when `result` is set.
     ready: Condvar,
 }
 
-/// A guess handed to the prefetch workers.
-type PrefetchJob = (u32, u32, Arc<Staged>);
+impl Landing {
+    /// Waits for the read and takes its outcome.
+    fn wait(&self) -> CoreResult<()> {
+        let mut result = self.result.lock();
+        while result.is_none() {
+            self.ready.wait(&mut result);
+        }
+        result.take().unwrap_or(Ok(()))
+    }
+
+    /// Whether the read is over.
+    fn done(&self) -> bool {
+        self.result.lock().is_some()
+    }
+}
+
+/// A read-ahead in flight: the slot it was given and where it lands.
+#[derive(Debug, Clone)]
+struct Reading {
+    slot: u32,
+    landing: Arc<Landing>,
+}
+
+/// A guess handed to the read-ahead workers: layer, expert, slot, landing.
+type PrefetchJob = (u32, u32, u32, Arc<Landing>);
+
+/// What [`ExpertStream::plan`] found for one layer's routed experts.
+///
+/// `ready` experts are in their slots and the layer's map names them now;
+/// `missing` ones have slots and map entries assigned but no bytes until
+/// [`ExpertStream::complete`] runs, so a pass can multiply the ready ones
+/// while the missing ones are read.
+#[derive(Debug, Clone, Default)]
+pub struct FetchPlan {
+    /// The layer.
+    pub layer: u32,
+    /// Experts a stage may read now.
+    pub ready: Vec<u32>,
+    /// Experts a stage may read only after [`ExpertStream::complete`].
+    pub missing: Vec<u32>,
+    /// The slot each of `missing` was given.
+    victims: Vec<u32>,
+}
 
 /// The mutable half of a stream.
 #[derive(Debug)]
@@ -129,6 +170,8 @@ struct State {
     owner: Vec<Option<(u32, u32)>>,
     /// Slot to the fetch that last wanted it.
     last_use: Vec<u64>,
+    /// Slots a read-ahead is writing, which no fetch may hand out.
+    reserved: Vec<bool>,
     /// Fetches issued so far, which is the recency clock.
     clock: u64,
     /// Running totals.
@@ -137,8 +180,10 @@ struct State {
 
 /// A pool of expert slots and the per-layer maps into it.
 pub struct ExpertStream {
-    /// One pool per array, each `slots` experts long.
-    pools: Vec<DeviceBuffer>,
+    /// One pool per array, each `slots` experts long; shared with the
+    /// read-ahead workers, which write slots of it.
+    pools: Arc<Vec<DeviceBuffer>>,
+    backend: Arc<dyn Backend>,
     /// The device copy of every layer's map, `layers * experts` words.
     map: DeviceBuffer,
     source: Arc<dyn ExpertSource>,
@@ -154,9 +199,11 @@ pub struct ExpertStream {
     /// the routed ids back, which a captured step cannot do and which cost a
     /// host round trip per layer per step.
     complete: AtomicBool,
-    /// Guesses read or being read ahead of their layer's fetch, by
-    /// `(layer, expert)`.
-    staged: Mutex<HashMap<(u32, u32), Arc<Staged>>>,
+    /// Read-aheads in flight, by `(layer, expert)`. Locked before `state`.
+    inflight: Mutex<HashMap<(u32, u32), Reading>>,
+    /// Read-aheads their layer's fetch did not want, still writing their
+    /// slots; a slot is free again once its read is over.
+    orphans: Mutex<Vec<Reading>>,
     /// Where guesses go to be read, once the first prefetch started the
     /// workers.
     jobs: Mutex<Option<mpsc::Sender<PrefetchJob>>>,
@@ -181,8 +228,8 @@ const READERS: usize = 16;
 /// Threads that read guessed experts while the device computes.
 const PREFETCHERS: usize = 4;
 
-/// Guesses that may be staged at once: a bound on the host memory the
-/// prefetch holds, a few layers' worth of a decode step's misses.
+/// Read-aheads that may be in flight at once: each holds a slot out of the
+/// pool until its layer's fetch takes or releases it.
 const PREFETCH_CAP: usize = 48;
 
 impl ExpertStream {
@@ -249,7 +296,8 @@ impl ExpertStream {
             "opened the routed expert stream"
         );
         Ok(Self {
-            pools,
+            pools: Arc::new(pools),
+            backend: Arc::clone(backend),
             map,
             source,
             layout,
@@ -261,11 +309,15 @@ impl ExpertStream {
                 host_map: vec![EMPTY; slots_total],
                 owner: vec![None; slots as usize],
                 last_use: vec![0; slots as usize],
-                clock: 0,
+                reserved: vec![false; slots as usize],
+                // One past every slot's `last_use`, so before the first fetch no slot
+                // reads as wanted by the current one.
+                clock: 1,
                 stats: StreamStats::default(),
             }),
             complete: AtomicBool::new(false),
-            staged: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
+            orphans: Mutex::new(Vec::new()),
             jobs: Mutex::new(None),
         })
     }
@@ -361,7 +413,7 @@ impl ExpertStream {
         layer: u32,
         missing: &[u32],
         victims: &[u32],
-        staged: &[Option<Vec<u8>>],
+        live: bool,
     ) -> CoreResult<()> {
         // Every array of every missing expert, and its map entry, in one
         // batch of writable ranges: the reads land where the stages read
@@ -375,15 +427,7 @@ impl ExpertStream {
                 jobs.push((index, array));
             }
         }
-        let offsets: Vec<usize> = self
-            .layout
-            .iter()
-            .scan(0usize, |at, &bytes| {
-                let here = *at;
-                *at += usize::try_from(bytes).unwrap_or(usize::MAX);
-                Some(here)
-            })
-            .collect();
+
         let arrays = views.len();
         for (&expert, _) in missing.iter().zip(victims) {
             views.push(self.map.slice(
@@ -391,8 +435,13 @@ impl ExpertStream {
                 4,
             )?);
         }
-        let (source, offsets) = (&self.source, &offsets);
-        backend.write_host(&views, &mut |slices| {
+        let source = &self.source;
+        let write = if live {
+            Backend::write_host_live
+        } else {
+            Backend::write_host
+        };
+        write(backend, &views, &mut |slices| {
             let (data, entries) = slices.split_at_mut(arrays);
             for (entry, &slot) in entries.iter_mut().zip(victims) {
                 entry.copy_from_slice(&slot.to_le_bytes());
@@ -405,14 +454,7 @@ impl ExpertStream {
                     .map(|(bufs, work)| {
                         scope.spawn(move || -> CoreResult<()> {
                             for (buf, &(index, array)) in bufs.iter_mut().zip(work) {
-                                match staged.get(index).and_then(Option::as_ref) {
-                                    // A guess already read it: copy, do not read.
-                                    Some(bytes) => {
-                                        let at = offsets[array];
-                                        buf.copy_from_slice(&bytes[at..at + buf.len()]);
-                                    }
-                                    None => source.read(layer, missing[index], array, buf)?,
-                                }
+                                source.read(layer, missing[index], array, buf)?;
                             }
                             Ok(())
                         })
@@ -430,112 +472,189 @@ impl ExpertStream {
         })
     }
 
-    /// Starts reading `guess`'s experts of `layer` that are in no slot, off
-    /// the fetch path, so the layer's fetch only copies the ones it then
-    /// wants.
+    /// Slots a batch of `n` new experts may take: never-filled ones first,
+    /// then the least recently used, none that the fetch at `clock` wants and
+    /// none a read-ahead is writing.
+    fn victims(&self, state: &State, n: usize, clock: u64) -> Vec<u32> {
+        let mut order: Vec<u32> = (0..self.slots)
+            .filter(|&slot| {
+                !state.reserved[slot as usize] && state.last_use[slot as usize] != clock
+            })
+            .collect();
+        order.sort_by_key(|&slot| {
+            (
+                state.owner[slot as usize].is_some(),
+                state.last_use[slot as usize],
+            )
+        });
+        order.truncate(n);
+        order
+    }
+
+    /// Starts reading `guess`'s experts of `layer` that are in no slot
+    /// straight into slots reserved for them, off the fetch path, so the
+    /// layer's fetch finds them already there.
     ///
-    /// A guess is advice: one the fetch does not want is dropped when that
-    /// fetch runs, never mapped, and a read that fails is retried by the
-    /// fetch itself. Returns at once; at most [`PREFETCH_CAP`] guesses are
-    /// staged at a time, the rest are not read ahead.
+    /// A reserved slot is one no queued work reads - it is none of the slots
+    /// the fetch that just ran stamped - so the read writes it while the
+    /// device computes. A guess the layer's fetch does not want is released
+    /// once its read is over, never mapped; a read that fails is retried by
+    /// the fetch itself. Returns at once; at most [`PREFETCH_CAP`] reads are
+    /// in flight.
     pub fn prefetch(&self, layer: u32, guess: &[u32]) {
         if self.complete.load(Ordering::Acquire) || layer >= self.layers {
             return;
         }
-        let wanted: Vec<u32> = {
-            let state = self.state.lock();
-            let base = layer as usize * self.experts as usize;
-            guess
-                .iter()
-                .copied()
-                .filter(|&e| e < self.experts && state.host_map[base + e as usize] == EMPTY)
-                .collect()
-        };
+        let mut inflight = self.inflight.lock();
+        let mut state = self.state.lock();
+        let base = layer as usize * self.experts as usize;
+        let room = PREFETCH_CAP.saturating_sub(inflight.len());
+        let wanted: Vec<u32> = guess
+            .iter()
+            .copied()
+            .filter(|&e| {
+                e < self.experts
+                    && state.host_map[base + e as usize] == EMPTY
+                    && !inflight.contains_key(&(layer, e))
+            })
+            .take(room)
+            .collect();
         if wanted.is_empty() {
             return;
         }
+        let clock = state.clock;
+        let slots = self.victims(&state, wanted.len(), clock);
+        let mut jobs = self.jobs.lock();
+        let sender = jobs.get_or_insert_with(|| self.start_prefetchers());
         let mut issued = 0u64;
-        {
-            let mut staged = self.staged.lock();
-            let mut jobs = self.jobs.lock();
-            let sender = jobs.get_or_insert_with(|| self.start_prefetchers());
-            for expert in wanted {
-                if staged.len() >= PREFETCH_CAP || staged.contains_key(&(layer, expert)) {
-                    continue;
-                }
-                let entry = Arc::new(Staged::default());
-                if sender.send((layer, expert, Arc::clone(&entry))).is_ok() {
-                    staged.insert((layer, expert), entry);
-                    issued += 1;
-                }
+        for (&expert, &slot) in wanted.iter().zip(&slots) {
+            let landing = Arc::new(Landing::default());
+            if sender
+                .send((layer, expert, slot, Arc::clone(&landing)))
+                .is_err()
+            {
+                break;
             }
+            if let Some((old_layer, old_expert)) = state.owner[slot as usize].take() {
+                let at = old_layer as usize * self.experts as usize + old_expert as usize;
+                state.host_map[at] = EMPTY;
+            }
+            state.reserved[slot as usize] = true;
+            inflight.insert((layer, expert), Reading { slot, landing });
+            issued += 1;
         }
-        self.state.lock().stats.prefetch_reads += issued;
+        state.stats.prefetch_reads += issued;
     }
 
-    /// The prefetch workers, sharing one queue; they stop when the stream,
-    /// and with it the queue's sender, is dropped.
+    /// The read-ahead workers, sharing one queue; they stop when the stream,
+    /// and with it the queue's sender, is dropped. Each writes its expert's
+    /// arrays straight into the slot it was given.
     fn start_prefetchers(&self) -> mpsc::Sender<PrefetchJob> {
         let (sender, receiver) = mpsc::channel::<PrefetchJob>();
         let receiver = Arc::new(Mutex::new(receiver));
         for _ in 0..PREFETCHERS {
             let receiver = Arc::clone(&receiver);
             let source = Arc::clone(&self.source);
+            let pools = Arc::clone(&self.pools);
+            let backend = Arc::clone(&self.backend);
             let layout = self.layout.clone();
             std::thread::spawn(move || {
                 loop {
                     let job = receiver.lock().recv();
-                    let Ok((layer, expert, staged)) = job else {
+                    let Ok((layer, expert, slot, landing)) = job else {
                         return;
                     };
-                    let total = layout
-                        .iter()
-                        .map(|&b| usize::try_from(b).unwrap_or(0))
-                        .sum();
-                    let mut bytes = vec![0u8; total];
-                    let mut at = 0usize;
-                    let mut result = Ok(());
-                    for (array, &len) in layout.iter().enumerate() {
-                        let len = usize::try_from(len).unwrap_or(0);
-                        result = source.read(layer, expert, array, &mut bytes[at..at + len]);
-                        if result.is_err() {
-                            break;
-                        }
-                        at += len;
-                    }
-                    *staged.bytes.lock() = Some(result.map(|()| bytes));
-                    staged.ready.notify_all();
+                    let result = (|| -> CoreResult<()> {
+                        let views = pools
+                            .iter()
+                            .zip(&layout)
+                            .map(|(pool, &bytes)| pool.slice(u64::from(slot) * bytes, bytes))
+                            .collect::<CoreResult<Vec<_>>>()?;
+                        backend.write_host_live(&views, &mut |slices| {
+                            for (array, buf) in slices.iter_mut().enumerate() {
+                                source.read(layer, expert, array, buf)?;
+                            }
+                            Ok(())
+                        })
+                    })();
+                    *landing.result.lock() = Some(result);
+                    landing.ready.notify_all();
                 }
             });
         }
         sender
     }
 
-    /// The staged bytes of each of `missing`, waiting for reads still in
-    /// flight, and drops every other guess for `layer`: its fetch is now, so
-    /// a guess it did not want is a guess that was wrong.
-    fn take_staged(&self, layer: u32, missing: &[u32]) -> Vec<Option<Vec<u8>>> {
-        let taken: Vec<Option<Arc<Staged>>> = {
-            let mut staged = self.staged.lock();
-            let taken = missing
-                .iter()
-                .map(|e| staged.remove(&(layer, *e)))
-                .collect();
-            staged.retain(|(l, _), _| *l != layer);
-            taken
-        };
-        taken
-            .into_iter()
-            .map(|entry| {
-                let entry = entry?;
-                let mut bytes = entry.bytes.lock();
-                while bytes.is_none() {
-                    entry.ready.wait(&mut bytes);
-                }
-                // A failed guess is read again by the fetch.
-                bytes.take().and_then(Result::ok)
+    /// The distinct experts of the `count` routed ids at `ids`, in order.
+    fn routed_ids(
+        &self,
+        backend: &dyn Backend,
+        ids: DeviceView<'_>,
+        count: u32,
+    ) -> CoreResult<Vec<u32>> {
+        let mut raw = vec![0u8; count as usize * 4];
+        backend.copy_d2h(ids.slice(0, raw.len() as u64)?, &mut raw)?;
+        let mut wanted: Vec<u32> = Vec::with_capacity(count as usize);
+        for word in raw.as_chunks::<4>().0 {
+            let id = i32::from_le_bytes(*word);
+            let expert = u32::try_from(id).ok().filter(|e| *e < self.experts).ok_or(
+                CoreError::OutOfBounds {
+                    offset: u64::try_from(id).unwrap_or(u64::MAX),
+                    len: 1,
+                    buffer_bytes: u64::from(self.experts),
+                },
+            )?;
+            if !wanted.contains(&expert) {
+                wanted.push(expert);
+            }
+        }
+        Ok(wanted)
+    }
+
+    /// Points `layer`'s map at the slots read-aheads `landed` in, before any
+    /// stage reads them; the device is idle, so a plain write is as cheap as
+    /// any.
+    fn write_landed(
+        &self,
+        backend: &dyn Backend,
+        layer: u32,
+        landed: &[(u32, u32)],
+    ) -> CoreResult<()> {
+        if landed.is_empty() {
+            return Ok(());
+        }
+        let entries = landed
+            .iter()
+            .map(|&(expert, _)| {
+                self.map.slice(
+                    (u64::from(layer) * u64::from(self.experts) + u64::from(expert)) * 4,
+                    4,
+                )
             })
-            .collect()
+            .collect::<CoreResult<Vec<_>>>()?;
+        backend.write_host(&entries, &mut |slices| {
+            for (entry, &(_, slot)) in slices.iter_mut().zip(landed) {
+                entry.copy_from_slice(&slot.to_le_bytes());
+            }
+            Ok(())
+        })
+    }
+
+    /// Frees the slots of orphaned read-aheads whose reads are over.
+    fn release_orphans(&self) {
+        let mut orphans = self.orphans.lock();
+        if orphans.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock();
+        orphans.retain(|reading| {
+            if reading.landing.done() {
+                state.reserved[reading.slot as usize] = false;
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Unmaps `missing` from `layer` and frees `victims`, on both maps.
@@ -586,7 +705,7 @@ impl ExpertStream {
         let experts: Vec<u32> = (0..self.experts).collect();
         for layer in 0..self.layers {
             let slots: Vec<u32> = experts.iter().map(|e| layer * self.experts + e).collect();
-            self.fill(backend, layer, &experts, &slots, &[])?;
+            self.fill(backend, layer, &experts, &slots, false)?;
             let mut state = self.state.lock();
             for (&e, &slot) in experts.iter().zip(&slots) {
                 state.host_map[(layer * self.experts + e) as usize] = slot;
@@ -602,7 +721,7 @@ impl ExpertStream {
     }
 
     /// Makes every expert `ids` names resident in a slot and points `layer`'s
-    /// map at it.
+    /// map at it: [`ExpertStream::plan`], then [`ExpertStream::complete`].
     ///
     /// `ids` is the layer's routed id list on the device, `count` entries of
     /// `i32`; the device is drained first so the list is the one this pass
@@ -620,6 +739,28 @@ impl ExpertStream {
         ids: DeviceView<'_>,
         count: u32,
     ) -> CoreResult<()> {
+        let plan = self.plan(backend, layer, ids, count)?;
+        self.complete(backend, &plan)
+    }
+
+    /// The first half of a fetch: drains the device, reads the routed ids
+    /// back, takes what read-aheads landed, and gives every other missing
+    /// expert a slot and a map entry - without reading it yet.
+    ///
+    /// The plan's `ready` experts may be multiplied as soon as this returns;
+    /// its `missing` ones only after [`ExpertStream::complete`]. Their slots
+    /// are none that the ready experts use, so the two can overlap.
+    ///
+    /// # Errors
+    ///
+    /// As [`ExpertStream::fetch`].
+    pub fn plan(
+        &self,
+        backend: &dyn Backend,
+        layer: u32,
+        ids: DeviceView<'_>,
+        count: u32,
+    ) -> CoreResult<FetchPlan> {
         if layer >= self.layers {
             return Err(CoreError::OutOfBounds {
                 offset: u64::from(layer),
@@ -627,76 +768,88 @@ impl ExpertStream {
                 buffer_bytes: u64::from(self.layers),
             });
         }
+        let mut plan = FetchPlan {
+            layer,
+            ..FetchPlan::default()
+        };
         if self.complete.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(plan);
         }
         let drained = std::time::Instant::now();
         backend.sync()?;
         let drain = drained.elapsed().as_secs_f64();
-        let mut raw = vec![0u8; count as usize * 4];
-        backend.copy_d2h(ids.slice(0, raw.len() as u64)?, &mut raw)?;
-        let mut wanted: Vec<u32> = Vec::with_capacity(count as usize);
-        for word in raw.as_chunks::<4>().0 {
-            let id = i32::from_le_bytes(*word);
-            let expert = u32::try_from(id).ok().filter(|e| *e < self.experts).ok_or(
-                CoreError::OutOfBounds {
-                    offset: u64::try_from(id).unwrap_or(u64::MAX),
-                    len: 1,
-                    buffer_bytes: u64::from(self.experts),
-                },
-            )?;
-            if !wanted.contains(&expert) {
-                wanted.push(expert);
-            }
-        }
-
+        let wanted = self.routed_ids(backend, ids, count)?;
+        self.release_orphans();
+        // Every read-ahead of this layer comes off the books now: the wanted
+        // ones are waited for, the others are orphaned.
+        let mut taken: HashMap<u32, Reading> = {
+            let mut inflight = self.inflight.lock();
+            let keys: Vec<(u32, u32)> = inflight
+                .keys()
+                .copied()
+                .filter(|(l, _)| *l == layer)
+                .collect();
+            keys.into_iter()
+                .filter_map(|key| inflight.remove(&key).map(|r| (key.1, r)))
+                .collect()
+        };
         let mut state = self.state.lock();
         state.clock += 1;
         state.stats.fetches += 1;
         state.stats.drain_seconds += drain;
         let clock = state.clock;
         let base = layer as usize * self.experts as usize;
-        let mut missing: Vec<u32> = Vec::new();
         state.stats.wanted += wanted.len() as u64;
+        let mut landing: Vec<(u32, Reading)> = Vec::new();
         for &expert in &wanted {
             let slot = state.host_map[base + expert as usize];
-            if slot == EMPTY {
-                missing.push(expert);
-            } else {
+            if slot != EMPTY {
                 state.stats.hits += 1;
                 state.last_use[slot as usize] = clock;
+                plan.ready.push(expert);
+            } else if let Some(reading) = taken.remove(&expert) {
+                // Stamped now, so no victim choice below can take it.
+                state.last_use[reading.slot as usize] = clock;
+                landing.push((expert, reading));
+            } else {
+                plan.missing.push(expert);
             }
         }
-        if missing.is_empty() {
-            return Ok(());
-        }
-
-        // Victims: never-filled slots first, then the least recently used,
-        // none of which this fetch wants (theirs were stamped with `clock`).
-        let mut victims: Vec<u32> = Vec::with_capacity(missing.len());
-        let mut order: Vec<u32> = (0..self.slots).collect();
-        order.sort_by_key(|&slot| {
-            (
-                state.owner[slot as usize].is_some(),
-                state.last_use[slot as usize],
-            )
-        });
-        for slot in order {
-            if victims.len() == missing.len() {
-                break;
-            }
-            if state.last_use[slot as usize] != clock {
-                victims.push(slot);
+        drop(state);
+        let mut landed: Vec<(u32, u32)> = Vec::new();
+        let mut failed: Vec<u32> = Vec::new();
+        for (expert, reading) in landing {
+            if reading.landing.wait().is_ok() {
+                landed.push((expert, reading.slot));
+            } else {
+                failed.push(reading.slot);
+                plan.missing.push(expert);
             }
         }
-        if victims.len() < missing.len() {
+        {
+            let mut orphans = self.orphans.lock();
+            orphans.extend(taken.into_values());
+        }
+        let mut state = self.state.lock();
+        for &slot in &failed {
+            state.reserved[slot as usize] = false;
+        }
+        for &(expert, slot) in &landed {
+            state.reserved[slot as usize] = false;
+            state.owner[slot as usize] = Some((layer, expert));
+            state.host_map[base + expert as usize] = slot;
+            state.stats.prefetched += 1;
+            plan.ready.push(expert);
+        }
+        let victims = self.victims(&state, plan.missing.len(), clock);
+        if victims.len() < plan.missing.len() {
             return Err(CoreError::ShapeMismatch {
                 field: "expert stream slots free for one layer",
-                expected: missing.len() as u64,
+                expected: plan.missing.len() as u64,
                 got: victims.len() as u64,
             });
         }
-        for (&expert, &slot) in missing.iter().zip(&victims) {
+        for (&expert, &slot) in plan.missing.iter().zip(&victims) {
             if let Some((old_layer, old_expert)) = state.owner[slot as usize] {
                 let at = old_layer as usize * self.experts as usize + old_expert as usize;
                 state.host_map[at] = EMPTY;
@@ -705,24 +858,37 @@ impl ExpertStream {
             state.last_use[slot as usize] = clock;
             state.host_map[base + expert as usize] = slot;
         }
-
         drop(state);
-        let staged = self.take_staged(layer, &missing);
-        let from_disk = staged.iter().filter(|s| s.is_none()).count() as u64;
+        plan.victims = victims;
+        self.write_landed(backend, layer, &landed)?;
+        Ok(plan)
+    }
+
+    /// The second half of a fetch: reads `plan`'s missing experts into their
+    /// slots and points the map at them, without draining the device - the
+    /// slots and map entries are ones no queued work reads.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the source reports for a read, after which the plan's
+    /// missing experts are forgotten on both maps.
+    pub fn complete(&self, backend: &dyn Backend, plan: &FetchPlan) -> CoreResult<()> {
+        if plan.missing.is_empty() {
+            return Ok(());
+        }
         let started = std::time::Instant::now();
-        if let Err(err) = self.fill(backend, layer, &missing, &victims, &staged) {
+        if let Err(err) = self.fill(backend, plan.layer, &plan.missing, &plan.victims, true) {
             // The maps were pointed at the victims before the reads ran. A
             // read that failed leaves its slot holding neither the old expert
             // nor the new one, so every expert of this batch is forgotten on
             // both maps: a later fetch reads it again instead of counting a
             // hit on bytes that never arrived.
-            self.forget(backend, layer, &missing, &victims)?;
+            self.forget(backend, plan.layer, &plan.missing, &plan.victims)?;
             return Err(err);
         }
         let mut state = self.state.lock();
-        state.stats.reads += from_disk;
-        state.stats.prefetched += missing.len() as u64 - from_disk;
-        state.stats.read_bytes += from_disk * self.slot_bytes();
+        state.stats.reads += plan.missing.len() as u64;
+        state.stats.read_bytes += plan.missing.len() as u64 * self.slot_bytes();
         state.stats.read_seconds += started.elapsed().as_secs_f64();
         Ok(())
     }
