@@ -222,7 +222,11 @@ fn ten_minutes_transcribe_inside_two_minutes() {
         .take_while(|(a, b)| a == b)
         .count();
     if let Some(path) = env_path("SHISO_TEST_DUMP_IDS") {
-        let text: String = out.iter().map(|t| format!("{t}\n")).collect();
+        let text = out
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(path, text).expect("the ids write");
     }
     eprintln!(
