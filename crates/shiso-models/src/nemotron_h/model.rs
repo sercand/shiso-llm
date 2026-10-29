@@ -32,7 +32,7 @@ use shiso_engine::layers::{Block, LayerWeights, Routed, Weights};
 use shiso_engine::moe_biased::{self, BiasedMoe, ExpertStack, RowAffine4Stack};
 use shiso_engine::projection::Weight;
 use shiso_engine::ssm::Ssm;
-use shiso_engine::{EngineOptions, HybridStack};
+use shiso_engine::{DraftHead, EngineOptions, HybridStack};
 
 use shiso_engine::sparse::{ExpertSource, ExpertStream, StreamStats};
 use shiso_modelfile::GgufFile;
@@ -140,7 +140,18 @@ impl NemotronHModel {
             expected: 1,
             got: 0,
         })?;
-        let blocks = gguf::routed_blocks(config);
+        let mut blocks = gguf::routed_blocks(config);
+        // The prediction block's banks stream through the same pool, as the
+        // routed layer after the stack's last.
+        let head_block = config.mtp_block().filter(|_| opts.spec.is_speculative());
+        if opts.spec.is_speculative() && head_block.is_none() {
+            return Err(CoreError::InvalidValue {
+                key: "--spec-k",
+                value: "this export carries no prediction block to draft with".to_owned(),
+            });
+        }
+        let head_rank = u32::try_from(blocks.len()).unwrap_or(u32::MAX);
+        blocks.extend(head_block);
         let source = Arc::new(GgufExperts::open(path, &file, &blocks, moe.experts)?);
         let layers = source.layers();
         let slot_bytes: u64 = source.layout().iter().sum();
@@ -201,7 +212,7 @@ impl NemotronHModel {
             .ok_or_else(|| CoreError::ConfigMissing {
                 key: "token_embd.weight".to_owned(),
             })?;
-        let stack = HybridStack::new(
+        let mut stack = HybridStack::new(
             backend,
             shape.clone(),
             weights,
@@ -210,6 +221,19 @@ impl NemotronHModel {
             None,
             opts,
         )?;
+        if let Some(block) = head_block {
+            let parts = gguf::draft_parts(backend, &file, config, &placement, block, head_rank)?;
+            // Sized for the widest pass the head runs, the prompt chunk it is
+            // warmed over; a chain is one row.
+            let head = DraftHead::new(
+                backend,
+                parts,
+                stack.geometry(),
+                stack.pool_pages(),
+                opts.prefill_rows,
+            )?;
+            stack.bind_draft(head)?;
+        }
         Ok(Self {
             info: ModelInfo {
                 context_capacity: stack.context_capacity(),
@@ -478,6 +502,41 @@ impl Loader<'_> {
     }
 }
 
+/// The speculative path, when the export's prediction block is bound.
+impl shiso_core::model::Speculating for NemotronHModel {
+    fn speculate(
+        &mut self,
+        session: SessionId,
+        first: TokenId,
+    ) -> CoreResult<shiso_core::model::Speculated> {
+        let eos = self.info.stop_tokens.primary();
+        self.stack.speculate(session, first, eos)
+    }
+
+    // None: this family drafts with a head, never a block drafter.
+    fn verify_block(
+        &mut self,
+        _: SessionId,
+        _: TokenId,
+        _: shiso_core::model::DraftHint,
+        _: &[TokenId],
+    ) -> CoreResult<Option<shiso_core::model::VerifiedBlock>> {
+        Ok(None)
+    }
+
+    fn settle_block(
+        &mut self,
+        _: SessionId,
+        _: shiso_core::model::VerifiedBlock,
+        _: u32,
+    ) -> CoreResult<()> {
+        Err(CoreError::Unsupported {
+            what: "settling a drafted block on a family that drafts with a head",
+            backend: "nemotron_h",
+        })
+    }
+}
+
 /// The media path: audio rows from the speech encoder spliced over the
 /// prompt's placeholder run, in one call as the other families state it.
 impl MediaModel for NemotronHModel {
@@ -518,5 +577,9 @@ impl Model for NemotronHModel {
 
     fn teardown(&mut self) -> CoreResult<()> {
         self.stack_mut().teardown()
+    }
+
+    fn spec_mut(&mut self) -> Option<&mut dyn shiso_core::model::Speculating> {
+        self.stack.draft_resident().then_some(self)
     }
 }

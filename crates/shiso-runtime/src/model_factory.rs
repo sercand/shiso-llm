@@ -267,9 +267,9 @@ impl FamilyDefaults {
         tools: ToolCallScheme::Qwen35,
         thinking_default: true,
         effort: EffortSpelling::STANDARD,
-        // No draft head is bound for this family yet; the export's own is not
-        // read. Flip this with the arm that binds one.
-        speculates: false,
+        // The GGUF export's prediction block is bound as a draft head; the
+        // MLX export has none, and its arm refuses a depth.
+        speculates: true,
     };
 
     /// Family defaults for the LFM2 hybrid.
@@ -785,6 +785,19 @@ fn load_nemotron_h(
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
     let model = if path.extension().is_some_and(|ext| ext == "gguf") {
+        // One prediction block, reusable up to eight draft steps.
+        if args.spec_k > MAX_NEMOTRON_H_SPEC_K {
+            return Err(FactoryError::Load(CoreError::InvalidValue {
+                key: "--spec-k",
+                value: format!(
+                    "{} was asked for; this family's prediction block drafts at most \
+                     {MAX_NEMOTRON_H_SPEC_K}",
+                    args.spec_k
+                ),
+            }));
+        }
+        let mut opts = opts;
+        opts.spec = SpecDepth::new(args.spec_k);
         let family = NemotronHConfig::from_gguf_path(path).map_err(FactoryError::Load)?;
         let reserve = args.expert_reserve_gb.saturating_mul(1 << 30);
         let residency = match args.expert_residency {
@@ -804,6 +817,12 @@ fn load_nemotron_h(
         )
         .map_err(FactoryError::Load)?
     } else {
+        if args.spec_k > 0 {
+            return Err(FactoryError::Load(CoreError::InvalidValue {
+                key: "--spec-k",
+                value: format!("{} carries no draft head; use --spec-k 0", path.display()),
+            }));
+        }
         let family = NemotronHConfig::from_dir(path).map_err(FactoryError::Load)?;
         NemotronHModel::load(backend, path, &family, opts).map_err(FactoryError::Load)?
     };
@@ -817,6 +836,9 @@ fn load_nemotron_h(
         defaults,
     })
 }
+
+/// Draft steps the speech decoder's prediction block may chain.
+const MAX_NEMOTRON_H_SPEC_K: u32 = 8;
 
 /// The LFM2 arm: a GGUF container whose geometry is its own metadata.
 ///

@@ -31,6 +31,7 @@ use shiso_core::buffer::{DeviceBuffer, import_host};
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::LayerIdx;
 use shiso_engine::attn::Attn;
+use shiso_engine::draft::{DraftParts, HeadNorm};
 use shiso_engine::ffn::Ffn;
 use shiso_engine::layers::{Block, LayerWeights, Routed, Weights};
 use shiso_engine::moe_biased::{
@@ -254,6 +255,51 @@ pub(crate) fn weights_gguf(
         ple_model_proj: None,
         ple_proj_norm: None,
         layers,
+    })
+}
+
+/// The multi-token prediction block as a draft head: `eh_proj` over the
+/// normed token embedding and the normed target state, one attention and one
+/// biased routed sub-layer, and a centring output norm before the target's
+/// own vocabulary projection.
+///
+/// The head reads the target's FINAL-normed state, so the target's output
+/// norm is its hidden pre-norm; its routed banks are routed layer `rank` of
+/// the stream when they are streamed.
+///
+/// # Errors
+///
+/// [`CoreError::ConfigMissing`] naming the first absent tensor, and whatever
+/// the imports report.
+pub(crate) fn draft_parts(
+    backend: &Arc<dyn Backend>,
+    file: &GgufFile,
+    config: &NemotronHConfig,
+    placement: &ExpertPlacement,
+    block: u32,
+    rank: u32,
+) -> CoreResult<DraftParts> {
+    let loader = Loader { file, backend };
+    let hidden = config.shape().hidden;
+    let at = |role: &str| format!("blk.{block}.{role}");
+    let (ffn, moe) = loader.moe(&format!("blk.{block}"), config, placement, rank)?;
+    let shape = config.shape().moe.ok_or(CoreError::ShapeMismatch {
+        field: "router geometry",
+        expected: 1,
+        got: 0,
+    })?;
+    Ok(DraftParts {
+        fc: loader.matrix(&at("nextn.eh_proj.weight"), 2 * hidden, hidden)?,
+        norm_embed: loader.vector(&at("nextn.enorm.weight"))?,
+        norm_hidden: loader.vector(&at("nextn.hnorm.weight"))?,
+        input_norm: loader.vector(&at("attn_norm.weight"))?,
+        ffn_norm: loader.vector(&at("post_attention_norm.weight"))?,
+        output_norm: loader.vector(&at("nextn.shared_head_norm.weight"))?,
+        head_norm: HeadNorm::Layer,
+        hidden_prenorm: Some(loader.vector("output_norm.weight")?),
+        attn: loader.attn(&format!("blk.{block}"), config)?,
+        ffn,
+        moe: Some((Routed::Biased(moe), shape)),
     })
 }
 

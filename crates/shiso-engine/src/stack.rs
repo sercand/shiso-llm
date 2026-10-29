@@ -1320,11 +1320,6 @@ impl HybridStack {
         )
     }
 
-    /// Projects row `token` of the pass that just ran into logits row `row`.
-    pub(crate) fn write_logits_row(&self, token: u32, row: u32) -> CoreResult<()> {
-        self.write_logits(token, row)
-    }
-
     /// Registers the span a speculative step settled on.
     ///
     /// No logits row travels with it. The row a resume would want is the one

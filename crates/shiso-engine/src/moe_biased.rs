@@ -194,7 +194,7 @@ impl RouterGuess {
         for row in rows.chunks_exact(hidden.max(1)) {
             scored.clear();
             for (e, w) in self.weights.chunks_exact(hidden.max(1)).enumerate() {
-                let logit: f32 = w.iter().zip(row).map(|(a, b)| a * b).sum();
+                let logit = dot8(w, row);
                 let score = 1.0 / (1.0 + (-logit).exp()) + self.bias[e];
                 scored.push((score, u32::try_from(e).unwrap_or(u32::MAX)));
             }
@@ -207,6 +207,22 @@ impl RouterGuess {
         }
         chosen
     }
+}
+
+/// `a · b` in eight independent lanes the compiler can keep in one vector
+/// register: a guess scores the whole router on the host every layer, and a
+/// single running sum serialises every multiply behind the one before it.
+fn dot8(a: &[f32], b: &[f32]) -> f32 {
+    let mut lanes = [0.0f32; 8];
+    let (ac, ar) = a.as_chunks::<8>();
+    let (bc, br) = b.as_chunks::<8>();
+    for (x, y) in ac.iter().zip(bc) {
+        for i in 0..8 {
+            lanes[i] += x[i] * y[i];
+        }
+    }
+    let tail: f32 = ar.iter().zip(br).map(|(x, y)| x * y).sum();
+    lanes.iter().sum::<f32>() + tail
 }
 
 /// Rows a pass may carry and still guess the next layer's experts: a decode

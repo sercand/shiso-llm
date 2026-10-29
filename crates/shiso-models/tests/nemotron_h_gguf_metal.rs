@@ -449,3 +449,150 @@ fn a_wider_prefill_pass_answers_the_same() {
         "the answer depends on the pass width"
     );
 }
+
+/// Prefills `cap`'s prompt on `model` and returns the first pick.
+fn prefill_capture(
+    backend: &Arc<dyn Backend>,
+    model: &mut NemotronHModel,
+    cap: &Capture,
+) -> (shiso_core::SessionId, u32) {
+    use shiso_core::media::{MediaModel, PadTokens, VisionGrid, VisionPrefill};
+    use shiso_core::{TokenId, alloc};
+
+    let n_rows = u32::try_from(cap.rows.len() / 2688).expect("fits");
+    let pad = TokenId::new(0);
+    let mut tokens: Vec<TokenId> = cap.prefix.iter().map(|&t| TokenId::new(t)).collect();
+    tokens.extend(std::iter::repeat_n(pad, n_rows as usize));
+    tokens.extend(cap.suffix.iter().map(|&t| TokenId::new(t)));
+    let rows = alloc(backend, (cap.rows.len() * 4) as u64).expect("alloc");
+    backend
+        .copy_h2d(rows.view(), bytemuck::cast_slice(&cap.rows))
+        .expect("h2d");
+    let grids = [VisionGrid::new(1, 1, n_rows)];
+    let media = VisionPrefill::new(
+        rows.view(),
+        &grids,
+        PadTokens::new(None, None).with_audio(Some(pad)),
+        2688,
+    )
+    .expect("the rows match the run");
+    let session = model.open_session().expect("session");
+    let first = {
+        let logits = model
+            .prefill_media(session, &tokens, &media)
+            .expect("prefill");
+        argmax_row(backend, logits.row(0).expect("row"))
+    };
+    (session, first)
+}
+
+/// Greedy decode of `cap`'s prompt to the end of the turn (at most `limit`
+/// tokens), plainly or speculating `k` deep: the tokens, the seconds, and the
+/// accepted and drafted counts.
+fn transcribe_ids(
+    path: &std::path::Path,
+    cap: &Capture,
+    k: u32,
+    limit: usize,
+) -> (Vec<u32>, f64, u32, u32) {
+    use shiso_core::{DecodeStep, TokenId};
+
+    let backend = metal();
+    let mut model = load_with(&backend, path, |opts| {
+        opts.spec = shiso_engine::sparse::mtp::SpecDepth::new(k);
+    });
+    let (session, mut last) = prefill_capture(&backend, &mut model, cap);
+    let mut out = vec![last];
+    let (mut accepted, mut drafted) = (0u32, 0u32);
+    let region = (k > 0 && std::env::var_os("SHISO_TEST_PROFILE").is_some()).then(|| {
+        shiso_core::profile::ProfileRegion::open(
+            backend
+                .as_profiler()
+                .expect("the Metal device times launches"),
+        )
+        .expect("a profile region opens")
+    });
+    let before = model.expert_stats().unwrap_or_default();
+    let started = std::time::Instant::now();
+    while last != 11 && out.len() < limit {
+        if k == 0 {
+            let logits = model
+                .decode_batch(&[DecodeStep {
+                    session,
+                    token: TokenId::new(last),
+                }])
+                .expect("decode");
+            last = argmax_row(&backend, logits.row(0).expect("row"));
+            out.push(last);
+        } else {
+            let step = model
+                .spec_mut()
+                .expect("a bound head")
+                .speculate(session, TokenId::new(last))
+                .expect("speculate");
+            accepted += step.accepted;
+            drafted += step.drafted;
+            for t in step.produced {
+                out.push(t.get());
+                last = t.get();
+                if last == 11 {
+                    break;
+                }
+            }
+        }
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    if let Some(region) = region {
+        #[expect(clippy::print_stderr, reason = "the profile is the run's report")]
+        {
+            eprintln!("{}", region.finish().expect("the region closes").table(25));
+        }
+    }
+    let after = model.expert_stats().unwrap_or_default();
+    #[expect(
+        clippy::print_stderr,
+        reason = "the stream's numbers are the run's report"
+    )]
+    {
+        eprintln!(
+            "k={k}: {} fetches, hit {:.3}, read {:.2} s ({} MiB), drain {:.2} s, {} guessed, {} used",
+            after.fetches - before.fetches,
+            (after.hits - before.hits) as f64 / (after.wanted - before.wanted).max(1) as f64,
+            after.read_seconds - before.read_seconds,
+            (after.read_bytes - before.read_bytes) >> 20,
+            after.drain_seconds - before.drain_seconds,
+            after.prefetch_reads - before.prefetch_reads,
+            after.prefetched - before.prefetched,
+        );
+    }
+    (out, seconds, accepted, drafted)
+}
+
+#[test]
+#[ignore = "requires a Metal device, the speech decoder export and the reference captures"]
+#[expect(clippy::print_stderr, reason = "the rates are the test's report")]
+fn speculative_greedy_equals_plain_greedy() {
+    let Some(path) = decoder() else { return };
+    let k: u32 = std::env::var("SHISO_TEST_SPEC_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    for clip in ["short_en", "meeting_60s"] {
+        let refs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../test-vectors/references/nemotron_transcribe/{clip}/verbatim"
+        ));
+        let Some(cap) = capture(&refs) else {
+            eprintln!("SKIP: no reference capture at {}", refs.display());
+            return;
+        };
+        let (plain, plain_s, _, _) = transcribe_ids(&path, &cap, 0, 400);
+        let (spec, spec_s, accepted, drafted) = transcribe_ids(&path, &cap, k, 400);
+        eprintln!(
+            "{clip}: {} tokens; plain {:.2} tok/s, speculative k={k} {:.2} tok/s; accepted {accepted} of {drafted}",
+            plain.len(),
+            plain.len() as f64 / plain_s,
+            spec.len() as f64 / spec_s,
+        );
+        assert_eq!(spec, plain, "{clip}: speculation changed the greedy answer");
+    }
+}

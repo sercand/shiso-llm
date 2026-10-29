@@ -244,6 +244,16 @@ pub fn run(
                 expected: 1,
                 got: 0,
             })?;
+            // One record per drafted row: the pass's last row is either
+            // rejected or the state the session keeps, so it is never one a
+            // rollback names, and a trail is `n_tok - 1` records deep.
+            if n_tok > trail.rows.saturating_add(1) {
+                return Err(CoreError::OutOfBounds {
+                    offset: u64::from(n_tok),
+                    len: 1,
+                    buffer_bytes: u64::from(trail.rows),
+                });
+            }
             let (conv_bytes, state_bytes) = (state.conv.len(), state.state.len());
             for row in 0..n_tok {
                 sequential(
@@ -257,9 +267,9 @@ pub fn run(
                         state,
                     },
                 )?;
-                // Past the trail's rows this slice is refused, which is the
-                // safe direction: a row whose record was never written is not
-                // one a rollback may name.
+                if row >= trail.rows {
+                    continue;
+                }
                 backend.copy_d2d(
                     trail.conv.slice(u64::from(row) * conv_bytes, conv_bytes)?,
                     state.conv,
