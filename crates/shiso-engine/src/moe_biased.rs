@@ -463,6 +463,9 @@ fn routed_stages(
 /// one plan serves both. With the device drained this pass's normalized rows
 /// are final, so the next layer's likely experts are guessed now - before any
 /// stage is queued, since reading the rows back would wait for it.
+///
+/// `None` means neither bank of the layer is streamed: every expert is
+/// resident, so there is nothing to plan.
 fn fetch_streamed<'a>(
     backend: &dyn Backend,
     moe: &'a BiasedMoe,
