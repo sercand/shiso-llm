@@ -130,7 +130,19 @@ fn ten_minutes_transcribe_inside_two_minutes() {
         .compute(pcm.samples());
     let tokens = tower.tokens_for(mel.valid()).expect("a clip of audio");
     let clips = [AudioClip::new(mel, tokens).expect("clip")];
+    let region = std::env::var_os("SHISO_TEST_PROFILE_ENCODE").map(|_| {
+        shiso_core::profile::ProfileRegion::open(
+            backend
+                .as_profiler()
+                .expect("the Metal device times launches"),
+        )
+        .expect("a profile region opens")
+    });
     let audio_rows = tower.encode(&backend, &clips).expect("encodes");
+    if let Some(region) = region {
+        eprintln!("{}", region.finish().expect("the region closes").table(16));
+        return;
+    }
     backend.sync().expect("sync");
     let encode = started.elapsed().as_secs_f64();
 
