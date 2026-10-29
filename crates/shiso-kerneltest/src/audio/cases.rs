@@ -76,6 +76,7 @@ pub const ENTRIES: &[&str] = &[
     "kernel_audio_window_attn_f32",
     "kernel_audio_rel_scores_f32",
     "kernel_audio_rope_half_f32",
+    "kernel_audio_rope_partial_f32",
     "kernel_audio_lstm_cell_f32",
     "kernel_audio_greedy_window_f32",
     "kernel_audio_greedy_step_u32",
@@ -1821,6 +1822,64 @@ pub fn rope_half_rotates_pairs_across_the_halves(gpu: &Gpu) {
         }
     }
     close(&gpu.read_f32(&buf), &want, 2e-5, "rope half");
+}
+
+/// `audio_args_rope_partial`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct RopePartialArgs {
+    rows: u32,
+    heads: u32,
+    head_dim: u32,
+    pos0: u32,
+    theta: f32,
+    rot: u32,
+}
+const _: () = assert!(size_of::<RopePartialArgs>() == 24);
+
+/// The partial rotary embedding turns only the first `rot` dimensions of each
+/// head, pairing `m` with `m + rot/2` at `theta^(-2m/rot)`, and leaves the
+/// rest as they were.
+pub fn rope_partial_rotates_only_the_leading_dims(gpu: &Gpu) {
+    let (rows, heads, hd, rot, pos0, theta) = (7usize, 3usize, 80usize, 40usize, 2u32, 10_000.0f32);
+    let x = oracle::signal(rows * heads * hd, 92);
+    let buf = gpu.upload(&f32_bytes(&x));
+    let args = RopePartialArgs {
+        rows: rows as u32,
+        heads: heads as u32,
+        head_dim: hd as u32,
+        pos0,
+        theta,
+        rot: rot as u32,
+    };
+    let pairs = rows * heads * rot / 2;
+    launch(
+        gpu,
+        "kernel_audio_rope_partial_f32",
+        Extent3::linear(blocks(pairs, LINEAR_BLOCK)),
+        Extent3::linear(LINEAR_BLOCK),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(buf.view()),
+        ],
+    );
+    drain(gpu);
+    let mut want = x.clone();
+    let half = rot / 2;
+    for r in 0..rows {
+        for h in 0..heads {
+            for m in 0..half {
+                let ang = f64::from(pos0 + r as u32)
+                    * f64::from(theta).powf(-2.0 * m as f64 / rot as f64);
+                let base = (r * heads + h) * hd;
+                let (a, b) = (f64::from(x[base + m]), f64::from(x[base + m + half]));
+                want[base + m] = (a * ang.cos() - b * ang.sin()) as f32;
+                want[base + m + half] = (b * ang.cos() + a * ang.sin()) as f32;
+            }
+        }
+    }
+    close(&gpu.read_f32(&buf), &want, 2e-5, "rope partial");
 }
 
 /// `audio_args_lstm`.

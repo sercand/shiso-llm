@@ -48,6 +48,16 @@ pub enum Framing {
         /// Round the signal length up to a multiple of this (1 for none).
         pad_to_multiple: usize,
     },
+    /// The signal is rounded up to `pad_to_multiple` samples with zeros and
+    /// pre-emphasised over that whole length (so the first padding sample
+    /// carries the last real one), then `n_fft/2` zeros go on the left only.
+    /// Frame `t` spans `n_fft` samples from `t·hop` with the window at the
+    /// frame's start rather than its centre. `1 + L/hop` frames, every one
+    /// valid.
+    FftLeftPadded {
+        /// Round the signal length up to a multiple of this (1 for none).
+        pad_to_multiple: usize,
+    },
 }
 
 /// Pre-emphasis applied before framing.
@@ -342,7 +352,7 @@ fn window(spec: &MelSpec) -> Vec<f64> {
     let len = spec.win_length;
     let offset = match spec.framing {
         Framing::Centred | Framing::CentredReflect => (spec.n_fft - len) / 2,
-        Framing::LeftPadded { .. } => 0,
+        Framing::LeftPadded { .. } | Framing::FftLeftPadded { .. } => 0,
     };
     let denom = match spec.window {
         Window::HannSymmetric => f64_of(len.saturating_sub(1).max(1)),
@@ -442,6 +452,11 @@ impl MelFrontend {
                 ));
             }
         }
+        if let Framing::FftLeftPadded { pad_to_multiple } = spec.framing
+            && pad_to_multiple == 0
+        {
+            return Err(bad("pad_to_multiple must be at least 1"));
+        }
         if spec.framing == Framing::CentredReflect && spec.preemphasis != Preemphasis::None {
             return Err(bad(
                 "reflect framing with pre-emphasis is not a frontend any model here uses",
@@ -484,6 +499,7 @@ impl MelFrontend {
         let hop = self.spec.hop_length;
         match self.spec.framing {
             Framing::Centred | Framing::CentredReflect => samples / hop,
+            Framing::FftLeftPadded { .. } => 1 + samples / hop,
             Framing::LeftPadded { .. } => {
                 // t·hop + win < win/2 + L  <=>  t·hop < L − (win − win/2)
                 let reach = self.spec.win_length - self.spec.win_length / 2;
@@ -500,7 +516,9 @@ impl MelFrontend {
     fn total_frames(&self, samples: usize) -> usize {
         let hop = self.spec.hop_length;
         match self.spec.framing {
-            Framing::Centred | Framing::CentredReflect => 1 + samples / hop,
+            Framing::Centred | Framing::CentredReflect | Framing::FftLeftPadded { .. } => {
+                1 + samples / hop
+            }
             Framing::LeftPadded { pad_to_multiple } => {
                 let padded =
                     samples.div_ceil(pad_to_multiple) * pad_to_multiple + self.spec.win_length / 2;
@@ -527,6 +545,13 @@ impl MelFrontend {
                     left + samples.len().div_ceil(pad_to_multiple) * pad_to_multiple,
                 )
             }
+            Framing::FftLeftPadded { pad_to_multiple } => {
+                let left = self.spec.n_fft / 2;
+                (
+                    left,
+                    left + samples.len().div_ceil(pad_to_multiple) * pad_to_multiple,
+                )
+            }
         };
         let mut out = vec![0.0; len.max(left)];
         let mut prev = 0.0f64;
@@ -543,6 +568,15 @@ impl MelFrontend {
                 }
             };
             prev = x;
+        }
+        // This framing pre-emphasises the padded signal, so the first zero of
+        // the padding becomes `-c` times the last real sample.
+        if let (Framing::FftLeftPadded { .. }, Preemphasis::Signal(c)) =
+            (self.spec.framing, self.spec.preemphasis)
+            && let Some(slot) = out.get_mut(left + samples.len())
+            && left + samples.len() < len
+        {
+            *slot = -f64::from(c) * prev;
         }
         // Reflect framing forbids pre-emphasis (checked in `new`), so `out`
         // still holds the real samples verbatim; mirror them into the
@@ -577,7 +611,7 @@ impl MelFrontend {
     ) {
         let n = self.fft.len();
         let span = match self.spec.framing {
-            Framing::Centred | Framing::CentredReflect => n,
+            Framing::Centred | Framing::CentredReflect | Framing::FftLeftPadded { .. } => n,
             Framing::LeftPadded { .. } => self.spec.win_length,
         };
         work.fft.frame.fill(0.0);

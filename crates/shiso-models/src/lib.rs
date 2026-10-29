@@ -32,6 +32,7 @@ pub mod llama;
 pub mod nemotron_asr;
 pub mod nemotron_diar;
 pub mod nemotron_h;
+pub mod nemotron_transcribe;
 pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen3_asr;
