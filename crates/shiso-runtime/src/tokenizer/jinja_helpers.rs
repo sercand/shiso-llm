@@ -197,6 +197,20 @@ fn bridge_python_methods(
                 let (): () = from_args(args)?;
                 return Ok(Value::from(value.as_str().unwrap_or_default().trim_start()));
             }
+            // A speech checkpoint's template counts its audio locators to
+            // check them against the audio parts. Python's semantics: the
+            // non-overlapping occurrences, and one more than the length for
+            // an empty needle.
+            "count" => {
+                let (needle,): (String,) = from_args(args)?;
+                let haystack = value.as_str().unwrap_or_default();
+                let n = if needle.is_empty() {
+                    haystack.chars().count() + 1
+                } else {
+                    haystack.matches(needle.as_str()).count()
+                };
+                return Ok(Value::from(n));
+            }
             "rstrip" => {
                 let (): () = from_args(args)?;
                 return Ok(Value::from(value.as_str().unwrap_or_default().trim_end()));
@@ -328,6 +342,18 @@ mod tests {
             &minijinja::Value::from("hello"),
         );
         assert_eq!(answer, "False|False");
+    }
+
+    /// Counting a substring, as a speech checkpoint's template counts its
+    /// audio locators: non-overlapping, and an empty needle is the length + 1.
+    #[test]
+    fn a_template_can_count_a_substring() {
+        let answer = render(
+            "{{ text.count('<|audio|>') }}|{{ text.count('aa') }}|{{ text.count('') }}",
+            "a substring count",
+            &minijinja::Value::from("<|audio|> aaa <|audio|>"),
+        );
+        assert_eq!(answer, "2|1|24");
     }
 
     /// The order the keys were written in is the order they render in. A

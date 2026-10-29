@@ -10,7 +10,9 @@
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use shiso_audio::{AudioDecodePolicy, DecodeLimits, Pcm};
+use shiso_ir::{Block, MediaSource, Message, Request, Role, ThinkingDirective};
 use shiso_runtime::api::transcribe::{Preset, TranscribeOutput, TranscribeRequest};
 use shiso_runtime::options::ServeOptions;
 use shiso_runtime::runtime::Runtime;
@@ -109,6 +111,51 @@ fn transcripts_match_the_reference() {
     ));
     assert_eq!(a.expect("transcribes"), solo);
     assert_eq!(b.expect("transcribes"), speakers);
+
+    // Chat audio (Task 5.4): a question about the recording, thinking on,
+    // the audio part first - the template moves it to the end of the turn.
+    let wav = std::fs::read(clips.join("meeting_60s.wav")).expect("the clip reads");
+    let mut question = Request::new(
+        "speech",
+        vec![Message::new(
+            Role::User,
+            vec![
+                Block::Audio(MediaSource::Inline(
+                    base64::engine::general_purpose::STANDARD.encode(&wav),
+                )),
+                Block::Text(
+                    "How many people speak in this recording? Answer with one number.".into(),
+                ),
+            ],
+        )],
+    );
+    // Thinking is this family's default.
+    assert_eq!(question.thinking, ThinkingDirective::Unspecified);
+    question.sampling.temperature = Some(0.0);
+    question.max_tokens = 2048;
+    let answer = futures::executor::block_on(rt.generate(question)).expect("answers");
+    // Asked with its thinking block open, this decoder answers a short
+    // question at once and ends the turn without closing the block, so the
+    // answer arrives as the trace; either place holds it.
+    let mut text = answer.message.text();
+    if text.trim().is_empty() {
+        text = answer
+            .message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                Block::Thinking(trace) => Some(trace.text.as_str()),
+                _ => None,
+            })
+            .collect();
+    }
+    eprintln!("chat answer: {text:?} ({:?})", answer.stop);
+    let count: u32 = text
+        .trim()
+        .trim_end_matches('.')
+        .parse()
+        .expect("the answer is one number");
+    assert!(count >= 1);
 
     // Silence is answered empty, without encoding.
     let silence = Pcm::new(vec![0.0; 32_000], 16_000).expect("pcm");
