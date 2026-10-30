@@ -87,6 +87,16 @@ pub struct EngineOptions {
     /// fewer reads of the same bytes; it costs scratch linear in the width.
     /// A whole multiple of [`crate::MAX_PREFILL_CHUNK`] up to
     /// [`crate::MAX_PREFILL_ROWS`], refused otherwise when the stack is built.
+    ///
+    /// A wider pass is not always the same arithmetic as the narrow one. A
+    /// chunk wider than [`crate::MAX_PREFILL_CHUNK`] skips the banded
+    /// matrix-library route of [`crate::projection::projection`], whose bands
+    /// are sized for that width, and runs the tile instead; so on a backend
+    /// with a matrix tier, for a weight that route takes, a prompt prefilled
+    /// wide is not bit-identical to the same prompt prefilled 512 rows at a
+    /// time. A checkpoint whose weights do not take that route answers the
+    /// same at either width: one with 4-bit nonlinear and 8-bit block weights
+    /// was measured bit-identical at 512 and 4096 rows on device.
     pub prefill_rows: u32,
 }
 
