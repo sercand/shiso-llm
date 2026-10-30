@@ -469,6 +469,13 @@ pub trait Backend: Send + Sync + fmt::Debug {
     /// or writes `dsts`. A backend that cannot write without draining falls
     /// back to [`Backend::write_host`], which is always correct.
     ///
+    /// The default is that fallback, and a backend without an override (CUDA
+    /// today) takes it: the bytes are staged in host memory and handed to
+    /// [`Backend::copy_h2d`], which that backend orders behind the work
+    /// already queued. A caller that streams weights in through this method
+    /// still answers correctly there, but its read gets no overlap with the
+    /// device.
+    ///
     /// # Errors
     ///
     /// As [`Backend::write_host`].
@@ -485,7 +492,14 @@ pub trait Backend: Send + Sync + fmt::Debug {
     /// A batching backend otherwise holds launches until the next
     /// [`Backend::sync`]; this lets the device start on them while the host
     /// does other work. The default does nothing, which is correct for a
-    /// backend that runs each launch as it is issued.
+    /// backend that runs each launch as it is issued, and is what a backend
+    /// without an override (CUDA today) gets: its launches are already on the
+    /// device's queue, so a caller that submits ahead of a host-side read
+    /// loses nothing in correctness there, only the earlier start.
+    ///
+    /// Submitting never waits, not even on an earlier submit no wait point has
+    /// seen finish; a fault in submitted work surfaces at the next wait point
+    /// ([`Backend::sync`] or a copy back to the host) at the latest.
     ///
     /// # Errors
     ///
@@ -982,4 +996,155 @@ pub trait CoopLaunch: Send + Sync + fmt::Debug {
     /// [`crate::CoreError::Unsupported`] when the device cannot launch cooperatively,
     /// [`crate::CoreError::Backend`] when the launch itself fails.
     fn run_cooperative(&self, kernel: KernelRef, args: &LaunchArgs<'_>) -> CoreResult<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    //! The provided methods a backend inherits when it does not override them.
+
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use super::{Backend, KernelRef, LaunchArgs};
+    use crate::buffer::{DeviceView, RawBuffer, alloc};
+    use crate::error::{CoreError, CoreResult};
+
+    /// A device that overrides only what the trait requires, and records every
+    /// host-to-device copy, so a provided method's route is visible.
+    #[derive(Debug, Default)]
+    struct PlainBackend {
+        /// One allocation is enough: every test here writes into one buffer.
+        bytes: Mutex<Vec<u8>>,
+        /// `(offset, len)` of each `copy_h2d`, in call order.
+        h2d: Mutex<Vec<(u64, u64)>>,
+        launches: Mutex<u32>,
+    }
+
+    impl PlainBackend {
+        fn bytes(&self) -> Vec<u8> {
+            self.bytes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        fn h2d(&self) -> Vec<(u64, u64)> {
+            self.h2d
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl Backend for PlainBackend {
+        fn backend_name(&self) -> &'static str {
+            "plain"
+        }
+
+        fn alloc_raw(&self, bytes: u64) -> CoreResult<RawBuffer> {
+            let width = usize::try_from(bytes).expect("a test allocation fits the host");
+            *self.bytes.lock().unwrap_or_else(PoisonError::into_inner) = vec![0; width];
+            Ok(RawBuffer::new(std::num::NonZeroU64::MIN, bytes))
+        }
+
+        fn free_raw(&self, _raw: RawBuffer) -> CoreResult<()> {
+            Ok(())
+        }
+
+        fn copy_h2d(&self, dst: DeviceView<'_>, src: &[u8]) -> CoreResult<()> {
+            let start = usize::try_from(dst.offset()).expect("a test offset fits the host");
+            self.bytes.lock().unwrap_or_else(PoisonError::into_inner)[start..start + src.len()]
+                .copy_from_slice(src);
+            self.h2d
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((dst.offset(), dst.len()));
+            Ok(())
+        }
+
+        fn copy_d2h(&self, _src: DeviceView<'_>, _dst: &mut [u8]) -> CoreResult<()> {
+            Err(CoreError::Unsupported {
+                what: "copy_d2h",
+                backend: "plain",
+            })
+        }
+
+        fn copy_d2d(&self, _dst: DeviceView<'_>, _src: DeviceView<'_>) -> CoreResult<()> {
+            Err(CoreError::Unsupported {
+                what: "copy_d2d",
+                backend: "plain",
+            })
+        }
+
+        fn run(&self, _kernel: KernelRef, _args: &LaunchArgs<'_>) -> CoreResult<()> {
+            *self.launches.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+            Ok(())
+        }
+
+        fn sync(&self) -> CoreResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_host_live_without_an_override_is_the_staged_write() {
+        let plain = Arc::new(PlainBackend::default());
+        let device: Arc<dyn Backend> = plain.clone();
+        let buffer = alloc(&device, 16).expect("alloc");
+        let head = buffer.slice(0, 4).expect("head");
+        let tail = buffer.slice(8, 8).expect("tail");
+        device
+            .write_host_live(&[head, tail], &mut |slices| {
+                assert_eq!(slices.len(), 2, "one slice per view");
+                assert_eq!((slices[0].len(), slices[1].len()), (4, 8));
+                slices[0].fill(0xAB);
+                slices[1].fill(0xCD);
+                Ok(())
+            })
+            .expect("write_host_live");
+        // The route the default takes: one staged copy per view, in view
+        // order, and nothing written outside the views.
+        assert_eq!(plain.h2d(), vec![(0, 4), (8, 8)]);
+        let mut expected = vec![0xAB; 4];
+        expected.extend([0; 4]);
+        expected.extend([0xCD; 8]);
+        assert_eq!(plain.bytes(), expected);
+    }
+
+    #[test]
+    fn write_host_live_without_an_override_copies_nothing_when_fill_fails() {
+        let plain = Arc::new(PlainBackend::default());
+        let device: Arc<dyn Backend> = plain.clone();
+        let buffer = alloc(&device, 8).expect("alloc");
+        let err = device
+            .write_host_live(&[buffer.view()], &mut |_| {
+                Err(CoreError::Unsupported {
+                    what: "fill",
+                    backend: "plain",
+                })
+            })
+            .expect_err("the fill's error reaches the caller");
+        assert!(
+            matches!(err, CoreError::Unsupported { what: "fill", .. }),
+            "{err:?}"
+        );
+        assert!(
+            plain.h2d().is_empty(),
+            "a failed fill must not reach the device"
+        );
+    }
+
+    #[test]
+    fn submit_without_an_override_does_nothing() {
+        let plain = Arc::new(PlainBackend::default());
+        let device: Arc<dyn Backend> = plain.clone();
+        device.submit().expect("submit");
+        assert!(plain.h2d().is_empty());
+        assert_eq!(
+            *plain
+                .launches
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            0
+        );
+    }
 }

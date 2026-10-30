@@ -147,10 +147,12 @@ pub(crate) struct State {
     commits: usize,
     /// The value the completion event was last asked to reach.
     signaled: u64,
-    /// The last command buffer committed without a signal, kept until a
-    /// drain has seen it finish: its work is outstanding, and a fault inside
-    /// it must reach the caller rather than vanish.
-    submitted: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    /// Command buffers committed without a signal, in commit order, kept
+    /// until a drain has seen them finish: their work is outstanding, and a
+    /// fault inside one must reach the caller rather than vanish. A list, not
+    /// one slot, so a second submit never has to wait on the first to keep
+    /// its status.
+    submitted: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     /// Samples of the open profile region; `None` when no region is open,
     /// which is the only state in which launches batch.
     profile: Option<Vec<LaunchSample>>,
@@ -304,7 +306,7 @@ impl MetalBackend {
                 pipelines: PipelineCache::default(),
                 commits: 0,
                 signaled: 0,
-                submitted: None,
+                submitted: Vec::new(),
                 profile: None,
             }),
         }))
@@ -323,6 +325,17 @@ impl MetalBackend {
     #[must_use]
     pub fn commits(&self) -> usize {
         self.inner.lock().commits
+    }
+
+    /// Command buffers handed over by [`Backend::submit`] that no drain has
+    /// seen finish yet.
+    ///
+    /// A wait point ([`Backend::sync`], a copy back) leaves this at zero, so a
+    /// test can tell that it waited without reading anything through a call
+    /// that would itself wait.
+    #[must_use]
+    pub fn outstanding_submits(&self) -> usize {
+        self.inner.lock().submitted.len()
     }
 
     /// Number of pipelines the cache currently holds.
@@ -429,15 +442,15 @@ impl MetalBackend {
         state: &mut State,
         op: &'static str,
     ) -> CoreResult<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>> {
-        let submitted = state.submitted.take();
+        let submitted = std::mem::take(&mut state.submitted);
         let Batch::Open {
             command_buffer,
             encoder,
         } = std::mem::take(&mut state.batch)
         else {
-            if let Some(submitted) = submitted {
-                submitted.waitUntilCompleted();
-                failed(&submitted, op)?;
+            for earlier in &submitted {
+                earlier.waitUntilCompleted();
+                failed(earlier, op)?;
             }
             return Ok(None);
         };
@@ -461,16 +474,17 @@ impl MetalBackend {
             .waitUntilSignaledValue_timeoutMS(value, DRAIN_SLICE_MS)
         {
             let earlier = submitted
-                .as_ref()
-                .is_some_and(|cb| cb.status() == MTLCommandBufferStatus::Error);
+                .iter()
+                .any(|cb| cb.status() == MTLCommandBufferStatus::Error);
             if earlier || command_buffer.status() == MTLCommandBufferStatus::Error {
                 break;
             }
         }
-        // The queue ran a submitted buffer before this one, so its status is
-        // final by now unless it faulted, which is what it is checked for.
-        if let Some(submitted) = &submitted {
-            failed(submitted, op)?;
+        // The queue ran the submitted buffers before this one, so their status
+        // is final by now unless one faulted, which is what they are checked
+        // for.
+        for earlier in &submitted {
+            failed(earlier, op)?;
         }
         failed(&command_buffer, op)?;
         Ok(Some(command_buffer))
@@ -786,13 +800,23 @@ impl Backend for MetalBackend {
         // is kept for that drain, which also waits for it when nothing else
         // was queued and reports it if it faulted.
         command_buffer.commit();
-        if let Some(earlier) = state.submitted.replace(command_buffer) {
-            // Only the newest submitted buffer is kept; an older one that
-            // faulted would go unseen, so it is checked here.
-            earlier.waitUntilCompleted();
-            failed(&earlier, "submit")?;
-        }
-        Ok(())
+        // Earlier submits are only looked at, never waited on: one that has
+        // finished cleanly is let go so the list stays short across a pass
+        // that submits per layer, and one that faulted is reported now rather
+        // than at the drain. Anything still running stays for the drain.
+        let mut fault = Ok(());
+        state.submitted.retain(|earlier| match earlier.status() {
+            MTLCommandBufferStatus::Completed => false,
+            MTLCommandBufferStatus::Error => {
+                if fault.is_ok() {
+                    fault = failed(earlier, "submit");
+                }
+                false
+            }
+            _ => true,
+        });
+        state.submitted.push(command_buffer);
+        fault
     }
 
     fn copy_d2h(&self, src: DeviceView<'_>, dst: &mut [u8]) -> CoreResult<()> {

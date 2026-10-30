@@ -1612,6 +1612,20 @@ fn q4_k_packers_match_the_kernel_unpack() {
     }
 }
 
+/// Reads `view` without a wait point: `write_host_live` resolves the bytes
+/// and hands them over without draining, so what it shows is whatever the
+/// device has finished by now.
+fn peek(gpu: &Gpu, view: shiso_core::DeviceView<'_>) -> Vec<u8> {
+    let mut seen = Vec::new();
+    gpu.device
+        .write_host_live(&[view], &mut |slices| {
+            seen = slices[0].to_vec();
+            Ok(())
+        })
+        .expect("write_host_live");
+    seen
+}
+
 #[test]
 #[ignore = "requires Metal GPU"]
 fn sync_waits_for_submitted_work() {
@@ -1620,17 +1634,120 @@ fn sync_waits_for_submitted_work() {
     let buffer = gpu.upload(&vec![0xFFu8; BYTES]);
     gpu.device.fill_zero(buffer.view()).expect("fill");
     gpu.device.submit().expect("submit");
+    assert_eq!(
+        gpu.metal.outstanding_submits(),
+        1,
+        "submit hands one buffer over"
+    );
     gpu.device.sync().expect("sync");
-    // The tail is the last part the clear reaches; read straight after the
-    // sync, it shows whether the sync waited for the submitted buffer.
+    // Nothing after the sync may wait on its own: a copy back drains the
+    // submitted buffer by itself, so it would hide a sync that did not.
+    assert_eq!(
+        gpu.metal.outstanding_submits(),
+        0,
+        "sync returned without seeing the submitted buffer finish"
+    );
+    // The tail is the last part the clear reaches.
     let tail = buffer
         .view()
         .slice((BYTES - 4096) as u64, 4096)
         .expect("tail");
-    let mut out = vec![0xAAu8; 4096];
-    gpu.device.copy_d2h(tail, &mut out).expect("d2h");
     assert!(
-        out.iter().all(|&b| b == 0),
+        peek(&gpu, tail).iter().all(|&b| b == 0),
         "sync returned before the clear ran"
+    );
+}
+
+#[test]
+#[ignore = "requires Metal GPU"]
+fn a_second_submit_does_not_wait_and_sync_sees_both() {
+    const BYTES: usize = 256 << 20;
+    let Some(gpu) = Gpu::open() else { return };
+    let first = gpu.upload(&vec![0xFFu8; BYTES]);
+    let second = gpu.upload(&vec![0xFFu8; BYTES]);
+    gpu.device.fill_zero(first.view()).expect("fill");
+    gpu.device.submit().expect("submit");
+    gpu.device.fill_zero(second.view()).expect("fill");
+    gpu.device.submit().expect("submit");
+    // A second submit keeps the first until a wait point sees it finish,
+    // rather than waiting for it there; how many are still listed depends on
+    // how far the device got, but never more than the two handed over.
+    assert!((1..=2).contains(&gpu.metal.outstanding_submits()));
+    gpu.device.sync().expect("sync");
+    assert_eq!(gpu.metal.outstanding_submits(), 0);
+    for (name, buffer) in [("first", &first), ("second", &second)] {
+        let tail = buffer
+            .view()
+            .slice((BYTES - 4096) as u64, 4096)
+            .expect("tail");
+        assert!(
+            peek(&gpu, tail).iter().all(|&b| b == 0),
+            "the {name} submitted clear had not run at the sync"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Metal GPU"]
+fn write_host_live_refuses_overlapping_views() {
+    let Some(gpu) = Gpu::open() else { return };
+    let buffer = gpu.upload(&[0u8; 64]);
+    let low = buffer.view().slice(0, 32).expect("low");
+    let high = buffer.view().slice(16, 32).expect("high");
+    let mut filled = false;
+    let err = gpu
+        .device
+        .write_host_live(&[low, high], &mut |_| {
+            filled = true;
+            Ok(())
+        })
+        .expect_err("two views over bytes 16..32 must be refused");
+    assert!(
+        matches!(
+            err,
+            shiso_core::CoreError::InvalidValue {
+                key: "write_host_live views",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(!filled, "the fill must not see aliased slices");
+}
+
+#[test]
+#[ignore = "requires Metal GPU"]
+fn write_host_live_leaves_the_open_batch_open() {
+    let Some(gpu) = Gpu::open() else { return };
+    let busy = gpu.upload(&[0xFFu8; 4096]);
+    let idle = gpu.upload(&[0u8; 4096]);
+    gpu.device.fill_zero(busy.view()).expect("fill");
+    let before = gpu.metal.commits();
+    gpu.device
+        .write_host_live(&[idle.view()], &mut |slices| {
+            slices[0].fill(0x5A);
+            Ok(())
+        })
+        .expect("write_host_live");
+    // The whole point of the live write: the batch encoding `busy` is still
+    // open, so the device was neither handed nor waited on.
+    assert_eq!(
+        gpu.metal.commits(),
+        before,
+        "write_host_live committed the open batch"
+    );
+    gpu.device.sync().expect("sync");
+    assert_eq!(
+        gpu.metal.commits(),
+        before + 1,
+        "the sync commits the batch"
+    );
+    assert!(
+        gpu.read(&idle).iter().all(|&b| b == 0x5A),
+        "the live write landed"
+    );
+    assert!(
+        gpu.read(&busy).iter().all(|&b| b == 0),
+        "the batch ran after it"
     );
 }
