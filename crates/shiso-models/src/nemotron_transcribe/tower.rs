@@ -160,6 +160,12 @@ impl NemotronTranscribeTower {
         })
     }
 
+    /// Whether a registration under `key` is still held.
+    #[cfg(test)]
+    pub(crate) fn holds(&self, key: TimingKey) -> bool {
+        registered(&self.timings, key)
+    }
+
     /// The export's numbers.
     #[must_use]
     pub const fn config(&self) -> &PeeConfig {
@@ -217,30 +223,46 @@ fn is_tag(word: &str) -> bool {
     (word.starts_with("<ev:") || word.starts_with("<sty:")) && word.ends_with('>')
 }
 
+/// Registers a clip of `fingerprint` in `registry`; the ticket's drop takes
+/// the entry, and whatever its encode kept, back out.
+fn register(registry: &Arc<Mutex<Timings>>, fingerprint: u64) -> TimingTicket {
+    let mut timings = registry.lock().unwrap_or_else(|poisoned| {
+        // The registrations are plain data; one left behind by a failed
+        // request is still a valid list.
+        poisoned.into_inner()
+    });
+    let key = TimingKey(timings.next);
+    timings.next += 1;
+    timings.entries.push(Timing {
+        key,
+        fingerprint,
+        kept: None,
+    });
+    let registry = Arc::downgrade(registry);
+    TimingTicket::new(key, move |key| {
+        if let Some(registry) = registry.upgrade() {
+            let mut timings = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            timings.entries.retain(|t| t.key != key);
+        }
+    })
+}
+
+/// Whether `registry` still holds an entry for `key`.
+#[cfg(test)]
+fn registered(registry: &Mutex<Timings>, key: TimingKey) -> bool {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries
+        .iter()
+        .any(|t| t.key == key)
+}
+
 impl WordTimer for NemotronTranscribeTower {
     fn want(&self, clip: &AudioClip) -> TimingTicket {
-        let fingerprint = fingerprint(clip);
-        let mut timings = self.timings.lock().unwrap_or_else(|poisoned| {
-            // The registrations are plain data; one left behind by a failed
-            // request is still a valid list.
-            poisoned.into_inner()
-        });
-        let key = TimingKey(timings.next);
-        timings.next += 1;
-        timings.entries.push(Timing {
-            key,
-            fingerprint,
-            kept: None,
-        });
-        let registry = Arc::downgrade(&self.timings);
-        TimingTicket::new(key, move |key| {
-            if let Some(registry) = registry.upgrade() {
-                let mut timings = registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                timings.entries.retain(|t| t.key != key);
-            }
-        })
+        register(&self.timings, fingerprint(clip))
     }
 
     fn words(
@@ -325,17 +347,38 @@ impl AudioTower for NemotronTranscribeTower {
     ) -> Result<EncodedRows, AudioError> {
         let ops = Ops::new(Arc::clone(backend));
         let mut held = self.held()?;
-        if held.is_none() {
-            let store = TensorStore::open_gguf(&self.path)?;
-            *held = Some(PeeWeights::load(&ops, &store, &self.config)?);
-        }
-        let weights = held.as_ref().ok_or(AudioError::Empty)?;
+        with_weights(
+            &mut held,
+            &WeightUse {
+                keep: self.resident,
+                load: || {
+                    let store = TensorStore::open_gguf(&self.path)?;
+                    PeeWeights::load(&ops, &store, &self.config)
+                },
+                run: |weights: &PeeWeights| self.encode_with(&ops, weights, clips),
+                // The rows are copied out; the device is done with the
+                // weights before they go.
+                settle: || Ok(backend.sync()?),
+            },
+        )
+    }
+}
+
+impl NemotronTranscribeTower {
+    /// Encodes `clips` with `weights` into one block of rows.
+    fn encode_with(
+        &self,
+        ops: &Ops,
+        weights: &PeeWeights,
+        clips: &[AudioClip],
+    ) -> Result<EncodedRows, AudioError> {
+        let backend = ops.backend();
         let width = self.config.fusion_dim;
         let mut grids = Vec::with_capacity(clips.len());
         let mut parts = Vec::with_capacity(clips.len());
         for clip in clips {
-            let e = encode(&ops, weights, &self.config, clip.mel())?;
-            self.keep_for_timing(&ops, weights, clip, &e)?;
+            let e = encode(ops, weights, &self.config, clip.mel())?;
+            self.keep_for_timing(ops, weights, clip, &e)?;
             grids.push(VisionGrid::new(
                 1,
                 1,
@@ -353,14 +396,50 @@ impl AudioTower for NemotronTranscribeTower {
             backend.copy_d2d(rows.slice(at, bytes)?, e.rows.view())?;
             at += bytes;
         }
-        if !self.resident {
-            // The rows are copied out; the weights go before the decoder's
-            // prompt pass needs the room.
-            backend.sync()?;
-            *held = None;
-        }
         Ok(EncodedRows { rows, grids })
     }
+}
+
+/// How one encode holds the weights.
+struct WeightUse<L, R, S> {
+    /// Whether the weights stay in their slot after the encode.
+    keep: bool,
+    /// Loads them when the slot is empty.
+    load: L,
+    /// The encode itself.
+    run: R,
+    /// Waits for the device to finish with them, before a slot that does
+    /// not keep them lets them go.
+    settle: S,
+}
+
+/// Runs `u.run` over the weights in `held`, loaded first when the slot is
+/// empty. When the slot does not keep them they are dropped on every exit -
+/// a failed encode included - since the decoder's expert pool was sized on
+/// the promise that this tower holds nothing between requests.
+fn with_weights<W, T, L, R, S>(
+    held: &mut Option<W>,
+    u: &WeightUse<L, R, S>,
+) -> Result<T, AudioError>
+where
+    L: Fn() -> Result<W, AudioError>,
+    R: Fn(&W) -> Result<T, AudioError>,
+    S: Fn() -> Result<(), AudioError>,
+{
+    let weights = match held.take() {
+        Some(weights) => weights,
+        None => (u.load)()?,
+    };
+    let out = (u.run)(&weights);
+    if u.keep {
+        *held = Some(weights);
+        return out;
+    }
+    let settled = (u.settle)();
+    drop(weights);
+    let out = out?;
+    settled?;
+    Ok(out)
 }
 
 /// Encoder rows for `valid_mel` mel rows, or `None` for a clip too short to
@@ -371,15 +450,20 @@ fn tokens_for(valid_mel: usize) -> Option<usize> {
 
 /// A stand-in with the tower's limits and no weights, for the limit tests.
 #[cfg(test)]
-pub(crate) fn limits_for_tests() -> impl Fn(MelSpec) -> Limits {
-    |mel| Limits { mel }
+pub(crate) fn limits_for_tests(max_seconds: f64) -> impl Fn(MelSpec) -> Limits {
+    move |mel| Limits { mel, max_seconds }
 }
+
+/// The real tower's limit, for the test that pins it.
+#[cfg(test)]
+pub(crate) const MAX_SECONDS_FOR_TESTS: f64 = MAX_SECONDS;
 
 /// The tower's limits and nothing else.
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct Limits {
     mel: MelSpec,
+    max_seconds: f64,
 }
 
 #[cfg(test)]
@@ -393,7 +477,7 @@ impl AudioTower for Limits {
     }
 
     fn max_seconds(&self) -> f64 {
-        MAX_SECONDS
+        self.max_seconds
     }
 
     fn out_hidden(&self) -> usize {

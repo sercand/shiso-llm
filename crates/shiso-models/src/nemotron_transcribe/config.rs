@@ -92,7 +92,8 @@ impl PeeConfig {
     ///
     /// [`AudioError::Checkpoint`] naming another architecture, an absent key,
     /// or a geometry this build does not run (a head that does not divide its
-    /// width, a rotation wider than a head, a stack other than 8).
+    /// width, a rotation wider than a head, a stack other than 8, or a zero
+    /// count where the plan, the frontend or the aligner divides by it).
     pub fn from_gguf(file: &GgufFile) -> Result<Self, AudioError> {
         let meta = file.metadata();
         if meta.architecture() != Some(GGUF_ARCH) {
@@ -110,6 +111,17 @@ impl PeeConfig {
         };
         let f = |key: &str| -> Result<f32, AudioError> {
             meta.get_f32(key).ok_or_else(|| missing(key))
+        };
+        // A count the window plan, the frontend or the aligner divides by or
+        // steps over: zero is refused here rather than found as a division
+        // by zero (or an empty window) halfway through a request.
+        let n = |key: &str| -> Result<usize, AudioError> {
+            match u(key)? {
+                0 => Err(AudioError::Checkpoint {
+                    what: format!("the speech encoder export sets {key} to 0"),
+                }),
+                v => Ok(v),
+            }
         };
         let b = |key: &str| -> Result<bool, AudioError> {
             meta.get_bool(key).ok_or_else(|| missing(key))
@@ -145,29 +157,39 @@ impl PeeConfig {
                 what: format!("a stack of {stack} mel frames; this build stacks 8"),
             });
         }
-        let sample_rate = u("pee.preprocessor.sample_rate")?;
+        let sample_rate = n("pee.preprocessor.sample_rate")?;
         let seconds = |key: &str| -> Result<usize, AudioError> {
             Ok((f(key)? * sample_rate as f32).round() as usize)
         };
+        let win_length = seconds("pee.preprocessor.window_size")?;
+        let hop_length = seconds("pee.preprocessor.window_stride")?;
+        if win_length == 0 || hop_length == 0 {
+            return Err(AudioError::Checkpoint {
+                what: format!(
+                    "the speech encoder export's analysis window ({win_length}) or hop \
+                     ({hop_length}) rounds to 0 samples"
+                ),
+            });
+        }
         Ok(Self {
             asr: block("pee.asr")?,
             diar: block("pee.diar")?,
             ctc: block("ctc")?,
-            mels: u("pee.preprocessor.features")?,
+            mels: n("pee.preprocessor.features")?,
             stack,
-            speakers: u("pee.diar.num_speakers")?,
+            speakers: n("pee.diar.num_speakers")?,
             head_hidden: u("pee.diar.tf_d_model")?,
             fusion_dim: u("pee.fusion.proj_dim")?,
             threshold: f("pee.fusion.speaker_activity_threshold")?,
-            ctc_vocab: u("ctc.vocab_size")?,
-            ctc_upsample: u("ctc.upsampling_factor")?,
+            ctc_vocab: n("ctc.vocab_size")?,
+            ctc_upsample: n("ctc.upsampling_factor")?,
             ctc_residual: f("ctc.residual_scale")?,
-            window_core: u("pee.online.inference_length")?,
-            window_context: u("pee.online.chunk_left_context")?,
+            window_core: n("pee.online.inference_length")?,
+            window_context: n("pee.online.chunk_left_context")?,
             sample_rate: u32::try_from(sample_rate).map_err(|_| missing("a sample rate"))?,
-            n_fft: u("pee.preprocessor.n_fft")?,
-            win_length: seconds("pee.preprocessor.window_size")?,
-            hop_length: seconds("pee.preprocessor.window_stride")?,
+            n_fft: n("pee.preprocessor.n_fft")?,
+            win_length,
+            hop_length,
         })
     }
 
@@ -192,4 +214,4 @@ impl PeeConfig {
 
 #[cfg(test)]
 #[path = "config_tests.rs"]
-mod tests;
+pub(crate) mod tests;

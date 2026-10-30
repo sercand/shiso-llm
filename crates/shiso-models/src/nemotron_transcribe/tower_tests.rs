@@ -1,8 +1,119 @@
-//! The tower's word timer end to end.
+//! The tower's word timer end to end, and on the host the two pieces of it
+//! that hold memory: the weights slot and the timing registry.
 //!
-//! The cases need a Metal device,
+//! The device cases need a Metal device,
 //! `SHISO_TEST_MODEL_NEMOTRON_TRANSCRIBE_ENCODER` and, for the word times,
 //! the captures' alignment dumps; each says on stderr why it skipped.
+
+use std::cell::Cell;
+use std::sync::{Arc, Mutex};
+
+use shiso_audio::AudioError;
+
+use super::{Timings, WeightUse, register, registered, with_weights};
+
+fn failing(_: &Vec<u8>) -> Result<(), AudioError> {
+    Err(AudioError::Empty)
+}
+
+#[test]
+fn a_failed_encode_lets_the_weights_go() {
+    let settled = Cell::new(0);
+    let mut held: Option<Vec<u8>> = None;
+    let err = with_weights(
+        &mut held,
+        &WeightUse {
+            keep: false,
+            load: || Ok(vec![1u8; 4]),
+            run: failing,
+            settle: || {
+                settled.set(settled.get() + 1);
+                Ok(())
+            },
+        },
+    )
+    .expect_err("the encode fails");
+    assert!(matches!(err, AudioError::Empty), "{err:?}");
+    assert!(held.is_none(), "a failed encode kept the weights");
+    assert_eq!(settled.get(), 1, "the device settles before they go");
+    // And a sound one lets them go too.
+    let out = with_weights(
+        &mut held,
+        &WeightUse {
+            keep: false,
+            load: || Ok(vec![2u8; 4]),
+            run: |w: &Vec<u8>| Ok(w.len()),
+            settle: || Ok(()),
+        },
+    )
+    .expect("encodes");
+    assert_eq!(out, 4);
+    assert!(held.is_none());
+}
+
+#[test]
+fn a_resident_slot_keeps_its_weights_through_a_failure() {
+    let mut held = Some(vec![7u8; 2]);
+    let loads = Cell::new(0);
+    let err = with_weights(
+        &mut held,
+        &WeightUse {
+            keep: true,
+            load: || {
+                loads.set(loads.get() + 1);
+                Ok(Vec::new())
+            },
+            run: failing,
+            settle: || Ok(()),
+        },
+    )
+    .expect_err("the encode fails");
+    assert!(matches!(err, AudioError::Empty), "{err:?}");
+    assert_eq!(held.as_deref(), Some(&[7u8, 7][..]));
+    assert_eq!(loads.get(), 0, "weights already held are not loaded again");
+}
+
+#[test]
+fn a_failed_load_leaves_the_slot_empty() {
+    let mut held: Option<Vec<u8>> = None;
+    let err = with_weights(
+        &mut held,
+        &WeightUse {
+            keep: true,
+            load: || Err(AudioError::Empty),
+            run: |_: &Vec<u8>| Ok(()),
+            settle: || Ok(()),
+        },
+    )
+    .expect_err("no weights");
+    assert!(matches!(err, AudioError::Empty), "{err:?}");
+    assert!(held.is_none());
+}
+
+#[test]
+fn a_dropped_ticket_takes_its_registration_out() {
+    let registry: Arc<Mutex<Timings>> = Arc::default();
+    let first = register(&registry, 1);
+    let second = register(&registry, 2);
+    let (a, b) = (first.key(), second.key());
+    assert_ne!(a, b);
+    assert!(registered(&registry, a) && registered(&registry, b));
+    drop(first);
+    assert!(
+        !registered(&registry, a),
+        "the dropped ticket's entry stays"
+    );
+    assert!(
+        registered(&registry, b),
+        "another clip's entry went with it"
+    );
+    drop(second);
+    assert!(!registered(&registry, b));
+    // A ticket that outlives its tower drops quietly.
+    let late = register(&registry, 3);
+    drop(registry);
+    drop(late);
+}
 
 #[cfg(target_os = "macos")]
 mod device {
@@ -105,6 +216,19 @@ mod device {
         };
         let want = reference_words(&dir);
         assert_eq!(got.len(), want.len(), "{rel}: word count");
+        // The tower's own promise, checked before the reorder below forgives
+        // anything: its words come out in start order.
+        if let Some(at) = got.windows(2).position(|w| w[1].start < w[0].start) {
+            panic!(
+                "{rel}: word {} {:?} at {} starts before word {} {:?} at {}",
+                at + 1,
+                got[at + 1].text,
+                got[at + 1].start,
+                at,
+                got[at].text,
+                got[at].start
+            );
+        }
         // Words are ordered by time, so a word whose time moved past its
         // neighbour's is out of place: bring each back to the reference's
         // position before comparing.
@@ -148,10 +272,11 @@ mod device {
             budget.seconds_off.is_none_or(|limit| worst <= limit),
             "{rel}: a word time is {worst} s off"
         );
+        let key = ticket.key();
+        assert!(tower.holds(key));
         drop(ticket);
-        let again = timer.words(&timer.want(&clip), &transcript, pcm.duration_secs());
         assert!(
-            matches!(again, Ok(WordTiming::Untimed { .. })),
+            !tower.holds(key),
             "a dropped ticket releases what the encode kept"
         );
     }
@@ -184,10 +309,12 @@ mod device {
             // bins against the reference (`meeting_10m_stages_match_reference`),
             // and activity decides which frames a word may sit on: measured on
             // the M4, 1788 of 1815 words exact, most of the rest one 10 ms
-            // diarization frame off, one word placed across an 11 s gap.
+            // diarization frame off, one word placed across an 11 s gap
+            // (10.959 s). The bound is that measurement, so a second word
+            // moving that far, or this one moving further, fails.
             Budget {
                 exact_permille: 980,
-                seconds_off: None,
+                seconds_off: Some(11.0),
             },
         );
     }

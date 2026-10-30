@@ -4,7 +4,10 @@ use std::path::Path;
 
 use shiso_core::CoreError;
 
-use super::{SPEECH_MODEL_KEY, speech_encoder_for};
+use shiso_modelfile::GgufFile;
+
+use super::{SPEECH_MODEL_KEY, check_pairing, speech_encoder_for};
+use crate::nemotron_h::NemotronHConfig;
 use crate::test_gguf::{Kv, write_gguf};
 
 fn decoder(dir: &Path, encoder: Option<&'static str>) -> std::path::PathBuf {
@@ -60,4 +63,28 @@ fn a_decoder_naming_no_encoder_pairs_with_none() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = decoder(dir.path(), None);
     assert_eq!(speech_encoder_for(&path, None).expect("reads"), None);
+}
+
+#[test]
+fn an_encoder_as_wide_as_the_decoder_pairs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decoder = dir.path().join("decoder.gguf");
+    crate::nemotron_h::config::gguf_tests::write(&decoder, &[], 1);
+    let config =
+        NemotronHConfig::from_gguf(&GgufFile::open(&decoder).expect("opens")).expect("reads");
+    let encoder = dir.path().join("encoder.gguf");
+    crate::nemotron_transcribe::config::tests::write(&encoder, "pee", 2688);
+    check_pairing(&encoder, &config).expect("2688 pairs with 2688");
+    crate::nemotron_transcribe::config::tests::write(&encoder, "pee", 4096);
+    let refused = check_pairing(&encoder, &config);
+    let Err(CoreError::InvalidValue { value, .. }) = refused else {
+        panic!("a 4096-wide encoder is refused, got {refused:?}");
+    };
+    assert!(value.contains("4096") && value.contains("2688"), "{value}");
+    // An encoder that is not one at all is refused the same way.
+    crate::nemotron_transcribe::config::tests::write(&encoder, "clip", 2688);
+    assert!(matches!(
+        check_pairing(&encoder, &config),
+        Err(CoreError::InvalidValue { .. })
+    ));
 }

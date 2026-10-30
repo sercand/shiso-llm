@@ -59,6 +59,58 @@ struct State {
     compressed: bool,
 }
 
+/// One window's output, for the state the next window reads.
+struct Advance<'a> {
+    /// `[cache + FIFO + window rows][speakers]`, 80 ms.
+    p80: &'a [f32],
+    /// The window's own embeddings, `[window rows][d]`.
+    emb: &'a [f32],
+    /// Window rows of left context before its core.
+    left_drop: usize,
+    /// The core rows that join the FIFO.
+    core: usize,
+    /// Embedding width.
+    d: usize,
+    /// Speakers.
+    speakers: usize,
+    /// The learned silence embedding a compressed cache closes groups with.
+    silence: &'a [f32],
+}
+
+impl State {
+    /// The reference's synchronous streaming update: the FIFO's activities
+    /// refreshed from this window, its core joining the FIFO, an overflowing
+    /// FIFO spilling into the cache, and a cache past `CACHE_LEN` compressed.
+    fn advance(&mut self, a: &Advance<'_>) {
+        let (d, n_spk) = (a.d, a.speakers);
+        let s_rows = self.cache.len() / d;
+        let f_rows = self.fifo.len() / d;
+        self.fifo_preds = a.p80[s_rows * n_spk..(s_rows + f_rows) * n_spk].to_vec();
+        self.fifo
+            .extend_from_slice(&a.emb[a.left_drop * d..(a.left_drop + a.core) * d]);
+        let first = s_rows + f_rows + a.left_drop;
+        self.fifo_preds
+            .extend_from_slice(&a.p80[first * n_spk..(first + a.core) * n_spk]);
+        if f_rows + a.core > FIFO_LEN {
+            let pop = (UPDATE_PERIOD.max((a.core + f_rows).saturating_sub(FIFO_LEN)))
+                .min(f_rows + a.core);
+            // Until the first compression the cache's activities are the
+            // ones this window scored; after it they are the kept ones.
+            if !self.compressed {
+                self.cache_preds = a.p80[..s_rows * n_spk].to_vec();
+            }
+            self.cache.extend(self.fifo.drain(..pop * d));
+            let moved: Vec<f32> = self.fifo_preds.drain(..pop * n_spk).collect();
+            self.cache_preds.extend(moved);
+            let n = self.cache.len() / d;
+            if n > CACHE_LEN {
+                compress(self, n, d, n_spk, a.silence);
+                self.compressed = true;
+            }
+        }
+    }
+}
+
 /// Indices of the `k` largest of `v`, ties to the lower index.
 fn topk(v: &[f32], k: usize) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..v.len()).collect();
@@ -69,6 +121,12 @@ fn topk(v: &[f32], k: usize) -> Vec<usize> {
 
 /// Keeps `CACHE_LEN` of the cache's `n` rows: the reference's compression,
 /// scored in its product domain so the same frames are kept.
+///
+/// The offline speaker family's `SpeakerCache::select` is the same selection
+/// in the log domain, which is that family's reference. The two agree in
+/// exact arithmetic but not in f32: this path's reference moved to products
+/// because log-domain scores kept different frames at near ties, so the two
+/// stay separate, each matching its own reference.
 fn compress(state: &mut State, n: usize, d: usize, speakers: usize, silence: &[f32]) {
     let per = CACHE_LEN / speakers - SIL_PER_SPEAKER;
     let strong = (per as f32 * STRONG_RATE).floor() as usize;
@@ -281,27 +339,19 @@ pub fn speaker_activity(
         if wi + 1 == plan.len() {
             break;
         }
-        state.fifo_preds = p80[s_rows * n_spk..(s_rows + f_rows) * n_spk].to_vec();
-        state.fifo.extend_from_slice(&emb[lc * d..(lc + core) * d]);
-        let first = s_rows + f_rows + lc;
-        state
-            .fifo_preds
-            .extend_from_slice(&p80[first * n_spk..(first + core) * n_spk]);
-        if f_rows + core > FIFO_LEN {
-            let pop =
-                (UPDATE_PERIOD.max((core + f_rows).saturating_sub(FIFO_LEN))).min(f_rows + core);
-            if !state.compressed {
-                state.cache_preds = p80[..s_rows * n_spk].to_vec();
-            }
-            state.cache.extend(state.fifo.drain(..pop * d));
-            let moved: Vec<f32> = state.fifo_preds.drain(..pop * n_spk).collect();
-            state.cache_preds.extend(moved);
-            let n = state.cache.len() / d;
-            if n > CACHE_LEN {
-                compress(&mut state, n, d, n_spk, &w.head.silence);
-                state.compressed = true;
-            }
-        }
+        state.advance(&Advance {
+            p80: &p80,
+            emb: &emb,
+            left_drop: lc,
+            core,
+            d,
+            speakers: n_spk,
+            silence: &w.head.silence,
+        });
     }
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "diar_tests.rs"]
+mod tests;

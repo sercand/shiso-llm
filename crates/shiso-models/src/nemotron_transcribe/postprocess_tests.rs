@@ -51,3 +51,23 @@ fn speaker_turns_keep_untagged_lead_text() {
     assert_eq!(speaker_turns("no tags"), vec![(None, "no tags".to_owned())]);
     assert!(speaker_turns("  ").is_empty());
 }
+
+#[test]
+fn a_tag_inside_a_word_leaves_the_word_whole() {
+    assert_eq!(strip_tags("don<ev:cough>'t", false), "don't");
+    assert_eq!(strip_tags("Hel<sty:whisper>lo there", false), "Hello there");
+    assert_eq!(strip_tags("a<ev:x><sty:y>b", true), "ab");
+    // Whitespace on one side of the tag is the word break, and it stays one.
+    assert_eq!(strip_tags("there.<ev:laugh> ok", false), "there. ok");
+    assert_eq!(strip_tags("there. <ev:laugh>ok", false), "there. ok");
+    // A kept speaker tag is a turn break, so it never glues words together.
+    assert_eq!(strip_tags("hi<spk:1>yo", true), "hi <spk:1> yo");
+    assert_eq!(strip_tags("hi<spk:1>yo", false), "hi yo");
+    assert_eq!(
+        speaker_turns("<spk:0> I don<ev:cough>'t <spk:1>Hel<sty:x>lo"),
+        vec![
+            (Some(0), "I don't".to_owned()),
+            (Some(1), "Hello".to_owned())
+        ]
+    );
+}

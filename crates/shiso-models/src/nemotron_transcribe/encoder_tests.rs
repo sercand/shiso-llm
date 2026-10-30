@@ -94,11 +94,15 @@ fn encoded(name: &str) -> Option<(PeeConfig, Encoded, Ops)> {
     Some((c, e, ops))
 }
 
-/// Worst per-row cosine and worst absolute difference of `got` and `want`,
-/// rows of `width`.
-fn agreement(got: &[f32], want: &[f32], width: usize) -> (f64, f32) {
+/// Worst per-row cosine, worst absolute difference and worst departure of
+/// the row norm ratio from one, of `got` and `want`, rows of `width`.
+///
+/// Cosine alone is blind to scale, so the norm ratio is graded beside it,
+/// and a zero row against a non-zero one is a cosine of zero, not a pass.
+fn agreement(got: &[f32], want: &[f32], width: usize) -> (f64, f32, f64) {
     let mut worst_cos = 1.0f64;
     let mut worst_abs = 0.0f32;
+    let mut worst_scale = 0.0f64;
     for (g, w) in got.chunks_exact(width).zip(want.chunks_exact(width)) {
         let (mut dot, mut ng, mut nw) = (0.0f64, 0.0f64, 0.0f64);
         for (a, b) in g.iter().zip(w) {
@@ -109,10 +113,21 @@ fn agreement(got: &[f32], want: &[f32], width: usize) -> (f64, f32) {
         }
         if ng > 0.0 && nw > 0.0 {
             worst_cos = worst_cos.min(dot / (ng.sqrt() * nw.sqrt()));
+            worst_scale = worst_scale.max((ng.sqrt() / nw.sqrt() - 1.0).abs());
+        } else if (ng > 0.0) != (nw > 0.0) {
+            worst_cos = 0.0;
+            worst_scale = f64::INFINITY;
         }
     }
-    (worst_cos, worst_abs)
+    (worst_cos, worst_abs, worst_scale)
 }
+
+/// A row agrees when it points the same way and has the same length.
+const ROW_COSINE: f64 = 0.9999;
+/// How far a row's norm may be from the reference's, as a ratio. Near-silent
+/// rows are short, so their ratio moves most: measured 2.5e-3 on
+/// `meeting_60s` at a cosine of 0.999998.
+const ROW_SCALE: f64 = 1e-2;
 
 #[expect(
     clippy::print_stderr,
@@ -129,7 +144,7 @@ fn stages_match(clip: &str) {
     let probs = floats(&dir.join("diar_probs.f32"));
     let fused = floats(&dir.join("fused.f32"));
     assert_eq!(e.frames * c.asr.d_model, speech.len(), "frame count");
-    let (sc, sa) = agreement(&e.speech, &speech, c.asr.d_model);
+    let (sc, sa, ss) = agreement(&e.speech, &speech, c.asr.d_model);
     let worst_p = e
         .activity
         .iter()
@@ -138,12 +153,15 @@ fn stages_match(clip: &str) {
         .fold(0.0f32, f32::max);
     let rows = crate::audio_ops::load::download_f32(&ops, e.rows.view(), e.frames * c.fusion_dim)
         .expect("rows read");
-    let (fc, fa) = agreement(&rows, &fused, c.fusion_dim);
+    let (fc, fa, fs) = agreement(&rows, &fused, c.fusion_dim);
     let low_rows = |got: &[f32], want: &[f32], width: usize| -> Vec<usize> {
         got.chunks_exact(width)
             .zip(want.chunks_exact(width))
             .enumerate()
-            .filter(|(_, (g, w))| agreement(g, w, width).0 < 0.9999)
+            .filter(|(_, (g, w))| {
+                let (cos, _, scale) = agreement(g, w, width);
+                cos < ROW_COSINE || scale > ROW_SCALE
+            })
             .map(|(i, _)| i)
             .collect()
     };
@@ -156,8 +174,9 @@ fn stages_match(clip: &str) {
         .filter(|(a, b)| (**a > c.threshold) != (**b > c.threshold))
         .count();
     eprintln!(
-        "{clip}: speech cos {sc:.6} |d| {sa:.4} ({} rows < 0.9999: {:?}); activity |d| {worst_p:.4}, \
-         {flips} of {} bins flip; fused cos {fc:.6} |d| {fa:.4} ({} rows < 0.9999: {:?})",
+        "{clip}: speech cos {sc:.6} |d| {sa:.4} scale {ss:.2e} ({} rows off: {:?}); activity \
+         |d| {worst_p:.4}, {flips} of {} bins flip; fused cos {fc:.6} |d| {fa:.4} scale {fs:.2e} \
+         ({} rows off: {:?})",
         speech_low.len(),
         &speech_low[..speech_low.len().min(12)],
         probs.len(),
@@ -170,13 +189,13 @@ fn stages_match(clip: &str) {
     let frames = e.frames;
     assert!(
         speech_low.len() * 1000 <= frames,
-        "{} of {frames} speech rows below 0.9999",
+        "{} of {frames} speech rows off",
         speech_low.len()
     );
     assert!(flips * 1000 <= probs.len(), "{flips} speaker bins flip");
     assert!(
         fused_low.len() * 200 <= frames,
-        "{} of {frames} fused rows below 0.9999",
+        "{} of {frames} fused rows off",
         fused_low.len()
     );
 }

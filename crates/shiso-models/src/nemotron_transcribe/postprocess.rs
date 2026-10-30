@@ -115,29 +115,32 @@ fn pieces(text: &str) -> Vec<(Option<Tag>, &str)> {
     out
 }
 
-/// Joins words with single spaces, so a removed tag leaves no gap.
+/// The kept pieces run together, whitespace normalized to single spaces.
+///
+/// A removed tag contributes nothing: the text on either side meets as it
+/// was written, so a tag inside a word (`don<ev:cough>'t`) leaves the word
+/// whole, and a tag between spaces leaves the space that was already there.
 fn join_words<'a>(parts: impl Iterator<Item = &'a str>) -> String {
     parts
-        .flat_map(str::split_whitespace)
+        .collect::<String>()
+        .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
 }
 
 /// `text` without its `<ev:*>` and `<sty:*>` tags, and without its
 /// `<spk:N>` tags unless `keep_speakers`; whitespace is normalized to single
-/// spaces.
+/// spaces. A kept speaker tag stands apart from the words around it, since it
+/// starts a turn.
 #[must_use]
 pub fn strip_tags(text: &str, keep_speakers: bool) -> String {
-    join_words(
-        pieces(text)
-            .into_iter()
-            .filter(|(tag, _)| match tag {
-                None => true,
-                Some(Tag::Speaker(_)) => keep_speakers,
-                Some(Tag::Other) => false,
-            })
-            .map(|(_, s)| s),
-    )
+    let parts = pieces(text);
+    join_words(parts.iter().flat_map(|(tag, s)| match tag {
+        None => [*s, "", ""],
+        Some(Tag::Speaker(_)) if keep_speakers => [" ", *s, " "],
+        Some(Tag::Speaker(_)) => [" ", "", ""],
+        Some(Tag::Other) => ["", "", ""],
+    }))
 }
 
 /// The transcript as speaker turns: the speaker each `<spk:N>` names and the

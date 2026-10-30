@@ -13,6 +13,9 @@ use shiso_core::CoreError;
 use shiso_modelfile::GgufFile;
 use shiso_vision::MediaPlacement;
 
+use crate::nemotron_h::NemotronHConfig;
+use crate::nemotron_transcribe::config::PeeConfig;
+
 /// The decoder metadata key naming the encoder export's file.
 pub const SPEECH_MODEL_KEY: &str = "nemo_speech.speech_model";
 
@@ -73,6 +76,30 @@ pub fn speech_encoder_for(
         });
     }
     Ok(Some(path))
+}
+
+/// Refuses an encoder export at `encoder` whose fused rows are not as wide as
+/// `decoder`'s residual stream.
+///
+/// Read from the encoder's metadata alone, before either export loads: the
+/// splice would otherwise find the mismatch only on the first audio request,
+/// after both had moved their weights to the device.
+///
+/// # Errors
+///
+/// [`CoreError::InvalidValue`] for an encoder that does not parse, whose
+/// metadata the reader refuses, or whose projection width differs from the
+/// decoder's.
+pub fn check_pairing(encoder: &Path, decoder: &NemotronHConfig) -> Result<(), CoreError> {
+    let refuse = |what: String| CoreError::InvalidValue {
+        key: "speech encoder",
+        value: format!("{}: {what}", encoder.display()),
+    };
+    let file = GgufFile::open(encoder).map_err(|err| refuse(err.to_string()))?;
+    let config = PeeConfig::from_gguf(&file).map_err(|err| refuse(err.to_string()))?;
+    config
+        .check_decoder(decoder.shape().hidden as usize)
+        .map_err(|err| refuse(err.to_string()))
 }
 
 #[cfg(test)]

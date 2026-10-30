@@ -7,7 +7,16 @@ use shiso_modelfile::GgufFile;
 use super::PeeConfig;
 use crate::test_gguf::{Kv, write_gguf};
 
-fn write(path: &Path, arch: &'static str, proj_dim: u32) {
+/// Keys whose value replaces the sound one, for the refusal cases.
+type Overrides<'a> = &'a [(&'static str, u32)];
+
+/// An encoder header of the published geometry, projecting to `proj_dim`;
+/// the pairing test writes one too.
+pub(crate) fn write(path: &Path, arch: &'static str, proj_dim: u32) {
+    write_with(path, arch, proj_dim, &[]);
+}
+
+fn write_with(path: &Path, arch: &'static str, proj_dim: u32, overrides: Overrides<'_>) {
     let block = |p: &'static str, d: u32, h: u32, l: u32, ff: u32, rot: u32, qk: bool| {
         let key = |s: &str| -> &'static str { Box::leak(format!("{p}.{s}").into_boxed_str()) };
         vec![
@@ -41,7 +50,21 @@ fn write(path: &Path, arch: &'static str, proj_dim: u32) {
         ("ctc.upsampling_factor", Kv::U32(2)),
         ("ctc.residual_scale", Kv::F32(0.1)),
     ]);
+    for (key, value) in overrides {
+        let slot = kvs
+            .iter_mut()
+            .find(|(k, _)| k == key)
+            .expect("an override names a written key");
+        slot.1 = Kv::U32(*value);
+    }
     write_gguf(path, &kvs, &[]);
+}
+
+fn read_with(overrides: Overrides<'_>) -> Result<PeeConfig, shiso_audio::AudioError> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("encoder.gguf");
+    write_with(&path, "pee", 2688, overrides);
+    PeeConfig::from_gguf(&GgufFile::open(&path).expect("opens"))
 }
 
 fn read(arch: &'static str, proj_dim: u32) -> Result<PeeConfig, shiso_audio::AudioError> {
@@ -94,4 +117,46 @@ fn fusion_dim_mismatch_is_refused() {
 fn foreign_arch_is_refused() {
     let err = read("clip", 2688).expect_err("not pee");
     assert!(err.to_string().contains("clip"), "{err}");
+}
+
+#[test]
+fn heads_that_do_not_divide_the_width_are_refused() {
+    for heads in [0, 3] {
+        let err = read_with(&[("pee.asr.n_heads", heads)]).expect_err("heads");
+        assert!(err.to_string().contains("heads do not divide"), "{err}");
+    }
+}
+
+#[test]
+fn a_rotation_wider_than_a_head_or_odd_is_refused() {
+    // The timestamp head's heads are 80 wide.
+    for rot in [96, 41, 0] {
+        let err = read_with(&[("ctc.rotary_dims", rot)]).expect_err("rotation");
+        assert!(err.to_string().contains("rotary dims"), "{rot}: {err}");
+    }
+}
+
+#[test]
+fn a_stack_other_than_eight_is_refused() {
+    let err = read_with(&[("pee.asr.subsampling_factor", 4)]).expect_err("stack 4");
+    assert!(err.to_string().contains("stacks 8"), "{err}");
+    let err = read_with(&[("pee.diar.subsampling_factor", 4)]).expect_err("branches differ");
+    assert!(err.to_string().contains("stacks 8"), "{err}");
+}
+
+#[test]
+fn a_zero_count_the_plan_divides_by_is_refused() {
+    for key in [
+        "pee.online.inference_length",
+        "pee.online.chunk_left_context",
+        "ctc.upsampling_factor",
+        "ctc.vocab_size",
+        "pee.diar.num_speakers",
+        "pee.preprocessor.features",
+        "pee.preprocessor.n_fft",
+        "pee.preprocessor.sample_rate",
+    ] {
+        let err = read_with(&[(key, 0)]).expect_err("zero");
+        assert!(err.to_string().contains(key), "{key}: {err}");
+    }
 }

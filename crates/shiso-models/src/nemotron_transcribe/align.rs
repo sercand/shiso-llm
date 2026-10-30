@@ -855,6 +855,35 @@ fn band_starts(greedy: &[usize], target: &[usize], states: i64, half: i64, width
     starts
 }
 
+/// The search's back-pointers, one per band cell: how many states the best
+/// path into the cell advanced (0 stay, 1 step, 2 skip), four to a byte.
+///
+/// The table is every searched frame by the band's width, and an hour of
+/// one speaker is some 90k frames by a band of a few thousand states, so a
+/// byte a cell would be hundreds of megabytes per stream.
+struct Moves {
+    packed: Vec<u8>,
+}
+
+impl Moves {
+    /// A table of `cells` moves, every one 0.
+    fn new(cells: usize) -> Self {
+        Self {
+            packed: vec![0; cells.div_ceil(4)],
+        }
+    }
+
+    /// Records `step` (at most 2) for `cell`, which holds 0 until then.
+    fn set(&mut self, cell: usize, step: u8) {
+        self.packed[cell / 4] |= step << (2 * (cell % 4));
+    }
+
+    /// The move recorded for `cell`.
+    fn get(&self, cell: usize) -> u8 {
+        (self.packed[cell / 4] >> (2 * (cell % 4))) & 0b11
+    }
+}
+
 /// The best CTC path's state at each searched frame, or `None` when no
 /// legal path fits the band.
 struct Path {
@@ -894,7 +923,7 @@ fn banded_search(
     let w = width as usize;
     let mut previous = vec![neg_inf; w];
     let mut padded = vec![neg_inf; w + 4];
-    let mut moves = vec![0u8; frames as usize * w];
+    let mut moves = Moves::new(frames as usize * w);
     for i in 0..w.min(2) {
         previous[i] = row(0)[labels[i]];
         if let Some(p) = prior
@@ -939,7 +968,7 @@ fn banded_search(
                 score += p;
             }
             previous[i] = score;
-            moves[t * w + i] = step;
+            moves.set(t * w + i, step);
         }
     }
     let last = starts[frames as usize - 1];
@@ -962,7 +991,7 @@ fn banded_search(
     for t in (0..frames as usize).rev() {
         out[t] = state as usize;
         if t > 0 {
-            state -= i64::from(moves[t * w + (state - starts[t]) as usize]);
+            state -= i64::from(moves.get(t * w + (state - starts[t]) as usize));
         }
     }
     Some(Path { states: out })
@@ -1201,6 +1230,27 @@ fn word_rows(
         .collect()
 }
 
+/// Refuses activity buffers that are not whole rows of every speaker, at
+/// least one: a ragged or short buffer would be resampled from row
+/// `rows - 1` of nothing.
+fn whole_rows(a: &Activity<'_>) -> Result<(), AlignError> {
+    if a.speakers == 0 {
+        return Ok(());
+    }
+    for (name, buf) in [("80 ms", a.rows80), ("10 ms", a.rows10)] {
+        if buf.is_empty() || !buf.len().is_multiple_of(a.speakers) {
+            return Err(AlignError::Inputs {
+                reason: format!(
+                    "{} {name} activity values are not whole rows of {} speakers",
+                    buf.len(),
+                    a.speakers
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The words of `desc.targets` timed against the head's log-probabilities,
 /// times rounded to the millisecond and ordered by start, then end. A
 /// speaker whose words have no legal path is left out, as the reference
@@ -1222,8 +1272,11 @@ pub fn align(desc: &AlignDesc<'_>, upsampling: usize) -> Result<Vec<Word>, Align
     }
     let step = desc.duration / frames as f64;
     let greedy = greedy_columns(desc.log_probs, c_n);
+    if let Some(a) = desc.activity {
+        whole_rows(&a)?;
+    }
     let (speaker, s_n) = match desc.activity {
-        Some(a) if a.speakers > 0 && !a.rows80.is_empty() => {
+        Some(a) if a.speakers > 0 => {
             let rows = a.rows80.len() / a.speakers;
             (
                 Some(resample_speakers(a.rows80, rows, a.speakers, frames)),
