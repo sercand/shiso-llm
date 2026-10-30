@@ -156,8 +156,17 @@ impl NemotronHModel {
         let layers = source.layers();
         let slot_bytes: u64 = source.layout().iter().sum();
         let banks = slot_bytes * u64::from(moe.experts) * u64::from(layers);
-        let slots = stream_slots(backend.as_ref(), &file, residency, banks, slot_bytes)
-            .map(|slots| slots.min(moe.experts * layers));
+        let slots = stream_slots(
+            backend.as_ref(),
+            &file,
+            residency,
+            &Banks {
+                bytes: banks,
+                slot_bytes,
+                experts: moe.experts,
+            },
+        )?
+        .map(|slots| slots.min(moe.experts * layers));
         let (placement, stream) = match slots {
             None => (ExpertPlacement::Resident, None),
             Some(slots) => {
@@ -251,52 +260,123 @@ pub enum GgufResidency {
     },
 }
 
-/// Slots the routed banks stream into, or `None` when they stay resident.
+/// The routed banks a pool is sized for.
+#[derive(Debug, Clone, Copy)]
+struct Banks {
+    /// Bytes every bank of every routed layer occupies together.
+    bytes: u64,
+    /// Bytes one slot holds: one expert's up and down projections.
+    slot_bytes: u64,
+    /// Experts per routed layer: a step can route to any of one layer's,
+    /// so a pool smaller than that cannot run a step.
+    experts: u32,
+}
+
+/// Slots the routed banks stream into.
 ///
 /// `Auto` keeps them resident when every weight fits in the device's working
 /// set with `reserve` to spare, and otherwise sizes the pool to what is left;
 /// `Fit` sizes the pool that way without the resident case.
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] when a pool sized to the device holds fewer
+/// slots than one layer has experts; the figures are logged beside it.
+// None: the banks stay resident and no pool is opened.
 fn stream_slots(
     backend: &dyn Backend,
     file: &GgufFile,
     residency: GgufResidency,
-    banks: u64,
-    slot_bytes: u64,
-) -> Option<u32> {
-    match residency {
-        GgufResidency::Resident => None,
-        GgufResidency::Streamed { slots } => Some(slots),
-        GgufResidency::Fit { reserve } | GgufResidency::Auto { reserve } => {
-            let total = backend.memory_info().map_or(u64::MAX, |info| info.total);
-            let rest = file
-                .tensors()
-                .iter()
-                .map(|t| t.bytes)
-                .sum::<u64>()
-                .saturating_sub(banks);
-            let fixed = rest.saturating_add(reserve);
-            if matches!(residency, GgufResidency::Auto { .. })
-                && fixed.saturating_add(banks) <= total
-            {
-                return None;
-            }
-            // Never more slots than the banks hold experts: a pool that large
-            // is the banks themselves, and a device that reports no working
-            // set would otherwise ask for every slot a u32 counts.
-            let fit =
-                (total.saturating_sub(fixed) / slot_bytes.max(1)).min(banks / slot_bytes.max(1));
-            let fit = u32::try_from(fit).unwrap_or(u32::MAX);
-            tracing::info!(
-                total_gib = total >> 30,
-                other_weights_gib = rest >> 30,
-                reserve_gib = reserve >> 30,
-                banks_gib = banks >> 30,
-                slots = fit,
-                "the routed banks do not fit; streaming them from disk"
-            );
-            Some(fit)
-        }
+    banks: &Banks,
+) -> CoreResult<Option<u32>> {
+    let (reserve, auto) = match residency {
+        GgufResidency::Resident => return Ok(None),
+        GgufResidency::Streamed { slots } => return Ok(Some(slots)),
+        GgufResidency::Fit { reserve } => (reserve, false),
+        GgufResidency::Auto { reserve } => (reserve, true),
+    };
+    let total = backend.memory_info().map_or(u64::MAX, |info| info.total);
+    let other = file
+        .tensors()
+        .iter()
+        .map(|t| t.bytes)
+        .sum::<u64>()
+        .saturating_sub(banks.bytes);
+    fit_slots(&Fit {
+        total,
+        other,
+        reserve,
+        auto,
+        banks: *banks,
+    })
+}
+
+/// What a device-sized pool is sized from.
+#[derive(Debug, Clone, Copy)]
+struct Fit {
+    /// The device's working set, in bytes.
+    total: u64,
+    /// Bytes of every weight but the routed banks.
+    other: u64,
+    /// Bytes left free beside the weights.
+    reserve: u64,
+    /// Whether the banks stay resident when everything fits.
+    auto: bool,
+    /// The banks.
+    banks: Banks,
+}
+
+/// The arithmetic of [`stream_slots`] for `Fit` and `Auto`, apart from the
+/// device so it can be checked on its own.
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] when fewer slots fit than one layer has
+/// experts: the stream could open, but no step could run through it.
+// None: everything fits and the banks stay resident.
+fn fit_slots(fit: &Fit) -> CoreResult<Option<u32>> {
+    let Fit {
+        total,
+        other,
+        reserve,
+        auto,
+        banks,
+    } = *fit;
+    let fixed = other.saturating_add(reserve);
+    if auto && fixed.saturating_add(banks.bytes) <= total {
+        return Ok(None);
     }
+    // Never more slots than the banks hold experts: a pool that large is the
+    // banks themselves, and a device that reports no working set would
+    // otherwise ask for every slot a u32 counts.
+    let per = banks.slot_bytes.max(1);
+    let slots = (total.saturating_sub(fixed) / per).min(banks.bytes / per);
+    let slots = u32::try_from(slots).unwrap_or(u32::MAX);
+    if slots < banks.experts {
+        tracing::error!(
+            total_gib = total >> 30,
+            other_weights_gib = other >> 30,
+            reserve_gib = reserve >> 30,
+            slot_mib = banks.slot_bytes >> 20,
+            slots,
+            experts = banks.experts,
+            "the device cannot hold one routed layer's experts beside the other weights"
+        );
+        return Err(CoreError::Unsupported {
+            what: "streaming routed experts on a device that cannot hold one layer's \
+                   experts beside the other weights",
+            backend: "nemotron_h",
+        });
+    }
+    tracing::info!(
+        total_gib = total >> 30,
+        other_weights_gib = other >> 30,
+        reserve_gib = reserve >> 30,
+        banks_gib = banks.bytes >> 30,
+        slots,
+        "the routed banks do not fit; streaming them from disk"
+    );
+    Ok(Some(slots))
 }
 
 /// The checkpoint and the device, for the imports below.
@@ -622,3 +702,7 @@ impl Model for NemotronHModel {
         Some(self)
     }
 }
+
+#[cfg(test)]
+#[path = "model_tests.rs"]
+mod tests;

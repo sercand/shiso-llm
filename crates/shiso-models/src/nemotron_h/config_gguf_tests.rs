@@ -34,8 +34,9 @@ fn tensor(name: &str) -> Tensor {
 }
 
 /// A header with the checkpoint's metadata; `extra` tensors beside the
-/// prediction block's projection, and `shared` shared experts.
-fn write(path: &Path, extra: &[&str], shared: u32) {
+/// prediction block's projection, and `shared` shared experts. The speech
+/// pairing test reads its 2688-wide residual stream too.
+pub(crate) fn write(path: &Path, extra: &[&str], shared: u32) {
     let mut kv_heads: Vec<i32> = PATTERN
         .chars()
         .map(|c| if c == 'A' { 2 } else { 0 })

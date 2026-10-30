@@ -619,7 +619,7 @@ fn refuse_switches(doc: &Document) -> CoreResult<()> {
 
 #[cfg(test)]
 #[path = "config_gguf_tests.rs"]
-mod gguf_tests;
+pub(crate) mod gguf_tests;
 
 #[cfg(test)]
 mod tests {

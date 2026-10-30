@@ -174,25 +174,32 @@ pub(crate) fn weights_gguf(
 ) -> CoreResult<Weights> {
     let loader = Loader { file, backend };
     let shape = config.shape();
+    let hidden = shape.hidden;
+    let experts = shape.moe.map_or(0, |moe| moe.experts);
     // Every routed layer's router on the host, for the layer before it to
-    // guess with, when the banks are streamed and guessing is on.
+    // guess with, when the banks are streamed and guessing is on. Sized
+    // here: the guess indexes the bias by router row on the scheduler
+    // thread, so a router and bias that disagree are refused at load, not
+    // found out mid-decode.
     let routers: Vec<HostRouter> = match placement {
         ExpertPlacement::Streamed { prefetch: true, .. } => routed_blocks(config)
             .iter()
             .map(|block| {
                 Ok((
                     loader
-                        .floats(&format!("blk.{block}.ffn_gate_inp.weight"))?
+                        .floats(
+                            &format!("blk.{block}.ffn_gate_inp.weight"),
+                            u64::from(experts) * u64::from(hidden),
+                        )?
                         .into(),
                     loader
-                        .floats(&format!("blk.{block}.exp_probs_b.bias"))?
+                        .floats(&format!("blk.{block}.exp_probs_b.bias"), u64::from(experts))?
                         .into(),
                 ))
             })
             .collect::<CoreResult<_>>()?,
         _ => Vec::new(),
     };
-    let hidden = shape.hidden;
     let mut layers = Vec::with_capacity(config.slots().len());
     let (mut ssm_rank, mut attn_rank, mut routed_rank) = (0u32, 0u32, 0u32);
     for (index, slot) in config.slots().iter().enumerate() {
@@ -228,14 +235,14 @@ pub(crate) fn weights_gguf(
                     });
                 routed_rank += 1;
                 (
-                    Some(loader.vector(&format!("{at}.attn_norm.weight"))?),
+                    Some(loader.vector(&format!("{at}.attn_norm.weight"), hidden)?),
                     Some(shared),
                     Some(Routed::Biased(routed)),
                 )
             }
         };
         layers.push(LayerWeights {
-            input_norm: loader.vector(&format!("{base}.attn_norm.weight"))?,
+            input_norm: loader.vector(&format!("{base}.attn_norm.weight"), hidden)?,
             post_attn_norm: None,
             ffn_norm,
             post_ffn_norm: None,
@@ -250,7 +257,7 @@ pub(crate) fn weights_gguf(
     }
     Ok(Weights {
         token_embd: loader.matrix("token_embd.weight", hidden, shape.vocab)?,
-        output_norm: loader.vector("output_norm.weight")?,
+        output_norm: loader.vector("output_norm.weight", hidden)?,
         lm_head: Some(loader.matrix("output.weight", hidden, shape.vocab)?),
         ple_model_proj: None,
         ple_proj_norm: None,
@@ -290,13 +297,16 @@ pub(crate) fn draft_parts(
     })?;
     Ok(DraftParts {
         fc: loader.matrix(&at("nextn.eh_proj.weight"), 2 * hidden, hidden)?,
-        norm_embed: loader.vector(&at("nextn.enorm.weight"))?,
-        norm_hidden: loader.vector(&at("nextn.hnorm.weight"))?,
-        input_norm: loader.vector(&at("attn_norm.weight"))?,
-        ffn_norm: loader.vector(&at("post_attention_norm.weight"))?,
-        output_norm: loader.vector(&at("nextn.shared_head_norm.weight"))?,
+        norm_embed: loader.vector(&at("nextn.enorm.weight"), hidden)?,
+        norm_hidden: loader.vector(&at("nextn.hnorm.weight"), hidden)?,
+        input_norm: loader.vector(&at("attn_norm.weight"), hidden)?,
+        // The head block holds its attention and its routed feed-forward
+        // together, so it carries a second norm for the feed-forward's input;
+        // a decoder block holds one mixer and only its `attn_norm`.
+        ffn_norm: loader.vector(&at("post_attention_norm.weight"), hidden)?,
+        output_norm: loader.vector(&at("nextn.shared_head_norm.weight"), hidden)?,
         head_norm: HeadNorm::Layer,
-        hidden_prenorm: Some(loader.vector("output_norm.weight")?),
+        hidden_prenorm: Some(loader.vector("output_norm.weight", hidden)?),
         attn: loader.attn(&format!("blk.{block}"), config)?,
         ffn,
         moe: Some((Routed::Biased(moe), shape)),
@@ -343,15 +353,17 @@ impl Loader<'_> {
         .map(Weight::row_exact)
     }
 
-    /// An `f32` tensor's values.
-    fn floats(&self, name: &str) -> CoreResult<Vec<f32>> {
+    /// An `f32` (or `bf16`) tensor's values, which must number `count`: the
+    /// container's dimensions can carry unit axes the engine does not, so
+    /// the element count is what is checked, as the MLX half checks shape.
+    fn floats(&self, name: &str, count: u64) -> CoreResult<Vec<f32>> {
         let view = self
             .file
             .get(name)
             .ok_or_else(|| CoreError::ConfigMissing {
                 key: name.to_owned(),
             })?;
-        match view.dtype {
+        let values = match view.dtype {
             DType::F32 => {
                 view.as_f32()
                     .map(<[f32]>::to_vec)
@@ -369,12 +381,23 @@ impl Loader<'_> {
                 key: "gguf vector",
                 value: format!("{name} is {other:?}, not f32 or bf16"),
             }),
+        }?;
+        if values.len() as u64 != count {
+            return Err(CoreError::ShapeMismatch {
+                field: "gguf vector elements",
+                expected: count,
+                got: values.len() as u64,
+            });
         }
+        Ok(values)
     }
 
-    /// An `f32` tensor uploaded as it is.
-    fn vector(&self, name: &str) -> CoreResult<DeviceBuffer> {
-        upload(self.backend, f32_bytes(&self.floats(name)?))
+    /// An `f32` tensor of `count` values, uploaded as it is.
+    fn vector(&self, name: &str, count: u32) -> CoreResult<DeviceBuffer> {
+        upload(
+            self.backend,
+            f32_bytes(&self.floats(name, u64::from(count))?),
+        )
     }
 
     /// One state-space block.
@@ -386,21 +409,23 @@ impl Loader<'_> {
             got: 0,
         })?;
         let at = |role: &str| format!("{base}.{role}");
+        let channels = s.conv_channels();
         // The container stores the decay itself, `-exp(A_log)`; the scan reads
         // its log and negates the exponential, so it is converted back once.
         let a_log: Vec<f32> = self
-            .floats(&at("ssm_a"))?
+            .floats(&at("ssm_a"), u64::from(s.heads))?
             .into_iter()
             .map(|a| (-a).ln())
             .collect();
         Ok(Ssm {
             in_proj: self.matrix(&at("ssm_in.weight"), shape.hidden, s.in_width())?,
-            conv_weight: self.vector(&at("ssm_conv1d.weight"))?,
-            conv_bias: self.vector(&at("ssm_conv1d.bias"))?,
-            dt_bias: self.vector(&at("ssm_dt.bias"))?,
+            // `[channels, taps]`, the layout the MLX half reads.
+            conv_weight: self.vector(&at("ssm_conv1d.weight"), channels * s.conv_kernel)?,
+            conv_bias: self.vector(&at("ssm_conv1d.bias"), channels)?,
+            dt_bias: self.vector(&at("ssm_dt.bias"), s.heads)?,
             a_log: upload(self.backend, f32_bytes(&a_log))?,
-            d: self.vector(&at("ssm_d"))?,
-            norm: self.vector(&at("ssm_norm.weight"))?,
+            d: self.vector(&at("ssm_d"), s.heads)?,
+            norm: self.vector(&at("ssm_norm.weight"), s.inner())?,
             out_proj: self.matrix(&at("ssm_out.weight"), s.inner(), shape.hidden)?,
         })
     }
@@ -448,7 +473,10 @@ impl Loader<'_> {
             up: self.matrix(&at("ffn_up_shexp.weight"), hidden, shape.intermediate)?,
             down: self.matrix(&at("ffn_down_shexp.weight"), shape.intermediate, hidden)?,
         };
-        let router_values = self.floats(&at("ffn_gate_inp.weight"))?;
+        let router_values = self.floats(
+            &at("ffn_gate_inp.weight"),
+            u64::from(moe.experts) * u64::from(hidden),
+        )?;
         let router = Weight::from_buffer(
             DType::F32,
             hidden,
@@ -483,7 +511,7 @@ impl Loader<'_> {
             shared,
             BiasedMoe {
                 router,
-                bias: self.vector(&at("exp_probs_b.bias"))?,
+                bias: self.vector(&at("exp_probs_b.bias"), moe.experts)?,
                 scale: config.routed_scale(),
                 renormalize: config.renormalize(),
                 up: stack("ffn_up_exps.weight", 0, hidden, moe.intermediate)?,
