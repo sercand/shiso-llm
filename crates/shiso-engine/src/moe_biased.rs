@@ -261,9 +261,9 @@ const _: () = assert!(size_of::<ExpertArgs>() == 32);
 /// # Errors
 ///
 /// [`CoreError::ShapeMismatch`] when the router, the stacks and the shape
-/// disagree about a width, whatever [`projection::projection`] reports for the
-/// router or the shared expert, and [`CoreError::Backend`] naming the entry
-/// when a launch fails.
+/// disagree about a width, whatever [`check_streams`] refuses, whatever
+/// [`projection::projection`] reports for the router or the shared expert, and
+/// [`CoreError::Backend`] naming the entry when a launch fails.
 pub fn run(
     backend: &dyn Backend,
     moe: &BiasedMoe,
@@ -289,6 +289,7 @@ pub fn run(
             });
         }
     }
+    check_streams(&moe.up, &moe.down)?;
     let columns = u32::try_from(shape.slot_rows(n_tok)).unwrap_or(u32::MAX);
     // The shared expert first, into its own rows: it reads the same normalized
     // rows the router does, and its scratch is free again before the routed
@@ -498,6 +499,40 @@ fn fetch_streamed<'a>(
         );
     }
     Ok(Some((stream, plan)))
+}
+
+/// Refuses a layer whose two banks are both streamed but not through the same
+/// stream layer.
+///
+/// One fetch plans for both banks, through whichever is streamed first; a
+/// bank read through another stream, or another layer of the same one, would
+/// have its experts neither planned nor read, and its stage would multiply by
+/// whatever its map entries last named.
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] for streamed banks on different streams, and
+/// [`CoreError::ShapeMismatch`] for banks on different layers of one stream.
+pub fn check_streams(up: &ExpertStack, down: &ExpertStack) -> CoreResult<()> {
+    let (Some((up_stream, up_layer)), Some((down_stream, down_layer))) =
+        (streamed(up), streamed(down))
+    else {
+        return Ok(());
+    };
+    if !up_stream.is(down_stream) {
+        return Err(CoreError::Unsupported {
+            what: "routed up and down banks streamed through different streams",
+            backend: "engine",
+        });
+    }
+    if up_layer != down_layer {
+        return Err(CoreError::ShapeMismatch {
+            field: "streamed down bank layer",
+            expected: u64::from(up_layer),
+            got: u64::from(down_layer),
+        });
+    }
+    Ok(())
 }
 
 /// The stream and stream layer a stack reads through, when it is streamed.

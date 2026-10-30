@@ -28,8 +28,9 @@
 //! would be the same for any of them.
 
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -178,8 +179,14 @@ struct State {
     stats: StreamStats,
 }
 
+/// Hands each opened stream a key of its own.
+static NEXT_KEY: AtomicU64 = AtomicU64::new(0);
+
 /// A pool of expert slots and the per-layer maps into it.
 pub struct ExpertStream {
+    /// This stream's own, never reused, so two banks can be checked to read
+    /// through the same pool without comparing addresses.
+    key: u64,
     /// One pool per array, each `slots` experts long; shared with the
     /// read-ahead workers, which write slots of it.
     pools: Arc<Vec<DeviceBuffer>>,
@@ -296,6 +303,7 @@ impl ExpertStream {
             "opened the routed expert stream"
         );
         Ok(Self {
+            key: NEXT_KEY.fetch_add(1, Ordering::Relaxed),
             pools: Arc::new(pools),
             backend: Arc::clone(backend),
             map,
@@ -320,6 +328,12 @@ impl ExpertStream {
             orphans: Mutex::new(Vec::new()),
             jobs: Mutex::new(None),
         })
+    }
+
+    /// Whether `other` is this very stream, not merely one of the same shape.
+    #[must_use]
+    pub fn is(&self, other: &Self) -> bool {
+        self.key == other.key
     }
 
     /// Bytes one slot occupies across the arrays.
@@ -476,6 +490,11 @@ impl ExpertStream {
     /// then the least recently used, none that the fetch at `clock` wants and
     /// none a read-ahead is writing.
     fn victims(&self, state: &State, n: usize, clock: u64) -> Vec<u32> {
+        // An all-hit layer - every decode step's common case - asks for none,
+        // and must not pay for a sort that walks the whole pool.
+        if n == 0 {
+            return Vec::new();
+        }
         let mut order: Vec<u32> = (0..self.slots)
             .filter(|&slot| {
                 !state.reserved[slot as usize] && state.last_use[slot as usize] != clock
@@ -566,7 +585,12 @@ impl ExpertStream {
                     let Ok((layer, expert, slot, landing)) = job else {
                         return;
                     };
-                    let result = (|| -> CoreResult<()> {
+                    // A source that panics must still settle the landing: the
+                    // fetch that takes this read waits on it with no timeout,
+                    // on the scheduler thread. The panic becomes the error a
+                    // reader thread's panic becomes in `fill`, and the worker
+                    // lives on for the next job.
+                    let read = AssertUnwindSafe(|| -> CoreResult<()> {
                         let views = pools
                             .iter()
                             .zip(&layout)
@@ -578,7 +602,14 @@ impl ExpertStream {
                             }
                             Ok(())
                         })
-                    })();
+                    });
+                    let result = catch_unwind(read).unwrap_or_else(|_| {
+                        Err(CoreError::Backend {
+                            backend: "engine",
+                            op: "reading a routed expert ahead of its fetch",
+                            source: "the read-ahead worker panicked".into(),
+                        })
+                    });
                     *landing.result.lock() = Some(result);
                     landing.ready.notify_all();
                 }
@@ -663,15 +694,16 @@ impl ExpertStream {
     /// frees its slot: the last resort of a fetch the pool cannot otherwise
     /// serve.
     fn settle_read_aheads(&self) {
-        let pending: Vec<Reading> = self.inflight.lock().drain().map(|(_, r)| r).collect();
-        let mut orphans = self.orphans.lock();
-        orphans.extend(pending);
-        for reading in orphans.iter() {
+        let mut pending: Vec<Reading> = self.inflight.lock().drain().map(|(_, r)| r).collect();
+        // Waited on with no lock held, so a prefetch or an orphan release
+        // never queues behind a read that is still going.
+        pending.append(&mut self.orphans.lock());
+        for reading in &pending {
             // A failed read-ahead frees its slot as surely as a landed one.
             let _ = reading.landing.wait();
         }
         let mut state = self.state.lock();
-        for reading in orphans.drain(..) {
+        for reading in pending {
             state.reserved[reading.slot as usize] = false;
         }
     }
@@ -684,14 +716,11 @@ impl ExpertStream {
         missing: &[u32],
         victims: &[u32],
     ) -> CoreResult<()> {
-        let mut state = self.state.lock();
-        let base = layer as usize * self.experts as usize;
-        for (&expert, &slot) in missing.iter().zip(victims) {
-            state.host_map[base + expert as usize] = EMPTY;
-            state.owner[slot as usize] = None;
-            state.last_use[slot as usize] = 0;
-        }
-        drop(state);
+        self.unmap_host(
+            &mut self.state.lock(),
+            layer,
+            missing.iter().copied().zip(victims.iter().copied()),
+        );
         for &expert in missing {
             backend.copy_h2d(
                 self.map.slice(
@@ -702,6 +731,41 @@ impl ExpertStream {
             )?;
         }
         Ok(())
+    }
+
+    /// Unmaps each `(expert, slot)` of `layer` on the host map alone and
+    /// leaves the slot empty and least recent.
+    fn unmap_host(&self, state: &mut State, layer: u32, pairs: impl Iterator<Item = (u32, u32)>) {
+        let base = layer as usize * self.experts as usize;
+        for (expert, slot) in pairs {
+            state.host_map[base + expert as usize] = EMPTY;
+            state.owner[slot as usize] = None;
+            state.last_use[slot as usize] = 0;
+        }
+    }
+
+    /// [`ExpertStream::write_landed`], or - when the device refuses it - the
+    /// host map put back to match a device map that never named `landed` or
+    /// the `missing` experts given `victims`: a later fetch would otherwise
+    /// count a hit on an entry the device does not have, over a slot that
+    /// still holds its previous owner's bytes.
+    fn publish_landed(
+        &self,
+        backend: &dyn Backend,
+        layer: u32,
+        landed: &[(u32, u32)],
+        missing: &[u32],
+        victims: &[u32],
+    ) -> CoreResult<()> {
+        let written = self.write_landed(backend, layer, landed);
+        if written.is_err() {
+            let pairs = landed
+                .iter()
+                .copied()
+                .chain(missing.iter().copied().zip(victims.iter().copied()));
+            self.unmap_host(&mut self.state.lock(), layer, pairs);
+        }
+        written
     }
 
     /// Fills a pool that holds every expert of every layer, once: expert `e`
@@ -842,7 +906,11 @@ impl ExpertStream {
         }
         let mut state = self.state.lock();
         for &slot in &failed {
+            // Unstamped as well: the stamp above kept the slot from this
+            // fetch's victims while its read was out, and the expert it was
+            // for is about to be read again, into this slot if it is free.
             state.reserved[slot as usize] = false;
+            state.last_use[slot as usize] = 0;
         }
         for &(expert, slot) in &landed {
             state.reserved[slot as usize] = false;
@@ -865,7 +933,7 @@ impl ExpertStream {
             // The landed experts are on the host map already; the device map
             // has to agree before the refusal, or a later fetch counts a hit
             // on an entry no stage can read.
-            self.write_landed(backend, layer, &landed)?;
+            self.publish_landed(backend, layer, &landed, &[], &[])?;
             return Err(CoreError::ShapeMismatch {
                 field: "expert stream slots free for one layer",
                 expected: plan.missing.len() as u64,
@@ -882,8 +950,8 @@ impl ExpertStream {
             state.host_map[base + expert as usize] = slot;
         }
         drop(state);
+        self.publish_landed(backend, layer, &landed, &plan.missing, &victims)?;
         plan.victims = victims;
-        self.write_landed(backend, layer, &landed)?;
         Ok(plan)
     }
 
