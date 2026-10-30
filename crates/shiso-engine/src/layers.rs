@@ -240,6 +240,10 @@ pub(crate) fn rms_norm_mul(
 
 /// `dst = layer_norm(x) * weight` over `n_tok` rows of `hidden`, the variance
 /// biased and no offset: a draft head whose output norm centres its rows.
+///
+/// Its entry, `kernel_dense_layer_norm_mul_f32`, is in the Metal library
+/// only: on a backend without it the launch fails, so a head built with
+/// [`crate::draft::HeadNorm::Layer`] runs on Metal alone.
 pub(crate) fn layer_norm_mul(
     backend: &dyn Backend,
     x: DeviceView<'_>,

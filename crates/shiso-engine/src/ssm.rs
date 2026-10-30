@@ -220,6 +220,7 @@ struct Span<'a> {
 /// # Errors
 ///
 /// [`CoreError::OutOfBounds`] for a recording pass wider than its trail;
+/// [`CoreError::Unsupported`] for a trail over a batch of several sessions;
 /// [`CoreError::ShapeMismatch`] when a batch's
 /// state list is not as long as the pass; whatever [`projection::projection`]
 /// reports for either projection; and [`CoreError::Backend`] naming the entry
@@ -232,28 +233,40 @@ pub fn run(
     io: GdnIo<'_>,
     n_tok: u32,
 ) -> CoreResult<()> {
+    // Both refusals come before the first launch, so a refused pass leaves
+    // the scratch and the state as it found them.
+    match (io.states, io.trail) {
+        (GdnStates::PerRow(_), Some(_)) => {
+            // A trail records "the state after row i" so a rejection can wind
+            // one session back to it. A batch's rows belong to different
+            // sessions, so there is no such sequence, and running the batch
+            // without writing the trail would leave a rollback restoring
+            // whatever the allocator last left in it.
+            return Err(CoreError::Unsupported {
+                what: "a state-space trail over a batch of several sessions, whose rows \
+                       are not one sequence for a rollback to wind back along",
+                backend: "engine",
+            });
+        }
+        // One record per drafted row: the pass's last row is either rejected
+        // or the state the session keeps, so it is never one a rollback
+        // names, and a trail is `n_tok - 1` records deep.
+        (GdnStates::Chunk(_), Some(trail)) if n_tok > trail.rows.saturating_add(1) => {
+            return Err(CoreError::OutOfBounds {
+                offset: u64::from(n_tok),
+                len: 1,
+                buffer_bytes: u64::from(trail.rows),
+            });
+        }
+        _ => {}
+    }
     projection::projection(backend, &ssm.in_proj, n_tok, io.input, scratch.proj.view())?;
-    match io.states {
+    match (io.states, io.trail) {
         // A verify pass: the two sequential stages a row at a time, the state
         // copied out after each, as `StateTrail` describes. Both kernels carry
         // their state across rows in registers and write it back at the end,
         // so splitting the loop is the same arithmetic.
-        GdnStates::Chunk(state) if io.trail.is_some() => {
-            let trail = io.trail.ok_or(CoreError::ShapeMismatch {
-                field: "state-space trail",
-                expected: 1,
-                got: 0,
-            })?;
-            // One record per drafted row: the pass's last row is either
-            // rejected or the state the session keeps, so it is never one a
-            // rollback names, and a trail is `n_tok - 1` records deep.
-            if n_tok > trail.rows.saturating_add(1) {
-                return Err(CoreError::OutOfBounds {
-                    offset: u64::from(n_tok),
-                    len: 1,
-                    buffer_bytes: u64::from(trail.rows),
-                });
-            }
+        (GdnStates::Chunk(state), Some(trail)) => {
             let (conv_bytes, state_bytes) = (state.conv.len(), state.state.len());
             for row in 0..n_tok {
                 sequential(
@@ -282,7 +295,7 @@ pub fn run(
                 )?;
             }
         }
-        GdnStates::Chunk(state) => sequential(
+        (GdnStates::Chunk(state), None) => sequential(
             backend,
             ssm,
             geometry,
@@ -293,7 +306,7 @@ pub fn run(
                 state,
             },
         )?,
-        GdnStates::PerRow(states) => {
+        (GdnStates::PerRow(states), _) => {
             if states.len() != n_tok as usize {
                 return Err(CoreError::ShapeMismatch {
                     field: "state-space batch states",
