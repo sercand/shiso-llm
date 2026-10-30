@@ -442,7 +442,8 @@ pub struct ServeOptions {
     /// Where a sparse checkpoint's routed expert banks live: imported beside
     /// the other weights, or streamed from disk into a pool of expert slots.
     ///
-    /// Read only by the sparse family's MLX directory. `auto` imports them
+    /// Read by the sparse family's MLX directory and the hybrid family's GGUF
+    /// file. `auto` imports them
     /// when every weight fits in the device's working set with
     /// `--expert-reserve-gb` to spare, and streams them otherwise; the other
     /// two insist, and `resident` on a device that cannot hold them fails at
@@ -466,6 +467,10 @@ pub struct ServeOptions {
     /// Expert slots when the banks are streamed; zero sizes the pool from the
     /// working set.
     ///
+    /// A nonzero count under `--expert-residency auto` streams the banks into
+    /// that pool even when they would fit. `resident` ignores the count,
+    /// because a recipe may set one that the operator's `resident` overrides.
+    ///
     /// One slot holds one expert of one layer, 2.6 MiB for the published
     /// checkpoint.
     #[cfg_attr(
@@ -473,6 +478,18 @@ pub struct ServeOptions {
         arg(long, env = "SHISO_EXPERT_SLOTS", default_value_t = 0)
     )]
     pub expert_slots: u32,
+    /// Guess each routed layer's experts from the layer before it and read
+    /// them while the device computes, for a family that streams its banks.
+    ///
+    /// A guess never changes an answer: what it missed, the layer's own fetch
+    /// reads. It costs a read nobody uses when it is wrong.
+    #[cfg_attr(feature = "clap", arg(
+        long,
+        env = "SHISO_EXPERT_PREFETCH",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    ))]
+    pub expert_prefetch: bool,
 
     /// The per-layer n-gram embedding table, for a checkpoint that keeps it in
     /// a file of its own: the sparse family's trellis export.
@@ -489,6 +506,23 @@ pub struct ServeOptions {
     /// Absent means text only, and the encoder is never loaded.
     #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VISION"))]
     pub vision: Option<PathBuf>,
+    /// The speech encoder export of a speech decoder, overriding the file the
+    /// decoder's own metadata names beside it.
+    ///
+    /// Only a decoder that is paired with an encoder reads it; the pairing is
+    /// refused at boot when the file is missing, before the decoder loads.
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_SPEECH_ENCODER"))]
+    pub speech_encoder: Option<PathBuf>,
+    /// Keep the speech encoder's weights on the device between requests.
+    ///
+    /// Off, they are loaded for each recording and dropped when it is
+    /// encoded, which leaves their 1.7 GB to the decoder's expert pool; a
+    /// server taking many short requests keeps them.
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_SPEECH_ENCODER_RESIDENT", default_value_t = false)
+    )]
+    pub speech_encoder_resident: bool,
     /// Pixel ceiling one image may occupy after resizing.
     #[cfg_attr(feature = "clap", arg(long, env = "SHISO_VISION_MAX_PIXELS"))]
     #[cfg_attr(feature = "clap", arg(default_value_t = DEFAULT_VISION_MAX_PIXELS))]
@@ -982,8 +1016,11 @@ impl Default for ServeOptions {
             expert_residency: ExpertResidencyChoice::Auto,
             expert_reserve_gb: 6,
             expert_slots: 0,
+            expert_prefetch: true,
             ngram: None,
             vision: None,
+            speech_encoder: None,
+            speech_encoder_resident: false,
             vision_max_pixels: DEFAULT_VISION_MAX_PIXELS,
             vision_allow_remote_images: false,
             video_allow_decode: false,

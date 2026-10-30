@@ -418,9 +418,16 @@ fn start(
         vision,
         audio,
         cache: media_cache,
+        placement,
     } = towers;
-    let pads = match (vision.as_ref(), vocabulary.as_ref()) {
-        (Some(tower), Some(vocabulary)) => vocabulary.media_ids(&tower.placement()),
+    // An open vision tower answers the placement; an audio tower alone is
+    // answered by the family's.
+    let placement = vision
+        .as_ref()
+        .map(VisionTower::placement)
+        .or(placement.filter(|_| audio.is_some()));
+    let pads = match (placement, vocabulary.as_ref()) {
+        (Some(placement), Some(vocabulary)) => vocabulary.media_ids(&placement),
         _ => PadTokens::default(),
     };
     let keyed = model.as_model_mut().spec_mut().is_some();

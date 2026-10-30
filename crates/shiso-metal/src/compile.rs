@@ -241,6 +241,11 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "dense/dense_moe.metal",
         include_str!("../../../kernels/metal/dense/dense_moe.metal"),
     ),
+    // A `q8_0` projection over a few activation rows, each weight read once.
+    (
+        "dense/dense_q8_rows.metal",
+        include_str!("../../../kernels/metal/dense/dense_q8_rows.metal"),
+    ),
     // The gated short convolution block's one sequential kernel.
     (
         "dense/dense_short_conv.metal",

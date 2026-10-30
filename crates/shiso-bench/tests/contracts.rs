@@ -291,6 +291,13 @@ const _: Option<&dyn shiso_audio::RecognizerStream> = None;
 const _: Option<&dyn shiso_audio::Diarizer> = None;
 const _: Option<&dyn shiso_audio::DiarizationPass> = None;
 const _: Option<&dyn shiso_audio::AudioTower> = None;
+const _: Option<&dyn shiso_audio::WordTimer> = None;
+// A speech decoder's tower times the decoder's words against the clip it
+// encoded: the transcription core asks the tower for its timer.
+type TowerTimer = for<'a> fn(
+    &'a (dyn shiso_audio::AudioTower + 'static),
+) -> Option<&'a dyn shiso_audio::WordTimer>;
+const _: TowerTimer = <dyn shiso_audio::AudioTower>::word_timer;
 
 /// A recognized token is the one `TokenId`, at an encoder frame.
 fn token_event_fields(event: shiso_audio::TokenEvent) -> (TokenId, u32) {
@@ -1537,3 +1544,11 @@ fn every_inventory_entry_resolves_on_the_cpu_device() {
         .collect();
     assert!(missing.is_empty(), "no CPU kernel for {missing:?}");
 }
+
+// The biased routed block's stacks are one enum over the stored codecs, and a
+// streamed IQ4_NL stack is checked against its stream's slot width by the same
+// function the loader calls on a resident one.
+const _: fn(&shiso_engine::moe_biased::ExpertStack) -> CoreResult<()> =
+    shiso_engine::moe_biased::check_stack;
+const _: fn(&shiso_engine::moe_biased::RowIq4NlStack) -> u64 =
+    shiso_engine::moe_biased::RowIq4NlStack::expert_bytes;

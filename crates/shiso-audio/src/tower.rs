@@ -94,14 +94,103 @@ pub trait AudioTower: Send + Sync + fmt::Debug {
         backend: &Arc<dyn Backend>,
         clips: &[AudioClip],
     ) -> Result<EncodedRows, AudioError>;
+
+    /// The tower's word timer, for a tower that can time a transcript's
+    /// words against a clip it encoded. `None` by default.
+    fn word_timer(&self) -> Option<&dyn WordTimer> {
+        None
+    }
+}
+
+/// Times a transcript's words against the clip it was written from.
+///
+/// The words are only known once the language model has written them, long
+/// after the clip was encoded, so the tower has to keep what timing needs
+/// from that encode. It keeps it only for clips registered with
+/// [`WordTimer::want`] before they are encoded, and only while their ticket
+/// lives.
+pub trait WordTimer: Send + Sync + fmt::Debug {
+    /// Registers `clip`: the tower's next encode of it keeps what timing its
+    /// words needs, until the ticket is dropped. The clip must reach the
+    /// tower's encode: rows reused from an earlier request's encode leave
+    /// nothing to time against.
+    fn want(&self, clip: &AudioClip) -> TimingTicket;
+
+    /// The words of `transcript`, timed against the clip `ticket` registered,
+    /// which is `seconds` long.
+    ///
+    /// # Errors
+    ///
+    /// A device or checkpoint error. A transcript the timer cannot align is
+    /// not an error: it is [`WordTiming::Untimed`] with the reason.
+    fn words(
+        &self,
+        ticket: &TimingTicket,
+        transcript: &str,
+        seconds: f64,
+    ) -> Result<WordTiming, AudioError>;
+}
+
+/// What a [`WordTimer`] made of a transcript.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WordTiming {
+    /// Its words, in order of start.
+    Timed(Vec<crate::transcript::Word>),
+    /// No times: the transcript could not be aligned, or the clip was not
+    /// encoded after it was registered.
+    Untimed {
+        /// Why, for the log.
+        reason: String,
+    },
+}
+
+/// Which registration a [`TimingTicket`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TimingKey(pub u64);
+
+/// A clip registered with a [`WordTimer`]; dropping it releases what the
+/// tower keeps for the clip.
+pub struct TimingTicket {
+    key: TimingKey,
+    release: Option<Box<dyn FnOnce(TimingKey) + Send + Sync>>,
+}
+
+impl TimingTicket {
+    /// A ticket for `key` that calls `release` with it when dropped.
+    pub fn new(key: TimingKey, release: impl FnOnce(TimingKey) + Send + Sync + 'static) -> Self {
+        Self {
+            key,
+            release: Some(Box::new(release)),
+        }
+    }
+
+    /// The registration.
+    #[must_use]
+    pub const fn key(&self) -> TimingKey {
+        self.key
+    }
+}
+
+impl Drop for TimingTicket {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release(self.key);
+        }
+    }
+}
+
+impl fmt::Debug for TimingTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("TimingTicket").field(&self.key).finish()
+    }
 }
 
 /// Frames `pcm` for `tower` and counts its tokens.
 ///
 /// # Errors
 ///
-/// [`AudioError::TooLong`] past the tower's limit, [`AudioError::Empty`] for a
-/// clip too short to make one token, or [`AudioError::BadSpec`] for a
+/// [`AudioError::TooLong`] past the tower's limit, [`AudioError::Empty`] for no
+/// samples or a clip too short to make one token, or [`AudioError::BadSpec`] for a
 /// frontend the tower's spec does not build.
 pub fn clip_for(tower: &dyn AudioTower, pcm: &Pcm) -> Result<AudioClip, AudioError> {
     let seconds = pcm.duration_secs();
@@ -112,6 +201,11 @@ pub fn clip_for(tower: &dyn AudioTower, pcm: &Pcm) -> Result<AudioClip, AudioErr
     };
     if seconds > max {
         return Err(too_long());
+    }
+    // A frontend that pads before framing makes a row of padding out of no
+    // samples at all; that row is not audio.
+    if pcm.samples().is_empty() {
+        return Err(AudioError::Empty);
     }
     let frontend = MelFrontend::new(tower.mel_spec().clone())?;
     let all = frontend.compute(pcm.samples());

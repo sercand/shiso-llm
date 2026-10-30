@@ -208,6 +208,7 @@ impl Stack {
                         vision: Some(tower),
                         audio: None,
                         cache: None,
+                        placement: None,
                     },
                 )
             }

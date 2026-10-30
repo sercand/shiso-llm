@@ -69,6 +69,8 @@ pub enum PromptField {
     Prompt,
     /// The Responses input.
     Input,
+    /// The transcription upload.
+    File,
 }
 
 impl PromptField {
@@ -79,6 +81,7 @@ impl PromptField {
             Self::Messages => "messages",
             Self::Prompt => "prompt",
             Self::Input => "input",
+            Self::File => "file",
         }
     }
 }
@@ -269,6 +272,34 @@ pub async fn start_with_prompt(
         request,
         tokens,
         (media, digests),
+        Arc::from(""),
+        field,
+    )
+    .await
+}
+
+/// [`start_with_prompt`] with the media encoded even when an earlier
+/// request's rows for it are cached: no digest files it, so neither the
+/// media cache nor a stored prefix stands in for the tower.
+///
+/// For a request whose tower keeps something from the encode itself, as a
+/// word timer keeps the timestamp head's output.
+///
+/// # Errors
+///
+/// As [`start_with_prompt`].
+pub async fn start_with_fresh_media(
+    state: &AppState,
+    request: &Request,
+    tokens: Vec<TokenId>,
+    media: Vec<crate::media::MediaItem>,
+    field: PromptField,
+) -> Result<Started, AppError> {
+    queue(
+        state,
+        request,
+        tokens,
+        (media, Vec::new()),
         Arc::from(""),
         field,
     )

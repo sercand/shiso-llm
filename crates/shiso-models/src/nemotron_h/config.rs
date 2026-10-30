@@ -32,6 +32,7 @@ use shiso_engine::shape::{
     Activation, AttnLayer, GdnShape, HybridShape, LayerKind, MediaPositions, MoeShape, NormScheme,
     SsmShape,
 };
+use shiso_modelfile::{GgufFile, GgufMetadata, MetaValue};
 
 /// The `model_type` this family answers to.
 pub const MODEL_TYPE: &str = "nemotron_h";
@@ -117,7 +118,29 @@ pub struct NemotronHConfig {
     routed_scale: f32,
     renormalize: bool,
     stop_tokens: Vec<TokenId>,
+    mtp_block: Option<u32>,
 }
+
+/// Every number the stack shape is built from, whichever container stated it.
+struct Geometry {
+    vocab: u32,
+    hidden: u32,
+    rms_eps: f32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    ssm: SsmShape,
+    experts: u32,
+    used: u32,
+    shared: u32,
+    expert_width: u32,
+    shared_width: u32,
+    routed_scale: f32,
+    renormalize: bool,
+}
+
+/// The architecture name a GGUF export of this family declares.
+const GGUF_ARCH: &str = "nemotron_h_moe";
 
 impl NemotronHConfig {
     /// Whether `model_type` names this family.
@@ -169,6 +192,128 @@ impl NemotronHConfig {
                 }),
             })
             .collect::<CoreResult<Vec<_>>>()?;
+        let geometry = Geometry {
+            vocab: doc.vocab_size,
+            hidden: doc.hidden_size,
+            rms_eps: doc.layer_norm_epsilon,
+            q_heads: doc.num_attention_heads,
+            kv_heads: doc.num_key_value_heads,
+            head_dim: doc.head_dim,
+            ssm: SsmShape {
+                heads: doc.mamba_num_heads,
+                head_dim: doc.mamba_head_dim,
+                state: doc.ssm_state_size,
+                groups: doc.n_groups,
+                conv_kernel: doc.conv_kernel,
+            },
+            experts: doc.n_routed_experts,
+            used: doc.num_experts_per_tok,
+            shared: doc.n_shared_experts,
+            expert_width: doc.moe_intermediate_size,
+            shared_width: doc.moe_shared_expert_intermediate_size,
+            routed_scale: doc.routed_scaling_factor,
+            renormalize: doc.norm_topk_prob,
+        };
+        let stop_tokens = match doc.eos_token_id {
+            EosIds::One(id) => vec![TokenId::new(id)],
+            EosIds::Many(ids) => ids.into_iter().map(TokenId::new).collect(),
+        };
+        Self::build(&geometry, mixers, stop_tokens, None)
+    }
+
+    /// Reads the geometry out of a GGUF export's metadata and tensor
+    /// directory.
+    ///
+    /// The per-block arrays spell the layer pattern: a block with key/value
+    /// heads is attention, one with a feed-forward width is routed, and any
+    /// other is state-space. The trailing `nextn_predict_layers` blocks are
+    /// the multi-token prediction head, which is not part of the stack.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownArch`] for another architecture,
+    /// [`CoreError::ConfigMissing`] naming an absent key, and
+    /// [`CoreError::InvalidValue`] naming the key or tensor of a switch this
+    /// build does not implement: grouped selection, more than one shared
+    /// expert, gated experts, or a block whose arrays name two kinds.
+    pub fn from_gguf(file: &GgufFile) -> CoreResult<Self> {
+        let meta = file.metadata();
+        if meta.architecture() != Some(GGUF_ARCH) {
+            return Err(CoreError::UnknownArch {
+                model_type: meta.architecture().unwrap_or_default().to_owned(),
+            });
+        }
+        let u32_of = |suffix: &str| {
+            meta.arch_u32(suffix)
+                .ok_or_else(|| CoreError::ConfigMissing {
+                    key: format!("{GGUF_ARCH}.{suffix}"),
+                })
+        };
+        let f32_of = |suffix: &str| {
+            meta.arch_f32(suffix)
+                .ok_or_else(|| CoreError::ConfigMissing {
+                    key: format!("{GGUF_ARCH}.{suffix}"),
+                })
+        };
+        let shared = refuse_gguf_switches(file)?;
+        let (mixers, kv_heads, mtp_block) = gguf_mixers(meta)?;
+        let inner = u32_of("ssm.inner_size")?;
+        let ssm_heads = u32_of("ssm.time_step_rank")?;
+        let geometry = Geometry {
+            vocab: u32_of("vocab_size")?,
+            hidden: u32_of("embedding_length")?,
+            rms_eps: f32_of("attention.layer_norm_rms_epsilon")?,
+            q_heads: u32_of("attention.head_count")?,
+            kv_heads,
+            head_dim: u32_of("attention.key_length")?,
+            ssm: SsmShape {
+                heads: ssm_heads,
+                head_dim: inner / ssm_heads.max(1),
+                state: u32_of("ssm.state_size")?,
+                groups: u32_of("ssm.group_count")?,
+                conv_kernel: u32_of("ssm.conv_kernel")?,
+            },
+            experts: u32_of("expert_count")?,
+            used: u32_of("expert_used_count")?,
+            shared,
+            expert_width: u32_of("expert_feed_forward_length")?,
+            shared_width: u32_of("expert_shared_feed_forward_length")?,
+            routed_scale: f32_of("expert_weights_scale")?,
+            renormalize: meta
+                .get_bool(&format!("{GGUF_ARCH}.expert_weights_norm"))
+                .ok_or_else(|| CoreError::ConfigMissing {
+                    key: format!("{GGUF_ARCH}.expert_weights_norm"),
+                })?,
+        };
+        let eos = meta.get_u32("tokenizer.ggml.eos_token_id").ok_or_else(|| {
+            CoreError::ConfigMissing {
+                key: "tokenizer.ggml.eos_token_id".to_owned(),
+            }
+        })?;
+        Self::build(&geometry, mixers, vec![TokenId::new(eos)], mtp_block)
+    }
+
+    /// Opens the GGUF export at `path` and reads its geometry.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] when the file does not parse as GGUF, and
+    /// whatever [`NemotronHConfig::from_gguf`] reports.
+    pub fn from_gguf_path(path: &Path) -> CoreResult<Self> {
+        let file = GgufFile::open(path).map_err(|err| CoreError::InvalidValue {
+            key: "nemotron_h gguf",
+            value: format!("{}: {err}", path.display()),
+        })?;
+        Self::from_gguf(&file)
+    }
+
+    /// Pairs the layers into slots and builds the stack shape.
+    fn build(
+        g: &Geometry,
+        mixers: Vec<Mixer>,
+        stop_tokens: Vec<TokenId>,
+        mtp_block: Option<u32>,
+    ) -> CoreResult<Self> {
         let slots = pair(&mixers)?;
         let mut layers = Vec::with_capacity(slots.len());
         let mut no_ffn = Vec::new();
@@ -195,27 +340,20 @@ impl NemotronHConfig {
         // No rotation at all: the attention layers carry no positional
         // encoding, the state-space layers are what orders the sequence.
         let attn = vec![
-            AttnLayer::new(
-                doc.num_attention_heads,
-                doc.num_key_value_heads,
-                doc.head_dim,
-                0,
-                0,
-                0.0
-            )
-            .without_qk_norm();
+            AttnLayer::new(g.q_heads, g.kv_heads, g.head_dim, 0, 0, 0.0)
+                .without_qk_norm();
             attn_slots
         ];
         let shape = HybridShape {
             layers,
             attn,
-            hidden: doc.hidden_size,
-            vocab: doc.vocab_size,
-            intermediate: doc.moe_shared_expert_intermediate_size,
+            hidden: g.hidden,
+            vocab: g.vocab,
+            intermediate: g.shared_width,
             // Unused: the recurrent slots are state-space ones.
             gdn: GdnShape::new(0, 0, 0, 0),
             attn_output_gate: false,
-            rms_eps: doc.layer_norm_epsilon,
+            rms_eps: g.rms_eps,
             activation: Activation::Relu2,
             norms: NormScheme::PreOnly,
             embed_scale: None,
@@ -224,35 +362,28 @@ impl NemotronHConfig {
             ple: None,
             media_positions: MediaPositions::Linear,
             v_norm: false,
-            moe: Some(MoeShape::new(
-                doc.n_routed_experts,
-                doc.num_experts_per_tok,
-                doc.n_shared_experts,
-                doc.moe_intermediate_size,
-            )),
-            ssm: Some(SsmShape {
-                heads: doc.mamba_num_heads,
-                head_dim: doc.mamba_head_dim,
-                state: doc.ssm_state_size,
-                groups: doc.n_groups,
-                conv_kernel: doc.conv_kernel,
-            }),
+            moe: Some(MoeShape::new(g.experts, g.used, g.shared, g.expert_width)),
+            ssm: Some(g.ssm),
             short_conv: None,
             no_ffn,
         };
         shape.validate()?;
-        let stop_tokens = match doc.eos_token_id {
-            EosIds::One(id) => vec![TokenId::new(id)],
-            EosIds::Many(ids) => ids.into_iter().map(TokenId::new).collect(),
-        };
         Ok(Self {
             shape,
             slots,
             mixers,
-            routed_scale: doc.routed_scaling_factor,
-            renormalize: doc.norm_topk_prob,
+            routed_scale: g.routed_scale,
+            renormalize: g.renormalize,
             stop_tokens,
+            mtp_block,
         })
+    }
+
+    /// The GGUF block holding the multi-token prediction head, when the
+    /// export carries one.
+    #[must_use]
+    pub const fn mtp_block(&self) -> Option<u32> {
+        self.mtp_block
     }
 
     /// The stack's shape.
@@ -294,6 +425,107 @@ impl NemotronHConfig {
 
 /// Groups the checkpoint's layers into slots: each mixing layer opens one, and
 /// a routed layer joins the slot the mixing layer before it opened.
+/// Refuses the GGUF export's switches this build does not implement, by key
+/// or tensor name, and returns the shared expert count it accepted.
+fn refuse_gguf_switches(file: &GgufFile) -> CoreResult<u32> {
+    let meta = file.metadata();
+    let refuse = |key: &'static str, value: String| CoreError::InvalidValue { key, value };
+    let u32_of = |suffix: &str| {
+        meta.arch_u32(suffix)
+            .ok_or_else(|| CoreError::ConfigMissing {
+                key: format!("{GGUF_ARCH}.{suffix}"),
+            })
+    };
+    if u32_of("expert_group_count")? != 1 || u32_of("expert_group_used_count")? != 1 {
+        return Err(refuse(
+            "expert_group_count",
+            "grouped expert selection is not implemented".to_owned(),
+        ));
+    }
+    let shared = u32_of("expert_shared_count")?;
+    if shared != 1 {
+        return Err(refuse(
+            "expert_shared_count",
+            format!("{shared} shared experts; the slot carries exactly one"),
+        ));
+    }
+    if let Some(gated) = file
+        .tensors()
+        .iter()
+        .find(|t| t.name.contains("ffn_gate_exps") || t.name.contains("ffn_gate_shexp"))
+    {
+        return Err(refuse(
+            "ffn_gate_exps",
+            format!("{}: gated experts are not this family's", gated.name),
+        ));
+    }
+    Ok(shared)
+}
+
+/// The decoder's layer kinds from the per-block arrays, the widest key/value
+/// head count among them, and the prediction head's block, if any.
+fn gguf_mixers(meta: &GgufMetadata) -> CoreResult<(Vec<Mixer>, u32, Option<u32>)> {
+    let refuse = |key: &'static str, value: String| CoreError::InvalidValue { key, value };
+    let blocks = meta
+        .arch_u32("block_count")
+        .ok_or_else(|| CoreError::ConfigMissing {
+            key: format!("{GGUF_ARCH}.block_count"),
+        })?;
+    let mtp = meta.arch_u32("nextn_predict_layers").unwrap_or(0);
+    let decoder = blocks.checked_sub(mtp).ok_or_else(|| {
+        refuse(
+            "nextn_predict_layers",
+            format!("{mtp} prediction blocks out of {blocks}"),
+        )
+    })?;
+    let kv = per_block(meta, "attention.head_count_kv", blocks)?;
+    let ffn = per_block(meta, "feed_forward_length", blocks)?;
+    let mut mixers = Vec::with_capacity(decoder as usize);
+    for block in 0..decoder as usize {
+        mixers.push(match (kv[block] > 0, ffn[block] > 0) {
+            (false, false) => Mixer::Mamba,
+            (true, false) => Mixer::Attention,
+            (false, true) => Mixer::Moe,
+            (true, true) => {
+                return Err(refuse(
+                    "feed_forward_length",
+                    format!("block {block} is both attention and routed"),
+                ));
+            }
+        });
+    }
+    let kv_heads = kv.iter().copied().max().unwrap_or(0);
+    Ok((mixers, kv_heads, (mtp > 0).then_some(decoder)))
+}
+
+/// One per-block integer array of the GGUF metadata, `blocks` long.
+fn per_block(meta: &GgufMetadata, suffix: &str, blocks: u32) -> CoreResult<Vec<u32>> {
+    let key = format!("{GGUF_ARCH}.{suffix}");
+    let array = meta
+        .get_array(&key)
+        .ok_or_else(|| CoreError::ConfigMissing { key: key.clone() })?;
+    let values = array
+        .iter()
+        .map(|entry| match entry {
+            Ok(MetaValue::I32(v)) => u32::try_from(v).ok(),
+            Ok(MetaValue::U32(v)) => Some(v),
+            _ => None,
+        })
+        .collect::<Option<Vec<u32>>>()
+        .ok_or_else(|| CoreError::InvalidValue {
+            key: "per-block array",
+            value: format!("{key} holds an entry that is not a non-negative integer"),
+        })?;
+    if values.len() != blocks as usize {
+        return Err(CoreError::ShapeMismatch {
+            field: "per-block array length",
+            expected: u64::from(blocks),
+            got: values.len() as u64,
+        });
+    }
+    Ok(values)
+}
+
 fn pair(mixers: &[Mixer]) -> CoreResult<Vec<SlotLayers>> {
     let mut slots: Vec<SlotLayers> = Vec::new();
     for (layer, mixer) in mixers.iter().enumerate() {
@@ -384,6 +616,10 @@ fn refuse_switches(doc: &Document) -> CoreResult<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "config_gguf_tests.rs"]
+pub(crate) mod gguf_tests;
 
 #[cfg(test)]
 mod tests {

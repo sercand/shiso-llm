@@ -60,10 +60,17 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
 pub fn build_router(state: Arc<AppState>) -> Router {
     // An audio upload is a file, not a JSON body, so the transcription routes
     // take their own, larger limit; the route's layer is the inner one and wins.
-    let upload_limit = state.audio.as_ref().map_or(
-        DEFAULT_MAX_BODY_BYTES,
-        crate::audio::AudioService::max_upload_bytes,
-    );
+    let upload_limit = state
+        .audio
+        .as_ref()
+        .map(crate::audio::AudioService::max_upload_bytes)
+        .or_else(|| {
+            state
+                .speech
+                .as_ref()
+                .map(shiso_runtime::api::transcribe::SpeechDecoder::max_upload_bytes)
+        })
+        .unwrap_or(DEFAULT_MAX_BODY_BYTES);
     let image_upload_limit = state.image.as_ref().map_or(
         crate::image::DEFAULT_MAX_UPLOAD_BYTES,
         crate::image::ImageService::max_upload_bytes,

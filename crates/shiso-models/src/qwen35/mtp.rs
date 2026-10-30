@@ -46,7 +46,7 @@ use shiso_core::buffer::{DeviceBuffer, alloc};
 use shiso_core::config::HfConfig;
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_engine::attn::Attn;
-use shiso_engine::draft::DraftParts;
+use shiso_engine::draft::{DraftParts, HeadNorm};
 use shiso_engine::ffn::Ffn;
 use shiso_engine::projection::Weight;
 use shiso_modelfile::mlx_quant::MlxAffineLayout;
@@ -674,6 +674,8 @@ pub fn resident(
         input_norm: norm(head, backend, &head.layer.input_layernorm)?,
         ffn_norm: norm(head, backend, &head.layer.post_attention_layernorm)?,
         output_norm: norm(head, backend, &head.norm)?,
+        head_norm: HeadNorm::Rms,
+        hidden_prenorm: None,
         attn,
         ffn,
         // A DENSE head: this family's block is one feed-forward and its sidecar

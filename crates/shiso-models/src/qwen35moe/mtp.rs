@@ -48,8 +48,9 @@ use shiso_core::backend::Backend;
 use shiso_core::buffer::{DeviceBuffer, alloc};
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_engine::attn::Attn;
-use shiso_engine::draft::DraftParts;
+use shiso_engine::draft::{DraftParts, HeadNorm};
 use shiso_engine::ffn::Ffn;
+use shiso_engine::layers::Routed;
 use shiso_engine::moe::{ActDtype, ExpertSlab, Moe};
 use shiso_engine::projection::Weight;
 use shiso_engine::shape::{HybridShape, MoeShape};
@@ -142,6 +143,8 @@ impl MtpHead {
             input_norm: self.norm(backend, &format!("{layer}.input_layernorm.weight"))?,
             ffn_norm: self.norm(backend, &format!("{layer}.post_attention_layernorm.weight"))?,
             output_norm: self.norm(backend, "norm.weight")?,
+            head_norm: HeadNorm::Rms,
+            hidden_prenorm: None,
             attn: self.attn(backend, layer, shape)?,
             // The SHARED expert, which is the routed block's dense half and
             // takes the same field the target's `LayerWeights::ffn` does.
@@ -165,7 +168,7 @@ impl MtpHead {
                     hidden,
                 )?,
             },
-            moe: Some((self.routed(backend, layer, hidden, moe)?, moe)),
+            moe: Some((Routed::Glu(self.routed(backend, layer, hidden, moe)?), moe)),
         })
     }
 

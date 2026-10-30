@@ -182,6 +182,7 @@ impl Stack {
             open_audio: _,
             placement,
             defaults,
+            speech: _,
         } = shiso_server::model_factory::load_model(
             backend,
             args.model.as_deref().expect("this test passes --model"),
@@ -247,6 +248,7 @@ impl Stack {
                 vision: tower,
                 audio: None,
                 cache: None,
+                placement: None,
             },
             Some(Arc::clone(&vocabulary)),
             &model_id,

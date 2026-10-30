@@ -147,6 +147,12 @@ pub(crate) struct State {
     commits: usize,
     /// The value the completion event was last asked to reach.
     signaled: u64,
+    /// Command buffers committed without a signal, in commit order, kept
+    /// until a drain has seen them finish: their work is outstanding, and a
+    /// fault inside one must reach the caller rather than vanish. A list, not
+    /// one slot, so a second submit never has to wait on the first to keep
+    /// its status.
+    submitted: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     /// Samples of the open profile region; `None` when no region is open,
     /// which is the only state in which launches batch.
     profile: Option<Vec<LaunchSample>>,
@@ -300,6 +306,7 @@ impl MetalBackend {
                 pipelines: PipelineCache::default(),
                 commits: 0,
                 signaled: 0,
+                submitted: Vec::new(),
                 profile: None,
             }),
         }))
@@ -318,6 +325,17 @@ impl MetalBackend {
     #[must_use]
     pub fn commits(&self) -> usize {
         self.inner.lock().commits
+    }
+
+    /// Command buffers handed over by [`Backend::submit`] that no drain has
+    /// seen finish yet.
+    ///
+    /// A wait point ([`Backend::sync`], a copy back) leaves this at zero, so a
+    /// test can tell that it waited without reading anything through a call
+    /// that would itself wait.
+    #[must_use]
+    pub fn outstanding_submits(&self) -> usize {
+        self.inner.lock().submitted.len()
     }
 
     /// Number of pipelines the cache currently holds.
@@ -424,11 +442,16 @@ impl MetalBackend {
         state: &mut State,
         op: &'static str,
     ) -> CoreResult<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>> {
+        let submitted = std::mem::take(&mut state.submitted);
         let Batch::Open {
             command_buffer,
             encoder,
         } = std::mem::take(&mut state.batch)
         else {
+            for earlier in &submitted {
+                earlier.waitUntilCompleted();
+                failed(earlier, op)?;
+            }
             return Ok(None);
         };
         match encoder {
@@ -450,18 +473,20 @@ impl MetalBackend {
             .done
             .waitUntilSignaledValue_timeoutMS(value, DRAIN_SLICE_MS)
         {
-            if command_buffer.status() == MTLCommandBufferStatus::Error {
+            let earlier = submitted
+                .iter()
+                .any(|cb| cb.status() == MTLCommandBufferStatus::Error);
+            if earlier || command_buffer.status() == MTLCommandBufferStatus::Error {
                 break;
             }
         }
-        let status = command_buffer.status();
-        if status == MTLCommandBufferStatus::Error {
-            let detail = command_buffer.error().map_or_else(
-                || format!("{status:?}"),
-                |err| format!("{status:?}: {}", err.localizedDescription()),
-            );
-            return Err(MetalError::backend(op, detail));
+        // The queue ran the submitted buffers before this one, so their status
+        // is final by now unless one faulted, which is what they are checked
+        // for.
+        for earlier in &submitted {
+            failed(earlier, op)?;
         }
+        failed(&command_buffer, op)?;
         Ok(Some(command_buffer))
     }
 
@@ -706,6 +731,92 @@ impl Backend for MetalBackend {
             })
             .collect();
         fill(&mut slices)
+    }
+
+    fn write_host_live(
+        &self,
+        dsts: &[DeviceView<'_>],
+        fill: &mut dyn FnMut(&mut [&mut [u8]]) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        // The spans are resolved under the lock and filled outside it, so a
+        // long read into them does not hold up the thread encoding launches.
+        let spans: Vec<(usize, usize)> = {
+            let state = self.inner.lock();
+            dsts.iter()
+                .map(|view| {
+                    let entry = state.view(*view)?;
+                    let offset = usize::try_from(view.offset()).unwrap_or(usize::MAX);
+                    Ok((
+                        Self::contents(entry) as usize + offset,
+                        usize::try_from(view.len()).unwrap_or(usize::MAX),
+                    ))
+                })
+                .collect::<CoreResult<_>>()?
+        };
+        let mut sorted = spans.clone();
+        sorted.sort_unstable();
+        if sorted
+            .windows(2)
+            .any(|pair| pair[0].0.saturating_add(pair[0].1) > pair[1].0)
+        {
+            return Err(CoreError::InvalidValue {
+                key: "write_host_live views",
+                value: "two of the ranges overlap".to_owned(),
+            });
+        }
+        let mut slices: Vec<&mut [u8]> = spans
+            .iter()
+            .map(|&(start, len)| {
+                // SAFETY: each span lies inside a live buffer (checked by
+                // `view` under the lock); the views borrow the buffers that
+                // own them for this whole call, so none can be freed while the
+                // slices exist; the spans were just shown to be pairwise
+                // disjoint; and the caller's contract is that no work the
+                // device has been or will be given before this returns touches
+                // these bytes, so nothing else reads or writes them meanwhile.
+                unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len) }
+            })
+            .collect();
+        fill(&mut slices)
+    }
+
+    fn submit(&self) -> CoreResult<()> {
+        let mut state = self.inner.lock();
+        let Batch::Open {
+            command_buffer,
+            encoder,
+        } = std::mem::take(&mut state.batch)
+        else {
+            return Ok(());
+        };
+        match encoder {
+            Encoder::Compute(encoder) => encoder.endEncoding(),
+            Encoder::Blit(encoder) => encoder.endEncoding(),
+            Encoder::None => {}
+        }
+        state.commits += 1;
+        // No signal: the queue runs its command buffers in order, so the next
+        // drain's signal is reached only after this one has run. The buffer
+        // is kept for that drain, which also waits for it when nothing else
+        // was queued and reports it if it faulted.
+        command_buffer.commit();
+        // Earlier submits are only looked at, never waited on: one that has
+        // finished cleanly is let go so the list stays short across a pass
+        // that submits per layer, and one that faulted is reported now rather
+        // than at the drain. Anything still running stays for the drain.
+        let mut fault = Ok(());
+        state.submitted.retain(|earlier| match earlier.status() {
+            MTLCommandBufferStatus::Completed => false,
+            MTLCommandBufferStatus::Error => {
+                if fault.is_ok() {
+                    fault = failed(earlier, "submit");
+                }
+                false
+            }
+            _ => true,
+        });
+        state.submitted.push(command_buffer);
+        fault
     }
 
     fn copy_d2h(&self, src: DeviceView<'_>, dst: &mut [u8]) -> CoreResult<()> {
@@ -994,3 +1105,20 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<MetalBackend>();
 };
+
+/// Refuses a command buffer that ended in an error, naming `op` and the
+/// driver's description.
+fn failed(
+    command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    op: &'static str,
+) -> CoreResult<()> {
+    let status = command_buffer.status();
+    if status != MTLCommandBufferStatus::Error {
+        return Ok(());
+    }
+    let detail = command_buffer.error().map_or_else(
+        || format!("{status:?}"),
+        |err| format!("{status:?}: {}", err.localizedDescription()),
+    );
+    Err(MetalError::backend(op, detail))
+}

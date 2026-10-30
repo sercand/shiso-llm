@@ -35,7 +35,7 @@
 //! A family that genuinely cannot checkpoint is a reason to widen this into an
 //! enum of the two, not a reason to narrow every arm to the weaker contract.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use shiso_audio::{AudioError, AudioTower};
@@ -51,7 +51,10 @@ use shiso_models::gemma4::{
 };
 use shiso_models::lfm2::{Lfm2Config, Lfm2Model, Lfm2Tower};
 use shiso_models::llama::{LlamaConfig, LlamaModel};
-use shiso_models::nemotron_h::{NemotronHConfig, NemotronHModel};
+use shiso_models::nemotron_h::{GgufResidency, NemotronHConfig, NemotronHModel};
+use shiso_models::nemotron_transcribe::{
+    NemotronTranscribeTower, PLACEMENT as TRANSCRIBE_PLACEMENT, speech_encoder_for,
+};
 use shiso_models::qwen4exp::{Qwen4ExpConfig, Qwen4ExpModel};
 use shiso_models::qwen35::mtp::{self, AffineQuant, MtpManifest};
 use shiso_models::qwen35::{Qwen35Config, Qwen35Model, Qwen35Tower};
@@ -267,9 +270,9 @@ impl FamilyDefaults {
         tools: ToolCallScheme::Qwen35,
         thinking_default: true,
         effort: EffortSpelling::STANDARD,
-        // No draft head is bound for this family yet; the export's own is not
-        // read. Flip this with the arm that binds one.
-        speculates: false,
+        // The GGUF export's prediction block is bound as a draft head; the
+        // MLX export has none, and its arm refuses a depth.
+        speculates: true,
     };
 
     /// Family defaults for the LFM2 hybrid.
@@ -396,6 +399,22 @@ pub struct Loaded {
     pub placement: MediaPlacement,
     /// What this family defaults to for output parsing and thinking.
     pub defaults: FamilyDefaults,
+    /// The encoder export a speech decoder is paired with, when this
+    /// checkpoint is one.
+    pub speech: Option<SpeechPairing>,
+}
+
+/// A speech decoder's pairing with its encoder export.
+///
+/// Set, it says three things the boot path acts on: the audio tower opens
+/// from [`SpeechPairing::encoder`] rather than from `--vision`; the prompt
+/// carries no opening token, because the decoder was trained on prompts with
+/// none and its tokenizer config names one anyway; and transcription requests
+/// are answered by this model when no separate recognizer is loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeechPairing {
+    /// The encoder export the audio tower opens from.
+    pub encoder: PathBuf,
 }
 
 impl std::fmt::Debug for Loaded {
@@ -403,6 +422,7 @@ impl std::fmt::Debug for Loaded {
         f.debug_struct("Loaded")
             .field("placement", &self.placement)
             .field("defaults", &self.defaults)
+            .field("speech", &self.speech)
             .finish_non_exhaustive()
     }
 }
@@ -457,6 +477,31 @@ fn open_gemma4_audio(
     Ok(AudioTowerFound::Tower(Arc::new(Gemma4AudioTower::open(
         backend, path,
     )?)))
+}
+
+/// The speech decoder's audio opener: the encoder export the pairing found.
+///
+/// The width check against the decoder is the boot path's, which every audio
+/// tower passes through: the encoder's fused rows must be exactly the
+/// decoder's residual width.
+fn open_transcribe_audio(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+) -> Result<AudioTowerFound, AudioError> {
+    Ok(AudioTowerFound::Tower(Arc::new(
+        NemotronTranscribeTower::open(backend, path, false)?,
+    )))
+}
+
+/// [`open_transcribe_audio`] with the encoder's weights kept on the device
+/// between requests (`--speech-encoder-resident`).
+fn open_transcribe_audio_resident(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+) -> Result<AudioTowerFound, AudioError> {
+    Ok(AudioTowerFound::Tower(Arc::new(
+        NemotronTranscribeTower::open(backend, path, true)?,
+    )))
 }
 
 /// The Gemma 4 family's opener.
@@ -553,6 +598,7 @@ pub fn load_model(
                 open_audio: no_audio_tower,
                 placement: Qwen35Tower::PLACEMENT,
                 defaults,
+                speech: None,
             });
         }
         Err(CoreError::UnknownArch { .. }) => {}
@@ -618,6 +664,7 @@ pub fn load_model(
                 open_audio: no_audio_tower,
                 placement: Qwen35Tower::PLACEMENT,
                 defaults,
+                speech: None,
             });
         }
         Err(CoreError::UnknownArch { .. }) => {}
@@ -647,13 +694,14 @@ pub fn load_model(
                 open_audio: open_gemma4_audio,
                 placement: MediaPlacement::GEMMA4,
                 defaults,
+                speech: None,
             });
         }
         Err(CoreError::UnknownArch { .. }) => {}
         Err(other) => return Err(FactoryError::Load(other)),
     }
 
-    load_last_arms(backend, path, config, opts, defaults)
+    load_last_arms(backend, path, config, args, opts, defaults)
 }
 
 /// Refuses `--kv-cache-dtype` other than f16 for every family but the sparse
@@ -733,14 +781,16 @@ fn load_last_arms(
     backend: &Arc<dyn Backend>,
     path: &Path,
     config: &HfConfig,
+    args: &ServeOptions,
     opts: EngineOptions,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
     // The hybrid state-space family: a directory of MLX shards whose geometry
     // is its own `config.json`, read again here because the parsed document
-    // carries no typed view of it.
+    // carries no typed view of it, or a GGUF export whose geometry is its
+    // metadata.
     if NemotronHConfig::describes_type(config.model_type()) {
-        return load_nemotron_h(backend, path, opts, defaults);
+        return load_nemotron_h(backend, path, args, opts, defaults);
     }
 
     // The LFM2 hybrid reads every width out of its container and checks the
@@ -762,6 +812,7 @@ fn load_last_arms(
             // a renderer is configured with.
             placement: MediaPlacement::QWEN35,
             defaults,
+            speech: None,
         });
     }
 
@@ -778,11 +829,88 @@ fn load_last_arms(
 fn load_nemotron_h(
     backend: &Arc<dyn Backend>,
     path: &Path,
+    args: &ServeOptions,
     opts: EngineOptions,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
-    let family = NemotronHConfig::from_dir(path).map_err(FactoryError::Load)?;
-    let model = NemotronHModel::load(backend, path, &family, opts).map_err(FactoryError::Load)?;
+    let gguf = path.extension().is_some_and(|ext| ext == "gguf");
+    // Before any weight moves: a decoder that names an encoder it cannot find
+    // is refused here, by the path it looked for.
+    let speech = if gguf {
+        speech_encoder_for(path, args.speech_encoder.as_deref())
+            .map_err(FactoryError::Load)?
+            .map(|encoder| SpeechPairing { encoder })
+    } else if let Some(named) = args.speech_encoder.as_deref() {
+        return Err(FactoryError::Load(CoreError::InvalidValue {
+            key: "--speech-encoder",
+            value: format!(
+                "{} was named, but {} is not a speech decoder export",
+                named.display(),
+                path.display()
+            ),
+        }));
+    } else {
+        None
+    };
+    let model = if gguf {
+        // One prediction block, reusable up to eight draft steps.
+        if args.spec_k > MAX_NEMOTRON_H_SPEC_K {
+            return Err(FactoryError::Load(CoreError::InvalidValue {
+                key: "--spec-k",
+                value: format!(
+                    "{} was asked for; this family's prediction block drafts at most \
+                     {MAX_NEMOTRON_H_SPEC_K}",
+                    args.spec_k
+                ),
+            }));
+        }
+        let mut opts = opts;
+        opts.spec = SpecDepth::new(args.spec_k);
+        let family = NemotronHConfig::from_gguf_path(path).map_err(FactoryError::Load)?;
+        // An encoder that projects to another width would write its rows
+        // into the wrong embedding slots; refused before any weight moves.
+        if let Some(pairing) = speech.as_ref() {
+            shiso_models::nemotron_transcribe::pairing::check_pairing(&pairing.encoder, &family)
+                .map_err(FactoryError::Load)?;
+        }
+        let residency = gguf_residency(
+            args.expert_residency,
+            args.expert_slots,
+            args.expert_reserve_gb.saturating_mul(1 << 30),
+        );
+        NemotronHModel::load_gguf(
+            backend,
+            path,
+            &family,
+            opts,
+            residency,
+            args.expert_prefetch,
+        )
+        .map_err(FactoryError::Load)?
+    } else {
+        if args.spec_k > 0 {
+            return Err(FactoryError::Load(CoreError::InvalidValue {
+                key: "--spec-k",
+                value: format!("{} carries no draft head; use --spec-k 0", path.display()),
+            }));
+        }
+        let family = NemotronHConfig::from_dir(path).map_err(FactoryError::Load)?;
+        NemotronHModel::load(backend, path, &family, opts).map_err(FactoryError::Load)?
+    };
+    if speech.is_some() {
+        return Ok(Loaded {
+            model: Box::new(model),
+            open_tower: open_no_tower,
+            open_audio: if args.speech_encoder_resident {
+                open_transcribe_audio_resident
+            } else {
+                open_transcribe_audio
+            },
+            placement: TRANSCRIBE_PLACEMENT,
+            defaults,
+            speech,
+        });
+    }
     Ok(Loaded {
         model: Box::new(model),
         open_tower: open_no_tower,
@@ -791,8 +919,12 @@ fn load_nemotron_h(
         // renderer is configured with.
         placement: MediaPlacement::QWEN35,
         defaults,
+        speech: None,
     })
 }
+
+/// Draft steps the speech decoder's prediction block may chain.
+const MAX_NEMOTRON_H_SPEC_K: u32 = 8;
 
 /// The LFM2 arm: a GGUF container whose geometry is its own metadata.
 ///
@@ -814,6 +946,7 @@ fn load_lfm2(
         open_audio: no_audio_tower,
         placement: Lfm2Tower::PLACEMENT,
         defaults,
+        speech: None,
     })
 }
 
@@ -850,6 +983,7 @@ fn load_qwen35_block(
         open_audio: no_audio_tower,
         placement: Qwen35Tower::PLACEMENT,
         defaults,
+        speech: None,
     })
 }
 
@@ -965,6 +1099,7 @@ fn load_qwen35moe(
         open_audio: no_audio_tower,
         placement: Qwen35Tower::PLACEMENT,
         defaults,
+        speech: None,
     })
 }
 
@@ -1283,6 +1418,7 @@ fn load_qwen4exp_streamed(
         open_audio: no_audio_tower,
         placement: Qwen35Tower::PLACEMENT,
         defaults,
+        speech: None,
     })
 }
 
@@ -1331,6 +1467,7 @@ fn load_qwen4exp_exl3(
         open_audio: no_audio_tower,
         placement: Qwen35Tower::PLACEMENT,
         defaults,
+        speech: None,
     })
 }
 
@@ -1390,6 +1527,7 @@ fn load_qwen4exp_mlx(
             open_audio: no_audio_tower,
             placement: Qwen35Tower::PLACEMENT,
             defaults,
+            speech: None,
         });
     }
     let model = Qwen4ExpModel::load_mlx(
@@ -1407,6 +1545,7 @@ fn load_qwen4exp_mlx(
         open_audio: no_audio_tower,
         placement: Qwen35Tower::PLACEMENT,
         defaults,
+        speech: None,
     })
 }
 
@@ -1427,16 +1566,59 @@ pub fn recognises(config: &HfConfig) -> bool {
         || LlamaConfig::describes(config)
 }
 
+/// Where a GGUF load puts the routed banks: `--expert-residency` decides,
+/// and `--expert-slots`, when set, fixes the pool a streamed load reads into.
+/// `stream` without a slot count still streams, into as many slots as fit.
+/// As for the sparse family, a slot count makes `auto` stream and `resident`
+/// ignores it.
+fn gguf_residency(
+    choice: crate::options::ExpertResidencyChoice,
+    slots: u32,
+    reserve: u64,
+) -> GgufResidency {
+    use crate::options::ExpertResidencyChoice;
+    match choice {
+        ExpertResidencyChoice::Resident => GgufResidency::Resident,
+        _ if slots > 0 => GgufResidency::Streamed { slots },
+        ExpertResidencyChoice::Stream => GgufResidency::Fit { reserve },
+        ExpertResidencyChoice::Auto => GgufResidency::Auto { reserve },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        FactoryError, FamilyDefaults, recognises, refuse_clef_mismatch, sparse_prefill_rows,
+        FactoryError, FamilyDefaults, gguf_residency, recognises, refuse_clef_mismatch,
+        sparse_prefill_rows,
     };
+    use crate::options::ExpertResidencyChoice;
     use shiso_core::{CoreError, HfConfig};
+    use shiso_models::nemotron_h::GgufResidency;
 
     fn document(model_type: &str) -> HfConfig {
         HfConfig::from_json_str(&format!(r#"{{"model_type":"{model_type}"}}"#))
             .expect("the document parses")
+    }
+
+    #[test]
+    fn stream_without_a_slot_count_still_streams() {
+        let reserve = 1 << 30;
+        assert_eq!(
+            gguf_residency(ExpertResidencyChoice::Stream, 0, reserve),
+            GgufResidency::Fit { reserve }
+        );
+        assert_eq!(
+            gguf_residency(ExpertResidencyChoice::Stream, 900, reserve),
+            GgufResidency::Streamed { slots: 900 }
+        );
+        assert_eq!(
+            gguf_residency(ExpertResidencyChoice::Auto, 0, reserve),
+            GgufResidency::Auto { reserve }
+        );
+        assert_eq!(
+            gguf_residency(ExpertResidencyChoice::Resident, 900, reserve),
+            GgufResidency::Resident
+        );
     }
 
     #[test]

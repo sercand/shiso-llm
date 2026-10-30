@@ -136,6 +136,9 @@ pub struct MediaTowers {
     /// Where the towers' output is kept by content digest, shared with the
     /// renderer. `None` encodes every item of every request.
     pub cache: Option<Arc<MediaCache>>,
+    /// The family's placement, which resolves the placeholder ids when no
+    /// vision tower is open to answer it: an audio tower alone.
+    pub placement: Option<shiso_vision::MediaPlacement>,
 }
 
 /// Feeds `values` to `hash` as little-endian bytes, a block at a time so a

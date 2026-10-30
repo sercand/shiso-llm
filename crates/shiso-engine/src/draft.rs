@@ -90,8 +90,9 @@ use crate::blocks::AttnIo;
 use crate::ffn::Ffn;
 use crate::kv::{DeviceKv, KvLayout};
 use crate::launch::F32_BYTES;
+use crate::layers::Routed;
 use crate::layers::{self, Geometry, ResidualIndex, Scratch};
-use crate::moe::{Moe, MoeScratch};
+use crate::moe::MoeScratch;
 use crate::mtp::{DraftSource, SpecDepth, StepOutcome};
 use crate::projection::{self, Weight};
 use crate::shape::MoeShape;
@@ -116,6 +117,13 @@ pub struct DraftParts {
     pub ffn_norm: DeviceBuffer,
     /// Norm in front of the shared vocabulary projection, `[hidden]`.
     pub output_norm: DeviceBuffer,
+    /// How [`DraftParts::output_norm`] normalizes.
+    pub head_norm: HeadNorm,
+    /// A norm applied to a TARGET hidden row before
+    /// [`DraftParts::norm_hidden`], `[hidden]`, for a head trained on the
+    /// target's final-normed state rather than its residual. `None` reads the
+    /// residual as it is.
+    pub hidden_prenorm: Option<DeviceBuffer>,
     /// The head's single attention block.
     pub attn: Attn,
     /// The head's single feed-forward.
@@ -138,7 +146,18 @@ pub struct DraftParts {
     /// extracted `Qwen3.6-35B-A3B-MTP-4bit` head is MLX affine 4-bit group 64
     /// where the target's GGUF is `Q4_K`/`Q5_K` - and the codec is a property
     /// of the slabs, so nothing here has to say so.
-    pub moe: Option<(Moe, MoeShape)>,
+    pub moe: Option<(Routed, MoeShape)>,
+}
+
+/// How a draft head normalizes its output before the vocabulary projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadNorm {
+    /// Root-mean-square, the target's own; the head's next chain step reads
+    /// its residual.
+    Rms,
+    /// Centred and scaled, no offset; the head's next chain step reads the
+    /// normed row, which is the state the head was trained to continue from.
+    Layer,
 }
 
 /// A draft head resident on the device, with the cache and scratch it runs in.
@@ -565,10 +584,10 @@ impl HybridStack {
     /// weight once for all the rows, and a decode step is where its bytes go.
     fn verify(&mut self, session: SessionId, rows: &[TokenId]) -> CoreResult<()> {
         self.run_verify_rows(session, rows)?;
-        for row in 0..u32::try_from(rows.len()).unwrap_or(1) {
-            self.write_logits_row(row, row)?;
-        }
-        Ok(())
+        // Every row in one projection, so the vocabulary matrix - the widest
+        // in the stack - is read once for the pass rather than once a row:
+        // measured on an M4 over a 374 MB `q8_0` head, 3.6 ms a row.
+        self.write_logits_rows(u32::try_from(rows.len()).unwrap_or(1))
     }
 
     /// The greedy pick of every row of the pass that just ran.
@@ -920,15 +939,40 @@ impl HybridStack {
                 Hidden::Own => head.own.view(),
                 Hidden::TargetRows => resident.scratch.stream_at(residual)?.slice(at, hidden)?,
             };
-            layers::rms_norm_mul(
-                backend.as_ref(),
-                src,
-                head.parts.norm_hidden.view(),
-                pair.slice(both.saturating_add(hidden), hidden)?,
-                geometry.hidden,
-                1,
-                eps,
-            )?;
+            let half = pair.slice(both.saturating_add(hidden), hidden)?;
+            match (&head.parts.hidden_prenorm, from) {
+                // A target row the head reads final-normed: the target's
+                // output norm first, into the pair, then the head's own on it.
+                (Some(prenorm), Hidden::Staged | Hidden::TargetRows) => {
+                    layers::rms_norm_mul(
+                        backend.as_ref(),
+                        src,
+                        prenorm.view(),
+                        half,
+                        geometry.hidden,
+                        1,
+                        eps,
+                    )?;
+                    layers::rms_norm_mul(
+                        backend.as_ref(),
+                        half,
+                        head.parts.norm_hidden.view(),
+                        half,
+                        geometry.hidden,
+                        1,
+                        eps,
+                    )?;
+                }
+                _ => layers::rms_norm_mul(
+                    backend.as_ref(),
+                    src,
+                    head.parts.norm_hidden.view(),
+                    half,
+                    geometry.hidden,
+                    1,
+                    eps,
+                )?,
+            }
         }
         projection::projection(
             backend.as_ref(),
@@ -985,18 +1029,32 @@ impl HybridStack {
         // case and the whole feed-forward in the second, which is the same
         // field meaning the same thing the target's `LayerWeights` does.
         match (head.parts.moe.as_ref(), head.moe_scratch.as_ref()) {
-            (Some((moe, shape)), Some(moe_scratch)) => crate::moe::run(
-                backend.as_ref(),
-                moe,
-                &head.parts.ffn,
-                *shape,
-                moe_scratch,
-                crate::moe::MoeIo {
+            (Some((routed, shape)), Some(moe_scratch)) => {
+                let io = crate::moe::MoeIo {
                     input: scratch.normed(),
                     block_out: scratch.block_out(),
-                },
-                n_tok,
-            )?,
+                };
+                match routed {
+                    Routed::Glu(moe) => crate::moe::run(
+                        backend.as_ref(),
+                        moe,
+                        &head.parts.ffn,
+                        *shape,
+                        moe_scratch,
+                        io,
+                        n_tok,
+                    )?,
+                    Routed::Biased(moe) => crate::moe_biased::run(
+                        backend.as_ref(),
+                        moe,
+                        &head.parts.ffn,
+                        *shape,
+                        moe_scratch,
+                        io,
+                        n_tok,
+                    )?,
+                }
+            }
             // A head that stated a routed block and got no scratch for it is a
             // construction this type cannot produce - both come from `new` -
             // so it is refused rather than run as a dense head, which would
@@ -1037,11 +1095,30 @@ impl HybridStack {
             n_tok,
             eps,
         )?;
-        // The head's own residual for the last row of this pass, for the chain
+        // A centring head norm replaces the root-mean-square one the add
+        // above fused in, and its normed row - not the residual - is what the
+        // head continues from.
+        let carried = match head.parts.head_norm {
+            HeadNorm::Rms => stream,
+            HeadNorm::Layer => {
+                layers::layer_norm_mul(
+                    backend.as_ref(),
+                    stream,
+                    head.parts.output_norm.view(),
+                    scratch.normed(),
+                    geometry.hidden,
+                    n_tok,
+                    // The head's own epsilon, the family's layer-norm one.
+                    eps,
+                )?;
+                scratch.normed()
+            }
+        };
+        // The head's own state for the last row of this pass, for the chain
         // step that reads it next.
         backend.copy_d2d(
             head.own.view(),
-            stream.slice(
+            carried.slice(
                 u64::from(n_tok.saturating_sub(1)).saturating_mul(hidden),
                 hidden,
             )?,

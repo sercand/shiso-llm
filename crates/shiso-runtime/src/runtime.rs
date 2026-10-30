@@ -444,6 +444,22 @@ impl Runtime {
         .await
     }
 
+    /// Transcribes a clip with the loaded speech decoder.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::api::transcribe::transcribe`].
+    pub async fn transcribe(
+        &self,
+        request: crate::api::transcribe::TranscribeRequest,
+    ) -> Result<crate::api::transcribe::TranscribeOutput, AppError> {
+        within(
+            self.executor.handle().clone(),
+            crate::api::transcribe::transcribe(&self.state, request),
+        )
+        .await
+    }
+
     /// Makes the pictures of a text-to-image request.
     ///
     /// # Errors

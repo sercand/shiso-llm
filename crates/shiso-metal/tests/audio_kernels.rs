@@ -78,6 +78,7 @@ device_cases!(
     window_attention_full_bidirectional_matches,
     a_query_with_no_visible_key_yields_zeros,
     rope_half_rotates_pairs_across_the_halves,
+    rope_partial_rotates_only_the_leading_dims,
     lstm_cell_matches_the_gate_equations,
     bias_rows_adds_one_row_to_every_row,
     argmax_rows_keeps_the_lowest_index_of_the_largest,

@@ -435,6 +435,8 @@ fn fixture_with_draft(count: u32) -> (HybridStack, Vec<SessionId>) {
         input_norm: norm(&backend, HIDDEN),
         ffn_norm: norm(&backend, HIDDEN),
         output_norm: norm(&backend, HIDDEN),
+        head_norm: crate::draft::HeadNorm::Rms,
+        hidden_prenorm: None,
         attn: crate::attn::Attn {
             q: weight(&backend, HIDDEN, Q_HEADS * HEAD_DIM),
             k: Some(weight(&backend, HIDDEN, KV_HEADS * HEAD_DIM)),
@@ -539,4 +541,39 @@ fn a_plain_decode_step_stales_the_staged_row() {
         None,
         "a pass that is not a verify leaves a residual of its own, so the staged row is stale"
     );
+}
+
+/// Checkpoints a prompt of `chunks` chunks of `rows` rows leaves the cache,
+/// prefilled `rows` at a time.
+fn checkpoints_after(rows: u32, chunks: u32) -> u32 {
+    let mut opts = EngineOptions::new();
+    opts.prefill_rows = rows;
+    let (_recorder, mut stack, _) = fixture_with_options(0, opts);
+    let session = stack.open_session().expect("a session opens");
+    let prompt: Vec<TokenId> = (0..rows * chunks)
+        .map(|i| TokenId::new((i * 7 + 3) % VOCAB))
+        .collect();
+    stack
+        .prefill_chunk(session, &prompt)
+        .expect("the prompt prefills");
+    stack
+        .resident()
+        .expect("the fixture is resident")
+        .cache
+        .stats()
+        .ckpt_used
+}
+
+/// A periodic checkpoint lands on every chunk end, whatever the chunk width.
+///
+/// The cache's stride stop is the next multiple of the stride past the
+/// frontier, and the frontier is where the previous chunk ended. Measured
+/// against the narrow width, a wide chunk's end is never that stop while a
+/// slot is spare, so a wide prefill kept no periodic checkpoint at all.
+#[test]
+fn a_wide_prefill_checkpoints_at_its_own_chunk_ends() {
+    let narrow = checkpoints_after(crate::MAX_PREFILL_CHUNK, 2);
+    assert_eq!(narrow, 2, "one checkpoint per 512-row chunk end");
+    let wide = checkpoints_after(2 * crate::MAX_PREFILL_CHUNK, 2);
+    assert_eq!(wide, 2, "one checkpoint per 1024-row chunk end");
 }

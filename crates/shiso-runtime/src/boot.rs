@@ -278,7 +278,8 @@ pub fn boot_embedding(
 /// returns. A failure is a model that cannot keep its own picks off the list,
 /// which is a boot failure rather than a server that sometimes ends a turn on a
 /// quoted closer. No vocabulary means no specials are known, and nothing is
-/// suppressed.
+/// suppressed. `kept` names the specials that stay generable beyond the
+/// parsers' tags.
 pub(crate) fn suppress_control_tokens(
     model: &mut dyn shiso_core::Model,
     vocabulary: Option<&tokenizer::Vocabulary>,
@@ -286,13 +287,20 @@ pub(crate) fn suppress_control_tokens(
         shiso_parsers::ReasoningScheme,
         shiso_parsers::ToolCallScheme,
     ),
+    kept: &KeptTokens,
 ) -> Result<Arc<[shiso_core::TokenId]>, BootError> {
+    let width = model.info().vocab;
     let suppressed = vocabulary
         .map(|vocabulary| {
-            vocabulary.generation_suppressed(
-                model.info().stop_tokens,
-                &shiso_parsers::generated_tags(reasoning, tools),
-            )
+            let mut tags = shiso_parsers::generated_tags(reasoning, tools);
+            tags.extend(kept.tags.iter().map(String::as_str));
+            vocabulary
+                .generation_suppressed(model.info().stop_tokens, &tags)
+                .into_iter()
+                // A placeholder with no logit is one the model cannot pick,
+                // and no suppression list can name it.
+                .filter(|id| !(kept.placeholders.contains(id) && id.get() >= width))
+                .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     model
@@ -303,6 +311,52 @@ pub(crate) fn suppress_control_tokens(
         "control tokens suppressed in generation"
     );
     Ok(Arc::from(suppressed))
+}
+
+/// Specials a family keeps generable, beside its parsers' tags.
+#[derive(Debug, Default)]
+pub(crate) struct KeptTokens {
+    /// Spellings of specials that are part of the answer: a speech decoder's
+    /// speaker, event and style tags.
+    pub(crate) tags: Vec<String>,
+    /// The family's media placeholders. One past the logits width is a marker
+    /// the model has no logit for, and is left off the list rather than
+    /// refusing boot over it.
+    pub(crate) placeholders: Vec<shiso_core::TokenId>,
+}
+
+impl KeptTokens {
+    /// What `placement` and a speech pairing keep generable in `vocabulary`.
+    fn for_family(
+        vocabulary: Option<&tokenizer::Vocabulary>,
+        placement: &shiso_vision::MediaPlacement,
+        speech: bool,
+    ) -> Self {
+        let Some(vocabulary) = vocabulary else {
+            return Self::default();
+        };
+        let pads = vocabulary.media_ids(placement);
+        let tags = if speech {
+            vocabulary
+                .special_spellings()
+                .into_iter()
+                .filter(|s| {
+                    shiso_models::nemotron_transcribe::TAG_PREFIXES
+                        .iter()
+                        .any(|p| s.starts_with(p))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            tags,
+            placeholders: [pads.image(), pads.video(), pads.audio()]
+                .into_iter()
+                .flatten()
+                .collect(),
+        }
+    }
 }
 
 /// The engine thread's handle, joined at shutdown.
@@ -341,6 +395,7 @@ pub fn boot_language_model(
         open_audio,
         placement,
         defaults,
+        speech,
     } = load_checkpoint(&backend, kind, &config, args, model_path)?;
     // Before anything stands on a session: the tier is a property of the cache
     // the sessions draw their pages from, so it is chosen while there are none.
@@ -360,7 +415,7 @@ pub fn boot_language_model(
     // rather than a failure: the ids still reach the caller, and a checkpoint
     // whose vocabulary lives somewhere this flag was not pointed at is an
     // operator mistake that should be reported, not a reason to refuse to run.
-    let vocabulary = load_vocabulary(args);
+    let vocabulary = load_vocabulary(args, speech.is_none());
 
     // Before the listener binds, and only when the operator named one. A tower
     // that will not load, or that does not pair with this checkpoint, ends the
@@ -371,7 +426,12 @@ pub fn boot_language_model(
     // server without one falls back to what the checkpoint's config declares.
     let vision_spec = vision.as_ref().map(|tower| tower.preprocess().clone());
     // The same container, asked for the other tower it may carry.
-    let audio = open_audio_tower(&backend, args, model.as_mut(), open_audio)?;
+    let audio = open_audio_tower(
+        &backend,
+        audio_container(speech.as_ref(), args),
+        model.as_mut(),
+        open_audio,
+    )?;
     // Every weight this process will read is resident now, the tower's too, so
     // whatever the backend kept to make those imports fast can go.
     backend.finish_imports();
@@ -387,20 +447,11 @@ pub fn boot_language_model(
         .transpose()?;
     // The renderer reads the store the scheduler writes.
     let turn_replay = scheduler.turn_replay.clone();
-    let reasoning_scheme = args.reasoning_parser.reasoning(defaults.reasoning);
-    let tool_call_scheme = args.tool_call_parser.tools(defaults.tools);
-    tracing::info!(
-        reasoning = ?reasoning_scheme,
-        tools = ?tool_call_scheme,
-        thinking_default = defaults.thinking_default,
-        "output parsers configured"
-    );
+    let schemes = output_schemes(args, defaults);
+    let kept = KeptTokens::for_family(vocabulary.as_deref(), &placement, speech.is_some());
     // Before the engine thread exists, so no pass ever runs without it.
-    scheduler.suppressed = suppress_control_tokens(
-        model.as_mut(),
-        vocabulary.as_deref(),
-        (reasoning_scheme, tool_call_scheme),
-    )?;
+    scheduler.suppressed =
+        suppress_control_tokens(model.as_mut(), vocabulary.as_deref(), schemes, &kept)?;
     // One cache, read by the renderer and filled by the engine thread, so a
     // picture is decoded and encoded once however many turns carry it.
     let media_cache = (vision.is_some() || audio.is_some()).then(|| {
@@ -415,12 +466,13 @@ pub fn boot_language_model(
             vision,
             audio: audio.clone(),
             cache: media_cache.clone(),
+            placement: Some(placement),
         },
         vocabulary.clone(),
         &model_id,
         args.ctx,
         scheduler,
-        (reasoning_scheme, tool_call_scheme),
+        schemes,
     );
 
     let mut state = AppState::new(engine, model_id, args.ctx);
@@ -436,6 +488,7 @@ pub fn boot_language_model(
         state = state.with_checkpoint_tier(tier);
     }
     state.kv = cache;
+    state.speech = speech_decoder(args, speech.as_ref(), audio.as_ref());
     if let Some(vocabulary) = vocabulary {
         if let Some(renderer) = build_renderer(
             args,
@@ -646,7 +699,64 @@ fn open_vision_tower(
     Ok(Some(tower))
 }
 
-/// Opens the audio tower from the `--vision` container, when it carries one.
+/// The output parsers the flags and the family's defaults settle on.
+fn output_schemes(
+    args: &ServeOptions,
+    defaults: model_factory::FamilyDefaults,
+) -> (
+    shiso_parsers::ReasoningScheme,
+    shiso_parsers::ToolCallScheme,
+) {
+    let reasoning_scheme = args.reasoning_parser.reasoning(defaults.reasoning);
+    let tool_call_scheme = args.tool_call_parser.tools(defaults.tools);
+    tracing::info!(
+        reasoning = ?reasoning_scheme,
+        tools = ?tool_call_scheme,
+        thinking_default = defaults.thinking_default,
+        "output parsers configured"
+    );
+    (reasoning_scheme, tool_call_scheme)
+}
+
+/// The speech decoder's audio side, when the checkpoint is one and its tower
+/// opened.
+fn speech_decoder(
+    args: &ServeOptions,
+    speech: Option<&model_factory::SpeechPairing>,
+    audio: Option<&Arc<dyn shiso_audio::AudioTower>>,
+) -> Option<api::transcribe::SpeechDecoder> {
+    speech?;
+    if let Some(asr) = args.asr_model.as_deref() {
+        // Both may serve, each on its own route: the recognizer keeps the
+        // transcription route, the decoder answers audio in chat. Said here,
+        // because a transcription naming the decoder is answered as an
+        // unknown model.
+        tracing::warn!(
+            recognizer = %asr.display(),
+            "--asr-model answers /v1/audio/transcriptions; the speech decoder serves audio in chat only"
+        );
+    }
+    Some(api::transcribe::SpeechDecoder::new(
+        Arc::clone(audio?),
+        args.audio_limits(),
+        args.audio_decode_policy(),
+        args.audio_max_upload_bytes(),
+    ))
+}
+
+/// Where the audio tower is read from: a speech decoder's paired encoder, or
+/// for any other family the `--vision` container.
+fn audio_container<'a>(
+    speech: Option<&'a model_factory::SpeechPairing>,
+    args: &'a ServeOptions,
+) -> Option<&'a std::path::Path> {
+    speech
+        .map(|pairing| pairing.encoder.as_path())
+        .or(args.vision.as_deref())
+}
+
+/// Opens the audio tower from `container` (the `--vision` container, or a
+/// speech decoder's paired encoder), when it carries one.
 ///
 /// # Errors
 ///
@@ -657,11 +767,11 @@ fn open_vision_tower(
 // or a container exported without the tower. Each is logged.
 pub fn open_audio_tower(
     backend: &Arc<dyn shiso_core::Backend>,
-    args: &ServeOptions,
+    container: Option<&std::path::Path>,
     model: &mut dyn shiso_engine::ckpt::Checkpointed,
     open: model_factory::AudioTowerOpener,
 ) -> Result<Option<Arc<dyn shiso_audio::AudioTower>>, BootError> {
-    let Some(path) = args.vision.as_ref() else {
+    let Some(path) = container else {
         return Ok(None);
     };
     let _tag = shiso_core::ledger::scope(shiso_core::MemTag::VisionWeights);
@@ -968,10 +1078,15 @@ fn load_chat_template(args: &ServeOptions) -> Option<String> {
 }
 
 /// Loads the vocabulary, reporting rather than failing when it is absent.
-fn load_vocabulary(args: &ServeOptions) -> Option<Arc<tokenizer::Vocabulary>> {
+///
+/// `opening_token: false` drops the opening token the tokenizer config names:
+/// a speech decoder was trained on prompts that open straight on the turn
+/// marker, and its tokenizer config names one all the same.
+fn load_vocabulary(args: &ServeOptions, opening_token: bool) -> Option<Arc<tokenizer::Vocabulary>> {
     let path = args.tokenizer_path();
     match tokenizer::Vocabulary::from_file(&path) {
-        Ok(vocabulary) => Some(Arc::new(vocabulary)),
+        Ok(vocabulary) if opening_token => Some(Arc::new(vocabulary)),
+        Ok(vocabulary) => Some(Arc::new(vocabulary.with_bos(None))),
         Err(error) => {
             tracing::warn!(
                 path = %path.display(),

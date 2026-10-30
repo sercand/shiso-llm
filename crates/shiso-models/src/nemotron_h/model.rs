@@ -23,17 +23,22 @@ use shiso_core::backend::Backend;
 use shiso_core::buffer::DeviceBuffer;
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{LayerIdx, SessionId, TokenId};
+use shiso_core::media::{MediaModel, VisionPrefill};
 use shiso_core::model::{DecodeStep, Logits, Model, ModelInfo, StopTokens};
 use shiso_engine::attn::Attn;
 use shiso_engine::dense::DenseKernels;
 use shiso_engine::ffn::Ffn;
 use shiso_engine::layers::{Block, LayerWeights, Routed, Weights};
-use shiso_engine::moe_biased::{self, BiasedMoe, RowAffine4Stack};
+use shiso_engine::moe_biased::{self, BiasedMoe, ExpertStack, RowAffine4Stack};
 use shiso_engine::projection::Weight;
 use shiso_engine::ssm::Ssm;
-use shiso_engine::{EngineOptions, HybridStack};
+use shiso_engine::{DraftHead, EngineOptions, HybridStack};
+
+use shiso_engine::sparse::{ExpertSource, ExpertStream, StreamStats};
+use shiso_modelfile::GgufFile;
 
 use crate::nemotron_h::config::{Mixer, NemotronHConfig};
+use crate::nemotron_h::gguf::{self, ExpertPlacement, GgufExperts};
 use crate::qwen4exp::mlx::{MlxCheckpoint, f32_bytes, upload};
 
 /// The producer tag this container's shard headers carry.
@@ -47,6 +52,8 @@ const GROUP: u32 = 64;
 pub struct NemotronHModel {
     stack: HybridStack,
     info: ModelInfo,
+    /// The routed expert stream, when the banks are not resident.
+    stream: Option<Arc<ExpertStream>>,
 }
 
 impl NemotronHModel {
@@ -100,8 +107,276 @@ impl NemotronHModel {
                 stop_tokens: StopTokens::new(config.stop_tokens())?,
             },
             stack,
+            stream: None,
         })
     }
+
+    /// Opens a GGUF export and puts it on the device, its routed experts
+    /// resident or streamed from the file as `residency` says; streamed ones
+    /// are guessed and read ahead one layer when `prefetch` is set.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ConfigMissing`] naming the first tensor the export does
+    /// not hold, [`CoreError::InvalidValue`] for one in a format this loader
+    /// does not take, [`CoreError::Unsupported`] for a device that cannot hold
+    /// one layer's experts beside the other weights, and whatever the device
+    /// or the stack reports.
+    pub fn load_gguf(
+        backend: &Arc<dyn Backend>,
+        path: &Path,
+        config: &NemotronHConfig,
+        opts: EngineOptions,
+        residency: GgufResidency,
+        prefetch: bool,
+    ) -> CoreResult<Self> {
+        let file = GgufFile::open_shared(path).map_err(|err| CoreError::InvalidValue {
+            key: "nemotron_h gguf",
+            value: format!("{}: {err}", path.display()),
+        })?;
+        let shape = config.shape();
+        let moe = shape.moe.ok_or(CoreError::ShapeMismatch {
+            field: "router geometry",
+            expected: 1,
+            got: 0,
+        })?;
+        let mut blocks = gguf::routed_blocks(config);
+        // The prediction block's banks stream through the same pool, as the
+        // routed layer after the stack's last.
+        let head_block = config.mtp_block().filter(|_| opts.spec.is_speculative());
+        if opts.spec.is_speculative() && head_block.is_none() {
+            return Err(CoreError::InvalidValue {
+                key: "--spec-k",
+                value: "this export carries no prediction block to draft with".to_owned(),
+            });
+        }
+        let head_rank = u32::try_from(blocks.len()).unwrap_or(u32::MAX);
+        blocks.extend(head_block);
+        let source = Arc::new(GgufExperts::open(path, &file, &blocks, moe.experts)?);
+        let layers = source.layers();
+        let slot_bytes: u64 = source.layout().iter().sum();
+        let banks = slot_bytes * u64::from(moe.experts) * u64::from(layers);
+        let slots = stream_slots(
+            backend.as_ref(),
+            &file,
+            residency,
+            &Banks {
+                bytes: banks,
+                slot_bytes,
+                experts: moe.experts,
+            },
+        )?
+        .map(|slots| slots.min(moe.experts * layers));
+        let (placement, stream) = match slots {
+            None => (ExpertPlacement::Resident, None),
+            Some(slots) => {
+                let stream = Arc::new(ExpertStream::open(
+                    backend,
+                    source,
+                    layers,
+                    moe.experts,
+                    slots,
+                    moe.experts,
+                )?);
+                (
+                    ExpertPlacement::Streamed {
+                        stream: Arc::clone(&stream),
+                        prefetch,
+                    },
+                    Some(stream),
+                )
+            }
+        };
+        let weights = gguf::weights_gguf(backend, &file, config, &placement)?;
+        let embed = file
+            .find("token_embd.weight")
+            .map(|desc| desc.dtype)
+            .ok_or_else(|| CoreError::ConfigMissing {
+                key: "token_embd.weight".to_owned(),
+            })?;
+        let mut stack = HybridStack::new(
+            backend,
+            shape.clone(),
+            weights,
+            embed,
+            Arc::new(DenseKernels),
+            None,
+            opts,
+        )?;
+        if let Some(block) = head_block {
+            let parts = gguf::draft_parts(backend, &file, config, &placement, block, head_rank)?;
+            // Sized for the widest pass the head runs, the prompt chunk it is
+            // warmed over; a chain is one row.
+            let head = DraftHead::new(
+                backend,
+                parts,
+                stack.geometry(),
+                stack.pool_pages(),
+                opts.prefill_rows,
+            )?;
+            stack.bind_draft(head)?;
+        }
+        Ok(Self {
+            info: ModelInfo {
+                context_capacity: stack.context_capacity(),
+                vocab: shape.vocab,
+                hidden: shape.hidden,
+                n_layers: shape.n_layers(),
+                stop_tokens: StopTokens::new(config.stop_tokens())?,
+            },
+            stack,
+            stream,
+        })
+    }
+
+    /// What the routed expert stream has done, when the banks are streamed.
+    #[must_use]
+    pub fn expert_stats(&self) -> Option<StreamStats> {
+        self.stream.as_ref().map(|s| s.stats())
+    }
+}
+
+/// How a GGUF load places the routed expert banks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GgufResidency {
+    /// Resident when every weight fits in the device's working set with
+    /// `reserve` bytes to spare, streamed into as many slots as fit otherwise.
+    Auto {
+        /// Bytes left free beside the weights.
+        reserve: u64,
+    },
+    /// Every expert imported, whatever the device says.
+    Resident,
+    /// Streamed whatever the device says, into as many slots as fit beside
+    /// the other weights with `reserve` bytes to spare.
+    Fit {
+        /// Bytes left free beside the weights.
+        reserve: u64,
+    },
+    /// Streamed into exactly this many slots.
+    Streamed {
+        /// Expert slots in the pool.
+        slots: u32,
+    },
+}
+
+/// The routed banks a pool is sized for.
+#[derive(Debug, Clone, Copy)]
+struct Banks {
+    /// Bytes every bank of every routed layer occupies together.
+    bytes: u64,
+    /// Bytes one slot holds: one expert's up and down projections.
+    slot_bytes: u64,
+    /// Experts per routed layer: a step can route to any of one layer's,
+    /// so a pool smaller than that cannot run a step.
+    experts: u32,
+}
+
+/// Slots the routed banks stream into.
+///
+/// `Auto` keeps them resident when every weight fits in the device's working
+/// set with `reserve` to spare, and otherwise sizes the pool to what is left;
+/// `Fit` sizes the pool that way without the resident case.
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] when a pool sized to the device holds fewer
+/// slots than one layer has experts; the figures are logged beside it.
+// None: the banks stay resident and no pool is opened.
+fn stream_slots(
+    backend: &dyn Backend,
+    file: &GgufFile,
+    residency: GgufResidency,
+    banks: &Banks,
+) -> CoreResult<Option<u32>> {
+    let (reserve, auto) = match residency {
+        GgufResidency::Resident => return Ok(None),
+        GgufResidency::Streamed { slots } => return Ok(Some(slots)),
+        GgufResidency::Fit { reserve } => (reserve, false),
+        GgufResidency::Auto { reserve } => (reserve, true),
+    };
+    let total = backend.memory_info().map_or(u64::MAX, |info| info.total);
+    let other = file
+        .tensors()
+        .iter()
+        .map(|t| t.bytes)
+        .sum::<u64>()
+        .saturating_sub(banks.bytes);
+    fit_slots(&Fit {
+        total,
+        other,
+        reserve,
+        auto,
+        banks: *banks,
+    })
+}
+
+/// What a device-sized pool is sized from.
+#[derive(Debug, Clone, Copy)]
+struct Fit {
+    /// The device's working set, in bytes.
+    total: u64,
+    /// Bytes of every weight but the routed banks.
+    other: u64,
+    /// Bytes left free beside the weights.
+    reserve: u64,
+    /// Whether the banks stay resident when everything fits.
+    auto: bool,
+    /// The banks.
+    banks: Banks,
+}
+
+/// The arithmetic of [`stream_slots`] for `Fit` and `Auto`, apart from the
+/// device so it can be checked on its own.
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] when fewer slots fit than one layer has
+/// experts: the stream could open, but no step could run through it.
+// None: everything fits and the banks stay resident.
+fn fit_slots(fit: &Fit) -> CoreResult<Option<u32>> {
+    let Fit {
+        total,
+        other,
+        reserve,
+        auto,
+        banks,
+    } = *fit;
+    let fixed = other.saturating_add(reserve);
+    if auto && fixed.saturating_add(banks.bytes) <= total {
+        return Ok(None);
+    }
+    // Never more slots than the banks hold experts: a pool that large is the
+    // banks themselves, and a device that reports no working set would
+    // otherwise ask for every slot a u32 counts.
+    let per = banks.slot_bytes.max(1);
+    let slots = (total.saturating_sub(fixed) / per).min(banks.bytes / per);
+    let slots = u32::try_from(slots).unwrap_or(u32::MAX);
+    if slots < banks.experts {
+        tracing::error!(
+            total_gib = total >> 30,
+            other_weights_gib = other >> 30,
+            reserve_gib = reserve >> 30,
+            slot_mib = banks.slot_bytes >> 20,
+            slots,
+            experts = banks.experts,
+            "the device cannot hold one routed layer's experts beside the other weights"
+        );
+        return Err(CoreError::Unsupported {
+            what: "streaming routed experts on a device that cannot hold one layer's \
+                   experts beside the other weights",
+            backend: "nemotron_h",
+        });
+    }
+    tracing::info!(
+        total_gib = total >> 30,
+        other_weights_gib = other >> 30,
+        reserve_gib = reserve >> 30,
+        banks_gib = banks.bytes >> 30,
+        slots,
+        "the routed banks do not fit; streaming them from disk"
+    );
+    Ok(Some(slots))
 }
 
 /// The checkpoint and the device, for the imports below.
@@ -242,8 +517,18 @@ impl Loader<'_> {
             "F32",
             &[u64::from(moe.experts)],
         )?;
-        let up = self.stack(&at("switch_mlp.fc1"), moe.experts, hidden, moe.intermediate)?;
-        let down = self.stack(&at("switch_mlp.fc2"), moe.experts, moe.intermediate, hidden)?;
+        let up = ExpertStack::Affine4(self.stack(
+            &at("switch_mlp.fc1"),
+            moe.experts,
+            hidden,
+            moe.intermediate,
+        )?);
+        let down = ExpertStack::Affine4(self.stack(
+            &at("switch_mlp.fc2"),
+            moe.experts,
+            moe.intermediate,
+            hidden,
+        )?);
         moe_biased::check_stack(&up)?;
         moe_biased::check_stack(&down)?;
         Ok((
@@ -255,6 +540,7 @@ impl Loader<'_> {
                 renormalize: config.renormalize(),
                 up,
                 down,
+                guess: None,
             },
         ))
     }
@@ -323,6 +609,54 @@ impl Loader<'_> {
     }
 }
 
+/// The speculative path, when the export's prediction block is bound.
+impl shiso_core::model::Speculating for NemotronHModel {
+    fn speculate(
+        &mut self,
+        session: SessionId,
+        first: TokenId,
+    ) -> CoreResult<shiso_core::model::Speculated> {
+        let eos = self.info.stop_tokens.primary();
+        self.stack.speculate(session, first, eos)
+    }
+
+    // None: this family drafts with a head, never a block drafter.
+    fn verify_block(
+        &mut self,
+        _: SessionId,
+        _: TokenId,
+        _: shiso_core::model::DraftHint,
+        _: &[TokenId],
+    ) -> CoreResult<Option<shiso_core::model::VerifiedBlock>> {
+        Ok(None)
+    }
+
+    fn settle_block(
+        &mut self,
+        _: SessionId,
+        _: shiso_core::model::VerifiedBlock,
+        _: u32,
+    ) -> CoreResult<()> {
+        Err(CoreError::Unsupported {
+            what: "settling a drafted block on a family that drafts with a head",
+            backend: "nemotron_h",
+        })
+    }
+}
+
+/// The media path: audio rows from the speech encoder spliced over the
+/// prompt's placeholder run, in one call as the other families state it.
+impl MediaModel for NemotronHModel {
+    fn prefill_media(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        media: &VisionPrefill<'_>,
+    ) -> CoreResult<Logits<'_>> {
+        self.stack_mut().prefill_last_media(session, tokens, media)
+    }
+}
+
 impl Model for NemotronHModel {
     fn info(&self) -> &ModelInfo {
         &self.info
@@ -351,4 +685,24 @@ impl Model for NemotronHModel {
     fn teardown(&mut self) -> CoreResult<()> {
         self.stack_mut().teardown()
     }
+
+    fn spec_mut(&mut self) -> Option<&mut dyn shiso_core::model::Speculating> {
+        self.stack.draft_resident().then_some(self)
+    }
+
+    /// The stack takes the verify's greedy picks itself, so the list goes to
+    /// it; the scheduler masks every row it draws from on its own.
+    fn suppress_tokens(&mut self, ids: &[TokenId]) -> CoreResult<()> {
+        self.stack_mut().suppress_tokens(ids)
+    }
+
+    // The scheduler reaches the audio splice through here; without it a
+    // paired encoder's rows would have nowhere to go and boot refuses them.
+    fn media_mut(&mut self) -> Option<&mut dyn MediaModel> {
+        Some(self)
+    }
 }
+
+#[cfg(test)]
+#[path = "model_tests.rs"]
+mod tests;

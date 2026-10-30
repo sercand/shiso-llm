@@ -25,6 +25,7 @@ pub mod iq;
 pub mod misc;
 pub mod ple;
 pub mod q4_0;
+pub mod q8_rows;
 pub mod routed;
 pub mod short_conv;
 pub mod ssm;
