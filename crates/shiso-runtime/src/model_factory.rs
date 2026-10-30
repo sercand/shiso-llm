@@ -867,6 +867,12 @@ fn load_nemotron_h(
         let mut opts = opts;
         opts.spec = SpecDepth::new(args.spec_k);
         let family = NemotronHConfig::from_gguf_path(path).map_err(FactoryError::Load)?;
+        // An encoder that projects to another width would write its rows
+        // into the wrong embedding slots; refused before any weight moves.
+        if let Some(pairing) = speech.as_ref() {
+            shiso_models::nemotron_transcribe::pairing::check_pairing(&pairing.encoder, &family)
+                .map_err(FactoryError::Load)?;
+        }
         let residency = gguf_residency(
             args.expert_residency,
             args.expert_slots,
@@ -1563,6 +1569,8 @@ pub fn recognises(config: &HfConfig) -> bool {
 /// Where a GGUF load puts the routed banks: `--expert-residency` decides,
 /// and `--expert-slots`, when set, fixes the pool a streamed load reads into.
 /// `stream` without a slot count still streams, into as many slots as fit.
+/// As for the sparse family, a slot count makes `auto` stream and `resident`
+/// ignores it.
 fn gguf_residency(
     choice: crate::options::ExpertResidencyChoice,
     slots: u32,

@@ -6,6 +6,9 @@
 //! `tokenizer.json` and `chat_template.jinja` beside it); says on stderr why
 //! it skipped otherwise. The tower is a stand-in with the encoder's frontend
 //! shape: what is under test is where the run lands, not what fills it.
+//!
+//! The audio-only renderer case needs no checkpoint: it renders through a
+//! stub vocabulary and template.
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -167,5 +170,77 @@ fn audio_part_moves_to_turn_end() {
     assert_eq!(
         text_first,
         prompt_ids(&vocabulary, &Preset::Verbatim, rows, marker).expect("renders")
+    );
+}
+
+/// A word-level vocabulary that holds the audio marker as a special token,
+/// so the render path runs with no checkpoint.
+fn stub_vocabulary() -> Arc<Vocabulary> {
+    let document = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [{
+            "id": 3, "content": "<|audio|>", "single_word": false, "lstrip": false,
+            "rstrip": false, "normalized": false, "special": true,
+        }],
+        "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": null,
+        "decoder": null,
+        "model": {
+            "type": "WordLevel",
+            "vocab": {"<unk>": 0, "hello": 1, "there": 2, "<|audio|>": 3},
+            "unk_token": "<unk>",
+        },
+    })
+    .to_string();
+    let inner = <tokenizers::Tokenizer as std::str::FromStr>::from_str(&document)
+        .expect("the stub vocabulary loads");
+    Arc::new(Vocabulary::from_tokenizer(inner).with_bos(None))
+}
+
+/// Text parts as written, each audio part as the marker.
+const STUB_TEMPLATE: &str = "{% for m in messages %}{% if m.content is string %}{{ m.content }}\
+     {% else %}{% for p in m.content %}{% if p.type == 'audio' %} <|audio|>{% else %}{{ p.text }}\
+     {% endif %}{% endfor %}{% endif %}{% endfor %}";
+
+fn stub_renderer(vocabulary: &Arc<Vocabulary>, tower: bool) -> PromptRenderer {
+    let renderer = PromptRenderer::new(
+        STUB_TEMPLATE,
+        SERVER_TOOL_JSON_STYLE,
+        Arc::clone(vocabulary),
+    )
+    .expect("the template compiles");
+    if !tower {
+        return renderer;
+    }
+    renderer.with_audio_tower(
+        stand(),
+        PLACEMENT,
+        DecodeLimits::new(NonZeroU32::new(3600).expect("non-zero")),
+        AudioDecodePolicy::default(),
+    )
+}
+
+/// A renderer given an audio tower and no vision tower still finds the
+/// marker it rendered, and a prompt with no audio renders as it would with
+/// no tower attached.
+#[test]
+fn an_audio_only_renderer_places_the_clip_and_leaves_text_alone() {
+    let vocabulary = stub_vocabulary();
+    let with_tower = stub_renderer(&vocabulary, true);
+    let marker = vocabulary
+        .media_ids(&PLACEMENT)
+        .audio()
+        .expect("the stub declares the audio marker");
+    let tokens = render(&with_tower, vec![Block::Text("hello".into()), audio()]);
+    // One second of 16 kHz audio is 100 mel rows, eight to a row.
+    assert_eq!(tokens.iter().filter(|&&id| id == marker).count(), 13);
+
+    let text = vec![Block::Text("hello there".into())];
+    assert_eq!(
+        render(&with_tower, text.clone()),
+        render(&stub_renderer(&vocabulary, false), text)
     );
 }

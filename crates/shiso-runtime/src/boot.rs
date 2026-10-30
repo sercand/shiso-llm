@@ -726,6 +726,16 @@ fn speech_decoder(
     audio: Option<&Arc<dyn shiso_audio::AudioTower>>,
 ) -> Option<api::transcribe::SpeechDecoder> {
     speech?;
+    if let Some(asr) = args.asr_model.as_deref() {
+        // Both may serve, each on its own route: the recognizer keeps the
+        // transcription route, the decoder answers audio in chat. Said here,
+        // because a transcription naming the decoder is answered as an
+        // unknown model.
+        tracing::warn!(
+            recognizer = %asr.display(),
+            "--asr-model answers /v1/audio/transcriptions; the speech decoder serves audio in chat only"
+        );
+    }
     Some(api::transcribe::SpeechDecoder::new(
         Arc::clone(audio?),
         args.audio_limits(),

@@ -467,6 +467,10 @@ pub struct ServeOptions {
     /// Expert slots when the banks are streamed; zero sizes the pool from the
     /// working set.
     ///
+    /// A nonzero count under `--expert-residency auto` streams the banks into
+    /// that pool even when they would fit. `resident` ignores the count,
+    /// because a recipe may set one that the operator's `resident` overrides.
+    ///
     /// One slot holds one expert of one layer, 2.6 MiB for the published
     /// checkpoint.
     #[cfg_attr(

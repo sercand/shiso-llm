@@ -382,6 +382,31 @@ mod speech_tests {
     }
 
     #[test]
+    fn keywords_are_refused_by_name() {
+        let mut f = form();
+        f.context.keywords.push("shiso".into());
+        assert!(refused_param(&f).contains("keywords"));
+    }
+
+    #[test]
+    fn streamed_json_and_text_are_served() {
+        for format in [ResponseFormat::Json, ResponseFormat::Text] {
+            let mut f = form();
+            f.response_format = format;
+            f.stream = true;
+            assert!(check_speech_form(&f, "speech").is_ok());
+        }
+    }
+
+    #[test]
+    fn word_timestamps_in_text_are_refused_by_name() {
+        let mut f = form();
+        f.response_format = ResponseFormat::Text;
+        f.granularities.push(Granularity::Word);
+        assert!(refused_param(&f).contains("timestamp_granularities"));
+    }
+
+    #[test]
     fn another_model_is_unknown() {
         let mut f = form();
         f.model = "whisper".into();
