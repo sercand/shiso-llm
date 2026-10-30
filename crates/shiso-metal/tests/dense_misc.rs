@@ -93,6 +93,13 @@ fn the_layer_norm_centres_scales_and_weights_each_row() {
 
 #[test]
 #[ignore = "requires a Metal device"]
+fn the_layer_norm_keeps_a_large_mean_row_precise() {
+    let Some(gpu) = open() else { return };
+    misc::the_layer_norm_keeps_a_large_mean_row_precise(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
 fn q8_rows_matches_the_host_product() {
     let Some(gpu) = open() else { return };
     shiso_kerneltest::dense::q8_rows::q8_rows_matches_the_host_product(&gpu);

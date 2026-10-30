@@ -68,6 +68,7 @@ disagree, the kernel is right and this file is the bug.
 | `kernel_dense_experts_iq4nl_f32` | `blocks, map, input, sorted, bounds, active, out` | `(ceil(out_dim/16), min(columns, n_expert))` | 128 | 0 |
 | `kernel_dense_experts_iq4nl_gemm_f32` | `blocks, map, input, sorted, bounds, active, out` | `(ceil(out_dim/64), min(columns, n_expert))` | 128 | 0 (static, 11.5 KiB) |
 | `kernel_dense_ple_prepare_affine4` | `out, proj, norm_w, rows, ids` | `(n_layers, n_tok)` | 128 | 1156 |
+| `kernel_dense_q8_0_rows_f32_r1` .. `kernel_dense_q8_0_rows_f32_r8` | `w, x, y` | `ceil(out_dim/2)` | 128 | 0 (static, 256 B) |
 
 The four attention entries take their threadgroup memory from the compile-time
 strides in `dense_common.h`, never from `head_dim`: the norm pair asks for
@@ -114,6 +115,7 @@ for field in `crates/shiso-engine/src/launch.rs`.
 | `dense_args_attn` | `head_dim, n_head, n_head_kv, n_tok, page_tokens, window, scale, page_stride` | `DenseAttnArgs`, 32 bytes |
 | `dense_args_ple` | `n_tok, n_layers, dim, row_bytes, resident, eps, proj_scale, embed_scale, mix_scale` | `DensePleArgs`, 36 bytes |
 | `dense_args_ple_gate` | `n_tok, n_layers, dim, layer` | `DensePleGateArgs`, 16 bytes |
+| `dense_args_q8_rows` (`dense_q8_rows.metal`) | `uint32_t in_dim; uint32_t out_dim;` | `Args` inside `q8_rows_projection`, `crates/shiso-engine/src/projection.rs`, 8 bytes |
 | `shs_metal_args_glu` (`metal/generic/glu.metal`) | `ne00, nb01, ne10, nb11, ne0, nb1, i00, i10, alpha, limit` | `GluArgs`, 64 bytes |
 | `shs_metal_args_norm` (`metal/generic/norm.metal`) | `ne00, ne00_t, nb1, nb2, nb3, eps, nef1..3, nbf1..3` | `NormArgs`, 144 bytes |
 
@@ -198,6 +200,29 @@ for field in `crates/shiso-engine/src/launch.rs`.
   `4 * (DENSE_BLOCK_SUM_SLOTS + DENSE_PLE_DIM)` = `4 * (33 + 256)` = 1156 bytes:
   the block sum's slots first, the decoded row after them. The engine's mirror is
   `DENSE_PLE_SMEM_BYTES` in `crates/shiso-engine/src/launch.rs`.
+- `kernel_dense_layer_norm_mul_f32`: per row, with `p = src[0]`,
+  `dmean = sum_i(src[i] - p) / dim`, `d_i = (src[i] - p) - dmean`,
+  `dst[i] = d_i * rsqrt(sum_i(d_i^2) / dim + eps) * w[i]` - the biased
+  variance, no bias term. Every deviation is taken about the row's first
+  value, not about zero, so the mean is never stored at the row's magnitude:
+  near 1e4 an f32 ulp is 1e-3, a tenth of a deviation of order 1e-2. The
+  entry is compiled `math_mode(safe)` so `(src[i] - p) - dmean` is not
+  reassociated back into `src[i] - (p + dmean)`; both sums go through
+  `dense_block_sum`.
+- `kernel_dense_q8_0_rows_f32_rR` (`R` = 1..=8): `y[t][o] = sum_k W[o][k] x[t][k]`
+  for the `R` activation rows `t`, `W` stored as `[out_dim][in_dim/32]` `q8_0`
+  blocks (34 bytes: an f16 scale, then 32 signed quants). `in_dim` must be a
+  multiple of 32, since each row of `x` is read as whole blocks of `float4`. A
+  threadgroup owns output rows `2g` and `2g + 1` (the second clamped to
+  `out_dim - 1` for the read and skipped for the store); its four simdgroups
+  take every fourth eight-block step, four lanes to a block and eight values a
+  lane, each lane's eight products summed before the block scale multiplies
+  them. The lane partials go through `dense_warp_sum` and the four simdgroup
+  partials meet in the static `partial` array, added in simdgroup order. Every
+  order is a function of the shape alone, and a row is summed the same way
+  whatever `R` is, so a verified row answers as the one-row step it checks.
+  The file is compiled `math_mode(safe)` for the same reason. The engine
+  launches `_r{n_tok}` from `q8_rows_projection` for `n_tok` 1..=8.
 - `kernel_dense_ple_gate_mul`: `gate[t, i] = dense_gelu_tanh(gate[t, i]) * ple[t, layer, i]`,
   in place, flat over `n_tok * dim`. The slot is a field of the argument block
   rather than a grid dimension, because one layer of the loop runs one of these.

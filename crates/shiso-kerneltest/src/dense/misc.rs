@@ -515,14 +515,40 @@ const _: () = assert!(size_of::<LayerNormArgs>() == 8);
 /// `dst[r] = (src[r] - mean) / sqrt(var + eps) * w`, the variance biased,
 /// over every row on its own.
 pub fn the_layer_norm_centres_scales_and_weights_each_row(gpu: &Gpu) {
-    let (rows, dim, eps) = (3usize, 2688usize, 1e-5f32);
+    let (rows, dim) = (3usize, 2688usize);
     let src: Vec<f32> = crate::oracle::signal(rows * dim, 61)
         .iter()
         .enumerate()
         .map(|(i, v)| v * 3.0 + (i / dim) as f32)
         .collect();
+    check_layer_norm(gpu, &src, dim, "layer norm");
+}
+
+/// A row whose mean dwarfs its spread: values near `1e4` (an f32 ulp of about
+/// `1e-3` there) moving by about `1e-2`. A mean stored at the row's magnitude
+/// is off by a tenth of a deviation before any deviation is formed, which no
+/// summation order recovers; the kernel takes everything about the row's first
+/// value instead. The rows differ in sign and offset so a pivot that leaked
+/// across rows would show.
+pub fn the_layer_norm_keeps_a_large_mean_row_precise(gpu: &Gpu) {
+    let dim = 2688usize;
+    let offsets = [1.0e4f32, -2.5e4, 6.0e3];
+    let noise = crate::oracle::signal(offsets.len() * dim, 63);
+    let src: Vec<f32> = noise
+        .iter()
+        .enumerate()
+        .map(|(i, v)| offsets[i / dim] + v * 1.0e-2)
+        .collect();
+    check_layer_norm(gpu, &src, dim, "large-mean layer norm");
+}
+
+/// Launches the layer norm over `src` (whole rows of `dim`) and compares it
+/// with an `f64` reading of the formula over the same `f32` inputs.
+fn check_layer_norm(gpu: &Gpu, src: &[f32], dim: usize, what: &str) {
+    let eps = 1e-5f32;
+    let rows = src.len() / dim;
     let w = crate::oracle::signal(dim, 62);
-    let d_src = gpu.upload(&f32_bytes(&src));
+    let d_src = gpu.upload(&f32_bytes(src));
     let d_w = gpu.upload(&f32_bytes(&w));
     let d_dst = zeros(gpu, rows * dim);
     let args = LayerNormArgs {
@@ -557,5 +583,5 @@ pub fn the_layer_norm_centres_scales_and_weights_each_row(gpu: &Gpu) {
             want[r * dim + i] = ((f64::from(row[i]) - mean) * inv * f64::from(w[i])) as f32;
         }
     }
-    close(&gpu.read_f32(&d_dst), &want, "layer norm");
+    close(&gpu.read_f32(&d_dst), &want, what);
 }

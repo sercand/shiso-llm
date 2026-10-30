@@ -121,6 +121,13 @@ fn iq4nl_expert_gemm_matches_host_dequant() {
 
 #[test]
 #[ignore = "requires a Metal device"]
+fn iq4nl_expert_stages_read_the_row_by_token_says() {
+    let Some(gpu) = open() else { return };
+    routed::iq4nl_expert_stages_read_the_row_by_token_says(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
 fn iq4nl_expert_gemm_reads_through_the_slot_map() {
     let Some(gpu) = open() else { return };
     routed::iq4nl_expert_gemm_reads_through_the_slot_map(&gpu);

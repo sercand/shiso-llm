@@ -510,36 +510,35 @@ impl Iq4NlFixture {
             .collect()
     }
 
-    /// Runs the stage over `stack` (whole, or a slot pool when `map` is
-    /// given) and returns the `[columns, out_dim]` output.
+    /// Runs the one-column stage over `stack` (whole, or a slot pool when
+    /// `map` is given) on the first projection's input, and returns the
+    /// `[columns, out_dim]` output.
     fn run(&self, gpu: &Gpu, stack: &[u8], map: Option<&[i32]>, act: u32, x: &[f32]) -> Vec<f32> {
-        self.run_entry(
-            gpu,
-            "kernel_dense_experts_iq4nl_f32",
-            16,
-            stack,
+        let desc = Iq4NlLaunchDesc {
             map,
             act,
-            x,
-        )
+            ..Iq4NlLaunchDesc::ONE_COLUMN
+        };
+        self.run_entry(gpu, &desc, stack, x)
     }
 
-    /// As [`Iq4NlFixture::run`], through `entry`, whose threadgroup covers
-    /// `rows_per_group` output rows.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a test fixture's one launch helper"
-    )]
+    /// Launches `desc` over `stack` and `x` and returns the `[columns,
+    /// out_dim]` output. `x` holds a row a token when `desc.by_token` is 1 and
+    /// a row a column when it is 0.
     fn run_entry(
         &self,
         gpu: &Gpu,
-        entry: &'static str,
-        rows_per_group: u32,
+        desc: &Iq4NlLaunchDesc<'_>,
         stack: &[u8],
-        map: Option<&[i32]>,
-        act: u32,
         x: &[f32],
     ) -> Vec<f32> {
+        let Iq4NlLaunchDesc {
+            entry,
+            rows_per_group,
+            map,
+            act,
+            by_token,
+        } = *desc;
         let columns = self.n_tok * self.used;
         let w_buf = gpu.upload(stack);
         let map_buf = gpu.upload(&i32_bytes(map.unwrap_or(&[0])));
@@ -553,7 +552,7 @@ impl Iq4NlFixture {
             out_dim: self.out_dim as u32,
             n_expert: self.experts as u32,
             n_used: self.used as u32,
-            by_token: 1,
+            by_token,
             act,
             // `mapped`, then `layer_base`: the map below is one layer's, so
             // its base is zero.
@@ -586,6 +585,62 @@ impl Iq4NlFixture {
     fn input(&self) -> Vec<f32> {
         signal(self.n_tok * self.in_dim, 73)
     }
+
+    /// The host product of the dequantized rows for `x` read as `by_token`
+    /// says, through `act`, `[columns, out_dim]`.
+    fn want(&self, x: &[f32], by_token: u32, act: u32) -> Vec<f64> {
+        let mut wanted = vec![0.0f64; self.ids.len() * self.out_dim];
+        for (col, &e) in self.ids.iter().enumerate() {
+            let xr = if by_token == 1 { col / self.used } else { col };
+            let input = &x[xr * self.in_dim..(xr + 1) * self.in_dim];
+            for r in 0..self.out_dim {
+                let dot: f64 = self
+                    .row(e as usize, r)
+                    .iter()
+                    .zip(input)
+                    .map(|(a, b)| a * f64::from(*b))
+                    .sum();
+                wanted[col * self.out_dim + r] = if act == 1 { dot.max(0.0).powi(2) } else { dot };
+            }
+        }
+        wanted
+    }
+}
+
+/// How one launch of the `IQ4_NL` stage is shaped: which entry, how many
+/// output rows its threadgroup covers, and the stage's switches.
+#[derive(Debug, Clone, Copy)]
+struct Iq4NlLaunchDesc<'a> {
+    entry: &'static str,
+    /// Output rows one threadgroup covers, which sets the grid's x extent.
+    rows_per_group: u32,
+    /// The slot map, or `None` to read the whole stack.
+    map: Option<&'a [i32]>,
+    /// 1 fuses `max(v, 0)^2` into the store.
+    act: u32,
+    /// 1 reads a column's token row (the first projection), 0 the column's own
+    /// row (the second).
+    by_token: u32,
+}
+
+impl Iq4NlLaunchDesc<'_> {
+    /// The one-column entry a decode step takes, on the first projection.
+    const ONE_COLUMN: Iq4NlLaunchDesc<'static> = Iq4NlLaunchDesc {
+        entry: "kernel_dense_experts_iq4nl_f32",
+        rows_per_group: 16,
+        map: None,
+        act: 0,
+        by_token: 1,
+    };
+
+    /// The tiled entry a prompt pass takes, on the first projection.
+    const TILED: Iq4NlLaunchDesc<'static> = Iq4NlLaunchDesc {
+        entry: "kernel_dense_experts_iq4nl_gemm_f32",
+        rows_per_group: 64,
+        map: None,
+        act: 0,
+        by_token: 1,
+    };
 }
 
 /// The `IQ4_NL` stage against the host product of the dequantized rows.
@@ -676,15 +731,45 @@ fn gemm(
     act: u32,
     x: &[f32],
 ) -> Vec<f32> {
-    f.run_entry(
-        gpu,
-        "kernel_dense_experts_iq4nl_gemm_f32",
-        64,
-        stack,
+    let desc = Iq4NlLaunchDesc {
         map,
         act,
-        x,
-    )
+        ..Iq4NlLaunchDesc::TILED
+    };
+    f.run_entry(gpu, &desc, stack, x)
+}
+
+/// Both entries read a column's token row when `by_token` is 1 and the
+/// column's own row when it is 0, the second projection's input: one row a
+/// column, each different, so a column that read its token's row (or a
+/// neighbour's) would land on another row's product.
+pub fn iq4nl_expert_stages_read_the_row_by_token_says(gpu: &Gpu) {
+    let f = Iq4NlFixture::with_tokens(40, 100);
+    let columns = f.n_tok * f.used;
+    let stack: &[u8] = bytemuck::cast_slice(&f.blocks);
+    for base in [Iq4NlLaunchDesc::ONE_COLUMN, Iq4NlLaunchDesc::TILED] {
+        for (by_token, act) in [(1u32, 1u32), (0, 0), (0, 1)] {
+            let rows = if by_token == 1 { f.n_tok } else { columns };
+            let x = signal(rows * f.in_dim, 73 + by_token);
+            let desc = Iq4NlLaunchDesc {
+                act,
+                by_token,
+                ..base
+            };
+            let got = f.run_entry(gpu, &desc, stack, &x);
+            let wanted = f.want(&x, by_token, act);
+            let peak = wanted.iter().fold(0.0f64, |m, w| m.max(w.abs()));
+            let worst = got
+                .iter()
+                .zip(&wanted)
+                .fold(0.0f64, |m, (h, w)| m.max((f64::from(*h) - w).abs()));
+            assert!(
+                worst <= 1e-3 * peak,
+                "{} by_token {by_token} act {act}: worst error {worst} against a peak of {peak}",
+                base.entry,
+            );
+        }
+    }
 }
 
 /// The tiled stage against the host product of the dequantized rows, with a

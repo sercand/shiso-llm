@@ -132,6 +132,11 @@ kernel void kernel_dense_scale_f32(
     x[i] = x[i] * args.s;
 }
 
+// The layer norm is compiled with exact floating point: its precision rests on
+// forming each deviation as (x - pivot) - dmean, and fast math is free to
+// reassociate that into x - (pivot + dmean), which rounds the mean back to the
+// row's magnitude and undoes the whole point.
+#pragma METAL fp math_mode(safe)
 /// `dst[r] = (src[r] - mean(src[r])) / sqrt(var(src[r]) + eps) * w`, the
 /// variance biased, one threadgroup a row. Both sums go through
 /// `dense_block_sum`, so a row's result is the same whatever else the launch
@@ -149,19 +154,27 @@ kernel void kernel_dense_layer_norm_mul_f32(
     threadgroup float scratch[DENSE_BLOCK_SUM_SLOTS];
     device const float * x = src + (uint64_t) row * args.dim;
     device float * y = dst + (uint64_t) row * args.dim;
+    // Everything is taken about the row's first value, never about zero: the
+    // hidden states this normalizes can carry large-magnitude dimensions, and
+    // a row near 1e4 has an f32 ulp of 1e-3 there, so a mean *stored* at that
+    // magnitude is already off by a tenth of a deviation of order 1e-2. `x -
+    // pivot` is exact for values that close to each other, and the shifted
+    // mean `dmean` stays deviation-sized.
+    const float pivot = x[0];
     float sum = 0.0f;
     for (uint i = tid; i < args.dim; i += nt) {
-        sum += x[i];
+        sum += x[i] - pivot;
     }
-    const float mean = dense_block_sum(sum, scratch, tid, nt) / (float) args.dim;
+    const float dmean = dense_block_sum(sum, scratch, tid, nt) / (float) args.dim;
     float sq = 0.0f;
     for (uint i = tid; i < args.dim; i += nt) {
-        const float d = x[i] - mean;
+        const float d = (x[i] - pivot) - dmean;
         sq += d * d;
     }
     const float var = dense_block_sum(sq, scratch, tid, nt) / (float) args.dim;
     const float inv = rsqrt(var + args.eps);
     for (uint i = tid; i < args.dim; i += nt) {
-        y[i] = (x[i] - mean) * inv * w[i];
+        y[i] = ((x[i] - pivot) - dmean) * inv * w[i];
     }
 }
+#pragma METAL fp math_mode(fast)
