@@ -3,10 +3,11 @@
 //! one file whose projections are already block-quantized.
 //!
 //! Read as stored. The projections stay in the blocks the file wrote them in
-//! (`q4_K` and `q6_K` here, both formats the dense matvecs read), the norms
-//! and convolution kernels are the file's own `f32`, and the selector's two
-//! codebooks stay `q4_K` on the host, one 256-wide super-block a vocabulary
-//! row, decoded a row at a time for the candidates a drafted position scores.
+//! (`q4_K` and `q6_K` in one export, `q4_0` or `q8_0` throughout in others;
+//! every one a format the dense matvecs read), the norms and convolution
+//! kernels are the file's own `f32`, and the selector's two codebooks stay in
+//! their blocks on the host, decoded a row at a time for the candidates a
+//! drafted position scores.
 //!
 //! Names and their directory twins, checked value for value against the
 //! `bfloat16` export of the same drafter (every norm and kernel equal):
@@ -46,7 +47,13 @@ use shiso_modelfile::{ModelFile, TensorDesc};
 use crate::qwen35::block_draft::GGUF_ARCHITECTURE;
 
 /// Projection formats this container is read in.
-const PROJECTION_TYPES: [DType; 4] = [DType::Q4_K, DType::Q6_K, DType::Q8_0, DType::F16];
+const PROJECTION_TYPES: [DType; 5] = [
+    DType::Q4_0,
+    DType::Q4_K,
+    DType::Q6_K,
+    DType::Q8_0,
+    DType::F16,
+];
 
 /// A file error, as the engine's error type.
 #[expect(
@@ -119,7 +126,9 @@ impl File {
             })
         };
         let (host, range) = self.file.tensor_host(desc).map_err(open_failure)?;
+        // Every drafter projection runs at a block's eight rows.
         Weight::import(backend, desc.dtype, dim(*cols)?, dim(*rows)?, host, range)
+            .map(Weight::with_rows_kernel)
     }
 
     /// A norm weight or a convolution kernel, as the file's `f32`.
@@ -169,25 +178,37 @@ impl File {
         })
     }
 
-    /// A selector codebook: `q4_K`, one super-block a vocabulary row.
+    /// A selector codebook, one vocabulary row of `rank` values a row, kept
+    /// in the blocks the file stored it in: `q4_K` (one super-block a row),
+    /// `q4_0` or `q8_0` (blocks of 32).
     fn codebook(&self, name: &str, rank: u32, vocab: u32) -> CoreResult<Codebook> {
         let desc = self.desc(name)?;
         let dims = desc.shape.dims();
-        if desc.dtype != DType::Q4_K || dims != [u64::from(rank), u64::from(vocab)] || rank != 256 {
-            return Err(CoreError::InvalidValue {
-                key: "block drafter codebook",
-                value: format!(
-                    "{name} is {:?} {dims:?}, where the selector reads one 256-wide q4_K block \
-                     per vocabulary row ({vocab} rows of rank {rank})",
-                    desc.dtype
-                ),
-            });
+        let refused = || CoreError::InvalidValue {
+            key: "block drafter codebook",
+            value: format!(
+                "{name} is {:?} {dims:?}, where the selector reads {vocab} rows of rank {rank} \
+                 as q4_K (rank 256), q4_0 or q8_0",
+                desc.dtype
+            ),
+        };
+        if dims != [u64::from(rank), u64::from(vocab)] {
+            return Err(refused());
         }
-        let bytes = self.file.tensor_bytes(name).map_err(open_failure)?;
-        Ok(Codebook {
-            rank,
-            rows: CodebookRows::Q4K(bytes.into_owned()),
-        })
+        let bytes = self
+            .file
+            .tensor_bytes(name)
+            .map_err(open_failure)?
+            .into_owned();
+        let rows = match desc.dtype {
+            DType::Q4_K if rank == 256 => CodebookRows::Q4K(bytes),
+            DType::Q4_0 => CodebookRows::Q4_0(bytes),
+            DType::Q8_0 => CodebookRows::Q8_0(bytes),
+            _ => return Err(refused()),
+        };
+        let book = Codebook { rank, rows };
+        book.check(vocab)?;
+        Ok(book)
     }
 }
 

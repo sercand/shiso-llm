@@ -1117,6 +1117,7 @@ pub fn import(
         output_mix,
         layers,
         draft: None,
+        block_vocabulary: None,
         expert_map: None,
     })
 }

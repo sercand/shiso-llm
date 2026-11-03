@@ -242,8 +242,13 @@ impl SparseStack {
             draft: self.has_draft_head(),
             kv,
         };
-        let geometry =
-            paged::cache_geometry(&self.shape, planes, self.opts.spec).with_layout(layout);
+        let geometry = paged::cache_geometry(
+            &self.shape,
+            planes,
+            self.opts.spec,
+            self.opts.block_draft.map_or(0, |fp| fp.page_bytes()),
+        )
+        .with_layout(layout);
         let (pool_pages, ckpt_slots) = (
             self.opts.engine.kv_pool_pages,
             self.opts.engine.kv_ckpt_slots,
@@ -360,8 +365,11 @@ impl SparseStack {
         // A speculating session's blob carries its staged draft row, and a
         // resume marks that row usable because the blob carried it. So a session
         // that has not staged one is not checkpointed at all rather than
-        // checkpointed with zeros that a later run would draft from.
-        let staged = live.spec_depth().is_speculative() == live.pending_draft().is_some();
+        // checkpointed with zeros that a later run would draft from. Only a
+        // stack with a draft head stages one: a block drafter reads the
+        // target's taps, which its own cache pages carry.
+        let staged =
+            !planes.draft || live.spec_depth().is_speculative() == live.pending_draft().is_some();
         // A prompt's end and a shared boundary are admitted without asking the
         // cache where this path branches: the cache answers with the earliest
         // stop, and every rendered prompt shares at least its template's opening
@@ -587,7 +595,7 @@ impl SparseStack {
             .frontier_ckpt(live.pages.frontier())
             .is_some_and(|ckpt| ckpt.pos == q);
         if !standing {
-            if live.spec_depth().is_speculative() && !live.staged_row_current() {
+            if planes.draft && live.spec_depth().is_speculative() && !live.staged_row_current() {
                 return Ok(SaveOutcome::NoDraftRow);
             }
             snapshot(backend.as_ref(), live, blob_bytes, &mut staging.ckpt)?;
@@ -959,8 +967,25 @@ fn snapshot(
     if let Some(window) = session.ngram_window() {
         at = read_into(backend, blob, at, window)?;
     }
-    if let Some(row) = session.pending_draft() {
-        at = read_into(backend, blob, at, row)?;
+    // The draft row's slot is there whenever the session speculates. A stack
+    // whose drafter is a block drafter stages no row, so its slot is zeros:
+    // nothing reads it, and the ring after it stays where a restore looks.
+    if let Some(spec) = session.spec.as_ref() {
+        if spec.pending_valid {
+            at = read_into(backend, blob, at, spec.pending.view())?;
+        } else {
+            let len = usize::try_from(spec.pending.len()).unwrap_or(usize::MAX);
+            let end = at.saturating_add(len);
+            let held = blob.len() as u64;
+            blob.get_mut(at..end)
+                .ok_or(CoreError::ShapeMismatch {
+                    field: "checkpoint draft row",
+                    expected: u64::try_from(end).unwrap_or(u64::MAX),
+                    got: held,
+                })?
+                .fill(0);
+            at = end;
+        }
     }
     at = read_into(backend, blob, at, session.indexer_rings())?;
     let got = u64::try_from(at).unwrap_or(u64::MAX);

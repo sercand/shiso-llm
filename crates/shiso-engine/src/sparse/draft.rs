@@ -158,6 +158,11 @@ pub(crate) struct VerifiedRound {
     /// The row of the pass `first` sits at: zero alone, the run's offset in a
     /// segmented pass.
     start: u32,
+    /// When the round began drafting, which is what a block drafter weighs a
+    /// drafted round's cost by against a plain one's.
+    started: std::time::Instant,
+    /// Whether a drafter ran for this round, whatever it kept.
+    proposed: bool,
 }
 
 impl VerifiedRound {
@@ -851,7 +856,7 @@ impl SparseStack {
     /// chain runs ahead of the frontier and the pass that catches it up starts
     /// from inside the accepted prefix, so what it can state is the position it
     /// reaches rather than how far past the frontier that is.
-    fn reserve_to(&mut self, session: SessionId, positions: u32) -> CoreResult<bool> {
+    pub(crate) fn reserve_to(&mut self, session: SessionId, positions: u32) -> CoreResult<bool> {
         let capacity = self.opts.engine.ctx;
         if positions > capacity {
             return Err(CoreError::ContextOverflow {
@@ -1398,6 +1403,7 @@ impl SparseStack {
         eos: TokenId,
     ) -> CoreResult<Vec<VerifiedRound>> {
         self.verified.clear();
+        let started = std::time::Instant::now();
         let mut plans = Vec::with_capacity(steps.len());
         for &BlockStep { session, first, .. } in steps {
             let live = self.session(session)?;
@@ -1412,7 +1418,18 @@ impl SparseStack {
             ));
         }
         let uniform = plans.windows(2).all(|pair| pair[0].3 == pair[1].3);
-        let chains = if uniform && plans.len() > 1 {
+        let mut proposed = vec![true; plans.len()];
+        let chains = if self.has_block_drafter() {
+            let mut chains = Vec::with_capacity(plans.len());
+            for ((&(session, first, frontier, head, _), step), ran) in
+                plans.iter().zip(steps).zip(proposed.iter_mut())
+            {
+                let drafts = self.block_drafts(session, first, frontier, step.hint, head)?;
+                *ran = drafts.is_some();
+                chains.push(drafts.unwrap_or_default());
+            }
+            chains
+        } else if uniform && plans.len() > 1 {
             let sessions = plans.iter().map(|plan| plan.0).collect::<Vec<_>>();
             let firsts = plans.iter().map(|plan| plan.1).collect::<Vec<_>>();
             let frontiers = plans.iter().map(|plan| plan.2).collect::<Vec<_>>();
@@ -1426,8 +1443,8 @@ impl SparseStack {
             chains
         };
         let mut rounds = Vec::with_capacity(plans.len());
-        for ((&(session, first, frontier, _, budget), head), step) in
-            plans.iter().zip(chains).zip(steps)
+        for (((&(session, first, frontier, _, budget), head), step), proposed) in
+            plans.iter().zip(chains).zip(steps).zip(proposed)
         {
             let (drafts, source) = self.lookup_or_head(session, first, head, budget, eos)?;
             let (drafts, source) = scaffolded(drafts, source, step.proposal, budget);
@@ -1438,6 +1455,8 @@ impl SparseStack {
                 drafts,
                 source,
                 start: 0,
+                started,
+                proposed,
             });
         }
         let mut lengths = rounds
@@ -1497,6 +1516,9 @@ impl SparseStack {
         rounds: &[VerifiedRound],
         outcomes: &[StepOutcome],
     ) -> CoreResult<()> {
+        if self.has_block_drafter() {
+            return self.settle_block_rounds(rounds, outcomes);
+        }
         let width = u64::from(self.shape.stream_dim()) * crate::sparse::kernels::F32_BYTES;
         let several = rounds.len() > 1;
         if several {
@@ -1531,6 +1553,47 @@ impl SparseStack {
                 Some(round.start + outcome.logits_row),
             )?;
             self.mark_staged_current(round.session)?;
+        }
+        Ok(())
+    }
+
+    /// [`SparseStack::settle_rounds`] for a stack whose drafter is a block
+    /// drafter: the rewind and the commit, and the round's outcome folded into
+    /// the drafter's estimates. No row is staged and nothing is caught up - the
+    /// drafter absorbed the verify's rows when the pass ran, and its next block
+    /// overwrites the rejected ones.
+    fn settle_block_rounds(
+        &mut self,
+        rounds: &[VerifiedRound],
+        outcomes: &[StepOutcome],
+    ) -> CoreResult<()> {
+        for (round, outcome) in rounds.iter().zip(outcomes) {
+            self.remember_lookup(round.session, outcome)?;
+            if let Some(rewind) = outcome.rollback {
+                self.spec_rollback(round.session, rewind)?;
+            }
+            self.advance(
+                round.session,
+                &outcome.committed,
+                false,
+                Some(round.start + outcome.logits_row),
+            )?;
+            let took = round.started.elapsed();
+            // A block the drafter's own doubt cut to nothing still paid for the
+            // draft, so it is neither a drafted round nor a plain one.
+            let cut = round.proposed && round.drafts.is_empty();
+            tracing::debug!(
+                session = %round.session,
+                round_ms = took.as_secs_f64() * 1e3,
+                drafted = round.drafts.len(),
+                accepted = outcome.logits_row,
+                "block speculative round"
+            );
+            if let Some(drafter) = self.block.as_mut()
+                && !cut
+            {
+                drafter.learn(round.session, outcome, round.drafts.len(), took);
+            }
         }
         Ok(())
     }

@@ -312,6 +312,8 @@ in_dim, n_expert, n_used, inter, splits, gate_splits, rows`; grid
 - `q4e_add2_kernel`
 - `q4e_argmax_rows_kernel`
 - `q4e_copy_row_kernel`
+- `q4e_stream_mean_rows_kernel`
+- `q4e_top_slices_kernel`
 
 ### `q4e_embed`
 
@@ -807,6 +809,8 @@ exists, because it is the one that writes the ring.
 | `q4e_add2_kernel` | `ceil(n / 256)` | `256` | `0` |
 | `q4e_argmax_rows_kernel` | `n_rows` | `1024` | `0` |
 | `q4e_copy_row_kernel` | `ceil(n / 256)` | `256` | `0` |
+| `q4e_stream_mean_rows_kernel` | `ceil(n_tok * n_embd / 256)` | `256` | `0` |
+| `q4e_top_slices_kernel` | `(slices, n_rows)` | `256` | `0` |
 
 ### `q4e_embed`
 

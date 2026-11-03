@@ -355,6 +355,9 @@ pub struct Weight {
     /// Whether a one-row product must sum exactly as a row of a few-row one;
     /// see [`Weight::row_exact`].
     row_exact: bool,
+    /// Whether a pass of a few rows reads this weight through the multi-row
+    /// kernel ([`Weight::with_rows_kernel`]) where the device has one.
+    rows_kernel: bool,
 }
 
 impl Weight {
@@ -408,6 +411,7 @@ impl Weight {
             aux: None,
             rotation: None,
             row_exact: false,
+            rows_kernel: false,
         })
     }
 
@@ -438,6 +442,7 @@ impl Weight {
             aux: Some(WeightAux::Affine(AffineAux { scales, biases })),
             rotation: None,
             row_exact: false,
+            rows_kernel: false,
         })
     }
 
@@ -490,6 +495,7 @@ impl Weight {
             })),
             rotation: None,
             row_exact: false,
+            rows_kernel: false,
         })
     }
     /// Imports an FP8 weight and the scale that decodes it.
@@ -585,6 +591,7 @@ impl Weight {
             aux: None,
             rotation: None,
             row_exact: false,
+            rows_kernel: false,
         }
     }
 
@@ -596,6 +603,20 @@ impl Weight {
     #[must_use]
     pub const fn row_exact(mut self) -> Self {
         self.row_exact = true;
+        self
+    }
+
+    /// The same weight, read at two to eight rows by the multi-row kernel on a
+    /// device that holds it by name - `q4_0` and `q8_0` only; every other
+    /// format and width keeps its path.
+    ///
+    /// Opt-in because the kernel's bits are not the extended family's: a
+    /// target whose answers are compared across builds must not change them by
+    /// loading. A drafter's projections only decide what is proposed, and they
+    /// run at eight rows a pass, the width the extended family reads worst.
+    #[must_use]
+    pub fn with_rows_kernel(mut self) -> Self {
+        self.rows_kernel = true;
         self
     }
 
@@ -958,6 +979,33 @@ fn dispatch(
     if weight.row_exact && weight.dtype == DType::Q8_0 && (1..=Q8_ROWS_MAX).contains(&n_tok) {
         return q8_rows_projection(backend, weight, n_tok, src, dst);
     }
+    if weight.rows_kernel
+        && (2..=ROWS_KERNEL_MAX).contains(&n_tok)
+        && backend.specializes_by_name()
+        && let Some(entry) = rows_kernel_name(weight.dtype)
+    {
+        let args = RowsMvArgs {
+            in_dim: weight.in_dim,
+            out_dim: weight.out_dim,
+            n_rows: n_tok,
+            pad0: 0,
+        };
+        let per_warp = rows_kernel_per_warp(weight.out_dim);
+        let entry = entry[rows_kernel_variant(per_warp)];
+        return run(
+            backend,
+            KernelRef::new(crate::launch::DENSE, entry),
+            Extent3::linear(weight.out_dim.div_ceil(ROWS_KERNEL_WARPS * per_warp)),
+            Extent3::new(ROWS_KERNEL_THREADS, 1, 1),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(weight.view()),
+                KernelArg::Buffer(src),
+                KernelArg::Buffer(dst),
+            ],
+        );
+    }
     let r1ptg = ext_r1ptg(n_tok);
     let nxpsg = ext_nxpsg(u64::from(weight.in_dim), n_tok);
     // The lane split is a pipeline constant on one backend and part of the
@@ -1036,6 +1084,65 @@ fn dispatch(
 const fn ext_nr_entry(dtype: DType) -> Option<(&'static str, u32)> {
     match dtype {
         DType::Q4_K => Some(("kernel_mul_mv_ext_q4_K_f32_r1_1_nr2", 2)),
+        _ => None,
+    }
+}
+
+/// Widest pass the multi-row kernel reads (`kernels/cuda/dense/dense_rows_mv.cuh`).
+const ROWS_KERNEL_MAX: u32 = 8;
+
+/// Warps in one block of the multi-row kernel.
+const ROWS_KERNEL_WARPS: u32 = 4;
+
+/// Output rows one warp of the multi-row kernel owns for an output this wide.
+/// A row's sum is the same bits whichever variant computes it, so this is a
+/// speed choice by shape alone.
+///
+/// Measured on a GB10 at eight activation rows, `q4_0`: 4096 x 1024 in 31 us
+/// at two a warp against 52 at four; 2560 x 4096 in 40, 38 and 49 us at two,
+/// four and eight. Past two the activations are not what bounds it - a row of
+/// 2560 x 4096 streams at 236 GB/s at one activation row and the multiplies
+/// take the rest - so more a warp only costs blocks.
+const fn rows_kernel_per_warp(out_dim: u32) -> u32 {
+    if out_dim >= 4096 { 4 } else { 2 }
+}
+
+/// Index of a rows-a-warp count in a [`rows_kernel_name`] triple.
+const fn rows_kernel_variant(per_warp: u32) -> usize {
+    match per_warp {
+        8 => 2,
+        4 => 1,
+        _ => 0,
+    }
+}
+
+/// Threads in one block of the multi-row kernel.
+const ROWS_KERNEL_THREADS: u32 = 128;
+
+/// Argument block of the multi-row kernel.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RowsMvArgs {
+    in_dim: u32,
+    out_dim: u32,
+    n_rows: u32,
+    pad0: u32,
+}
+
+/// The multi-row kernels for a weight format, where there are any, at two,
+/// four and eight output rows a warp.
+const fn rows_kernel_name(dtype: DType) -> Option<[&'static str; 3]> {
+    match dtype {
+        DType::Q4_0 => Some([
+            "kernel_dense_rows_mv_q4_0_f32_r2",
+            "kernel_dense_rows_mv_q4_0_f32_r4",
+            "kernel_dense_rows_mv_q4_0_f32_r8",
+        ]),
+        DType::Q8_0 => Some([
+            "kernel_dense_rows_mv_q8_0_f32_r2",
+            "kernel_dense_rows_mv_q8_0_f32_r4",
+            "kernel_dense_rows_mv_q8_0_f32_r8",
+        ]),
         _ => None,
     }
 }

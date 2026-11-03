@@ -189,10 +189,23 @@ pub enum CodebookRows {
     Bf16(Vec<u16>),
     /// `q4_K` super-blocks, exactly one a row: the codebook's rank is 256.
     Q4K(Vec<u8>),
+    /// `q4_0` blocks of 32, `rank / 32` a row.
+    Q4_0(Vec<u8>),
+    /// `q8_0` blocks of 32, `rank / 32` a row.
+    Q8_0(Vec<u8>),
 }
 
 /// Bytes of one `q4_K` super-block.
 const Q4K_BLOCK_BYTES: usize = size_of::<shiso_modelfile::quant::BlockQ4K>();
+
+/// Values in one `q4_0` or `q8_0` block.
+const LEGACY_BLOCK: usize = 32;
+
+/// Bytes of one `q4_0` block: an `f16` scale and thirty-two packed nibbles.
+const Q4_0_BLOCK_BYTES: usize = 18;
+
+/// Bytes of one `q8_0` block: an `f16` scale and thirty-two signed bytes.
+const Q8_0_BLOCK_BYTES: usize = size_of::<shiso_modelfile::quant::BlockQ8_0>();
 
 impl Codebook {
     /// Row `id`, widened into `out`, which is cleared first. An id past the
@@ -219,8 +232,81 @@ impl Codebook {
                     out.extend(shiso_modelfile::quant::dequant_q4_k(&block));
                 }
             }
+            CodebookRows::Q4_0(bytes) => {
+                let row = rank / LEGACY_BLOCK * Q4_0_BLOCK_BYTES;
+                if let Some(raw) = bytes.get(id * row..(id + 1) * row) {
+                    for block in raw.chunks_exact(Q4_0_BLOCK_BYTES) {
+                        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                        let qs = &block[2..];
+                        // Low nibbles are the block's first sixteen values,
+                        // high nibbles its last sixteen, each offset by eight.
+                        out.extend(qs.iter().map(|q| f32::from(i16::from(q & 0x0f) - 8) * d));
+                        out.extend(qs.iter().map(|q| f32::from(i16::from(q >> 4) - 8) * d));
+                    }
+                }
+            }
+            CodebookRows::Q8_0(bytes) => {
+                let row = rank / LEGACY_BLOCK * Q8_0_BLOCK_BYTES;
+                if let Some(raw) = bytes.get(id * row..(id + 1) * row) {
+                    for block in raw.chunks_exact(Q8_0_BLOCK_BYTES) {
+                        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                        out.extend(block[2..].iter().map(|q| f32::from(q.cast_signed()) * d));
+                    }
+                }
+            }
         }
     }
+
+    /// Whether the rows hold `vocab` rows of this rank, whole.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] for a table of another size, or a rank the
+    /// stored blocks do not divide.
+    pub fn check(&self, vocab: u32) -> CoreResult<()> {
+        let rank = self.rank as usize;
+        let (row, held) = match &self.rows {
+            CodebookRows::Bf16(values) => (rank * 2, values.len() * 2),
+            CodebookRows::Q4K(bytes) => (
+                if rank == shiso_modelfile::quant::QK_K {
+                    Q4K_BLOCK_BYTES
+                } else {
+                    0
+                },
+                bytes.len(),
+            ),
+            CodebookRows::Q4_0(bytes) => (
+                if rank.is_multiple_of(LEGACY_BLOCK) {
+                    rank / LEGACY_BLOCK * Q4_0_BLOCK_BYTES
+                } else {
+                    0
+                },
+                bytes.len(),
+            ),
+            CodebookRows::Q8_0(bytes) => (
+                if rank.is_multiple_of(LEGACY_BLOCK) {
+                    rank / LEGACY_BLOCK * Q8_0_BLOCK_BYTES
+                } else {
+                    0
+                },
+                bytes.len(),
+            ),
+        };
+        let want = row.saturating_mul(vocab as usize);
+        if row == 0 || held != want {
+            return Err(CoreError::ShapeMismatch {
+                field: "block drafter codebook bytes",
+                expected: want as u64,
+                got: held as u64,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// An IEEE half bit pattern, widened.
+fn f16_to_f32(bits: u16) -> f32 {
+    half::f16::from_bits(bits).to_f32()
 }
 
 /// A `bfloat16` bit pattern, widened.
@@ -267,29 +353,201 @@ pub struct BlockDrafter {
     parts: BlockDraftParts,
     /// Key and value runs, one attention slot per drafter layer.
     kv: DeviceKv,
-    /// Activation rows at the target's widths, which are wide enough for the
-    /// drafter's own.
+    /// Activation rows at the drafter's widths, `rows` of them.
     scratch: Scratch,
-    /// The tapped residual rows of the last target pass.
+    /// The tapped residual rows of the last target pass, for a target that
+    /// writes them here; see [`BlockDrafter::sink`].
     taps: DeviceBuffer,
     /// Convolution output rows.
     conv: DeviceBuffer,
     /// Dynamic kernel rows.
     dynk: DeviceBuffer,
-    /// Drafted positions' logits over the whole vocabulary.
+    /// Drafted positions' logits over the whole vocabulary, for a target whose
+    /// candidates are taken on the host.
     logits: DeviceBuffer,
     /// Drafted positions' selector projections.
     projected: DeviceBuffer,
     /// The widths the attention launches at.
     geometry: AttnGeometry,
-    /// Rows every buffer holds.
+    /// Rows the scratch holds: the widest piece one absorb launch covers.
     rows: u32,
-    /// Staging for the int32 rows.
-    staging: Vec<u8>,
+    /// Rows [`BlockDrafter::taps`] holds.
+    sink_rows: u32,
     /// Each speculating session's copy-lookup and acceptance state.
     copies: std::collections::HashMap<SessionId, CopyState>,
     /// What rounds cost on this device, smoothed.
     costs: RoundCosts,
+}
+
+/// Where a drafter's keys and values come from.
+enum Pool {
+    /// A pool of its own, this many pages deep.
+    Open(u32),
+    /// One its target opened beside its own.
+    Given(DeviceKv),
+}
+
+/// What a resident drafter adds to the device beside its target: the bytes it
+/// needs per cache page, the bytes it needs once, and the layers it taps.
+///
+/// What a target that sizes its cache pool to the device has to know before the
+/// pool is opened, which is before the drafter itself is bound. Plain data, so
+/// it travels in a target's options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockDraftFootprint {
+    /// The tapped layers, in concatenation order; the first `n_taps` count.
+    taps: [u32; MAX_BLOCK_TAPS],
+    /// How many of `taps` are the drafter's.
+    n_taps: u32,
+    /// Residual width the taps are read at.
+    hidden: u32,
+    /// Bytes of the drafter's own keys and values per cache page.
+    page_bytes: u64,
+    /// Drafter layers, each one attention slot of keys and values.
+    kv_layers: u32,
+    /// Key and value heads of one layer.
+    kv_heads: u32,
+    /// Width of one head.
+    head_dim: u32,
+    /// Bytes of the drafter's scratch and buffers, allocated once.
+    fixed_bytes: u64,
+}
+
+/// Most target layers one drafter may tap.
+pub const MAX_BLOCK_TAPS: usize = 8;
+
+impl BlockDraftFootprint {
+    /// The tapped layers, in the order the drafter concatenates them.
+    #[must_use]
+    pub fn taps(&self) -> &[u32] {
+        &self.taps[..self.n_taps as usize]
+    }
+
+    /// Residual width each tap is read at.
+    #[must_use]
+    pub const fn hidden(&self) -> u32 {
+        self.hidden
+    }
+
+    /// Bytes the drafter's keys and values add to every cache page.
+    #[must_use]
+    pub const fn page_bytes(&self) -> u64 {
+        self.page_bytes
+    }
+
+    /// Bytes the drafter allocates once, beside its cache.
+    #[must_use]
+    pub const fn fixed_bytes(&self) -> u64 {
+        self.fixed_bytes
+    }
+
+    /// The runs of the drafter's keys and values, which a target opens beside
+    /// its own pool.
+    pub(crate) fn layout(&self) -> KvLayout {
+        KvLayout::for_attn_slots(self.kv_layers, self.kv_heads, self.head_dim)
+    }
+}
+
+/// Rows one absorb launch covers on a target whose passes are wider: a chunk
+/// of prompt is absorbed in pieces this wide, so the drafter's scratch is sized
+/// by this and not by the target's widest pass.
+pub const ABSORB_ROWS: u32 = 512;
+
+/// The candidates one drafted position offers the selector: its best ids,
+/// best first, and their logits.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Candidates {
+    /// Token ids, best first.
+    pub(crate) ids: Vec<u32>,
+    /// Each id's logit.
+    pub(crate) logits: Vec<f32>,
+}
+
+/// What a drafter borrows from the target it drafts for: the embedding table
+/// the block's rows enter through and the vocabulary head its drafted rows
+/// leave through. The drafter has neither of its own.
+pub(crate) trait DraftTarget {
+    /// Writes the embedding rows of `ids` into `dst`, `[ids.len()][hidden]`
+    /// `f32`. `drafter` is the drafter's scratch, whose id row already holds
+    /// `ids`.
+    fn embed(
+        &self,
+        backend: &dyn Backend,
+        ids: &[TokenId],
+        drafter: &Scratch,
+        dst: DeviceView<'_>,
+    ) -> CoreResult<()>;
+
+    /// Projects `rows` normed rows to the vocabulary and answers each row's `k`
+    /// best candidates.
+    fn candidates(
+        &self,
+        backend: &dyn Backend,
+        normed: DeviceView<'_>,
+        rows: u32,
+        k: u32,
+    ) -> CoreResult<Vec<Candidates>>;
+}
+
+/// The dense stack as a drafter's target: its gather and its output matrix,
+/// with the candidates taken on the host from the drafter's own logits block.
+struct DenseTarget<'a> {
+    weights: &'a Weights,
+    geometry: &'a Geometry,
+    logits: DeviceView<'a>,
+}
+
+impl DraftTarget for DenseTarget<'_> {
+    fn embed(
+        &self,
+        backend: &dyn Backend,
+        ids: &[TokenId],
+        drafter: &Scratch,
+        dst: DeviceView<'_>,
+    ) -> CoreResult<()> {
+        let n = u32::try_from(ids.len()).unwrap_or(u32::MAX);
+        layers::embed_rows(backend, self.weights, self.geometry, drafter, dst, n)
+    }
+
+    fn candidates(
+        &self,
+        backend: &dyn Backend,
+        normed: DeviceView<'_>,
+        rows: u32,
+        k: u32,
+    ) -> CoreResult<Vec<Candidates>> {
+        projection::projection(
+            backend,
+            self.weights.output_matrix(),
+            rows,
+            normed,
+            self.logits,
+        )?;
+        let vocab = self.geometry.vocab as usize;
+        let mut bytes = vec![0u8; rows as usize * vocab * 4];
+        backend.copy_d2h(self.logits.slice(0, bytes.len() as u64)?, &mut bytes)?;
+        let logits = floats(&bytes);
+        Ok(logits
+            .chunks_exact(vocab.max(1))
+            .map(|row| {
+                let ids = top_k(row, k as usize);
+                let logits = ids.iter().map(|&id| row[id as usize]).collect();
+                Candidates { ids, logits }
+            })
+            .collect())
+    }
+}
+
+/// The target a drafter is made resident beside when that target is not the
+/// dense stack: the three widths the drafter's checks and buffers need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BesideTarget {
+    /// Residual width.
+    pub(crate) hidden: u32,
+    /// Layers.
+    pub(crate) layers: u32,
+    /// Vocabulary rows.
+    pub(crate) vocab: u32,
 }
 
 /// Where a session's generation began, the copies it has seen fail, and how
@@ -338,22 +596,86 @@ struct RoundCosts {
     drafted_ms: f64,
     /// Milliseconds of a one-row round.
     plain_ms: f64,
+    /// Whether `drafted_ms` and `plain_ms` are measured yet rather than the
+    /// priors: the first sample of each replaces its prior outright.
+    measured: (bool, bool),
+    /// Drafted rounds since the last one-row round, which is what decides when
+    /// a device that has never run a one-row round is made to run one.
+    since_plain: u32,
 }
 
 impl Default for RoundCosts {
     /// Priors from an M1 Max on the 27B: a drafted round about 1.9 plain ones.
-    /// Replaced by measurement within a few rounds.
+    /// Each is replaced by its first measurement. The ratio is the device's and
+    /// the model's, not a constant: on a GB10 serving the sparse family a
+    /// one-row step is three times faster than the prior says, and a session
+    /// that only ever drafts would never learn it - see
+    /// [`BlockDrafter::pays`].
     fn default() -> Self {
         Self {
             drafted_ms: 175.0,
             plain_ms: 92.0,
+            measured: (false, false),
+            since_plain: 0,
         }
     }
 }
 
+impl BlockDraftParts {
+    /// What these parts cost beside a target once resident with scratch for
+    /// `rows` rows: see [`BlockDraftFootprint`].
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] for a drafter tapping more than
+    /// [`MAX_BLOCK_TAPS`] layers.
+    pub fn footprint(&self, vocab: u32, rows: u32) -> CoreResult<BlockDraftFootprint> {
+        let shape = &self.shape;
+        if shape.taps.len() > MAX_BLOCK_TAPS {
+            return Err(CoreError::ShapeMismatch {
+                field: "block drafter taps",
+                expected: MAX_BLOCK_TAPS as u64,
+                got: shape.taps.len() as u64,
+            });
+        }
+        let mut taps = [0u32; MAX_BLOCK_TAPS];
+        taps[..shape.taps.len()].copy_from_slice(&shape.taps);
+        let layers = u32::try_from(self.layers.len()).unwrap_or(u32::MAX);
+        let page_bytes =
+            KvLayout::for_attn_slots(layers, shape.n_head_kv, shape.head_dim).page_bytes();
+        // The scratch a pass of `rows` rows writes: two residual streams, the
+        // normed rows, a block's output, the convolution and the three
+        // feed-forward rows, and the attention's query, key, value and output
+        // rows; then the logits and selector rows of one block.
+        let rows = u64::from(rows.max(shape.block));
+        let hidden = u64::from(shape.hidden);
+        let q = u64::from(shape.n_head) * u64::from(shape.head_dim);
+        let kv = u64::from(shape.n_head_kv) * u64::from(shape.head_dim);
+        let per_row = 5 * hidden
+            + 3 * u64::from(shape.intermediate)
+            + u64::from(shape.dyn_width())
+            + 2 * q
+            + 2 * kv;
+        let drafted = u64::from(shape.block - 1);
+        let fixed_bytes = (rows * per_row
+            + drafted * (u64::from(vocab) + u64::from(shape.selector_rank)))
+            * F32_BYTES;
+        Ok(BlockDraftFootprint {
+            taps,
+            n_taps: u32::try_from(shape.taps.len()).unwrap_or(u32::MAX),
+            hidden: shape.hidden,
+            page_bytes,
+            kv_layers: layers,
+            kv_heads: shape.n_head_kv,
+            head_dim: shape.head_dim,
+            fixed_bytes,
+        })
+    }
+}
+
 impl BlockDrafter {
-    /// Makes `parts` resident beside a target of `target`'s geometry and layer
-    /// count.
+    /// Makes `parts` resident beside a dense target of `target`'s geometry and
+    /// layer count.
     ///
     /// `rows` is the widest target pass whose taps it absorbs at once - a
     /// prompt chunk - and at least a block.
@@ -370,9 +692,60 @@ impl BlockDrafter {
         rows: u32,
     ) -> CoreResult<Self> {
         let (geometry, target_layers) = target;
+        Self::build(
+            backend,
+            parts,
+            (geometry, target_layers),
+            Pool::Open(pool_pages),
+            (rows, rows),
+        )
+    }
+
+    /// Makes `parts` resident beside a target that is not the dense stack:
+    /// one that writes the drafter's taps into a sink of its own and lends
+    /// [`DraftTarget`] for its embedding and vocabulary head.
+    ///
+    /// Its scratch holds [`ABSORB_ROWS`] rows, whatever the target's widest
+    /// pass: a wider pass is absorbed in pieces.
+    ///
+    /// # Errors
+    ///
+    /// As [`BlockDrafter::new`].
+    ///
+    /// `kv` is the drafter's keys and values, which such a target opens beside
+    /// its own pool from [`BlockDraftFootprint::layout`], so its pages travel
+    /// with the target's.
+    pub(crate) fn new_beside(
+        backend: &Arc<dyn Backend>,
+        parts: BlockDraftParts,
+        target: BesideTarget,
+        kv: DeviceKv,
+    ) -> CoreResult<Self> {
+        let geometry = beside_geometry(&parts, target.vocab)?;
+        // One row of sink: the target keeps the taps, so this one is never
+        // written, and a zero-byte allocation is not something every backend
+        // will hand out.
+        Self::build(
+            backend,
+            parts,
+            (&geometry, target.layers),
+            Pool::Given(kv),
+            (ABSORB_ROWS, 1),
+        )
+    }
+
+    /// Both constructors' body: `rows` is `(scratch rows, sink rows)`.
+    fn build(
+        backend: &Arc<dyn Backend>,
+        parts: BlockDraftParts,
+        target: (&Geometry, u32),
+        pool: Pool,
+        rows: (u32, u32),
+    ) -> CoreResult<Self> {
+        let (geometry, target_layers) = target;
         let shape = &parts.shape;
         shape.check(geometry.hidden, target_layers)?;
-        let rows = rows.max(shape.block);
+        let (rows, sink_rows) = (rows.0.max(shape.block), rows.1);
         let n_taps = u32::try_from(shape.taps.len()).unwrap_or(u32::MAX);
         if parts.fc.in_dim != n_taps * shape.hidden || parts.fc.out_dim != shape.hidden {
             return Err(CoreError::ShapeMismatch {
@@ -381,15 +754,26 @@ impl BlockDrafter {
                 got: u64::from(parts.fc.in_dim),
             });
         }
+        parts.predecessor.check(geometry.vocab)?;
+        parts.successor.check(geometry.vocab)?;
         let layers = u32::try_from(parts.layers.len()).unwrap_or(u32::MAX);
-        let kv = DeviceKv::open(
-            backend,
-            &KvLayout::for_attn_slots(layers, shape.n_head_kv, shape.head_dim),
-            pool_pages,
-        )?;
+        let layout = KvLayout::for_attn_slots(layers, shape.n_head_kv, shape.head_dim);
+        let (kv, pool_pages) = match pool {
+            Pool::Open(pages) => (DeviceKv::open(backend, &layout, pages)?, pages),
+            Pool::Given(kv) => {
+                if kv.page_bytes() != layout.page_bytes() {
+                    return Err(CoreError::ShapeMismatch {
+                        field: "block drafter cache page bytes",
+                        expected: layout.page_bytes(),
+                        got: kv.page_bytes(),
+                    });
+                }
+                (kv, 0)
+            }
+        };
         let scratch = Scratch::new(backend, geometry, rows, 1)?;
         let row = u64::from(shape.hidden) * F32_BYTES;
-        let taps = alloc(backend, u64::from(rows) * u64::from(n_taps) * row)?;
+        let taps = alloc(backend, u64::from(sink_rows) * u64::from(n_taps) * row)?;
         let conv = alloc(backend, u64::from(rows) * row)?;
         let dynk = alloc(
             backend,
@@ -401,23 +785,7 @@ impl BlockDrafter {
             backend,
             drafted * u64::from(shape.selector_rank) * F32_BYTES,
         )?;
-        let geometry = AttnGeometry {
-            n_head: shape.n_head,
-            n_head_kv: shape.n_head_kv,
-            head_dim: shape.head_dim,
-            n_rot: shape.head_dim,
-            freq_dims: shape.head_dim,
-            rope_base: shape.rope_theta,
-            eps: shape.eps,
-            page_tokens: PAGE_TOKENS,
-            window: shape.window,
-            #[expect(clippy::cast_precision_loss, reason = "a head width")]
-            scale: 1.0 / (shape.head_dim as f32).sqrt(),
-            v_norm: false,
-            output_gate: false,
-            owns_kv: true,
-            qk_norm: true,
-        };
+        let geometry = drafter_attn(shape);
         tracing::info!(
             layers,
             block = shape.block,
@@ -437,7 +805,7 @@ impl BlockDrafter {
             projected,
             geometry,
             rows,
-            staging: Vec::new(),
+            sink_rows,
             copies: std::collections::HashMap::new(),
             costs: RoundCosts::default(),
         })
@@ -445,7 +813,7 @@ impl BlockDrafter {
 
     /// Folds one round's outcome into the session's acceptance and the
     /// device's round costs, and remembers a copy the target rejected.
-    fn learn(
+    pub(crate) fn learn(
         &mut self,
         session: SessionId,
         outcome: &crate::mtp::StepOutcome,
@@ -457,12 +825,25 @@ impl BlockDrafter {
         // the next round will cost, and one of them would otherwise keep a
         // session from drafting for dozens of rounds while the average decays.
         let ms = took.as_secs_f64() * 1e3;
+        let costs = &mut self.costs;
         if drafted == 0 {
-            let est = self.costs.plain_ms;
-            self.costs.plain_ms += COST_EMA * (ms.min(3.0 * est) - est);
+            costs.since_plain = 0;
+            if costs.measured.1 {
+                let est = costs.plain_ms;
+                costs.plain_ms += COST_EMA * (ms.min(3.0 * est) - est);
+            } else {
+                costs.plain_ms = ms;
+                costs.measured.1 = true;
+            }
         } else {
-            let est = self.costs.drafted_ms;
-            self.costs.drafted_ms += COST_EMA * (ms.min(3.0 * est) - est);
+            costs.since_plain = costs.since_plain.saturating_add(1);
+            if costs.measured.0 {
+                let est = costs.drafted_ms;
+                costs.drafted_ms += COST_EMA * (ms.min(3.0 * est) - est);
+            } else {
+                costs.drafted_ms = ms;
+                costs.measured.0 = true;
+            }
         }
         let Some(state) = self.copies.get_mut(&session) else {
             return;
@@ -478,138 +859,225 @@ impl BlockDrafter {
         }
     }
 
+    /// Whether a drafted round is expected to commit more tokens a
+    /// millisecond than a plain one, for `session` now.
+    ///
+    /// A drafted round commits its kept drafts and one more; a plain round
+    /// commits one. On a device where every width up to a block verifies at
+    /// about the same cost, those are the only two choices worth weighing. A
+    /// session that stopped drafting drafts one round in [`PROBE_EVERY`], so
+    /// text that turns predictable is noticed. A session never seen drafts.
+    pub(crate) fn pays(&mut self, session: SessionId) -> bool {
+        let costs = self.costs;
+        // A device that has drafted for a while and never run a one-row round
+        // runs one, so the comparison below is between two measurements.
+        if !costs.measured.1 && costs.since_plain >= PROBE_EVERY {
+            return false;
+        }
+        let Some(state) = self.copies.get_mut(&session) else {
+            return true;
+        };
+        // Stopped only when drafting is clearly losing: near the break-even
+        // the two cost the same, and a session that stopped on noise gives up
+        // every round the text turns predictable again until the next probe.
+        let pays = (state.accepted + 1.0) / costs.drafted_ms > LOSING / costs.plain_ms;
+        if pays || state.idle >= PROBE_EVERY {
+            state.idle = 0;
+            true
+        } else {
+            state.idle += 1;
+            false
+        }
+    }
+
+    /// Starts tracking `session`'s acceptance, from a generation that begins
+    /// at `generated_from`, unless it is tracked already.
+    pub(crate) fn track(&mut self, session: SessionId, generated_from: u32) {
+        self.copies
+            .entry(session)
+            .or_insert_with(|| CopyState::new(generated_from));
+    }
+
+    /// Stops tracking a session that closed.
+    pub(crate) fn forget(&mut self, session: SessionId) {
+        self.copies.remove(&session);
+    }
+
     /// Rows of one block.
     #[must_use]
     pub const fn block(&self) -> u32 {
         self.parts.shape.block
     }
 
-    /// Where the next target pass writes its taps.
+    /// The drafter's widths.
+    #[must_use]
+    pub const fn shape(&self) -> &BlockDraftShape {
+        &self.parts.shape
+    }
+
+    /// Where the next dense target pass writes its taps.
     pub(crate) fn sink(&self) -> TapSink<'_> {
         TapSink {
             layers: &self.parts.shape.taps,
             dst: self.taps.view(),
-            rows: self.rows,
+            rows: self.sink_rows,
         }
     }
 
-    /// Projects rows `from .. from + n` of the last target pass's taps into the
-    /// drafter's context at positions `pos ..`.
+    /// The drafter's own tap rows, which a dense target pass writes.
+    pub(crate) fn own_taps(&self) -> DeviceView<'_> {
+        self.taps.view()
+    }
+
+    /// Projects rows `from .. from + n` of a target pass's taps, `taps` being
+    /// `[row][tap][hidden]` `f32`, into the drafter's context at positions
+    /// `pos ..`, in pieces no wider than the drafter's scratch.
     ///
     /// # Errors
     ///
-    /// [`CoreError::ShapeMismatch`] for more rows than the sink holds, and
-    /// whatever a launch reports.
+    /// [`CoreError::OutOfBounds`] for more rows than `taps` holds, and whatever
+    /// a launch reports.
     pub(crate) fn absorb(
-        &mut self,
+        &self,
         backend: &Arc<dyn Backend>,
+        taps: DeviceView<'_>,
         pages: DeviceView<'_>,
-        from: u32,
-        n: u32,
+        rows: (u32, u32),
         pos: u32,
     ) -> CoreResult<()> {
-        if n == 0 {
-            return Ok(());
-        }
-        if from + n > self.rows {
-            return Err(CoreError::ShapeMismatch {
-                field: "absorbed tap rows",
-                expected: u64::from(self.rows),
-                got: u64::from(from + n),
-            });
-        }
+        let (from, n) = rows;
         let shape = &self.parts.shape;
         let n_taps = u64::try_from(shape.taps.len()).unwrap_or(u64::MAX);
         let row = u64::from(shape.hidden) * F32_BYTES;
-        let taps = self
-            .taps
-            .view()
-            .slice(u64::from(from) * n_taps * row, u64::from(n) * n_taps * row)?;
-        crate::stack::upload_row(
-            backend.as_ref(),
-            &mut self.staging,
-            self.scratch.positions(),
-            (0..n).map(|t| i32::try_from(pos + t).unwrap_or(i32::MAX)),
-        )?;
-        let ctx = self.scratch.stream_at(ResidualIndex::SECOND)?;
-        projection::projection(backend.as_ref(), &self.parts.fc, n, taps, ctx)?;
-        layers::rms_norm_mul(
-            backend.as_ref(),
-            ctx,
-            self.parts.hidden_norm.view(),
-            self.scratch.normed(),
-            shape.hidden,
-            n,
-            shape.eps,
-        )?;
-        for (rank, layer) in self.parts.layers.iter().enumerate() {
-            let (k, v) = self
-                .kv
-                .layer_runs(u32::try_from(rank).unwrap_or(u32::MAX))?;
-            crate::dense::attn::store(
+        let mut staging = Vec::new();
+        let mut done = 0;
+        while done < n {
+            let m = (n - done).min(self.rows);
+            let at = from + done;
+            let piece = taps.slice(u64::from(at) * n_taps * row, u64::from(m) * n_taps * row)?;
+            let start = pos + done;
+            crate::stack::upload_row(
                 backend.as_ref(),
-                &layer.attn,
-                &self.geometry,
-                self.scratch.attn(),
-                &AttnCache {
-                    k,
-                    v,
-                    pages: Pages::shared(pages),
-                },
-                crate::dense::attn::StoreRows {
-                    pos: self.scratch.positions(),
-                    input: self.scratch.normed(),
-                    n_tok: n,
-                },
+                &mut staging,
+                self.scratch.positions(),
+                (0..m).map(|t| i32::try_from(start + t).unwrap_or(i32::MAX)),
             )?;
+            let ctx = self.scratch.stream_at(ResidualIndex::SECOND)?;
+            projection::projection(backend.as_ref(), &self.parts.fc, m, piece, ctx)?;
+            layers::rms_norm_mul(
+                backend.as_ref(),
+                ctx,
+                self.parts.hidden_norm.view(),
+                self.scratch.normed(),
+                shape.hidden,
+                m,
+                shape.eps,
+            )?;
+            for (rank, layer) in self.parts.layers.iter().enumerate() {
+                let (k, v) = self
+                    .kv
+                    .layer_runs(u32::try_from(rank).unwrap_or(u32::MAX))?;
+                crate::dense::attn::store(
+                    backend.as_ref(),
+                    &layer.attn,
+                    &self.geometry,
+                    self.scratch.attn(),
+                    &AttnCache {
+                        k,
+                        v,
+                        pages: Pages::shared(pages),
+                    },
+                    crate::dense::attn::StoreRows {
+                        pos: self.scratch.positions(),
+                        input: self.scratch.normed(),
+                        n_tok: m,
+                    },
+                )?;
+            }
+            done += m;
         }
         Ok(())
     }
 
+    /// The dense stack as this drafter's target.
+    pub(crate) fn dense_target<'a>(
+        &'a self,
+        weights: &'a Weights,
+        geometry: &'a Geometry,
+    ) -> impl DraftTarget + 'a {
+        DenseTarget {
+            weights,
+            geometry,
+            logits: self.logits.view(),
+        }
+    }
+
     /// The block behind `first`, which sits at position `pos`: `block - 1`
-    /// drafted tokens.
+    /// drafted tokens, each with its probability among its position's
+    /// candidates under the drafter's own row (see [`candidate_share`]).
     ///
     /// # Errors
     ///
     /// Whatever a launch or the read-back reports.
     pub(crate) fn propose(
-        &mut self,
+        &self,
         backend: &Arc<dyn Backend>,
-        target: (&Weights, &Geometry),
+        target: &dyn DraftTarget,
         pages: DeviceView<'_>,
         at: (TokenId, u32),
         hint: DraftHint,
-    ) -> CoreResult<Vec<TokenId>> {
-        let (weights, geometry) = target;
+    ) -> CoreResult<(Vec<TokenId>, Vec<f32>)> {
         let (first, pos) = at;
         let shape = &self.parts.shape;
         let b = shape.block;
         let hidden = shape.hidden;
         let row = u64::from(hidden) * F32_BYTES;
         let be = backend.as_ref();
+        let mut staging = Vec::new();
+        let ids: Vec<TokenId> = std::iter::once(first)
+            .chain(std::iter::repeat_n(shape.mask_token, (b - 1) as usize))
+            .collect();
         crate::stack::upload_row(
             be,
-            &mut self.staging,
+            &mut staging,
             self.scratch.ids(),
-            std::iter::once(first)
-                .chain(std::iter::repeat_n(shape.mask_token, (b - 1) as usize))
-                .map(|t| i32::try_from(t.get()).unwrap_or(0)),
+            ids.iter().map(|t| i32::try_from(t.get()).unwrap_or(0)),
         )?;
         crate::stack::upload_row(
             be,
-            &mut self.staging,
+            &mut staging,
             self.scratch.positions(),
             (0..b).map(|t| i32::try_from(pos + t).unwrap_or(i32::MAX)),
         )?;
         // Every drafted position sees the whole block: one bound for all rows.
         crate::stack::upload_row(
             be,
-            &mut self.staging,
+            &mut staging,
             self.scratch.bound(),
             (0..b).map(|_| i32::try_from(pos + b - 1).unwrap_or(i32::MAX)),
         )?;
-        let stream = self.scratch.stream_at(ResidualIndex::FIRST)?;
-        layers::embed_rows(be, weights, geometry, &self.scratch, stream, b)?;
+        let stream = self
+            .scratch
+            .stream_at(ResidualIndex::FIRST)?
+            .slice(0, u64::from(b) * row)?;
+        // Traced, each phase is waited for and timed: what a slow round
+        // spends its milliseconds on is otherwise invisible from the host.
+        let traced = tracing::enabled!(tracing::Level::TRACE);
+        let clock = std::time::Instant::now();
+        let phase = |what: &'static str| -> CoreResult<()> {
+            if traced {
+                be.sync()?;
+                tracing::trace!(
+                    phase = what,
+                    ms = clock.elapsed().as_secs_f64() * 1e3,
+                    "block draft"
+                );
+            }
+            Ok(())
+        };
+        phase("inputs")?;
+        target.embed(be, &ids, &self.scratch, stream)?;
+        phase("embed")?;
         for (rank, layer) in self.parts.layers.iter().enumerate() {
             self.layer(
                 be,
@@ -619,6 +1087,7 @@ impl BlockDrafter {
                 stream,
             )?;
         }
+        phase("layers")?;
         // The drafted positions: every row but the pending token's.
         let drafted = b - 1;
         let tail = stream.slice(row, u64::from(drafted) * row)?;
@@ -634,27 +1103,21 @@ impl BlockDrafter {
         )?;
         projection::projection(
             be,
-            weights.output_matrix(),
-            drafted,
-            normed,
-            self.logits.view(),
-        )?;
-        projection::projection(
-            be,
             &self.parts.hidden_projection,
             drafted,
             normed,
             self.projected.view(),
         )?;
-        let vocab = geometry.vocab as usize;
-        let mut bytes = vec![0u8; drafted as usize * vocab * 4];
-        be.copy_d2h(self.logits.view(), &mut bytes)?;
-        let logits = floats(&bytes);
+        phase("selector projection")?;
+        let candidates = target.candidates(be, normed, drafted, shape.selector_top_k)?;
+        phase("candidates")?;
         let rank = shape.selector_rank as usize;
         let mut pbytes = vec![0u8; drafted as usize * rank * 4];
         be.copy_d2h(self.projected.view(), &mut pbytes)?;
         let projected = floats(&pbytes);
-        Ok(self.select(first, (&logits, &projected, vocab), hint, pos + 1))
+        let picked = self.select(first, (&candidates, &projected), hint, pos + 1);
+        phase("select")?;
+        Ok(picked)
     }
 
     /// One drafter layer over the block's rows, in place on `stream`.
@@ -790,34 +1253,33 @@ impl BlockDrafter {
     fn select(
         &self,
         first: TokenId,
-        rows: (&[f32], &[f32], usize),
+        rows: (&[Candidates], &[f32]),
         hint: DraftHint,
         at: u32,
-    ) -> Vec<TokenId> {
-        let (logits, projected, vocab) = rows;
+    ) -> (Vec<TokenId>, Vec<f32>) {
+        let (candidates, projected) = rows;
         let shape = &self.parts.shape;
         let rank = shape.selector_rank as usize;
-        let k = shape.selector_top_k as usize;
         let sampled = hint.sampling.temperature > 0.0;
         let mut prev = first.get();
         let mut out = Vec::with_capacity(shape.block as usize - 1);
+        let mut sure = Vec::with_capacity(shape.block as usize - 1);
         let mut code = Vec::with_capacity(rank);
         let mut weighted = Vec::with_capacity(rank);
-        for (i, (row, hidden_row)) in logits
-            .chunks_exact(vocab)
+        for (i, (row, hidden_row)) in candidates
+            .iter()
             .zip(projected.chunks_exact(rank))
             .enumerate()
         {
             let position = at + u32::try_from(i).unwrap_or(u32::MAX);
-            let candidates = top_k(row, k);
             self.parts.predecessor.row_into(prev, &mut code);
             weighted.clear();
             weighted.extend(code.iter().zip(hidden_row).map(|(p, h)| p * h));
-            let mut best = (f32::NEG_INFINITY, candidates.first().copied().unwrap_or(0));
-            for &cand in &candidates {
+            let mut best = (f32::NEG_INFINITY, row.ids.first().copied().unwrap_or(0));
+            for (&cand, &logit) in row.ids.iter().zip(&row.logits) {
                 self.parts.successor.row_into(cand, &mut code);
                 let edge: f32 = code.iter().zip(&weighted).map(|(s, p)| s * p).sum();
-                let mut score = row[cand as usize] + edge;
+                let mut score = logit + edge;
                 if sampled {
                     let u = crate::sampling::keyed_uniform(hint.key, position, cand);
                     score = score / hint.sampling.temperature + DRAFT_NOISE * -(-u.ln()).ln();
@@ -828,9 +1290,34 @@ impl BlockDrafter {
             }
             prev = best.1;
             out.push(TokenId::new(prev));
+            sure.push(candidate_share(row, prev));
         }
-        out
+        (out, sure)
     }
+}
+
+/// `pick`'s temperature-one probability among `row`'s candidates: its
+/// softmax share of their logits.
+///
+/// An upper bound on its share of the drafter's whole row, by the mass the
+/// candidates leave out - which is what a caller cutting a block short at a
+/// guess the drafter doubts wants, since it never cuts a guess the whole row
+/// would have kept.
+fn candidate_share(row: &Candidates, pick: u32) -> f32 {
+    let top = row.logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !top.is_finite() {
+        return 0.0;
+    }
+    let mut total = 0.0f32;
+    let mut own = 0.0f32;
+    for (&id, &logit) in row.ids.iter().zip(&row.logits) {
+        let e = (logit - top).exp();
+        total += e;
+        if id == pick {
+            own = e;
+        }
+    }
+    if total > 0.0 { own / total } else { 0.0 }
 }
 
 /// The share of the caller's keyed noise a sampled draft's scores carry: the
@@ -860,6 +1347,63 @@ fn floats(bytes: &[u8]) -> Vec<f32> {
         .iter()
         .map(|b| f32::from_le_bytes(*b))
         .collect()
+}
+
+/// The attention widths every drafter layer launches at.
+fn drafter_attn(shape: &BlockDraftShape) -> AttnGeometry {
+    AttnGeometry {
+        n_head: shape.n_head,
+        n_head_kv: shape.n_head_kv,
+        head_dim: shape.head_dim,
+        n_rot: shape.head_dim,
+        freq_dims: shape.head_dim,
+        rope_base: shape.rope_theta,
+        eps: shape.eps,
+        page_tokens: PAGE_TOKENS,
+        window: shape.window,
+        #[expect(clippy::cast_precision_loss, reason = "a head width")]
+        scale: 1.0 / (shape.head_dim as f32).sqrt(),
+        v_norm: false,
+        output_gate: false,
+        owns_kv: true,
+        qk_norm: true,
+    }
+}
+
+/// A dense geometry at the drafter's own widths, which is all its scratch is
+/// sized by when its target is not the dense stack: a feed-forward of the
+/// drafter's width, one attention slot per layer, no recurrent or routed block.
+fn beside_geometry(parts: &BlockDraftParts, vocab: u32) -> CoreResult<Geometry> {
+    let shape = &parts.shape;
+    let attn = drafter_attn(shape);
+    let layers = parts.layers.len();
+    Ok(Geometry {
+        hidden: shape.hidden,
+        vocab,
+        intermediate: shape.intermediate,
+        moe: None,
+        eps: shape.eps,
+        activation: Activation::SwiGlu,
+        norms: crate::shape::NormScheme::PreOnly,
+        media_positions: crate::shape::MediaPositions::Linear,
+        embed_scale: None,
+        final_softcap: None,
+        layer_scalar: false,
+        // Never launched: the target lends the gather.
+        embed: layers::EmbedKernel::for_dtype(shiso_core::DType::Q8_0).ok_or(
+            CoreError::Unsupported {
+                what: "a row gather for the drafter's placeholder geometry",
+                backend: "engine",
+            },
+        )?,
+        ple: None,
+        gdn: None,
+        ssm: None,
+        short_conv: None,
+        has_ffn: vec![true; layers],
+        attn: vec![attn; layers],
+        attn_scratch: crate::attn::AttnScratchSizes::over(&[attn]),
+    })
 }
 
 /// The buffers one convolution launch reads and writes.
@@ -1046,24 +1590,9 @@ impl crate::stack::HybridStack {
     /// session that stopped drafting drafts one round in [`PROBE_EVERY`], so
     /// text that turns predictable is noticed.
     fn drafting_pays(&mut self, session: SessionId) -> bool {
-        let Some(drafter) = self.block.as_mut() else {
-            return false;
-        };
-        let costs = drafter.costs;
-        let Some(state) = drafter.copies.get_mut(&session) else {
-            return true;
-        };
-        // Stopped only when drafting is clearly losing: near the break-even
-        // the two cost the same, and a session that stopped on noise gives up
-        // every round the text turns predictable again until the next probe.
-        let pays = (state.accepted + 1.0) / costs.drafted_ms > LOSING / costs.plain_ms;
-        if pays || state.idle >= PROBE_EVERY {
-            state.idle = 0;
-            true
-        } else {
-            state.idle += 1;
-            false
-        }
+        self.block
+            .as_mut()
+            .is_some_and(|drafter| drafter.pays(session))
     }
 
     /// The drafter's block behind `first`, which sits at `frontier`.
@@ -1091,17 +1620,13 @@ impl crate::stack::HybridStack {
             .ok_or(CoreError::UnknownSession(session))?
             .kv()
             .view();
-        let drafter = block.as_mut().ok_or(CoreError::Unsupported {
+        let drafter = block.as_ref().ok_or(CoreError::Unsupported {
             what: "a block draft on a stack that carries no block drafter",
             backend: "engine",
         })?;
-        drafter.propose(
-            backend,
-            (&resident.weights, geometry),
-            pages,
-            (first, frontier),
-            hint,
-        )
+        let target = drafter.dense_target(&resident.weights, geometry);
+        let (drafts, _) = drafter.propose(backend, &target, pages, (first, frontier), hint)?;
+        Ok(drafts)
     }
 
     /// Hands the drafter the first `n` rows of the verify pass that just ran,
@@ -1119,7 +1644,7 @@ impl crate::stack::HybridStack {
             .kv()
             .view();
         match block.as_mut() {
-            Some(drafter) => drafter.absorb(backend, pages, 0, n, frontier),
+            Some(drafter) => drafter.absorb(backend, drafter.own_taps(), pages, (0, n), frontier),
             None => Ok(()),
         }
     }

@@ -175,6 +175,9 @@ pub enum Role {
     DraftFcHidden,
     /// The vocabulary head narrowed to the rows a draft is likely to want.
     DraftVocabulary,
+    /// The same narrowing for a block drafter's candidates, which a stack
+    /// with no draft head holds model-wide.
+    BlockVocabulary,
 }
 
 impl Role {
@@ -194,6 +197,7 @@ impl Role {
                 | Self::DraftFcEmbed
                 | Self::DraftFcHidden
                 | Self::DraftVocabulary
+                | Self::BlockVocabulary
         )
     }
 }
@@ -1180,6 +1184,16 @@ impl<'a> Binder<'a> {
                 Role::DraftNormHidden => vector(&head()?.norm_hidden),
                 Role::DraftFcEmbed => head()?.fc_embed.part(part),
                 Role::DraftFcHidden => head()?.fc_hidden.part(part),
+                Role::BlockVocabulary => self
+                    .weights
+                    .block_vocabulary
+                    .as_ref()
+                    .ok_or(CoreError::Unsupported {
+                        what: "a narrowed block drafter vocabulary on a build that has none",
+                        backend: "engine",
+                    })?
+                    .weight()
+                    .part(part),
                 _ => head()?
                     .head
                     .as_ref()
@@ -1322,7 +1336,8 @@ impl<'a> Binder<'a> {
             | Role::DraftNormHidden
             | Role::DraftFcEmbed
             | Role::DraftFcHidden
-            | Role::DraftVocabulary => unreachable_model_wide(),
+            | Role::DraftVocabulary
+            | Role::BlockVocabulary => unreachable_model_wide(),
         }
     }
 }

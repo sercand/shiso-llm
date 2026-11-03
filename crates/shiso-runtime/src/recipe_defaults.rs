@@ -157,6 +157,13 @@ fn apply_engine_defaults(
         tracing::info!(spec_lookup, "applied recipe default for spec_lookup");
     }
 
+    if let Some(confidence) = defaults.spec_confidence
+        && check_override("spec_confidence")
+    {
+        args.spec_confidence = confidence;
+        tracing::info!(confidence, "applied recipe default for spec_confidence");
+    }
+
     if let Some(capture_verify) = defaults.capture_verify
         && check_override("capture_verify")
     {

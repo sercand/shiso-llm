@@ -534,6 +534,15 @@ impl SparseStack {
                     device,
                 )?;
                 plan.append(body);
+                // A block drafter's taps close the layer's routed island, inside
+                // it, so a captured island replays them with the rest of it.
+                if half == Island::Experts
+                    && let Some(footprint) = self.opts.block_draft.as_ref()
+                    && let Some(tap) =
+                        crate::sparse::block::tap(&self.shape, footprint, il.get(), n_tok)
+                {
+                    plan.append(tap);
+                }
                 islands.push(IslandSpan {
                     key: IslandKey {
                         layer: il,

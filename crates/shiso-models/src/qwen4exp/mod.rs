@@ -42,7 +42,7 @@ pub use config::{
     ROPE_ORIGINAL_CONTEXT, ROPE_THETA, STREAM_RANK, STREAMS, VOCAB, is_attention, layer_kinds,
     shape,
 };
-pub use model::{Qwen4ExpModel, StreamedLoad};
+pub use model::{Drafter, Qwen4ExpModel, StreamedLoad};
 
 use crate::catalog::FamilyFacts;
 

@@ -269,6 +269,13 @@ pub enum Buf {
     /// What a caller that draws its own tokens reads in place of a whole row,
     /// wherever its draw only ever looks at the top of one.
     RowTop,
+    /// A block drafter's taps of the last target pass: per row, the mean over
+    /// the streams of each tapped layer's output, `[row][tap][hidden]` `f32`.
+    ///
+    /// Sized by the drafter's tap count, which the shape does not carry, so
+    /// [`Buf::bytes`] answers zero for it and [`Scratch::new`] sizes it; a stack
+    /// with no drafter holds it empty.
+    BlockTaps,
     /// The token ids no pick may land on, as `[count, id...]` with room for
     /// [`SUPPRESS_CAPACITY`] ids.
     ///
@@ -310,7 +317,7 @@ fn fused_qk_bytes(shape: &SparseShape, run_rows: u64) -> u64 {
 
 impl Buf {
     /// Every buffer, in allocation order.
-    pub const ALL: [Self; 81] = [
+    pub const ALL: [Self; 82] = [
         Self::Ids,
         Self::Positions,
         Self::Mrope,
@@ -389,6 +396,7 @@ impl Buf {
         Self::Logits,
         Self::Argmax,
         Self::RowTop,
+        Self::BlockTaps,
         Self::Suppress,
         Self::HalfActivation,
         Self::ProjectionPartial,
@@ -539,6 +547,7 @@ impl Buf {
             Self::Argmax => u64::from(logit_rows) * I32_BYTES,
             Self::RowTop => u64::from(logit_rows) * u64::from(ROW_TOP) * 2 * F32_BYTES,
             Self::Suppress => (u64::from(SUPPRESS_CAPACITY) + 1) * I32_BYTES,
+            Self::BlockTaps => 0,
             // The two split projections bound their own partial sets: the
             // single-precision one keeps the output width times the split at or
             // below 512 floats, and the half-precision one at or below the
@@ -675,6 +684,9 @@ impl Scratch {
     /// because a block the scorer has no slot for is a block the selection can
     /// never choose.
     ///
+    /// `block_taps` is how many layers a block drafter beside the stack taps,
+    /// zero for none: [`Buf::BlockTaps`] holds that many residual rows a token.
+    ///
     /// # Errors
     ///
     /// [`CoreError::Backend`] when an allocation fails.
@@ -684,12 +696,15 @@ impl Scratch {
         rows: u32,
         logit_rows: u32,
         ctx: u32,
+        block_taps: u32,
     ) -> CoreResult<Self> {
         let buffers = Buf::ALL
             .iter()
             .map(|buf| {
                 let bytes = if buf.is_ngram() && shape.ple.is_none() {
                     0
+                } else if *buf == Buf::BlockTaps {
+                    u64::from(rows) * u64::from(block_taps) * u64::from(shape.hidden) * F32_BYTES
                 } else {
                     buf.bytes(shape, rows, logit_rows, ctx)
                 };

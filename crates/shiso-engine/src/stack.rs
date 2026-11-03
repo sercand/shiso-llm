@@ -968,9 +968,15 @@ impl HybridStack {
         // drafter's context now. A verify pass's are not: which of them stay
         // is decided after it, and the drafter absorbs exactly those.
         if !trail.records()
-            && let Some(drafter) = block.as_mut()
+            && let Some(drafter) = block.as_ref()
         {
-            drafter.absorb(backend, live.kv().view(), 0, n_tok, start)?;
+            drafter.absorb(
+                backend,
+                drafter.own_taps(),
+                live.kv().view(),
+                (0, n_tok),
+                start,
+            )?;
         }
         live.push_history(tokens);
         // Recorded on the session and not on the stack: the row a draft head
@@ -1290,7 +1296,7 @@ impl HybridStack {
                 .ok_or(CoreError::UnknownSession(step.session))?;
             let at = live.written().saturating_sub(1);
             let row = u32::try_from(row).unwrap_or(u32::MAX);
-            drafter.absorb(backend, live.kv().view(), row, 1, at)?;
+            drafter.absorb(backend, drafter.own_taps(), live.kv().view(), (row, 1), at)?;
         }
         Ok(())
     }

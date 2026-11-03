@@ -1198,7 +1198,11 @@ impl SparseStack {
         } else {
             Some(&mut land)
         };
-        self.execute_rows_tapped(sessions, pass, media, tap, land)
+        let report = self.execute_rows_tapped(sessions, pass, media, tap, land)?;
+        // Every target pass goes through here, and a drafter's context is every
+        // row a target pass ran: see `crate::sparse::block`.
+        self.absorb_pass(sessions, pass)?;
+        Ok(report)
     }
 
     /// Warms the table for the chunk after the one just enqueued.

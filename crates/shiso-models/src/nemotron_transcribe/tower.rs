@@ -161,7 +161,7 @@ impl NemotronTranscribeTower {
     }
 
     /// Whether a registration under `key` is still held.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn holds(&self, key: TimingKey) -> bool {
         registered(&self.timings, key)
     }

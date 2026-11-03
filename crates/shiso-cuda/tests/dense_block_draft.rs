@@ -52,3 +52,14 @@ fn dyn_conv_matches_the_host_rule() {
     let Some((gpu, _)) = open() else { return };
     block_draft::dyn_conv_matches_the_host_rule(&gpu);
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn rows_mv_matches_the_host_product() {
+    let Some((gpu, cuda)) = open() else { return };
+    for entry in block_draft::ROWS_MV_ENTRIES {
+        cuda.prepare(KernelRef::new("dense", entry))
+            .unwrap_or_else(|err| panic!("{entry} does not resolve: {err}"));
+    }
+    block_draft::rows_mv_matches_the_host_product(&gpu);
+}

@@ -1,7 +1,7 @@
 //! The sparse family's misc kernels: cases graded against a host restatement of the CUDA bodies.
 //!
-//! The two leftovers of `q4e_misc` - the n-gram block's two-term residual add
-//! and the on-device greedy pick - and the half-precision row gathers of
+//! The leftovers of `q4e_misc` - the n-gram block's two-term residual add,
+//! the on-device greedy pick and the block drafter's stream mean - and the half-precision row gathers of
 //! `q4e_embed`. Each runs at the engine's grid: `elementwise` (256 threads) for
 //! the add and the gathers, `argmax_rows` (one 1024-thread block per row) for
 //! the pick. Every output here is an exact restatement - a copy, an f32 add, an
@@ -9,6 +9,7 @@
 #![expect(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
     reason = "kernel arguments are u32/i32 while the fixtures index in usize; every size and \
               index here is a small literal"
 )]
@@ -103,6 +104,121 @@ pub fn the_ngram_add_sums_both_branches_into_the_residual(gpu: &Gpu) {
     );
     let want: Vec<f32> = (0..n).map(|i| res[i] + (a[i] + b[i])).collect();
     same(&gpu.read_f32(&res_dev), &want, "add2");
+}
+
+/// `q4e_stream_mean_rows_kernel` writes each row's mean over the streams into
+/// its slot of a wider row and touches nothing else of that row: what a block
+/// drafter reads as one tapped layer. The streams are summed in order and
+/// divided once, so the oracle is that arithmetic, bitwise.
+///
+/// # Panics
+///
+/// When an element is not the host's.
+pub fn the_stream_mean_lands_in_its_tap_slot(gpu: &Gpu) {
+    const ROWS: u32 = 5;
+    const TAPS: u32 = 3;
+    const SLOT: u32 = 1;
+    let n = (ROWS * STREAMS * HIDDEN) as usize;
+    let res = signal(n, 13);
+    let width = (ROWS * TAPS * HIDDEN) as usize;
+    let fill = signal(width, 17);
+    let res_dev = gpu.upload(&f32_bytes(&res));
+    let dst_dev = gpu.upload(&f32_bytes(&fill));
+    launch(
+        gpu,
+        KernelRef::new(MOD_MISC, "q4e_stream_mean_rows_kernel"),
+        flat(u64::from(ROWS * HIDDEN)),
+        BLOCK_LINEAR,
+        &[
+            KernelArg::Buffer(dst_dev.view()),
+            KernelArg::Buffer(res_dev.view()),
+            KernelArg::U32(HIDDEN),
+            KernelArg::U32(STREAMS),
+            KernelArg::U32(ROWS),
+            KernelArg::U32(TAPS * HIDDEN),
+            KernelArg::U32(SLOT * HIDDEN),
+        ],
+    );
+    let (h, s) = (HIDDEN as usize, STREAMS as usize);
+    let mut want = fill;
+    for t in 0..ROWS as usize {
+        for e in 0..h {
+            let mut sum = 0.0f32;
+            for k in 0..s {
+                sum += res[(t * s + k) * h + e];
+            }
+            want[t * TAPS as usize * h + SLOT as usize * h + e] = sum / STREAMS as f32;
+        }
+    }
+    same(&gpu.read_f32(&dst_dev), &want, "stream mean");
+}
+
+/// `q4e_top_slices_kernel` takes each slice's `k` best entries, best first and
+/// ties to the lower id, which merged on the host are the row's own top `k`.
+/// Ties are planted inside a slice and across a slice boundary; a short last
+/// slice pads with -inf and an id past the row.
+///
+/// # Panics
+///
+/// When a slice's entry is not the host's.
+pub fn the_sliced_top_keeps_each_slice_best_first(gpu: &Gpu) {
+    const ROWS: usize = 3;
+    const K: u32 = 16;
+    const SLICES: u32 = 32;
+    let v = VOCAB as usize;
+    let mut logits = signal(ROWS * v, 23);
+    logits[100] = 4.0;
+    logits[101] = 4.0;
+    logits[7_759] = 3.5;
+    logits[7_760] = 3.5;
+    logits[v + v - 1] = 5.0;
+    let logits_dev = gpu.upload(&f32_bytes(&logits));
+    let entries = ROWS * (SLICES * K) as usize;
+    let values_dev = gpu.upload(&vec![0u8; entries * 4]);
+    let ids_dev = gpu.upload(&vec![0u8; entries * 4]);
+    run(
+        gpu,
+        KernelRef::new(MOD_MISC, "q4e_top_slices_kernel"),
+        &LaunchArgs {
+            grid: Extent3::new(SLICES, ROWS as u32, 1),
+            block: Extent3::new(BLOCK_LINEAR, 1, 1),
+            smem_bytes: 0,
+            args: &[
+                KernelArg::Buffer(logits_dev.view()),
+                KernelArg::U32(VOCAB),
+                KernelArg::U32(K),
+                KernelArg::U32(SLICES),
+                KernelArg::Buffer(values_dev.view()),
+                KernelArg::Buffer(ids_dev.view()),
+            ],
+        },
+    );
+    drain(gpu);
+    let values = gpu.read_f32(&values_dev);
+    let ids: Vec<u32> = gpu.read_f32(&ids_dev).iter().map(|f| f.to_bits()).collect();
+    let span = (v as u32).div_ceil(SLICES) as usize;
+    for row in 0..ROWS {
+        for slice in 0..SLICES as usize {
+            let lo = slice * span;
+            let hi = (lo + span).min(v);
+            let mut want: Vec<(f32, u32)> =
+                (lo..hi).map(|i| (logits[row * v + i], i as u32)).collect();
+            want.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            for t in 0..K as usize {
+                let at = (row * SLICES as usize + slice) * K as usize + t;
+                let (wv, wi) = want
+                    .get(t)
+                    .copied()
+                    .unwrap_or((f32::NEG_INFINITY, u32::MAX));
+                assert_eq!(ids[at], wi, "row {row} slice {slice} rank {t}: id");
+                assert_eq!(
+                    values[at].to_bits(),
+                    wv.to_bits(),
+                    "row {row} slice {slice} rank {t}: value"
+                );
+            }
+        }
+    }
 }
 
 /// `q4e_argmax_rows_kernel` picks each row's maximum over the whole

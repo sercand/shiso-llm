@@ -358,7 +358,7 @@ impl DeviceKv {
     /// point: the cache hands over a buffer sized from
     /// [`KvLayout::page_bytes`], and a walk that disagreed with it would write
     /// one run's bytes over another's.
-    fn page_bytes(&self) -> u64 {
+    pub(crate) fn page_bytes(&self) -> u64 {
         self.pool
             .run_bytes
             .iter()
