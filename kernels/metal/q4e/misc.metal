@@ -94,8 +94,12 @@ kernel void q4e_top_slices_kernel(
         device float *values [[buffer(4)]],
         device uint *ids [[buffer(5)]],
         uint2 group [[threadgroup_position_in_grid]],
-        uint tid [[thread_position_in_threadgroup]],
-        uint bdim [[threads_per_threadgroup]]) {
+        uint2 tid2 [[thread_position_in_threadgroup]],
+        uint2 bdim2 [[threads_per_threadgroup]]) {
+    // Metal wants every position attribute of one signature the same width,
+    // so the 1-D block's lane and size are read from the x of 2-D ones.
+    const uint tid = tid2.x;
+    const uint bdim = bdim2.x;
     threadgroup uint s_key[32];
     threadgroup uint s_id[32];
     threadgroup uint t_key;
