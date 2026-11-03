@@ -112,6 +112,21 @@ pub(crate) struct FakeBackend {
     next_id: AtomicU64,
     double_frees: AtomicU64,
     reads: AtomicU64,
+    uploads: Mutex<Vec<Upload>>,
+}
+
+/// One host-to-device copy, and where it fell among the launches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Upload {
+    /// Launches the device had received when the copy arrived: the copy is
+    /// ordered after launch `launches - 1` and before launch `launches`.
+    pub(crate) launches: usize,
+    /// The allocation written.
+    pub(crate) buffer: u64,
+    /// Byte offset into it.
+    pub(crate) offset: u64,
+    /// Bytes written.
+    pub(crate) len: u64,
 }
 
 impl FakeBackend {
@@ -138,6 +153,12 @@ impl FakeBackend {
     /// How many allocations the device is still holding.
     pub(crate) fn live_count(&self) -> usize {
         self.live.lock().len()
+    }
+
+    /// Every host-to-device copy the device received, in order, each with
+    /// its place among the launches.
+    pub(crate) fn uploads(&self) -> Vec<Upload> {
+        self.uploads.lock().clone()
     }
 
     /// How many device-to-host reads the device has served.
@@ -283,6 +304,13 @@ impl Backend for FakeBackend {
     fn copy_h2d(&self, dst: DeviceView<'_>, src: &[u8]) -> CoreResult<()> {
         let len = u64::try_from(src.len()).unwrap_or(u64::MAX);
         let range = self.range_of(dst, len, "copy_h2d")?;
+        let launches = self.launches.lock().len();
+        self.uploads.lock().push(Upload {
+            launches,
+            buffer: dst.id().get(),
+            offset: dst.offset(),
+            len,
+        });
         self.live
             .lock()
             .get_mut(&dst.id().get())

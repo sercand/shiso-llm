@@ -82,7 +82,7 @@ registers. Never dequantize a whole matrix to float in memory.
 
 ## Adding a kernel (files to touch)
 
-1. Write MSL in `crates/shiso-metal/metal/<set>/`. Instantiate templates with
+1. Write MSL in `kernels/metal/<set>/`. Instantiate templates with
    `template [[host_name("kernel_...")]]`. Keep the CUDA entry name for a port.
 2. For a new file, append it to `SOURCES` in `crates/shiso-metal/src/compile.rs`,
    after its set's `*_common.h`.
@@ -99,7 +99,7 @@ registers. Never dequantize a whole matrix to float in memory.
 7. Dispatch through `Backend::run(KernelRef::new(MODULE, "kernel_..."), ...)`.
    `grid` is the **threadgroup count**, not the thread count.
 
-Iterate on MSL without rebuilding: `SHISO_METAL_SOURCE_DIR=crates/shiso-metal/metal`
+Iterate on MSL without rebuilding: `SHISO_METAL_SOURCE_DIR=kernels/metal`
 (read at device creation, so it applies to tests and bench bins too).
 
 ## Profiling

@@ -32,6 +32,10 @@ libc = { workspace = true }
 # magic, version, row stride and slot count are written out a second time here
 # passes on the wrong file the moment the writer moves and this copy does not.
 shiso-models = { workspace = true }
+# The NVFP4 row codec restates the loader's `e2m1` and `e4m3` decoders rather
+# than depending on the container crate for two tables; a test grades the
+# restatement against the originals over every code and scale byte.
+shiso-modelfile = { workspace = true }
 # The fixtures are real files: the reader opens a descriptor and there is no
 # in-memory door into it.
 tempfile = { workspace = true }

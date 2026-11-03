@@ -59,6 +59,15 @@ struct QuantDoc {
     convrot: bool,
     #[serde(default)]
     convrot_groupsize: Option<u64>,
+    /// Written by exports whose scale is one value per row. Accepted, not
+    /// acted on: the layout is decided by the scale tensor's own shape,
+    /// which [`read_int8_layout`] checks against the weight's row count.
+    #[serde(default)]
+    #[expect(
+        dead_code,
+        reason = "read for validation of the document's field set only"
+    )]
+    per_row: Option<bool>,
 }
 
 /// The per-row INT8 layout of one linear, read and checked from its tensors.

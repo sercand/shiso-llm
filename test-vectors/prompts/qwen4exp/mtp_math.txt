@@ -1,0 +1,48 @@
+Problem: A train leaves City A at 9:00 AM traveling toward City B at a constant speed of 60 miles per hour. A second train leaves City B at 10:00 AM traveling toward City A at a constant speed of 80 miles per hour. The distance between the two cities is 340 miles. At what time do the two trains meet, and how far from City A is the meeting point?
+
+Solution:
+
+Step 1: Find how far the first train travels before the second train starts.
+The first train travels alone from 9:00 AM to 10:00 AM, which is 1 hour.
+Distance = speed × time = 60 × 1 = 60 miles.
+
+Step 2: Find the remaining distance between the trains at 10:00 AM.
+Remaining distance = 340 − 60 = 280 miles.
+
+Step 3: Find the closing speed.
+Since the trains travel toward each other, their speeds add.
+Closing speed = 60 + 80 = 140 miles per hour.
+
+Step 4: Find the time until they meet after 10:00 AM.
+Time = remaining distance ÷ closing speed = 280 ÷ 140 = 2 hours.
+
+Step 5: Find the meeting time.
+10:00 AM + 2 hours = 12:00 PM.
+
+Step 6: Find the distance from City A.
+The first train has traveled for a total of 1 + 2 = 3 hours.
+Distance from City A = 60 × 3 = 180 miles.
+
+Check: The second train has traveled for 2 hours at 80 miles per hour, so it covered 80 × 2 = 160 miles. Together, 180 + 160 = 340 miles, which is the full distance between the cities. The answer is consistent.
+
+Answer: The two trains meet at 12:00 PM, 180 miles from City A.
+
+Problem: A rectangle has a perimeter of 54 centimeters. Its length is 3 centimeters more than twice its width. Find the area of the rectangle.
+
+Solution:
+
+Step 1: Let the width be w centimeters. Then the length is 2w + 3 centimeters.
+
+Step 2: Write the perimeter equation.
+Perimeter = 2 × (length + width) = 2 × (2w + 3 + w) = 2 × (3w + 3) = 6w + 6.
+
+Step 3: Solve for w.
+6w + 6 = 54
+6w = 48
+w = 8
+
+Step 4: Find the length.
+Length = 2 × 8 + 3 = 19 centimeters.
+
+Step 5: Find the area.
+Area = length × width = 19 × 8 = 152 square centimeters.

@@ -577,17 +577,58 @@ impl<'a> Exec<'a> {
         &self,
         pass: &Pass,
         graphs: Option<&dyn GraphBackend>,
+        tap: Option<&mut ResidualTap>,
+    ) -> CoreResult<PassReport> {
+        self.run_pass_landed(pass, graphs, tap, None)
+    }
+
+    /// Issues a whole pass as [`Exec::run_pass_tapped`] does, calling `land`
+    /// exactly once on the way: in front of the island
+    /// [`Pass::ngram_island`] names, or before the first step when it names
+    /// none.
+    ///
+    /// `land` is the host work the island needs done first - awaiting the
+    /// n-gram reads and uploading them - and everything issued before it reads
+    /// none of what it writes, so the device runs those launches while the
+    /// host does it. A pass is one stream either way: the upload `land` makes
+    /// is ordered behind the launches already issued and in front of the ones
+    /// after it, exactly where the rows were always read.
+    ///
+    /// # Errors
+    ///
+    /// As [`Exec::run_pass_tapped`], plus whatever `land` reports. The steps
+    /// issued before a failing `land` have already been issued: a pass is a
+    /// stream, and there is no undo.
+    pub fn run_pass_landed(
+        &self,
+        pass: &Pass,
+        graphs: Option<&dyn GraphBackend>,
         mut tap: Option<&mut ResidualTap>,
+        mut land: Option<&mut dyn FnMut() -> CoreResult<()>>,
     ) -> CoreResult<PassReport> {
         let steps = pass.plan.steps();
         let graphs = graphs.filter(|_| pass.capturable && tap.is_none());
         if let Some(tap) = tap.as_deref_mut() {
             tap.restart();
         }
+        let landing_island = pass
+            .ngram_island
+            .filter(|island| *island < pass.islands.len());
+        if landing_island.is_none()
+            && let Some(land) = land.take()
+        {
+            land()?;
+        }
         let mut report = PassReport::default();
         let mut at = 0usize;
-        for (index, span) in pass.islands.iter().enumerate() {
+        let mut index = 0usize;
+        while let Some(span) = pass.islands.get(index) {
             report = merge(report, self.run_steps(prefix(steps, at, span.start)?)?);
+            if landing_island == Some(index)
+                && let Some(land) = land.take()
+            {
+                land()?;
+            }
             // The prologue is everything in front of the first island. It ends
             // with the broadcast; the reservation placed there writes no
             // activation.
@@ -596,7 +637,19 @@ impl<'a> Exec<'a> {
             {
                 self.copy_residual(tap, TapPoint::Embed, pass.rows)?;
             }
-            report = merge(report, self.run_island(steps, *span, graphs)?);
+            let last = if graphs.is_some() {
+                replay_run(&pass.islands, index, landing_island)
+            } else {
+                index
+            };
+            let group = IslandSpan {
+                len: pass.islands[last]
+                    .start
+                    .saturating_add(pass.islands[last].len)
+                    .saturating_sub(span.start),
+                ..*span
+            };
+            report = merge(report, self.run_island(steps, group, graphs)?);
             if let Some(tap) = tap.as_deref_mut() {
                 let point = match span.key.island {
                     Island::Mixer => TapPoint::Mixer(span.key.layer),
@@ -604,7 +657,8 @@ impl<'a> Exec<'a> {
                 };
                 self.copy_residual(tap, point, pass.rows)?;
             }
-            at = span.start.saturating_add(span.len);
+            at = group.start.saturating_add(group.len);
+            index = last.saturating_add(1);
         }
         report = merge(report, self.run_steps(tail(steps, at))?);
         Ok(report)
@@ -691,6 +745,32 @@ impl<'a> Exec<'a> {
     }
 }
 
+/// The last island of the run that starts at `first` and is captured and
+/// replayed as one graph: every following island that starts exactly where
+/// its predecessor ends, up to the one the n-gram rows land in front of,
+/// which has to wait for the host and so starts a run of its own.
+///
+/// Each captured graph is a separate launch, and the device leaves a gap
+/// between two of them: 3.45 us between every pair of islands in a GB10
+/// decode profile of the NVIDIA export, 96 a token, 0.33 ms of a 39 ms step,
+/// where a launch inside a graph follows the one before it in 0.1 us. A run
+/// has nothing of the host's between its islands (no prefix steps, no
+/// landing), so its launches are the same launches in the same order whether
+/// they are one graph or several, and the first island's key names the run:
+/// the pass that planned it is the only thing the grouping reads, and the key
+/// already says which pass that is.
+fn replay_run(islands: &[IslandSpan], first: usize, landing: Option<usize>) -> usize {
+    let mut last = first;
+    while let Some(next) = islands.get(last + 1) {
+        let end = islands[last].start.saturating_add(islands[last].len);
+        if next.start != end || landing == Some(last + 1) {
+            break;
+        }
+        last += 1;
+    }
+    last
+}
+
 /// The steps between where the last island ended and where this one starts.
 fn prefix(steps: &[Step], at: usize, start: usize) -> CoreResult<&[Step]> {
     steps.get(at..start).ok_or(CoreError::OutOfBounds {
@@ -730,4 +810,65 @@ pub fn bound_args<'a>(binder: &Binder<'a>, step: &Step) -> CoreResult<Vec<Kernel
     let mut out = Vec::new();
     binder.bind(step.args(), &mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use shiso_core::ids::LayerIdx;
+
+    use super::replay_run;
+    use crate::sparse::island::{Island, IslandContext, IslandKey};
+    use crate::sparse::stack::IslandSpan;
+
+    /// Islands of `lens` steps each, tiling a plan from step 3 except where
+    /// `gap_before` leaves a step out in front of an island.
+    fn spans(lens: &[usize], gap_before: Option<usize>) -> Vec<IslandSpan> {
+        let mut at = 3;
+        lens.iter()
+            .enumerate()
+            .map(|(i, &len)| {
+                if gap_before == Some(i) {
+                    at += 1;
+                }
+                let span = IslandSpan {
+                    key: IslandKey {
+                        layer: LayerIdx::new(u32::try_from(i / 2).expect("small")),
+                        island: if i % 2 == 0 {
+                            Island::Mixer
+                        } else {
+                            Island::Experts
+                        },
+                        rows: 1,
+                        selected: false,
+                        context: IslandContext::Session(1),
+                    },
+                    start: at,
+                    len,
+                };
+                at += len;
+                span
+            })
+            .collect()
+    }
+
+    #[test]
+    fn adjacent_islands_replay_as_one_run_to_the_end_of_the_pass() {
+        let islands = spans(&[4, 5, 6, 7, 8, 9], None);
+        assert_eq!(replay_run(&islands, 0, None), 5);
+        assert_eq!(replay_run(&islands, 3, None), 5);
+    }
+
+    #[test]
+    fn the_island_the_rows_land_in_front_of_starts_a_run_of_its_own() {
+        let islands = spans(&[4, 5, 6, 7, 8, 9], None);
+        assert_eq!(replay_run(&islands, 0, Some(2)), 1);
+        assert_eq!(replay_run(&islands, 2, Some(2)), 5);
+    }
+
+    #[test]
+    fn a_step_between_two_islands_ends_the_run() {
+        let islands = spans(&[4, 5, 6, 7], Some(2));
+        assert_eq!(replay_run(&islands, 0, None), 1);
+        assert_eq!(replay_run(&islands, 2, None), 3);
+    }
 }

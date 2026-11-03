@@ -800,3 +800,37 @@ fn profiling_with_one_sequence_is_accepted() {
     .validate()
     .expect("one sequence at a time is what profiling needs");
 }
+
+#[cfg(all(feature = "metal", feature = "cpu"))]
+#[test]
+fn the_device_flag_lists_this_builds_devices() {
+    let error = parse(&["--model", "m.gguf", "--device", "cuda"]).expect_err("cuda is not built");
+    assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    let text = error.to_string();
+    assert!(
+        text.contains("[possible values: auto, metal, cpu]"),
+        "{text}"
+    );
+}
+
+#[cfg(all(feature = "cpu", not(any(feature = "metal", feature = "cuda"))))]
+#[test]
+fn the_device_flag_lists_this_builds_devices() {
+    let error = parse(&["--model", "m.gguf", "--device", "metal"]).expect_err("metal is not built");
+    assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    assert!(
+        error.to_string().contains("[possible values: auto, cpu]"),
+        "{error}"
+    );
+    parse(&["--model", "m.gguf", "--device", "cpu"]).expect("cpu is built");
+}
+
+/// The environment fallback is declared the same way as every other knob; the
+/// variable itself is never set here (see the module note), so this reads the
+/// help and the default.
+#[test]
+fn shiso_device_env_is_checked_the_same_way() {
+    assert!(serve_help().contains("SHISO_DEVICE"));
+    let args = parse(&["--model", "m.gguf"]).expect("parses");
+    assert_eq!(args.device, shiso_runtime::device::DeviceChoice::Auto);
+}

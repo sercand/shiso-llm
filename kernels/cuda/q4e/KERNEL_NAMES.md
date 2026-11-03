@@ -8,7 +8,7 @@ registry key; a kernel inside it is fetched by the exact name recorded here.
 Two kinds of entry live in these units, and they are fetched differently.
 
 **Plain kernels** carry C linkage, so the name below is the name the driver
-answers to, verbatim. There are 57 of them.
+answers to, verbatim. There are 65 of them.
 
 **Template kernels** do not. They are instantiated explicitly at the bottom of
 their translation unit - 155 instantiations across 12 templates - and each one
@@ -33,8 +33,8 @@ back to the kernel it belongs to.
 
 | Registry key | Unit | Plain entries | Template instantiations |
 |---|---|---|---|
-| `q4e_hc` | `hc.cu` | 3 | 6 |
-| `q4e_moe` | `moe.cu` | 8 | 4 |
+| `q4e_hc` | `hc.cu` | 4 | 6 |
+| `q4e_moe` | `moe.cu` | 9 | 4 |
 | `q4e_gdn` | `gdn.cu` | 8 | 0 |
 | `q4e_gdn_tc` | `gdn_tc.cu` | 4 | 0 |
 | `q4e_ple` | `ple.cu` | 5 | 0 |
@@ -44,9 +44,15 @@ back to the kernel it belongs to.
 | `q4e_idx` | `idx.cu` | 8 | 0 |
 | `q4e_misc` | `misc.cu` | 3 | 0 |
 | `q4e_embed` | `embed.cu` | 4 | 0 |
-| `q4e_modelopt` | `modelopt.cu` | 7 | 0 |
+| `q4e_modelopt` | `modelopt.cu` | 9 | 0 |
 | `q4e_exact` | `exact.cu` | 2 | 0 |
-| **total** | 13 units | **69** | **105** |
+| `q4e_kv8` | `kv8.cu` | 8 | 0 |
+| `q4e_mxfp8` | `mxfp8.cu` | 9 | 0 |
+| `q4e_idxring` | `idxring.cu` | 1 | 0 |
+| `q4e_bf16` | `bf16.cu` | 12 | 0 |
+| `q4e_gdn_fused` | `gdn_fused.cu` | 2 | 0 |
+| `q4e_ffn` | `ffn.cu` | 3 | 0 |
+| **total** | 19 units | **108** | **105** |
 
 ## Plain entries, by module
 
@@ -56,19 +62,26 @@ back to the kernel it belongs to.
 - `q4e_hc_init_add_kernel`
 - `q4e_scale_silu_kernel`
 - `q4e_hc_collapse_f16_dual_kernel`
+- `q4e_hc_combine_scale_kernel` - the fused combine leaving the next norm's
+  per-(token, stream) scale in place of the normed streams.
 
 ### `q4e_modelopt`
 
-Not an upstream unit: this repository's own NVFP4 routed stages and FP8
+Not an upstream unit: this repository's own NVFP4 routed stages and FP8 and NVFP4
 n-gram decode, for the `modelopt` export.
 
 - `q4e_nvfp4_experts_gate_up_kernel`
+- `q4e_nvfp4_experts_gate_up_act_kernel` - the same rows, each column's
+  `silu(gate) * up` stored as `q4e_swiglu_kernel` would compute it.
+- `q4e_nvfp4_experts_gate_up_act_held_kernel` - the same activated rows, a
+  2560-wide row held in registers across an expert's columns (a verify).
 - `q4e_nvfp4_experts_down_kernel`
 - `q4e_nvfp4_experts_gemm_gate_up_kernel`
 - `q4e_nvfp4_experts_gemm_down_kernel`
 - `q4e_fp8_experts_gate_up_kernel`
 - `q4e_fp8_experts_down_kernel`
 - `q4e_ple_dequant_fp8_kernel`
+- `q4e_ple_dequant_nvfp4_kernel`
 
 ### `q4e_exact`
 
@@ -82,10 +95,143 @@ ported unit is edited.
   convolution: the two L2 norms, the gates, the recurrence and the output
   gate, bit for bit the five launches it replaces.
 
+### `q4e_kv8`
+
+Not an upstream unit: the key/value store and every reader of the attention
+K and V planes over a cache of FP8 E4M3 bytes (static scale 1) instead of
+f16, for `--kv-cache-dtype fp8`. Each is the named kernel with the cache's
+element type changed: the store rounds to E4M3 (saturating at 448, never the
+NaN code), and each reader decodes a byte to exactly the f16 value it stands
+for and then runs the ported arithmetic unchanged.
+
+- `q4e_qsa_store_kv_fp8_kernel` - `q4e_qsa_store_kv_kernel`.
+- `q4e_qsa_store_kv_batch_fp8_kernel` - `q4e_qsa_store_kv_batch_kernel`.
+- `q4e_qsa_attention_fp8_kernel` - `q4e_qsa_attention_kernel`.
+- `q4e_qsa_attention_batch_fp8_kernel` - `q4e_qsa_attention_batch_kernel`.
+- `q4e_qsa_attention_tiled_fp8_kernel` - `q4e_qsa_attention_tiled_kernel`.
+- `q4e_qsa_attention_split_fp8_kernel` - `q4e_qsa_attention_split_kernel`.
+- `q4e_qsa_attention_gather_fp8_kernel` - `q4e_qsa_attention_gather_kernel`.
+- `q4e_qsa_attention_tc_exact_fp8_kernel` - `q4e_qsa_attention_tc_exact_kernel`.
+
+### `q4e_mxfp8`
+
+Not an upstream unit: this repository's own dense projections over an MXFP8
+weight (`e4m3` codes, one `ue8m0` scale per 32), read as stored. One argument
+list for all five: `out, codes, scales, x, in_dim, out_dim, rows`.
+
+- `q4e_mxfp8_gemv_kernel` - one activation row; a row's sum is the
+  brain-float rows kernel's on the exactly widened weight. Two output rows a
+  warp.
+- `q4e_mxfp8_gemv_narrow_kernel` - the same sums, one output row a warp, for
+  outputs of at most 1024 rows.
+- `q4e_mxfp8_rows_kernel` - two to eight activation rows, each summed as the
+  one-row kernel sums it; the activations staged once a block, four output
+  rows a warp.
+- `q4e_mxfp8_rows_narrow_kernel` - the same sums, one output row a warp, for
+  outputs of at most 1024 rows.
+- `q4e_mxfp8_gemm_kernel` - a prompt chunk on tensor cores, 128 x 128 tiles,
+  one scale group a contraction step, activations rounded to halves.
+
+The group entries take up to four matrices that read one activation, each
+writing its own output, in one grid whose blocks each own rows of one matrix:
+`out0, codes0, scales0, out_dim0` for slots 0 to 3 (an unused slot has
+`out_dim` 0), then `x, in_dim, rows`. A row of every matrix is summed exactly
+as the single-matrix entries sum it.
+
+- `q4e_mxfp8_gemv_group_kernel` - one activation row, two output rows a warp.
+- `q4e_mxfp8_gemv_group_narrow_kernel` - one activation row, one output row a
+  warp with the next chunk's codes in flight, for groups of at most 4096 rows.
+- `q4e_mxfp8_rows_group_kernel` - two to eight activation rows, four output
+  rows a warp.
+- `q4e_mxfp8_rows_group_narrow_kernel` - two to eight activation rows, one
+  output row a warp, for groups of at most 1024 rows.
+
+### `q4e_idxring`
+
+Not an upstream unit: the indexer's pooled key pass over a per-session ring of
+raw keys, so a page carries no raw key row per position.
+
+- `q4e_idx_ring_pool_kernel` - `q4e_idx_pool_kernel`'s arithmetic, reading a
+  raw key from the pass's own f32 rows (rounded to f16 as the store rounded
+  it) or, before the pass's first position, from the ring; block 0 then copies
+  the frontier block's raw keys into a checkpoint's ring section when asked
+  (`snap_row != 0xFFFFFFFF`) and stores the pass's last 16 rows into the ring.
+
+### `q4e_bf16`
+
+Not an upstream unit: this repository's own dense projections over a
+brain-float weight, read as stored. The step kernels take
+`out, w, x, in_dim, out_dim, splits, rows` (each output row's contraction
+sliced across `splits` warps of one block and folded there); the prompt
+kernels take `out, w, x, in_dim, out_dim, rows`.
+
+- `q4e_bf16_gemv_kernel` - one activation row, one output row a warp, eight
+  contiguous weights a lane a step.
+- `q4e_bf16_rows_kernel` - two to eight activation rows, each summed as the
+  one-row kernel sums it; two output rows a warp.
+- `q4e_bf16_rows_wide_kernel` - nine to thirty-two rows, the same sums; four
+  output rows a warp.
+- `q4e_bf16_gemm_kernel` - a prompt chunk on tensor cores, 128 x 128 tiles,
+  activations rounded to brain floats.
+- `q4e_bf16_gemm_split_kernel` - the same with each activation carried as two
+  brain floats, for the narrow projections.
+- `q4e_bf16_gemm_pair_kernel` - the plain prompt kernel over two weights of one
+  input stacked in one grid (`out_a, w_a, out_dim_a, out_b, w_b, out_dim_b, x,
+  in_dim, rows`): the stream mix's contraction and injection logits.
+- `q4e_bf16_gemm_collapse_kernel` - the stream mix's expansion with the
+  collapse of the gated streams as its epilogue (`out, w_up, x, xn, in_dim,
+  n_embd, n_hc, rows`); `q4e_bf16_gemm_kernel` then `q4e_hc_collapse_kernel`,
+  bit for bit.
+- `q4e_bf16_gemm_pair_norm_kernel` - the pair over the residual streams, each
+  value normed as it is read (`..., res, scale, nw, n_embd, in_dim, rows`).
+- `q4e_bf16_gemm_collapse_norm_kernel` - the fused collapse over the residual
+  streams, normed as they are read (`out, w_up, x, res, scale, nw, in_dim,
+  n_embd, n_hc, rows`).
+- `q4e_bf16_gemv_pair_kernel`, `q4e_bf16_rows_pair_kernel` - the step kernels
+  over two weights of one input stacked in one grid (`out_a, w_a, out_dim_a,
+  out_b, w_b, out_dim_b, x, in_dim, splits, rows`).
+- `q4e_bf16_mix_step_kernel` - the stream mix's activation, expansion and
+  collapse for one to eight step rows (`out, w_up, x, xn, inv_hc, in_dim,
+  n_embd, n_hc, rows`), four 320-wide expansion rows a warp.
+
+### `q4e_gdn_fused`
+
+Not an upstream unit: a prefill chunk's recurrent block between its
+projections - convolution, norms, gates, the chunked delta rule and the output
+gate - in two kernels that reproduce the `q4e_gdn` / `q4e_gdn_tc` chain bit for
+bit.
+
+- `q4e_gdf_prep_kernel` - one block per (key head, run): the convolution, silu
+  and norms of the key head's rows, the gates and grams, and the three value
+  heads' triangular solves; writes u, T, P and the decays per (run, value head)
+  and the normalized query and key rows per (run, key head).
+- `q4e_gdf_scan_kernel` - one block per value head: the state carried across
+  the chunk's runs with the state transposed in mma accumulators, and each run's
+  outputs normed and gated in place.
+
+### `q4e_ffn`
+
+Not an upstream unit: a decode step's or a verify's router, gate logit, routed
+selection and shared expert in one launch of work items, reproducing the
+`q4e_bf16` step kernels, `q4e_moe_route_sort_tiny_kernel`, the `q4e_mxfp8`
+group and step kernels and `q4e_swiglu_kernel` bit for bit. Both take `logits,
+gate_logit, mid, shared_out, ids, weights, bounds, active, sorted, pos, sync,
+router, gate, g_codes, g_scales, u_codes, u_scales, d_codes, d_scales, x,
+in_dim, n_expert, n_used, inter, splits, gate_splits, rows`; grid
+`ceil(inter / 8) + n_expert * splits / 8 + 1 + ceil(in_dim / 16)`, 256 threads.
+
+- `q4e_ffn_route_kernel` - one activation row (a decode step).
+- `q4e_ffn_route_rows_kernel` - two to eight rows (a verify), the same sums.
+- `q4e_ffn_combine_kernel` - `q4e_moe_combine_kernel` then
+  `q4e_shared_add_kernel` in one pass (`out, down, weights, shared, logit,
+  n_embd, n_used`), grid `(ceil(n_embd / 256), rows)`, 256 threads.
+
 ### `q4e_moe`
 
 - `q4e_moe_route_kernel`
 - `q4e_moe_route_sort_small_kernel`
+- `q4e_moe_route_sort_tiny_kernel` - the small kernel's results for at most
+  eight tokens, at a shorter serial chain.
 - `q4e_swiglu_kernel`
 - `q4e_moe_combine_kernel`
 - `q4e_shared_add_kernel`
@@ -410,6 +556,7 @@ not thereby broken at the shipped shape.
 | `q4e_hc_collapse_kernel` ⊤ | `n_tok` | `256` | `0` |
 | `q4e_hc_collapse_f16_dual_kernel` | `n_tok` | `256` | `0` |
 | `q4e_hc_combine_norm_kernel` ⊤ | `(n_tok, n_tok >= 256 ? 1 : n_hc, 1)` | `256` | `0` |
+| `q4e_hc_combine_scale_kernel` | `(n_tok, n_tok >= 256 ? 1 : n_hc, 1)` | `256` | `0` |
 
 `q4e_hc_combine_norm_kernel`'s `y` is the launcher's own switch: one block per
 token once there are enough tokens to fill the machine that way, one block per
@@ -422,6 +569,7 @@ refuses the call outright when `n_embd > 256 * Q4E_HC_FUSE_MAX`.
 |---|---|---|---|
 | `q4e_moe_route_kernel` | `n_tok` | `256` | `n_expert * 4` |
 | `q4e_moe_route_sort_small_kernel` | `1` | `1024` | `0` |
+| `q4e_moe_route_sort_tiny_kernel` | `1` | `256` | `0` |
 | `q4e_swiglu_kernel` | `ceil(n / 256)` | `256` | `0` |
 | `q4e_moe_combine_kernel` | `(ceil(n_embd / 256), n_tok, 1)` | `256` | `0` |
 | `q4e_shared_add_kernel` | `(ceil(n_embd / 256), n_tok, 1)` | `256` | `0` |
@@ -606,6 +754,14 @@ tile unchanged, 66,048 B at the one head width it is planned at (128). It is
 planned only for one row of one session's decode step; every other pass runs
 the chain it replaces.
 
+### `q4e_kv8`
+
+Every entry takes the grid, block, dynamic shared memory and argument list of
+the f16 kernel it is named after (tables above), with the two cache pointers
+typed `uint8_t *` instead of `__half *`. The readers' shared tiles stay f16 -
+the codes are decoded as they are staged - so the reservations are the same
+numbers, including the opt-in ones.
+
 ### `q4e_idx`
 
 | Kernel | Grid | Block | Dynamic shared memory |
@@ -632,6 +788,17 @@ runs only at `n_head == 4` and when its 49,152 B opt-in succeeded; otherwise the
 scalar one, whose shared memory depends on `n_head` and reaches 32,768 B at the
 shipped 4. Their tile widths differ (`Q4E_IDX_TC_BT` vs `Q4E_IDX_BT`), so the
 `x` extents are not interchangeable.
+
+### `q4e_idxring`
+
+| Kernel | Grid | Block | Dynamic shared memory |
+|---|---|---|---|
+| `q4e_idx_ring_pool_kernel` | `n_tok / Q4E_IDX_R + 1` | `128` | `0` |
+
+Its arguments are `pooled, ring, k, w, pos, pages, n_tok, n_rot, rope_base,
+mrope_all, sec_t, sec_h, sec_w, eps, snap, snap_row`; the grid follows the
+same truncating-divide rule as `q4e_idx_pool_kernel` above, and block 0 always
+exists, because it is the one that writes the ring.
 
 ### `q4e_misc`
 

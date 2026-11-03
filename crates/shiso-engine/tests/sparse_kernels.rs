@@ -52,6 +52,7 @@ const SLOT: AttnSlot = AttnSlot {
     rank: 0,
     pool_slots: 1_024,
     ctx: CTX,
+    kv: shiso_core::page::KvElem::F16,
 };
 
 /// The shape this binary plans against: the shipping one.
@@ -93,6 +94,9 @@ const GPU: Device = Device {
     half_block_input: false,
     role: PassRole::Step,
     prompt_matmul: matmul::PromptMatmul::Rows,
+    prefill_activations: matmul::PrefillActivations::A16,
+    route_sort: matmul::RouteSort::Tiny,
+    normed: matmul::NormedStreams::Stored,
 };
 
 fn half(in_dim: u32, out_dim: u32) -> WeightDesc {
@@ -208,6 +212,37 @@ fn every_path() -> Plan {
         )
         .expect("a packed half-precision weight has a tier at every row count");
     }
+    // The brain-float module of a tensor-core device at every rung: the three
+    // step kernels with and without a split, both prompt GEMMs.
+    let tensor = Device {
+        prompt_matmul: matmul::PromptMatmul::Tensor,
+        ..GPU
+    };
+    let prompt = Device {
+        role: PassRole::Prompt { snapshot: None },
+        ..tensor
+    };
+    for (in_dim, out_dim, rows, device) in [
+        (shape.stream_dim(), shape.stream_rank, 1_u32, tensor),
+        (shape.hidden, shape.moe.experts, 5, tensor),
+        (shape.hidden, shape.stream_dim(), 20, tensor),
+        (shape.stream_dim(), shape.stream_rank, 512, prompt),
+        (shape.hidden, shape.moe.experts, 512, prompt),
+    ] {
+        matmul::project(
+            &mut plan,
+            WeightDesc::new(DType::BF16, in_dim, out_dim),
+            Bound::new(
+                WeightRef::layer(LayerRef::target(0), Role::Router),
+                Operand::Scratch(Buf::Mixed),
+                Operand::Scratch(Buf::MoeRouter),
+            ),
+            rows,
+            device,
+        )
+        .expect("a brain-float weight has a tier at every row count");
+    }
+    plan.append(brain_mixes(&shape, prompt));
     plan.append(hyper::init(&shape, 1));
     plan.append(hyper::init_add(
         &shape,
@@ -243,7 +278,7 @@ fn every_path() -> Plan {
                 NextNorm::Chained(WeightRef::layer(LayerRef::target(1), Role::AttnMixNorm)),
             ] {
                 plan.append(
-                    hyper::combine(&shape, next, rows, elem)
+                    hyper::combine(&shape, next, rows, elem, matmul::NormedStreams::Stored)
                         .expect("the residual fits the fused combine"),
                 );
             }
@@ -264,12 +299,18 @@ fn every_path() -> Plan {
         // Both recurrences, and both draft depths: the per-position checkpoint
         // slab is a pointer at one depth and a null at the other, and the
         // declaration says a pointer belongs in that slot either way.
+        // The chunked one both as the fused pair and as the chain a kernel set
+        // without the pair keeps.
         for policy in [
             ChunkPolicy {
                 min_rows: 0,
                 ..ChunkPolicy::new()
             },
             ChunkPolicy::new(),
+            ChunkPolicy {
+                fused: false,
+                ..ChunkPolicy::new()
+            },
         ] {
             for spec in [SpecDepth::NONE, SpecDepth::new(4)] {
                 let policy = Recurrence {
@@ -509,6 +550,70 @@ fn every_path() -> Plan {
         )
         .expect("a trellis projection has a tier");
     }
+    // The MXFP8 tier: the one-row and multi-row step kernels, a batched
+    // verify's passes of the latter, and the tensor-core prompt kernel.
+    let prompt = Device {
+        role: PassRole::Prompt { snapshot: None },
+        ..GPU
+    };
+    for (out_dim, rows, device) in [
+        (shape.hidden, 1_u32, GPU),
+        (shape.moe.experts, 1, GPU),
+        (shape.hidden, 5, GPU),
+        (shape.moe.experts, 5, GPU),
+        (shape.hidden, 20, GPU),
+        (shape.hidden, 333, prompt),
+    ] {
+        matmul::project(
+            &mut plan,
+            WeightDesc::new(DType::Mxfp8E4M3G32, shape.hidden, out_dim),
+            Bound::new(
+                WeightRef::layer(LayerRef::target(0), Role::AttnOutput),
+                Operand::Scratch(Buf::Mixed),
+                Operand::Scratch(Buf::BlockOut),
+            ),
+            rows,
+            device,
+        )
+        .expect("an MXFP8 projection has a tier at every row count");
+    }
+    // The low-precision prompt path: the W8A8 projection, and the W4A4 routed
+    // stage over an NVFP4 bank with its brain-float combine.
+    let lowp = Device {
+        prefill_activations: matmul::PrefillActivations::Lowp,
+        ..prompt
+    };
+    matmul::project(
+        &mut plan,
+        WeightDesc::new(DType::Mxfp8E4M3G32, shape.hidden, shape.hidden),
+        Bound::new(
+            WeightRef::layer(LayerRef::target(0), Role::AttnOutput),
+            Operand::Scratch(Buf::Mixed),
+            Operand::Scratch(Buf::BlockOut),
+        ),
+        333,
+        lowp,
+    )
+    .expect("a W8A8 prompt projection");
+    let nvfp4 = |in_dim, out_dim| WeightDesc::new(DType::Nvfp4Gs16, in_dim, out_dim);
+    let fp4_experts = ExpertDesc {
+        gate: nvfp4(shape.hidden, shape.moe.intermediate),
+        up: nvfp4(shape.hidden, shape.moe.intermediate),
+        down: nvfp4(shape.moe.intermediate, shape.hidden),
+        ..expert_desc(&shape)
+    };
+    plan.append(
+        moe::affine_experts(&shape, &fp4_experts, LayerRef::target(0), 333, lowp)
+            .expect("a W4A4 routed stage"),
+    );
+    plan.append(moe::combine_lowp(&shape, 333));
+    // The MXFP8 group launches: a recurrent layer's four input projections,
+    // attention's query, key, value and indexer key, and the shared expert's
+    // pair, at a decode row, a verify, a batched verify's passes and (the
+    // separate tensor-core launches) a prompt chunk.
+    plan.append(mxfp8_groups(&shape, prompt));
+    // The mixed export's routed block through the fused route launch.
+    plan.append(fused_routes(&shape));
     plan.launch(
         kernels::Entry::plain(kernels::MOD_MISC, "q4e_argmax_rows_kernel"),
         kernels::argmax_rows(9),
@@ -521,9 +626,431 @@ fn every_path() -> Plan {
     plan
 }
 
+/// The block planners over MXFP8 projection weights, where the projections
+/// of one input share group launches.
+fn mxfp8_groups(shape: &SparseShape, prompt: Device) -> Plan {
+    let mx = |in_dim: u32, out_dim: u32| WeightDesc::new(DType::Mxfp8E4M3G32, in_dim, out_dim);
+    let recurrent = mxfp8_recurrent(shape);
+    let attn = AttnDesc {
+        q: mx(shape.hidden, 2 * shape.q_dim()),
+        k: mx(shape.hidden, shape.kv_dim()),
+        v: mx(shape.hidden, shape.kv_dim()),
+        output: mx(shape.q_dim(), shape.hidden),
+        indexer: IndexerDesc {
+            q: mx(shape.hidden, shape.indexer_q_dim()),
+            k: mx(shape.hidden, shape.indexer.head_dim),
+        },
+    };
+    let inter = shape.moe.intermediate;
+    let experts = ExpertDesc {
+        shared_gate: mx(shape.hidden, inter),
+        shared_up: mx(shape.hidden, inter),
+        shared_down: mx(inter, shape.hidden),
+        ..expert_desc(shape)
+    };
+    let mut plan = Plan::new();
+    for (rows, device) in [(1_u32, GPU), (5, GPU), (20, GPU), (333, prompt)] {
+        plan.append(
+            recurrent::block(
+                shape,
+                &recurrent,
+                LayerRef::target(0),
+                0,
+                Recurrence {
+                    chunk: ChunkPolicy::new(),
+                    spec: SpecDepth::new(4),
+                    origin: RowOrigin::Sequential,
+                },
+                rows,
+                device,
+            )
+            .expect("an MXFP8 recurrent block has a tier"),
+        );
+        plan.append(
+            qsa::block(shape, &attn, SLOT, AttnContext::default(), rows, device)
+                .expect("an MXFP8 attention block has a tier"),
+        );
+        plan.append(
+            moe::shared_expert(shape, &experts, LayerRef::target(0), rows, device)
+                .expect("an MXFP8 shared expert has a tier"),
+        );
+        // The NVFP4 routed stages beside it: the activated gate and up on a
+        // step (the one activation launch left is the shared expert's), the
+        // tensor-core tiles and the activation launch on a prompt.
+        let nv = |in_dim: u32, out_dim: u32| WeightDesc::new(DType::Nvfp4Gs16, in_dim, out_dim);
+        let routed = ExpertDesc {
+            gate: nv(shape.hidden, inter),
+            up: nv(shape.hidden, inter),
+            down: nv(inter, shape.hidden),
+            ..experts
+        };
+        let block = moe::block(shape, &routed, LayerRef::target(0), rows, device)
+            .expect("an NVFP4 routed block has a tier");
+        if device.row_invariant() {
+            assert!(block.launches("q4e_nvfp4_experts_gemm_gate_up_kernel"));
+        } else {
+            assert!(
+                block.launches(if rows == 1 {
+                    "q4e_nvfp4_experts_gate_up_act_kernel"
+                } else {
+                    "q4e_nvfp4_experts_gate_up_act_held_kernel"
+                }) && block.count("q4e_swiglu_kernel") == 1,
+                "a step's routed activation rides on gate and up: {:?}",
+                block.names()
+            );
+            // The shared expert forks off beside the router and the routed
+            // stages, and joins before its gate logit.
+            let names = block.names();
+            let at = |what: &str| names.iter().position(|n| *n == what);
+            assert!(
+                at("fork") < at("q4e_swiglu_kernel")
+                    && at("q4e_swiglu_kernel") < at("resume")
+                    && at("resume") < at("fetch routed experts")
+                    && at("q4e_moe_combine_kernel") < at("join")
+                    && at("join") < at("q4e_shared_add_kernel")
+                    && at("fork").is_some(),
+                "{names:?}"
+            );
+        }
+        plan.append(block);
+    }
+    plan
+}
+
+/// A step device whose kernel set has the fused route launch and the
+/// brain-float step kernels it reproduces.
+const FUSED: Device = Device {
+    prompt_matmul: matmul::PromptMatmul::Tensor,
+    route_sort: matmul::RouteSort::Fused,
+    ..GPU
+};
+
+/// The NVIDIA mixed export's routed block: NVFP4 experts, a brain-float
+/// router and gate, an MXFP8 shared expert.
+fn mixed_experts(shape: &SparseShape) -> ExpertDesc {
+    let inter = shape.moe.intermediate;
+    let nv = |in_dim: u32, out_dim: u32| WeightDesc::new(DType::Nvfp4Gs16, in_dim, out_dim);
+    let mx = |in_dim: u32, out_dim: u32| WeightDesc::new(DType::Mxfp8E4M3G32, in_dim, out_dim);
+    let bf = |in_dim: u32, out_dim: u32| WeightDesc::new(DType::BF16, in_dim, out_dim);
+    ExpertDesc {
+        router: bf(shape.hidden, shape.moe.experts),
+        gate: nv(shape.hidden, inter),
+        up: nv(shape.hidden, inter),
+        down: nv(inter, shape.hidden),
+        shared_router: bf(shape.hidden, 1),
+        shared_gate: mx(shape.hidden, inter),
+        shared_up: mx(shape.hidden, inter),
+        shared_down: mx(inter, shape.hidden),
+    }
+}
+
+/// The mixed export's routed block at a decode row and a verify, through the
+/// fused route launch.
+fn fused_routes(shape: &SparseShape) -> Plan {
+    let experts = mixed_experts(shape);
+    let mut plan = Plan::new();
+    for rows in [1, 5] {
+        plan.append(
+            moe::block(shape, &experts, LayerRef::target(0), rows, FUSED)
+                .expect("the mixed export's routed block has a tier"),
+        );
+    }
+    plan
+}
+
+#[test]
+fn a_step_routes_and_runs_its_shared_expert_in_one_launch_where_the_set_has_it() {
+    let shape = shape();
+    let experts = mixed_experts(&shape);
+    for rows in 1..=moe::FUSED_ROUTE_MAX_TOKENS {
+        let block = moe::block(&shape, &experts, LayerRef::target(0), rows, FUSED)
+            .expect("the mixed export's routed block has a tier");
+        let names = block.names();
+        let entry = if rows == 1 {
+            "q4e_ffn_route_kernel"
+        } else {
+            "q4e_ffn_route_rows_kernel"
+        };
+        // The router, the selection, the shared expert and its gate logit are
+        // the one launch: nothing of theirs is left, and nothing forks.
+        assert_eq!(block.count(entry), 1, "{names:?}");
+        for gone in [
+            "q4e_bf16_gemv_kernel",
+            "q4e_bf16_rows_kernel",
+            "q4e_moe_route_sort_tiny_kernel",
+            "q4e_mxfp8_gemv_group_narrow_kernel",
+            "q4e_mxfp8_rows_group_kernel",
+            "q4e_swiglu_kernel",
+            "q4e_mxfp8_gemv_kernel",
+            "q4e_mxfp8_rows_kernel",
+            "q4e_moe_combine_kernel",
+            "q4e_shared_add_kernel",
+            "fork",
+            "join",
+        ] {
+            assert!(!block.launches(gone), "{gone} at {rows} rows: {names:?}");
+        }
+        let at = |what: &str| names.iter().position(|n| *n == what);
+        assert!(
+            at(entry) < at("fetch routed experts")
+                && at("fetch routed experts") < at("q4e_nvfp4_experts_down_kernel")
+                && at("q4e_nvfp4_experts_down_kernel") < at("q4e_ffn_combine_kernel")
+                && at("q4e_ffn_combine_kernel") == Some(names.len() - 1)
+                && at(entry) == Some(0),
+            "{names:?}"
+        );
+        // Every buffer the separate launches wrote, and the words it orders
+        // its items through.
+        let step = block
+            .steps()
+            .iter()
+            .find(|step| step.entry().is_some_and(|e| e.name() == entry))
+            .expect("the fused launch is a step of the plan");
+        let operands = step.operands().expect("a launch's operands");
+        for buf in [
+            Buf::MoeRouter,
+            Buf::SharedLogit,
+            Buf::SharedMid,
+            Buf::SharedOut,
+            Buf::MoeIds,
+            Buf::MoeWeights,
+            Buf::MoeBounds,
+            Buf::MoeActive,
+            Buf::MoeSorted,
+            Buf::MoeWsPos,
+            Buf::MoeSync,
+            Buf::Mixed,
+        ] {
+            assert!(operands.contains(&Operand::Scratch(buf)), "{buf:?}");
+        }
+    }
+}
+
+#[test]
+fn the_fused_route_launch_covers_every_item_and_keeps_the_step_kernels_slices() {
+    let shape = shape();
+    let experts = mixed_experts(&shape);
+    let block = moe::block(&shape, &experts, LayerRef::target(0), 1, FUSED)
+        .expect("the mixed export's routed block has a tier");
+    let step = block
+        .steps()
+        .iter()
+        .find(|step| {
+            step.entry()
+                .is_some_and(|e| e.name() == "q4e_ffn_route_kernel")
+        })
+        .expect("the fused launch is a step of the plan");
+    let shiso_engine::sparse::plan::Step::Kernel { launch, .. } = step else {
+        panic!("the fused route is an ordinary launch");
+    };
+    // Eighty shared gate-and-up items of eight rows, 256 router items of two
+    // rows at four slices and the gate's, 160 shared down items of sixteen.
+    assert_eq!(launch.grid.x, 640 / 8 + 512 * 4 / 8 + 1 + 2_560 / 16);
+    assert_eq!(launch.block.x, 256);
+    let operands = step.operands().expect("a launch's operands");
+    // `..., in_dim, n_expert, n_used, inter, splits, gate_splits, rows`: the
+    // slice counts the brain-float step kernels take for the two weights.
+    let tail: Vec<Operand> = operands[operands.len() - 7..].to_vec();
+    assert_eq!(
+        tail,
+        [
+            Operand::U32(2_560),
+            Operand::U32(512),
+            Operand::U32(10),
+            Operand::U32(640),
+            Operand::U32(matmul::bf16_split(2_560, 512)),
+            Operand::U32(matmul::bf16_split(2_560, 1)),
+            Operand::U32(1),
+        ]
+    );
+}
+
+#[test]
+fn a_pass_the_fused_route_cannot_reproduce_keeps_the_separate_launches() {
+    let shape = shape();
+    let experts = mixed_experts(&shape);
+    let fused = |rows: u32, device: Device, desc: &ExpertDesc| {
+        moe::block(&shape, desc, LayerRef::target(0), rows, device)
+            .expect("a routed block has a tier")
+            .names()
+            .iter()
+            .any(|n| n.starts_with("q4e_ffn_route"))
+    };
+    assert!(fused(1, FUSED, &experts));
+    // Wider than the tiny selection.
+    assert!(!fused(moe::FUSED_ROUTE_MAX_TOKENS + 1, FUSED, &experts));
+    // A kernel set without the launch, or without the step kernels whose sums
+    // it reproduces.
+    assert!(!fused(
+        1,
+        Device {
+            route_sort: matmul::RouteSort::Tiny,
+            ..FUSED
+        },
+        &experts
+    ));
+    assert!(!fused(
+        1,
+        Device {
+            prompt_matmul: matmul::PromptMatmul::Rows,
+            ..FUSED
+        },
+        &experts
+    ));
+    // A prompt pass, whose router takes the tensor-core GEMM.
+    assert!(!fused(
+        1,
+        Device {
+            role: PassRole::Prompt { snapshot: None },
+            ..FUSED
+        },
+        &experts
+    ));
+    // A shared expert or a router in another format.
+    let half_shared = ExpertDesc {
+        shared_gate: half(shape.hidden, shape.moe.intermediate),
+        ..experts
+    };
+    assert!(!fused(1, FUSED, &half_shared));
+    let half_router = ExpertDesc {
+        router: half(shape.hidden, shape.moe.experts),
+        ..experts
+    };
+    assert!(!fused(1, FUSED, &half_router));
+}
+
+/// The stream mixes over brain-float weights on a tensor-core device: a
+/// prompt pass takes the fused pair and collapse launches, a step the
+/// separate ones.
+fn brain_mixes(shape: &SparseShape, prompt: Device) -> Plan {
+    let bf = |in_dim: u32, out_dim: u32| WeightDesc::new(DType::BF16, in_dim, out_dim);
+    let step = Device {
+        role: PassRole::Step,
+        ..prompt
+    };
+    let scaled = Device {
+        normed: matmul::NormedStreams::Scaled,
+        ..prompt
+    };
+    let mut plan = Plan::new();
+    for inject in [true, false] {
+        let desc = MixDesc {
+            down: bf(shape.stream_dim(), shape.stream_rank),
+            up: bf(shape.stream_rank, shape.stream_dim()),
+            inject: inject.then(|| bf(shape.stream_dim(), shape.streams)),
+        };
+        let roles = if inject {
+            MixRoles::token_mixer(LayerRef::target(0))
+        } else {
+            MixRoles::output()
+        };
+        // A prompt pass: the pair and the fused collapse, over the stored
+        // normed streams or, chained on a scaled pass, norming as they read.
+        for (input, device, norming) in [
+            (MixInput::Raw, prompt, false),
+            (MixInput::AlreadyNormed, prompt, false),
+            (MixInput::Raw, scaled, false),
+            (MixInput::AlreadyNormed, scaled, true),
+        ] {
+            let mix = hyper::mix(shape, &desc, roles, input, 512, device, Elem::F32)
+                .expect("a brain-float mix has a tier");
+            let names = mix.names();
+            let collapse = if norming {
+                "q4e_bf16_gemm_collapse_norm_kernel"
+            } else {
+                "q4e_bf16_gemm_collapse_kernel"
+            };
+            let pair = if norming {
+                "q4e_bf16_gemm_pair_norm_kernel"
+            } else {
+                "q4e_bf16_gemm_pair_kernel"
+            };
+            assert!(mix.launches(collapse), "{names:?}");
+            assert_eq!(mix.launches(pair), inject, "{names:?}");
+            assert!(!mix.launches("q4e_hc_collapse_kernel"), "{names:?}");
+            plan.append(mix);
+        }
+        // A step or verify pass, a batched one's passes included: the step
+        // pair and the fused step, at every width.
+        for rows in [1_u32, 4, 12] {
+            let mix = hyper::mix(
+                shape,
+                &desc,
+                roles,
+                MixInput::AlreadyNormed,
+                rows,
+                step,
+                Elem::F32,
+            )
+            .expect("a brain-float mix has a tier");
+            let names = mix.names();
+            assert_eq!(
+                mix.count("q4e_bf16_mix_step_kernel"),
+                rows.div_ceil(8) as usize,
+                "{names:?}"
+            );
+            let pair = if rows == 1 {
+                "q4e_bf16_gemv_pair_kernel"
+            } else {
+                "q4e_bf16_rows_pair_kernel"
+            };
+            assert_eq!(mix.launches(pair), inject, "{names:?}");
+            assert!(!mix.launches("q4e_hc_collapse_kernel"), "{names:?}");
+            assert!(!mix.launches("q4e_scale_silu_kernel"), "{names:?}");
+            plan.append(mix);
+        }
+    }
+    // The chained combine of a scaled pass leaves the scale; a broken one is
+    // the residual update alone either way.
+    let next = NextNorm::Chained(WeightRef::layer(LayerRef::target(1), Role::AttnMixNorm));
+    let combine = hyper::combine(shape, next, 512, Elem::F32, matmul::NormedStreams::Scaled)
+        .expect("the residual fits");
+    assert!(combine.launches("q4e_hc_combine_scale_kernel"));
+    plan.append(combine);
+    plan
+}
+
+/// A recurrent layer whose five projections are MXFP8.
+fn mxfp8_recurrent(shape: &SparseShape) -> RecurrentDesc {
+    let mx = |in_dim: u32, out_dim: u32| WeightDesc::new(DType::Mxfp8E4M3G32, in_dim, out_dim);
+    RecurrentDesc {
+        qkv: mx(shape.hidden, shape.gdn_in_dim()),
+        gate: mx(shape.hidden, shape.gdn_v_dim()),
+        alpha: mx(shape.hidden, shape.gdn.v_heads),
+        beta: mx(shape.hidden, shape.gdn.v_heads),
+        out: mx(shape.gdn_v_dim(), shape.hidden),
+    }
+}
+
+#[test]
+fn a_recurrent_decode_row_projects_its_mxfp8_input_in_one_launch() {
+    let shape = shape();
+    let decode = recurrent::block(
+        &shape,
+        &mxfp8_recurrent(&shape),
+        LayerRef::target(0),
+        0,
+        Recurrence::default(),
+        1,
+        GPU,
+    )
+    .expect("an MXFP8 recurrent decode row has a tier");
+    assert_eq!(
+        (
+            decode.count("q4e_mxfp8_gemv_group_kernel"),
+            decode.count("q4e_mxfp8_gemv_kernel"),
+            decode.count("q4e_mxfp8_gemv_narrow_kernel"),
+        ),
+        (1, 1, 0),
+        "a recurrent decode row projects its input in one group launch and its \
+         output in one more: {:?}",
+        decode.names()
+    );
+}
+
 /// The kernel set's own name table.
 fn kernel_names() -> String {
-    read_kernel_file("q4e/KERNEL_NAMES.md")
+    read_kernel_file("q4e/KERNEL_NAMES.md") + &read_kernel_file("q4e_lowp/KERNEL_NAMES.md")
 }
 
 /// One file of the vendored kernel tree.
@@ -778,11 +1305,11 @@ fn the_geometry_of_every_kernel_is_the_expression_its_launcher_computes() {
         attn_batch,
         kernels::qsa_attention(shape.gqa.q_heads, rows, shape.gqa.head_dim)
     );
-    assert_eq!(kernels::idx_store_k_batch(rows), kernels::idx_store_k(rows));
 
     // And the pooled key pass a batch launches per row covers one position, so
-    // its grid is the one block the truncating divide plus one gives.
-    assert_eq!(kernels::idx_pool(1, kernels::IDX_R).grid.x, 1);
+    // its grid is the one block the truncating divide plus one gives - the
+    // block that also refills the row's raw key ring.
+    assert_eq!(kernels::idx_ring_pool(1, kernels::IDX_R).grid.x, 1);
 
     // Both n-gram row decodes: one block per (token, hash head) either way, and
     // the block width is the whole of the difference - a warp for the
@@ -844,6 +1371,7 @@ fn signatures() -> std::collections::BTreeMap<String, Signature> {
         "moe.cu",
         "gdn.cu",
         "gdn_tc.cu",
+        "gdn_fused.cu",
         "ple.cu",
         "matvec.cu",
         "qsa.cu",
@@ -852,6 +1380,14 @@ fn signatures() -> std::collections::BTreeMap<String, Signature> {
         "misc.cu",
         "embed.cu",
         "exact.cu",
+        "kv8.cu",
+        "mxfp8.cu",
+        "idxring.cu",
+        "../q4e_lowp/nvfp4_a4.cu",
+        "../q4e_lowp/mxfp8_a8.cu",
+        "bf16.cu",
+        "modelopt.cu",
+        "ffn.cu",
     ] {
         let path = dir.join(unit);
         let text = std::fs::read_to_string(&path)
@@ -1074,6 +1610,24 @@ fn every_launch_binds_exactly_the_parameters_its_kernel_declares() {
         kernels::EXL3_MOE,
         kernels::EXL3_RECONSTRUCT,
         "q4e_f32_to_f16_kernel",
+        "q4e_mxfp8_gemv_kernel",
+        "q4e_mxfp8_gemv_narrow_kernel",
+        "q4e_mxfp8_rows_kernel",
+        "q4e_mxfp8_rows_narrow_kernel",
+        "q4e_mxfp8_gemm_kernel",
+        "q4e_mxfp8_a8_quant_kernel",
+        "q4e_mxfp8_a8_gemm_kernel",
+        "q4e_nvfp4_a4_quant_kernel",
+        "q4e_nvfp4_a4_quant_bf16_kernel",
+        "q4e_nvfp4_a4_gate_up_kernel",
+        "q4e_nvfp4_a4_down_kernel",
+        "q4e_nvfp4_a4_combine_kernel",
+        "q4e_mxfp8_gemv_group_kernel",
+        "q4e_mxfp8_gemv_group_narrow_kernel",
+        "q4e_mxfp8_rows_group_kernel",
+        "q4e_ffn_route_kernel",
+        "q4e_ffn_route_rows_kernel",
+        "q4e_ffn_combine_kernel",
     ] {
         assert!(seen.contains(entry), "{entry} was never bound: {seen:?}");
     }
@@ -1086,6 +1640,187 @@ fn every_launch_binds_exactly_the_parameters_its_kernel_declares() {
     }
 }
 
+/// Every attention block shape the ladder can take at `slot`: each grant and
+/// selection state, one sequence's rows and a batch's, at a decode, a verify, a
+/// short chunk and a prefill width.
+fn attention_blocks(slot: AttnSlot) -> Plan {
+    let shape = shape();
+    let mut plan = Plan::new();
+    for rows in [1_u32, 4, 16, 512] {
+        for ctx in [
+            AttnContext::default(),
+            AttnContext {
+                tiled: true,
+                ..AttnContext::default()
+            },
+            AttnContext {
+                tensor_core: true,
+                tiled: true,
+                ..AttnContext::default()
+            },
+            AttnContext {
+                selected: true,
+                ..AttnContext::default()
+            },
+            AttnContext {
+                selected: true,
+                tensor_core: true,
+                tiled: true,
+                ..AttnContext::default()
+            },
+            AttnContext {
+                selected: true,
+                tensor_core: true,
+                tiled: true,
+                dense_rows: rows / 2,
+                ..AttnContext::default()
+            },
+            AttnContext {
+                origin: RowOrigin::Unrelated,
+                ..AttnContext::default()
+            },
+            AttnContext {
+                selected: true,
+                tensor_core: true,
+                tiled: true,
+                origin: RowOrigin::Unrelated,
+                batch_selected: 0b01,
+                ..AttnContext::default()
+            },
+        ] {
+            plan.append(
+                qsa::block(&shape, &attn_desc(&shape), slot, ctx, rows, GPU)
+                    .expect("a half-precision attention block has a tier"),
+            );
+        }
+        // The batched reader, which a block no longer reaches - a batch
+        // attends one row at a time - but the ladder still names.
+        plan.append(qsa::attend(
+            &shape,
+            slot,
+            AttnContext {
+                origin: RowOrigin::Unrelated,
+                ..AttnContext::default()
+            },
+            rows,
+        ));
+    }
+    plan
+}
+
+#[test]
+fn an_fp8_cache_changes_the_entry_of_every_cache_kernel_and_nothing_else() {
+    // The fp8 kernels are the f16 ones with the cache element changed, so the
+    // plan over an fp8 slot has to be the f16 plan launch for launch - the same
+    // grid, block, shared memory and operands - with only the store's and the
+    // readers' entries swapped for their twins. Anything else moving would be
+    // a path chosen by the element rather than by the shape.
+    let fp8_slot = AttnSlot {
+        kv: shiso_core::page::KvElem::Fp8E4m3,
+        ..SLOT
+    };
+    let f16 = attention_blocks(SLOT);
+    let fp8 = attention_blocks(fp8_slot);
+    assert_eq!(f16.steps().len(), fp8.steps().len(), "launch counts");
+    let twin = |name: &str| {
+        kernels::CacheKernel::ALL
+            .into_iter()
+            .find(|kernel| kernel.name(shiso_core::page::KvElem::F16).1 == name)
+            .map(|kernel| kernel.name(shiso_core::page::KvElem::Fp8E4m3))
+    };
+    let mut swapped = BTreeSet::new();
+    for (a, b) in f16.steps().iter().zip(fp8.steps()) {
+        let (
+            shiso_engine::sparse::plan::Step::Kernel {
+                entry: ea,
+                launch: la,
+                ..
+            },
+            shiso_engine::sparse::plan::Step::Kernel {
+                entry: eb,
+                launch: lb,
+                ..
+            },
+        ) = (a, b)
+        else {
+            assert_eq!(format!("{a:?}"), format!("{b:?}"));
+            continue;
+        };
+        assert_eq!(
+            format!("{la:?}"),
+            format!("{lb:?}"),
+            "{}: geometry",
+            ea.name()
+        );
+        assert_eq!(
+            a.operands().expect("binds"),
+            b.operands().expect("binds"),
+            "{}: operands",
+            ea.name()
+        );
+        match twin(ea.name()) {
+            Some((module, name)) => {
+                assert_eq!((eb.module(), eb.name()), (module, name), "{}", ea.name());
+                swapped.insert(name);
+            }
+            None => assert_eq!(
+                (ea.module(), ea.name()),
+                (eb.module(), eb.name()),
+                "a kernel that does not touch the cache planes kept its entry"
+            ),
+        }
+    }
+    let every: BTreeSet<_> = kernels::CacheKernel::ALL
+        .into_iter()
+        .map(|kernel| kernel.name(shiso_core::page::KvElem::Fp8E4m3).1)
+        .collect();
+    assert_eq!(
+        swapped, every,
+        "every fp8 entry is reachable from the ladder"
+    );
+}
+
+#[test]
+fn every_fp8_cache_launch_binds_the_parameters_its_kernel_declares() {
+    let signatures = signatures();
+    let table = kernel_names();
+    let plan = attention_blocks(AttnSlot {
+        kv: shiso_core::page::KvElem::Fp8E4m3,
+        ..SLOT
+    });
+    for step in plan.steps() {
+        let Some(entry) = step.entry() else {
+            continue;
+        };
+        let name = entry.name();
+        if entry.module() != kernels::MOD_KV8 {
+            continue;
+        }
+        assert!(
+            table.contains(&format!("`{name}`")),
+            "{name} is not in the name table"
+        );
+        let signature = signatures
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} is launched but kv8.cu does not declare it"));
+        let operands = step.operands().expect("binds");
+        assert_eq!(
+            operands.len(),
+            signature.pointers.len(),
+            "{name}: parameter count"
+        );
+        for (index, (operand, is_pointer)) in
+            operands.iter().zip(signature.pointers.iter()).enumerate()
+        {
+            assert_eq!(
+                operand.is_pointer(),
+                *is_pointer,
+                "{name} parameter {index}"
+            );
+        }
+    }
+}
+
 /// The five kernels that carry per-sequence state through one batched launch,
 /// and which parameter of each is the per-row array.
 ///
@@ -1094,11 +1829,13 @@ fn every_launch_binds_exactly_the_parameters_its_kernel_declares() {
 /// the position it points at. The batched attention entry is not among them any
 /// more: a batch attends one row at a time through the single-row kernels, over
 /// each row's own page table, so a row computes what it would alone.
-const BATCHED: [&str; 5] = [
+/// The raw indexer key store's batched entry is not here: no raw key is
+/// stored per position any more, and the pooled pass that took its place reads
+/// each row's ring by row instead.
+const BATCHED: [&str; 4] = [
     "q4e_gdn_conv_batch_kernel",
     "q4e_gdn_recurrent_batch_kernel",
     "q4e_qsa_store_kv_batch_kernel",
-    "q4e_idx_store_k_batch_kernel",
     "q4e_ple_conv_batch_kernel",
 ];
 
@@ -1120,7 +1857,6 @@ fn every_batched_entry_binds_a_per_row_array_where_its_declaration_takes_one() {
             Operand::RecurrentStates(0),
         ),
         ("q4e_qsa_store_kv_batch_kernel", 14, Operand::PageTables),
-        ("q4e_idx_store_k_batch_kernel", 3, Operand::PageTables),
         ("q4e_ple_conv_batch_kernel", 1, Operand::NgramWindows),
     ];
     for (name, index, want) in arrays {
@@ -1226,11 +1962,11 @@ fn the_pooled_key_pass_reads_the_rotary_table_from_its_prefix_and_nothing_else_d
     let pool = plan
         .steps()
         .iter()
-        .find(|step| step.name() == "q4e_idx_pool_kernel")
+        .find(|step| step.name() == "q4e_idx_ring_pool_kernel")
         .expect("the storing half pools");
     let operands = pool.operands().expect("the list fits a launch");
     assert_eq!(
-        operands[8],
+        operands[9],
         Operand::Scratch(Buf::Mrope),
         "the pooled pass reads the table whole"
     );
@@ -1254,6 +1990,77 @@ fn the_pooled_key_pass_reads_the_rotary_table_from_its_prefix_and_nothing_else_d
         matches!(operands[8], Operand::ScratchFrom(Buf::Mrope, offset) if offset > 0),
         "the query rotation reads the chunk's own first row, not the prefix: {:?}",
         operands[8]
+    );
+}
+
+#[test]
+fn the_storing_half_is_one_pooled_pass_per_session_over_its_own_ring_and_its_own_keys() {
+    // No raw key plane is written any more: the only launch after the key
+    // projection is the pooled pass, and it reads the session's ring. A chunk
+    // binds the pass's one session; a batch binds row `r`'s ring and row `r`'s
+    // key row in row `r`'s launch - a ring bound by the wrong row would pool
+    // one sequence's block out of another's raw keys.
+    let shape = shape();
+    let desc = attn_desc(&shape).indexer;
+    let slot = indexer::IndexerSlot::new(LayerRef::target(3), 2, CTX);
+    let pools = |origin, rows| {
+        indexer::store(&shape, &desc, slot, origin, rows, GPU)
+            .expect("a half-precision indexer has a tier")
+            .steps()
+            .iter()
+            .filter(|step| step.entry().is_some() && step.name().starts_with("q4e_idx"))
+            .map(|step| {
+                (
+                    step.name().to_owned(),
+                    step.operands().expect("the list fits a launch").to_vec(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let chunk = pools(RowOrigin::Sequential, 8);
+    assert_eq!(chunk.len(), 1, "one launch stores a chunk: {chunk:?}");
+    assert_eq!(chunk[0].0, "q4e_idx_ring_pool_kernel");
+    assert_eq!(chunk[0].1[1], Operand::IndexerRing(2));
+    assert_eq!(chunk[0].1[2], Operand::Scratch(Buf::IdxKey));
+    assert_eq!(
+        (chunk[0].1[14], chunk[0].1[15]),
+        (Operand::IndexerRing(2), Operand::U32(kernels::IDX_NO_TAP)),
+        "a pass with no tap hands the kernel its own ring and no row"
+    );
+    let batch = pools(RowOrigin::Unrelated, 3);
+    assert_eq!(batch.len(), 3, "a batch pools once per row: {batch:?}");
+    for (row, (name, operands)) in (0_u32..).zip(&batch) {
+        assert_eq!(name, "q4e_idx_ring_pool_kernel");
+        assert_eq!(operands[1], Operand::IndexerRingOf { rank: 2, row });
+        assert_eq!(
+            operands[2],
+            Operand::ScratchFrom(Buf::IdxKey, u64::from(row) * 128 * 4)
+        );
+        assert_eq!(operands[5], Operand::PagesOf(row));
+    }
+    // And a tap reaches the kernel only on the one-session pass that asks.
+    let tap = indexer::RingTap {
+        row: 5,
+        offset: 4_096,
+    };
+    let tapped = indexer::store(
+        &shape,
+        &desc,
+        slot.with_tap(Some(tap)),
+        RowOrigin::Sequential,
+        8,
+        GPU,
+    )
+    .expect("a half-precision indexer has a tier");
+    let step = tapped
+        .steps()
+        .iter()
+        .find(|step| step.name() == "q4e_idx_ring_pool_kernel")
+        .expect("the storing half pools");
+    let operands = step.operands().expect("the list fits a launch");
+    assert_eq!(
+        (operands[14], operands[15]),
+        (Operand::Snapshot(4_096), Operand::U32(5))
     );
 }
 
@@ -1414,6 +2221,141 @@ fn a_decode_row_plans_the_fused_step_and_a_verify_window_plans_the_chain() {
 }
 
 #[test]
+fn a_prompt_chunk_plans_the_fused_pair_where_the_set_has_it_and_the_chain_elsewhere() {
+    const CHAIN: [&str; 7] = [
+        "q4e_gdn_conv_par_kernel",
+        "q4e_gdn_conv_tail_kernel",
+        "q4e_gdn_l2norm_kernel",
+        "q4e_gdn_gates_kernel",
+        "q4e_gdn_tc_prep_kernel",
+        "q4e_gdn_tc_scan_kernel",
+        "q4e_gdn_out_gate_kernel",
+    ];
+    let shape = shape();
+    assert!(recurrent::fused_eligible(&shape), "the shipped geometry");
+    let prompt = Device {
+        role: PassRole::Prompt { snapshot: None },
+        ..GPU
+    };
+    let recurrent_launches = |entries: &[&'static str]| -> Vec<&'static str> {
+        entries
+            .iter()
+            .copied()
+            .filter(|name| name.starts_with("q4e_gdn") || name.starts_with("q4e_gdf"))
+            .collect()
+    };
+    // Between the projections: the prep, the carry, and the window rewrite
+    // after both, and nothing of the chain they replace.
+    let fused = recurrent_entries(&Recurrence::default(), 512, prompt);
+    assert_eq!(
+        recurrent_launches(&fused),
+        [
+            "q4e_gdf_prep_kernel",
+            "q4e_gdf_scan_kernel",
+            "q4e_gdn_conv_tail_kernel"
+        ]
+    );
+    // A kernel set without the pair keeps the chain, and so does a geometry the
+    // pair is not written for.
+    let chain_policy = Recurrence {
+        chunk: ChunkPolicy {
+            fused: false,
+            ..ChunkPolicy::new()
+        },
+        ..Recurrence::default()
+    };
+    let chain = recurrent_entries(&chain_policy, 512, prompt);
+    let mut odd = shape.clone();
+    odd.gdn = GdnShape::new(32, 16, 128, 4);
+    assert!(!recurrent::fused_eligible(&odd));
+    let odd_chain: Vec<&'static str> = recurrent::block(
+        &odd,
+        &recurrent_desc(&odd),
+        LayerRef::target(0),
+        0,
+        Recurrence::default(),
+        512,
+        prompt,
+    )
+    .expect("a half-precision recurrent block has a tier")
+    .steps()
+    .iter()
+    .filter_map(|step| step.entry().map(|entry| entry.name()))
+    .collect();
+    for entries in [&chain, &odd_chain] {
+        for name in CHAIN {
+            assert!(entries.contains(&name), "{name} missing: {entries:?}");
+        }
+        assert!(!entries.contains(&"q4e_gdf_prep_kernel"));
+    }
+    // A pass the chunked recurrence does not take never reaches the pair: it
+    // replaces the chunked chain and nothing else. (A prompt pass takes the
+    // chunked recurrence at every width, so the short pass here is a step.)
+    let short = recurrent_entries(&Recurrence::default(), 8, GPU);
+    assert!(short.contains(&"q4e_gdn_recurrent_kernel"));
+    assert!(!short.contains(&"q4e_gdf_prep_kernel"));
+}
+
+#[test]
+fn the_fused_carry_takes_the_snapshot_the_chained_carry_takes() {
+    // The state goes to the same place at the same run, and the window is cut
+    // at the same row, whichever carry the chunk takes.
+    let shape = shape();
+    let snapshot = Device {
+        role: PassRole::Prompt {
+            snapshot: Some(256),
+        },
+        ..GPU
+    };
+    let operands = |policy: &Recurrence, entry: &str| -> Vec<Vec<Operand>> {
+        recurrent::block(
+            &shape,
+            &recurrent_desc(&shape),
+            LayerRef::target(0),
+            2,
+            *policy,
+            512,
+            snapshot,
+        )
+        .expect("a half-precision recurrent block has a tier")
+        .steps()
+        .iter()
+        .filter(|step| step.name() == entry)
+        .map(|step| step.operands().expect("the list fits a launch").to_vec())
+        .collect()
+    };
+    let chain_policy = Recurrence {
+        chunk: ChunkPolicy {
+            fused: false,
+            ..ChunkPolicy::new()
+        },
+        ..Recurrence::default()
+    };
+    let chained = operands(&chain_policy, "q4e_gdn_tc_scan_kernel");
+    let fused = operands(&Recurrence::default(), "q4e_gdf_scan_kernel");
+    assert_eq!(chained.len(), 1);
+    assert_eq!(fused.len(), 1);
+    // `snap, snap_run` close both declarations.
+    assert_eq!(
+        chained[0][chained[0].len() - 2..],
+        fused[0][fused[0].len() - 2..]
+    );
+    assert_eq!(
+        fused[0][fused[0].len() - 2..],
+        [
+            Operand::Snapshot(shiso_engine::sparse::paged::snapshot_state_offset(
+                &shape, 2
+            )),
+            Operand::U32(4)
+        ]
+    );
+    assert_eq!(
+        operands(&chain_policy, "q4e_gdn_conv_tail_kernel"),
+        operands(&Recurrence::default(), "q4e_gdn_conv_tail_kernel")
+    );
+}
+
+#[test]
 fn a_head_width_the_step_kernel_is_not_sized_for_keeps_the_chain() {
     let mut shape = shape();
     shape.gdn.head_dim = 64;
@@ -1441,6 +2383,7 @@ fn the_combine_binds_the_next_block_s_norm_and_a_null_where_the_chain_breaks() {
         NextNorm::Chained(WeightRef::layer(LayerRef::target(1), Role::AttnMixNorm)),
         1,
         Elem::F32,
+        matmul::NormedStreams::Stored,
     )
     .expect("the residual fits the fused combine");
     let operands = chained.steps()[0]
@@ -1450,7 +2393,14 @@ fn the_combine_binds_the_next_block_s_norm_and_a_null_where_the_chain_breaks() {
         operands[4],
         Operand::Weight(WeightRef::layer(LayerRef::target(1), Role::AttnMixNorm))
     );
-    let broken = hyper::combine(&shape, NextNorm::Broken, 1, Elem::F32).expect("the residual fits");
+    let broken = hyper::combine(
+        &shape,
+        NextNorm::Broken,
+        1,
+        Elem::F32,
+        matmul::NormedStreams::Scaled,
+    )
+    .expect("the residual fits");
     let operands = broken.steps()[0]
         .operands()
         .expect("the list fits a launch");

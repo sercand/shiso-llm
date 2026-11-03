@@ -118,3 +118,61 @@ fn a_checkpoint_matching_both_is_refused() {
     .expect_err("ambiguous");
     assert!(matches!(error, ImageGenError::Checkpoint(_)));
 }
+
+#[test]
+fn detects_flux3_from_tensor_names() {
+    for prefix in ["", "model.diffusion_model."] {
+        let image = format!("{prefix}content_mode_blocks.image.0.q_proj.weight");
+        let text = format!("{prefix}txt_mode_blocks.0.q_proj.weight");
+        assert_eq!(
+            detect(&[
+                &image,
+                &text,
+                "single_blocks.0.q_proj.weight",
+                "txt_in.weight"
+            ])
+            .expect("flux3"),
+            ImageFamily::Flux3,
+            "prefix {prefix:?}"
+        );
+    }
+}
+
+#[test]
+fn flux3_and_flux2_signatures_do_not_overlap() {
+    // FLUX.3 keeps `single_blocks.*` and `txt_in.weight`, the names the older
+    // family also uses, so neither may claim the other's checkpoint.
+    let flux3 = [
+        "content_mode_blocks.image.0.q_proj.weight",
+        "txt_mode_blocks.0.q_proj.weight",
+        "single_blocks.0.q_proj.weight",
+        "txt_in.weight",
+        "emb_in.image.weight",
+    ];
+    assert_eq!(detect(&flux3).expect("flux3"), ImageFamily::Flux3);
+    let flux2 = [
+        "img_in.weight",
+        "txt_in.weight",
+        "double_blocks.0.img_attn.qkv.weight",
+        "single_blocks.0.linear1.weight",
+    ];
+    assert_eq!(detect(&flux2).expect("flux2"), ImageFamily::Flux2);
+    // Only half of the flux3 signature is not a family.
+    assert!(
+        detect(&[
+            "content_mode_blocks.image.0.q_proj.weight",
+            "single_blocks.0.q_proj.weight"
+        ])
+        .is_err()
+    );
+    // Both signatures at once are refused, naming both.
+    let mut both = flux3.to_vec();
+    both.extend(flux2);
+    let ImageGenError::Checkpoint(message) = detect(&both).expect_err("ambiguous") else {
+        panic!("expected a checkpoint error");
+    };
+    assert!(
+        message.contains("flux2") && message.contains("flux3"),
+        "{message}"
+    );
+}

@@ -1,10 +1,12 @@
 //! The per-row pointer arrays a batched decode dereferences, and who fills
 //! them.
 //!
-//! Six kernels in this set carry per-sequence state through a launch that
+//! Five kernels in this set carry per-sequence state through a launch that
 //! serves a whole batch: the recurrent convolution and recurrence, the n-gram
-//! convolution, the key/value store, the dense attention and the indexer's key
-//! store. Each of them takes, in place of the one buffer its scalar sibling
+//! convolution, the key/value store and the dense attention. (The indexer's
+//! raw key store was a sixth; no raw key is stored per position any more, and
+//! the pooled pass that reads each session's raw key ring runs once per row.)
+//! Each of them takes, in place of the one buffer its scalar sibling
 //! takes, a *device array* of one pointer per row - `float * const *states`, or
 //! `const int32_t *const *pages_arr`. The array is what makes one launch serve
 //! rows that belong to different sequences.

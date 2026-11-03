@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use reqwest::header::{ETAG, IF_NONE_MATCH};
 use sha2::{Digest, Sha256 as Sha256Hasher};
 
-use crate::config::HubConfig;
+use crate::config::{CONNECT_TIMEOUT, HubConfig, READ_TIMEOUT};
 use crate::error::HubError;
 use crate::recipe::{Index, IndexModelEntry, ModelName, Recipe};
 use crate::validate::{ValidationMode, validate_recipe};
@@ -24,6 +24,8 @@ impl RegistryClient {
     pub fn new(config: HubConfig) -> Self {
         let client = reqwest::Client::builder()
             .tls_built_in_root_certs(config.registry.url.scheme() != "http")
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { client, config }
@@ -121,12 +123,24 @@ impl RegistryClient {
             source: e,
         })?;
 
+        // Parsed before anything is written: an index this client cannot read
+        // must not replace one it can, nor leave an ETag that makes the next
+        // request ask for "not modified" against bytes that were thrown away.
+        let index: Index = match serde_json::from_slice(&index_bytes) {
+            Ok(index) => index,
+            Err(error) => {
+                if let Ok(cached) = Self::read_cached_index(index_path) {
+                    tracing::warn!(%error, "the registry index did not parse; using the cached one");
+                    return Ok(cached);
+                }
+                return Err(error.into());
+            }
+        };
+
         atomic_write(index_path, &index_bytes)?;
         if let Some(etag) = new_etag {
             atomic_write(etag_path, etag.as_bytes())?;
         }
-
-        let index: Index = serde_json::from_slice(&index_bytes)?;
         Ok(index)
     }
 

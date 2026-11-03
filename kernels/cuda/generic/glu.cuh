@@ -1,7 +1,7 @@
 /* The gated SiLU, which is the activation a qwen35 feed-forward is built on.
  *
  * Nothing here is copied. What is preserved from the Metal twin in
- * `crates/shiso-metal/metal/generic/glu.metal` is the contract: the entry name,
+ * `kernels/metal/generic/glu.metal` is the contract: the entry name,
  * the `GluArgs` block, the buffer order, the flat index taken straight from the
  * grid, the two element offsets the row is reached through, and the clamp pair
  * - which is applied only when `limit` is above 1e-6, so that zero means "no

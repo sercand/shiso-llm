@@ -238,6 +238,56 @@ fn a_different_build_never_reads_the_files() {
     );
 }
 
+/// A build that stores its keys and values at a narrower element files its
+/// pages under a different identity: the layout's key row width halves and the
+/// engine appends the codec to the arithmetic name. Each half alone must be
+/// enough, because a later codec of the same width moves only the name, and a
+/// device whose name does not change moves only the width.
+#[test]
+fn a_cache_at_another_kv_element_never_reads_the_files() {
+    let dir = tempfile::tempdir().expect("a directory");
+    let prompt = seq(100, 600);
+    {
+        let (cache, pages) = open(disk(dir.path()), 16);
+        let _frontier = prefill(&cache, &pages, &prompt, 3);
+        settle(&cache);
+    }
+    let narrower = PathLayout {
+        kv_width: layout().kv_width / 2,
+        ..layout()
+    };
+    let mut renamed = disk(dir.path());
+    renamed.numerics.push_str("+kv=e4m3s1");
+    for (what, layout, config) in [
+        ("width alone", narrower, disk(dir.path())),
+        ("codec name alone", layout(), renamed.clone()),
+        ("both", narrower, renamed),
+    ] {
+        let (backing, _pages) = FakeBacking::new();
+        let cache = KvCache::open(
+            &geometry().with_layout(layout),
+            Box::new(backing),
+            16,
+            8,
+            Some(config),
+        )
+        .expect("a fixture geometry with a layout opens a disk tier");
+        assert!(
+            cache.resume(&prompt, 1.0).expect("ok").is_none(),
+            "{what}: the other element's pages resumed"
+        );
+        assert_eq!(
+            cache.disk_stats().expect("open").entries,
+            0,
+            "{what}: the other element's entry is usable here"
+        );
+    }
+    // And the original build still finds its own file afterwards: the misses
+    // above discarded nothing.
+    let (cache, _pages) = open(disk(dir.path()), 16);
+    assert!(cache.resume(&prompt, 1.0).expect("ok").is_some());
+}
+
 #[test]
 fn a_corrupt_page_is_a_miss_and_the_entry_is_discarded() {
     let dir = tempfile::tempdir().expect("a directory");

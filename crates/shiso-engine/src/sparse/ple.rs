@@ -70,6 +70,8 @@ const NGRAM_BLOCK_ELEMS: u32 = 32;
 /// Bytes one such block occupies: a half-precision scale and sixteen packed
 /// pairs.
 const NGRAM_BLOCK_BYTES: u32 = 18;
+/// Weights one `e4m3` group scale of an NVFP4 n-gram row covers.
+const NGRAM_NVFP4_GROUP: u32 = 16;
 
 /// Bytes one gathered row occupies.
 ///
@@ -91,6 +93,15 @@ pub fn row_bytes(row: DType, head_dim: u32) -> Option<u32> {
     // One FP8 byte a weight; the scale is the table's, not the row's.
     if row == DType::Fp8E4M3 {
         return Some(head_dim);
+    }
+    // NVFP4: codes at four bits, then one `e4m3` scale byte per sixteen
+    // weights, gathered from two arrays into one row by the reader; the
+    // table's own scale is not in the row.
+    if row == DType::Nvfp4Gs16 {
+        if !head_dim.is_multiple_of(NGRAM_NVFP4_GROUP) {
+            return None;
+        }
+        return Some(head_dim / 2 + head_dim / NGRAM_NVFP4_GROUP);
     }
     if !head_dim.is_multiple_of(NGRAM_BLOCK_ELEMS) {
         return None;
@@ -132,16 +143,26 @@ impl NgramTable {
     /// block-quantized decode kernel takes no such pointer, so a bias supplied
     /// with one would be a tensor nothing reads.
     ///
+    /// The two codecs with one scale for the whole table - FP8
+    /// ([`DType::Fp8E4M3`]) and NVFP4 ([`DType::Nvfp4Gs16`], whose gathered
+    /// rows are codes then group scales) - take that scale in `bias` instead:
+    /// one `f32` on the device, uploaded by the loader from the row format's
+    /// own.
+    ///
     /// # Errors
     ///
     /// [`CoreError::ShapeMismatch`] when the row format and the reader's own
     /// codec disagree, and [`CoreError::ConfigMissing`] when the trellis codec
-    /// is missing its bias.
+    /// is missing its bias or a table-scaled codec its scale.
     pub fn new(row: DType, stream: Arc<PleStream>, bias: Option<DeviceBuffer>) -> CoreResult<Self> {
         let stored = hashed(&stream)?.row_type();
-        let fp8 = row == DType::Fp8E4M3;
-        if fp8 {
-            if !matches!(stored, PleRowType::Fp8E4M3 { .. }) {
+        let table_scaled = match row {
+            DType::Fp8E4M3 => Some(matches!(stored, PleRowType::Fp8E4M3 { .. })),
+            DType::Nvfp4Gs16 => Some(matches!(stored, PleRowType::Nvfp4 { .. })),
+            _ => None,
+        };
+        if let Some(agrees) = table_scaled {
+            if !agrees {
                 return Err(CoreError::ShapeMismatch {
                     field: "n-gram row codec",
                     expected: 1,
@@ -152,7 +173,7 @@ impl NgramTable {
             // kernel reads, uploaded by the loader from the row format's own.
             if bias.is_none() {
                 return Err(CoreError::ConfigMissing {
-                    key: "the FP8 n-gram table's scale on the device".to_owned(),
+                    key: format!("the {} n-gram table's scale on the device", row.type_name()),
                 });
             }
             return Ok(Self { row, stream, bias });
@@ -533,6 +554,7 @@ pub const fn decode_entry(row: DType, head_dim: u32) -> Option<Entry> {
         }
         DType::MlxAffine4Gs32 => Some(Entry::plain(MOD_PLE, "q4e_ple_dequant_affine_kernel")),
         DType::Fp8E4M3 => Some(Entry::plain(MOD_MODELOPT, "q4e_ple_dequant_fp8_kernel")),
+        DType::Nvfp4Gs16 => Some(Entry::plain(MOD_MODELOPT, "q4e_ple_dequant_nvfp4_kernel")),
         _ => Some(Entry::plain(MOD_PLE, "q4e_ple_dequant_kernel")),
     }
 }
@@ -601,8 +623,10 @@ pub fn block(
     // seventh n-gram role. Its block is the row width, because the code's ring
     // wraps at that width and one thread decodes one weight.
     let trellis = decode.name() == "q4e_ple_dequant_exl3_kernel";
-    let fp8 = desc.row == DType::Fp8E4M3;
-    let args = if fp8 {
+    // FP8 and NVFP4 rows share an argument list: the table's one scale is
+    // the last pointer.
+    let table_scaled = matches!(desc.row, DType::Fp8E4M3 | DType::Nvfp4Gs16);
+    let args = if table_scaled {
         // `out, rows, head_dim, n_heads, row_bytes, n_rows, scale`
         Args::of(&[
             Operand::Scratch(Buf::PleEmbed),
@@ -637,7 +661,7 @@ pub fn block(
     };
     // The affine decode takes the block-quantized decode's argument list and
     // the trellis decode's grid: one thread a weight, one block a row.
-    let launch = if trellis || fp8 || desc.row == DType::MlxAffine4Gs32 {
+    let launch = if trellis || table_scaled || desc.row == DType::MlxAffine4Gs32 {
         kernels::ple_dequant_trellis(heads, n_tok, ple.head_dim)
     } else {
         kernels::ple_dequant(heads, n_tok)
@@ -842,6 +866,43 @@ mod tests {
         assert!(decode_entry(DType::Exl3Ngram6, 128).is_none());
         // Every other format decodes at any width.
         assert!(decode_entry(DType::F16, 128).is_some());
+    }
+
+    #[test]
+    fn an_nvfp4_row_is_its_codes_then_one_scale_byte_per_sixteen() {
+        assert_eq!(row_bytes(DType::Nvfp4Gs16, 160), Some(80 + 10));
+        assert_eq!(row_bytes(DType::Nvfp4Gs16, 40), None, "not whole groups");
+        let entry = decode_entry(DType::Nvfp4Gs16, 160).expect("any whole-group width");
+        assert_eq!(entry.name(), "q4e_ple_dequant_nvfp4_kernel");
+    }
+
+    #[test]
+    fn an_nvfp4_table_needs_an_nvfp4_reader_and_its_scale() {
+        // The block-quantized rows are ninety bytes at this width too, so
+        // the stride cannot tell the two apart; only the codec check does.
+        let (_fixture, stream) = table_of(PLE.heads_per_ngram, PleRowType::BlockNl4);
+        let err = NgramTable::new(DType::Nvfp4Gs16, stream, None)
+            .expect_err("the reader is block-quantized");
+        assert!(
+            matches!(
+                err,
+                CoreError::ShapeMismatch {
+                    field: "n-gram row codec",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let (_fixture, stream) = table_of(
+            PLE.heads_per_ngram,
+            PleRowType::Nvfp4 {
+                global_bits: 1.0f32.to_bits(),
+            },
+        );
+        assert_eq!(stream.row_bytes(), 90);
+        let err = NgramTable::new(DType::Nvfp4Gs16, stream, None)
+            .expect_err("the table scale is not on the device");
+        assert!(matches!(err, CoreError::ConfigMissing { .. }), "{err:?}");
     }
 
     /// Rows the fixture table holds.

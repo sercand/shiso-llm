@@ -64,7 +64,9 @@ behind.
 - Prefill of the dense tensors follows exllamav3's `reconstruct_hgemm`: above
   144 rows `shs_exl3_reconstruct` expands the tensor to fp16 in the original
   basis and cuBLAS runs the GEMM on the raw activations .
-- Instances: K = 4, 5, 6 only, codebook mul1 only (`exl3.cu`).  The
+- Instances: K = 4, 5, 6 and 8, codebook mul1 only (`exl3.cu`, which maps a
+  width to its table row; K = 8 is the draft head of a re-quantized export,
+  and K = 7 is left out because no checkpoint uses it).  The
   QTIP-style GEMV and int8 GEMV fast paths are not vendored: upstream keeps
   them off on Blackwell and they exclude K = 6.
 

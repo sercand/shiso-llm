@@ -297,6 +297,12 @@ pub(crate) fn reordered_weight(
                 global,
             )
         }
+        // No export of this family stores MXFP8; the dense stack has no tier
+        // for it, and widening it here would be a serving path nobody asked for.
+        Stored::Mxfp8 => Err(CoreError::Unsupported {
+            what: "an MXFP8 weight in the dense family's modelopt export",
+            backend: "qwen35",
+        }),
     }
 }
 

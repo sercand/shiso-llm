@@ -21,7 +21,7 @@
 #
 # Nothing here is a byte copy, so no file carries a provenance header and
 # `scripts/q4e_ptx_oracle.sh --mode=fidelity` reports it as generated. The
-# arithmetic is the Metal twins' in `crates/shiso-metal/metal/qwen35`, which is
+# arithmetic is the Metal twins' in `kernels/metal/qwen35`, which is
 # what produced the committed goldens, and the laws those twins were themselves
 # ported from are the extracted, fidelity-gated units in `cuda/q4e`.
 

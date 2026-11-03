@@ -44,9 +44,12 @@ use shiso_modelfile::st_header::StDType;
 use shiso_vision::generator::ImageGenError;
 
 use super::lin::Lin;
-use super::ops::{EmbedCall, GemmCall, GqaCall, NormCall, Ops};
+use super::ops::{EmbedCall, GemmCall, GqaCall, NormCall, Ops, RopeHalfCall};
 use super::quant::{RotGroup, read_int8_layout, unrotate_row_f32};
 use super::weights::StStore;
+
+/// The `RoPE` position a masked pad row turns by.
+const PAD_POSITION: u32 = 1;
 
 /// What one text encoder load reads, and from where.
 #[derive(Debug)]
@@ -498,6 +501,43 @@ impl TextEncoder {
     /// of a (tokens, taps * hidden) target, and one round-trip per generation
     /// (a few megabytes) is cheaper than a scatter kernel the fallback could
     /// not run anyway.
+    pub(crate) fn prefill(&self, ops: &Ops, ids: &[u32]) -> Result<Vec<f32>, ImageGenError> {
+        self.prefill_rows(ops, ids, ids.len())
+    }
+
+    /// [`Self::prefill`] over a right-padded prompt: `ids` holds `real`
+    /// prompt tokens followed by pad ids.
+    ///
+    /// Row `i < real` is exactly the unpadded prefill's row. A pad row
+    /// attends the `real` keys and no pad key, and turns by `RoPE` position
+    /// 1 whatever its index - how the reference runs a masked batch, whose
+    /// position ids are the running count of real tokens with the masked
+    /// rows filled with 1. The pad rows' hidden states are the conditioning
+    /// the transformer is trained on, so they are returned like any other.
+    ///
+    /// # Errors
+    /// [`ImageGenError::EmptyPrompt`] for no real tokens, a refusal when
+    /// `real` exceeds the row count, and those of [`Self::prefill`].
+    pub(crate) fn prefill_padded(
+        &self,
+        ops: &Ops,
+        ids: &[u32],
+        real: usize,
+    ) -> Result<Vec<f32>, ImageGenError> {
+        if real == 0 {
+            return Err(ImageGenError::EmptyPrompt);
+        }
+        if real > ids.len() {
+            return Err(ImageGenError::Backend(format!(
+                "{real} real tokens in a prompt of {} rows",
+                ids.len()
+            )));
+        }
+        self.prefill_rows(ops, ids, real)
+    }
+
+    /// The prefill over `ids`, whose first `real` rows are prompt tokens
+    /// and whose later rows (if any) are masked pad rows.
     #[expect(
         clippy::too_many_lines,
         reason = "one transformer prefill over all layers, straight-line block graph by construction"
@@ -506,7 +546,7 @@ impl TextEncoder {
         clippy::many_single_char_names,
         reason = "attention math reads clearer with t/p/x/q/k/v than with long names"
     )]
-    pub(crate) fn prefill(&self, ops: &Ops, ids: &[u32]) -> Result<Vec<f32>, ImageGenError> {
+    fn prefill_rows(&self, ops: &Ops, ids: &[u32], real: usize) -> Result<Vec<f32>, ImageGenError> {
         let t = ids.len();
         let p = &self.params;
         if t == 0 {
@@ -616,22 +656,28 @@ impl TextEncoder {
                 dim: p.head_dim,
                 eps: p.rms_eps,
             })?;
-            ops.rope_half(
-                "text rope",
-                q.view(),
-                self.freqs.view(),
-                t,
-                p.q_heads,
-                p.head_dim,
-            )?;
-            ops.rope_half(
-                "text rope",
-                k.view(),
-                self.freqs.view(),
-                t,
-                p.kv_heads,
-                p.head_dim,
-            )?;
+            // Pad rows (from `real` on) turn by position 1; with no pad rows
+            // the pin is past the last row and nothing is pinned.
+            ops.rope_half(&RopeHalfCall {
+                step: "text rope",
+                tensor: q.view(),
+                freqs: self.freqs.view(),
+                tokens: t,
+                heads: p.q_heads,
+                head_dim: p.head_dim,
+                pinned_from: real,
+                pinned_pos: PAD_POSITION,
+            })?;
+            ops.rope_half(&RopeHalfCall {
+                step: "text rope",
+                tensor: k.view(),
+                freqs: self.freqs.view(),
+                tokens: t,
+                heads: p.kv_heads,
+                head_dim: p.head_dim,
+                pinned_from: real,
+                pinned_pos: PAD_POSITION,
+            })?;
             ops.gqa(&GqaCall {
                 step: "text attention",
                 out: attn.view(),
@@ -642,6 +688,7 @@ impl TextEncoder {
                 q_heads: p.q_heads,
                 kv_heads: p.kv_heads,
                 head_dim: p.head_dim,
+                valid_keys: real,
             })?;
             gemm("text o proj", &layer.o, &tmp, &attn, p.hidden, q_dim)?;
             ops.add(

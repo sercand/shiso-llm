@@ -113,16 +113,39 @@ pub fn the_ngram_add_sums_both_branches_into_the_residual(gpu: &Gpu) {
 ///
 /// When a row's pick is not the oracle's.
 pub fn the_greedy_pick_takes_the_lowest_index_of_the_maximum(gpu: &Gpu) {
-    let v = VOCAB as usize;
-    let mut logits = signal(4 * v, 11);
+    greedy_pick(gpu, VOCAB);
+}
+
+/// The same picks over a width that is not a multiple of four, which the
+/// kernel reads one float at a time rather than four.
+///
+/// # Panics
+///
+/// When a row's pick is not the oracle's.
+pub fn the_greedy_pick_reads_an_odd_width_one_float_at_a_time(gpu: &Gpu) {
+    greedy_pick(gpu, VOCAB + 1);
+}
+
+/// Six rows of `vocab` logits with the maximum placed where each way of
+/// walking a row could get the tie wrong, graded against a host scan.
+fn greedy_pick(gpu: &Gpu, vocab: u32) {
+    const ROWS: usize = 6;
+    let v = vocab as usize;
+    let mut logits = signal(ROWS * v, 11);
     // Row 0: the maximum at the last index, the tail of the strided loop.
     logits[v - 1] = 3.0;
     // Row 1: a tie between two threads of different warps; the lower wins.
     logits[v + 70_001] = 2.5;
     logits[v + 5_000] = 2.5;
-    // Row 2: a tie between two elements one thread visits.
+    // Row 2: a tie between two elements one thread visits a block apart.
     logits[2 * v + 7] = 2.0;
     logits[2 * v + 7 + BLOCK_WIDE as usize] = 2.0;
+    // Row 4: a tie inside one sixteen-byte load.
+    logits[4 * v + 14] = 2.0;
+    logits[4 * v + 13] = 2.0;
+    // Row 5: a tie between two loads one thread holds in the same round.
+    logits[5 * v + 4 * (3 + BLOCK_WIDE as usize) + 1] = 2.0;
+    logits[5 * v + 13] = 2.0;
     // Row 3: left as fixture data, whose maximum is wherever it lands.
     let want: Vec<i32> = logits
         .chunks(v)
@@ -137,21 +160,21 @@ pub fn the_greedy_pick_takes_the_lowest_index_of_the_maximum(gpu: &Gpu) {
         })
         .collect();
     assert_eq!(
-        &want[..3],
-        &[v as i32 - 1, 5_000, 7],
+        [want[0], want[1], want[2], want[4], want[5]],
+        [v as i32 - 1, 5_000, 7, 13, 13],
         "the oracle's own picks"
     );
     let logits_dev = gpu.upload(&f32_bytes(&logits));
-    let out = gpu.upload(&i32_bytes(&[i32::MIN; 4]));
+    let out = gpu.upload(&i32_bytes(&[i32::MIN; ROWS]));
     launch(
         gpu,
         KernelRef::new(MOD_MISC, "q4e_argmax_rows_kernel"),
-        Extent3::new(4, 1, 1),
+        Extent3::new(ROWS as u32, 1, 1),
         BLOCK_WIDE,
         &[
             KernelArg::Buffer(out.view()),
             KernelArg::Buffer(logits_dev.view()),
-            KernelArg::U32(VOCAB),
+            KernelArg::U32(vocab),
         ],
     );
     let got: Vec<i32> = gpu

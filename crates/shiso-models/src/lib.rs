@@ -22,19 +22,24 @@ pub(crate) mod diffusion;
 pub mod embedder;
 pub mod embedding_gemma2;
 pub mod flux2;
+pub mod flux3;
 pub mod gemma4;
 pub mod image_registry;
 #[cfg(test)]
 mod image_registry_tests;
 pub mod lfm2;
+pub mod llama;
 pub mod nemotron_asr;
 pub mod nemotron_diar;
 pub mod nemotron_h;
+pub mod nemotron_transcribe;
 pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen3_asr;
 pub mod qwen4exp;
 pub(crate) mod qwen_image21;
+#[cfg(test)]
+mod test_gguf;
 
 pub use catalog::FamilyFacts;
 
@@ -51,8 +56,10 @@ pub fn family_catalog() -> &'static [FamilyFacts] {
         nemotron_diar::FACTS,
         qwen3_asr::FACTS,
         flux2::FACTS,
+        flux3::FACTS,
         qwen_image21::FACTS,
         embedding_gemma2::FACTS,
         lfm2::FACTS,
+        llama::FACTS,
     ]
 }

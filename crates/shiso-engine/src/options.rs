@@ -24,7 +24,7 @@
 //! size that was allocated.
 
 use shiso_core::error::{CoreError, CoreResult};
-use shiso_core::page::{PAGE_TOKENS, pages_for};
+use shiso_core::page::{KvElem, PAGE_TOKENS, pages_for};
 use shiso_core::{Backend, MemoryInfo};
 
 use crate::mtp::SpecDepth;
@@ -71,6 +71,33 @@ pub struct EngineOptions {
     ///
     /// `None`, the default, trusts the count.
     pub kv_check: Option<KvCheck>,
+    /// The element the cache stores attention keys and values as.
+    ///
+    /// [`KvElem::F16`], the default, is the only one every stack supports. A
+    /// stack that cannot store another refuses it when it is built rather than
+    /// storing f16 under a different name: the pool it sized and the pages it
+    /// files on disk would both be the wrong size.
+    pub kv_elem: KvElem,
+    /// Rows one prefill pass of a hybrid stack carries, which sizes every
+    /// activation buffer of its scratch.
+    ///
+    /// [`crate::MAX_PREFILL_CHUNK`], the default, is the narrow width whose
+    /// scratch every family can afford. A stack that streams its routed
+    /// experts from disk reads every expert once per pass, so a wide pass is
+    /// fewer reads of the same bytes; it costs scratch linear in the width.
+    /// A whole multiple of [`crate::MAX_PREFILL_CHUNK`] up to
+    /// [`crate::MAX_PREFILL_ROWS`], refused otherwise when the stack is built.
+    ///
+    /// A wider pass is not always the same arithmetic as the narrow one. A
+    /// chunk wider than [`crate::MAX_PREFILL_CHUNK`] skips the banded
+    /// matrix-library route of [`crate::projection::projection`], whose bands
+    /// are sized for that width, and runs the tile instead; so on a backend
+    /// with a matrix tier, for a weight that route takes, a prompt prefilled
+    /// wide is not bit-identical to the same prompt prefilled 512 rows at a
+    /// time. A checkpoint whose weights do not take that route answers the
+    /// same at either width: one with 4-bit nonlinear and 8-bit block weights
+    /// was measured bit-identical at 512 and 4096 rows on device.
+    pub prefill_rows: u32,
 }
 
 impl EngineOptions {
@@ -88,6 +115,8 @@ impl EngineOptions {
             spec: SpecDepth::NONE,
             kv_fit: None,
             kv_check: None,
+            kv_elem: KvElem::F16,
+            prefill_rows: crate::MAX_PREFILL_CHUNK,
         }
     }
 

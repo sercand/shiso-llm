@@ -17,6 +17,7 @@
 //! prefixed into the text, say - would corrupt the continuation it exists to
 //! produce. A trace the model emits anyway is dropped here rather than mixed in.
 
+use crate::error::ErrorResponse as _;
 use std::sync::Arc;
 
 use axum::body::Bytes;

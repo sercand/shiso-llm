@@ -8,7 +8,7 @@
 use shiso_core::DType;
 
 /// Every variant, so the round-trip test cannot silently skip one.
-const ALL: [DType; 29] = [
+const ALL: [DType; 31] = [
     DType::F32,
     DType::F16,
     DType::Q4_0,
@@ -16,6 +16,7 @@ const ALL: [DType; 29] = [
     DType::Q5_1,
     DType::Q8_0,
     DType::Q2_K,
+    DType::Q3_K,
     DType::Q4_K,
     DType::Q5_K,
     DType::Q6_K,
@@ -35,6 +36,7 @@ const ALL: [DType; 29] = [
     DType::Exl3K4,
     DType::Exl3K5,
     DType::Exl3K6,
+    DType::Exl3K8,
     DType::Exl3Ngram6,
     DType::Pq2_0,
     DType::Ptq1_0,
@@ -59,7 +61,7 @@ fn on_disk_ids_are_unique() {
 
 #[test]
 fn discriminants_are_the_documented_ids() {
-    let expected: [(DType, u32); 29] = [
+    let expected: [(DType, u32); 31] = [
         (DType::F32, 0),
         (DType::F16, 1),
         (DType::Q4_0, 2),
@@ -67,6 +69,7 @@ fn discriminants_are_the_documented_ids() {
         (DType::Q5_1, 7),
         (DType::Q8_0, 8),
         (DType::Q2_K, 10),
+        (DType::Q3_K, 11),
         (DType::Q4_K, 12),
         (DType::Q5_K, 13),
         (DType::Q6_K, 14),
@@ -86,6 +89,7 @@ fn discriminants_are_the_documented_ids() {
         (DType::Exl3K4, 68),
         (DType::Exl3K5, 69),
         (DType::Exl3K6, 70),
+        (DType::Exl3K8, 73),
         (DType::Exl3Ngram6, 72),
         (DType::Pq2_0, 142),
         (DType::Ptq1_0, 143),
@@ -103,7 +107,7 @@ fn unknown_id_is_none_rather_than_a_default() {
     assert_eq!(DType::from_gguf_id(u32::MAX), None);
     // The ids in the gaps between the ones this build reads stay unknown.
     for id in 71..=100 {
-        if id != 72 {
+        if id != 72 && id != 73 {
             assert_eq!(DType::from_gguf_id(id), None, "id {id} should be unknown");
         }
     }
@@ -111,7 +115,8 @@ fn unknown_id_is_none_rather_than_a_default() {
 
 #[test]
 fn block_dimensions_of_the_formats_that_matter() {
-    let pinned: [(DType, u32, u32); 15] = [
+    let pinned: [(DType, u32, u32); 17] = [
+        (DType::Mxfp8E4M3G32, 32, 32),
         (DType::Pq2_0, 128, 34),
         (DType::Ptq1_0, 128, 28),
         (DType::MlxAffine2Gs128, 128, 36),
@@ -120,6 +125,7 @@ fn block_dimensions_of_the_formats_that_matter() {
         (DType::MXFP4, 32, 17),
         (DType::IQ2_XXS, 256, 66),
         (DType::Exl3Ngram6, 160, 122),
+        (DType::Exl3K8, 256, 256),
         (DType::IQ2_XS, 256, 74),
         (DType::IQ3_XXS, 256, 98),
         (DType::IQ1_S, 256, 50),
@@ -190,4 +196,17 @@ fn ternary_and_two_bit_affine_are_told_apart() {
     assert!(DType::MlxAffine2Gs128.is_affine());
     assert!(!DType::MlxAffine2Gs128.is_ternary());
     assert_eq!(DType::MlxAffine2Gs128.affine_bits(), Some(2));
+}
+
+#[test]
+fn mxfp8_is_this_project_s_own_id_and_never_read_from_a_container() {
+    // Numbered beside the other engine-side formats, above every upstream id,
+    // and not mapped by the container reader: an MXFP8 matrix is two arrays,
+    // which a single tensor record cannot carry.
+    assert_eq!(DType::Mxfp8E4M3G32.gguf_id(), 213);
+    assert_eq!(DType::from_gguf_id(213), None);
+    assert_eq!(DType::Mxfp8E4M3G32.type_name(), "mxfp8_e4m3_g32");
+    assert!(DType::Mxfp8E4M3G32.is_quantized());
+    assert!(!DType::Mxfp8E4M3G32.is_modelopt());
+    assert!(!DType::Mxfp8E4M3G32.is_affine());
 }

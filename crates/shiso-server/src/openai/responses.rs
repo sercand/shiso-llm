@@ -12,6 +12,7 @@
 //! conversation. A caller that asked to continue and got a fresh answer has been
 //! told nothing went wrong while the model was shown none of the history.
 
+use crate::error::ErrorResponse as _;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};

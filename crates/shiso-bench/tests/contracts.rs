@@ -69,6 +69,27 @@ const _: FromSamples = ProfileReport::from_samples;
 type ReportJson = fn(&ProfileReport) -> serde_json::Value;
 const _: ReportJson = ProfileReport::to_json;
 
+// The group-scaled weights a model crate's loader assembles for the sparse
+// engine: the MXFP8 dense projection, whose format id the engine's tier
+// ladder matches on and whose two arrays are the codes and the group scales,
+// and the resident NVFP4 bank a draft head's experts are held in.
+const _: () = assert!(shiso_core::DType::Mxfp8E4M3G32.gguf_id() == 213);
+type Mxfp8Bytes = fn(u32, u32) -> Option<(u64, u64)>;
+const _: Mxfp8Bytes = shiso_engine::sparse::weights::mxfp8_bytes;
+type Mxfp8Weight = fn(
+    u32,
+    u32,
+    [shiso_core::DeviceBuffer; 2],
+) -> CoreResult<shiso_engine::sparse::weights::Weight>;
+const _: Mxfp8Weight = shiso_engine::sparse::weights::Weight::mxfp8;
+type Nvfp4Bank = fn(
+    u32,
+    u32,
+    u32,
+    [shiso_core::DeviceBuffer; 3],
+) -> CoreResult<shiso_engine::sparse::weights::Weight>;
+const _: Nvfp4Bank = shiso_engine::sparse::weights::Weight::nvfp4;
+
 const _: Option<&Recipe> = None;
 const _: Option<&ModelRef> = None;
 const _: Option<&HostProfile> = None;
@@ -182,6 +203,33 @@ type Commit =
     fn(&KvCache, &mut Frontier, &[TokenId], u32, CommitOpts<'static>, f64) -> Result<(), KvError>;
 const _: Commit = KvCache::commit;
 
+/// The cache element: one family-neutral type from the command line to the
+/// pool. The server converts its flag into it, the engine options carry it,
+/// the sparse stack's page geometry and attention slots take it, and its width
+/// and codec name are what the disk tier files a page under - so a second
+/// spelling anywhere along that path would be a page sized at one element and
+/// filed under another.
+fn kv_elem_codes(kv: shiso_core::page::KvElem) -> (u32, &'static str, u8) {
+    use shiso_core::page::KvElem;
+    // Exhaustive on purpose: an element added without a row here is a build
+    // failure, not a silent f16.
+    let tag = match kv {
+        KvElem::F16 => 0,
+        KvElem::Fp8E4m3 => 1,
+    };
+    (kv.bytes(), kv.codec(), tag)
+}
+const _: fn(shiso_core::page::KvElem) -> (u32, &'static str, u8) = kv_elem_codes;
+const _: fn(shiso_server::cli::KvCacheDtype) -> shiso_core::page::KvElem = Into::into;
+const _: fn(&shiso_engine::EngineOptions) -> shiso_core::page::KvElem = |opts| opts.kv_elem;
+const _: fn(shiso_core::page::KvElem) -> shiso_engine::sparse::paged::PagePlanes =
+    |kv| shiso_engine::sparse::paged::PagePlanes {
+        indexer: true,
+        draft: true,
+        kv,
+    };
+const _: fn(shiso_engine::sparse::qsa::AttnSlot) -> shiso_core::page::KvElem = |slot| slot.kv;
+
 // ---------------------------------------------------------------------------
 // the shapes that had drifted before
 // ---------------------------------------------------------------------------
@@ -243,6 +291,13 @@ const _: Option<&dyn shiso_audio::RecognizerStream> = None;
 const _: Option<&dyn shiso_audio::Diarizer> = None;
 const _: Option<&dyn shiso_audio::DiarizationPass> = None;
 const _: Option<&dyn shiso_audio::AudioTower> = None;
+const _: Option<&dyn shiso_audio::WordTimer> = None;
+// A speech decoder's tower times the decoder's words against the clip it
+// encoded: the transcription core asks the tower for its timer.
+type TowerTimer = for<'a> fn(
+    &'a (dyn shiso_audio::AudioTower + 'static),
+) -> Option<&'a dyn shiso_audio::WordTimer>;
+const _: TowerTimer = <dyn shiso_audio::AudioTower>::word_timer;
 
 /// A recognized token is the one `TokenId`, at an encoder frame.
 fn token_event_fields(event: shiso_audio::TokenEvent) -> (TokenId, u32) {
@@ -639,6 +694,146 @@ fn image_gen_error_variants(error: &ImageGenError) -> (u8, u32, u32) {
 }
 const _: fn(&ImageGenError) -> (u8, u32, u32) = image_gen_error_variants;
 
+/// The typed image cores as embedders and the server call them: the IR they
+/// take and return, the four entry points (blocking and sink-streaming, for a
+/// generation and for an edit), and the floor they check first. A drift in any
+/// of them stops here.
+mod image_core {
+    use shiso_ir::image::{Edit, Generate, Image, Images, Step, Usage};
+    use shiso_runtime::error::AppError;
+    use shiso_runtime::image::{
+        MAX_IMAGES_PER_REQUEST, MAX_STEPS_PER_IMAGE, edit, edit_stream, generate, generate_stream,
+        preflight, validate, validate_edit, validate_edit_shape,
+    };
+    use shiso_runtime::state::AppState;
+
+    /// The entry points are async and the streaming ones take a sink that
+    /// answers whether anyone is still reading; the futures are named so the
+    /// compiler checks both.
+    #[expect(
+        dead_code,
+        reason = "named only so the compiler checks the async signature"
+    )]
+    fn generate_future(
+        state: &AppState,
+        request: Generate,
+    ) -> impl Future<Output = Result<Images, AppError>> + '_ {
+        generate(state, request)
+    }
+    #[expect(
+        dead_code,
+        reason = "named only so the compiler checks the async signature"
+    )]
+    fn generate_stream_future(
+        state: &AppState,
+        request: Generate,
+    ) -> impl Future<Output = Result<(), AppError>> + '_ {
+        generate_stream(state, request, |_: Step| true)
+    }
+    #[expect(
+        dead_code,
+        reason = "named only so the compiler checks the async signature"
+    )]
+    fn edit_future(
+        state: &AppState,
+        request: Edit,
+    ) -> impl Future<Output = Result<Images, AppError>> + '_ {
+        edit(state, request)
+    }
+    #[expect(
+        dead_code,
+        reason = "named only so the compiler checks the async signature"
+    )]
+    fn edit_stream_future(
+        state: &AppState,
+        request: Edit,
+    ) -> impl Future<Output = Result<(), AppError>> + '_ {
+        edit_stream(state, request, |_: Step| true)
+    }
+    const _: fn(&Generate) -> Result<(), AppError> = validate;
+    const _: fn(&Edit) -> Result<(), AppError> = validate_edit;
+    type EditShape = fn(&[Vec<u8>], Option<usize>) -> Result<(), AppError>;
+    const _: EditShape = validate_edit_shape;
+    type Preflight = fn(&AppState, &Generate, &[Vec<u8>]) -> Result<(), AppError>;
+    const _: Preflight = preflight;
+    const _: [usize; 1] = [MAX_IMAGES_PER_REQUEST];
+    const _: [u32; 1] = [MAX_STEPS_PER_IMAGE];
+
+    type GenerateFields = (
+        String,
+        Option<usize>,
+        Option<String>,
+        Option<String>,
+        Option<u32>,
+        Option<u64>,
+        Option<String>,
+        Option<u32>,
+    );
+    fn generate_fields(request: Generate) -> GenerateFields {
+        (
+            request.prompt,
+            request.n,
+            request.size,
+            request.aspect_ratio,
+            request.steps,
+            request.seed,
+            request.output_format,
+            request.output_compression,
+        )
+    }
+    const _: fn(Generate) -> GenerateFields = generate_fields;
+
+    type EditFields = (Generate, Vec<Vec<u8>>);
+    fn edit_fields(request: Edit) -> EditFields {
+        (request.generate, request.references)
+    }
+    const _: fn(Edit) -> EditFields = edit_fields;
+
+    type ImagesFields = (u64, Vec<Image>, Usage);
+    fn images_fields(images: Images) -> ImagesFields {
+        (images.created, images.images, images.usage)
+    }
+    const _: fn(Images) -> ImagesFields = images_fields;
+
+    fn image_fields(image: Image) -> (Vec<u8>, String) {
+        (image.bytes, image.media_type)
+    }
+    const _: fn(Image) -> (Vec<u8>, String) = image_fields;
+
+    fn usage_fields(usage: Usage) -> (u32, u32, u32) {
+        (
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens(),
+        )
+    }
+    const _: fn(Usage) -> (u32, u32, u32) = usage_fields;
+
+    /// The stream's three events and what each carries.
+    type StepFields = Option<(u32, Vec<u8>, u64, Image, Usage)>;
+    fn step_fields(step: Step) -> StepFields {
+        match step {
+            Step::Admitted => None,
+            Step::Partial { index, bytes } => Some((
+                index,
+                bytes,
+                0,
+                Image {
+                    bytes: Vec::new(),
+                    media_type: String::new(),
+                },
+                Usage::default(),
+            )),
+            Step::Completed {
+                created,
+                image,
+                usage,
+            } => Some((0, Vec::new(), created, image, usage)),
+        }
+    }
+    const _: fn(Step) -> StepFields = step_fields;
+}
+
 // ---------------------------------------------------------------------------
 // Embeddings.
 //
@@ -700,6 +895,498 @@ const _: fn(Vec<u32>) -> shiso_ir::EmbedInput = shiso_ir::EmbedInput::Tokens;
 type Matryoshka = fn(&[f32], usize) -> Result<Vec<f32>, shiso_models::embedder::EmbedError>;
 const _: Matryoshka = shiso_models::embedder::matryoshka;
 
+/// The typed decision core as embedders and the server call it: the IR it
+/// takes and returns, `decide`, and the pure steps the server's scheduler
+/// builds the decisions route from. A drift in any of them stops here.
+mod decision {
+    use std::sync::Arc;
+
+    use shiso_core::{ReadoutPrompt, SchemaQuestion, TokenId};
+    use shiso_ir::decision::{
+        Answer, AnswerKind, Choice, ChoiceValue, Input, Level, Part, Question, QuestionKind,
+        ReadoutState, Request, Response, Usage,
+    };
+    use shiso_runtime::decision::score::{
+        RunScore, ScoreError, ScoreRun, Scored, fold_head, fold_readout, readout_runs,
+    };
+    use shiso_runtime::decision::{core, decide, scored_answer};
+    use shiso_runtime::error::AppError;
+    use shiso_runtime::state::AppState;
+
+    /// `decide` answers an IR request from the model a state serves. The
+    /// future is named so the compiler checks the async signature.
+    #[expect(
+        dead_code,
+        reason = "named only so the compiler checks the async signature"
+    )]
+    fn decide_future(
+        state: &Arc<AppState>,
+        request: Request,
+    ) -> impl Future<Output = Result<Response, AppError>> + '_ {
+        decide(state, request)
+    }
+
+    type RequestFields = (
+        Input,
+        ReadoutState,
+        Vec<Question>,
+        Option<f64>,
+        Option<bool>,
+        bool,
+    );
+    fn request_fields(request: Request) -> RequestFields {
+        (
+            request.input,
+            request.readout_state,
+            request.questions,
+            request.temperature,
+            request.preserve_thinking,
+            request.token_ids,
+        )
+    }
+    const _: fn(Request) -> RequestFields = request_fields;
+
+    /// Every shape of input, with its payload types. Exhaustive: a shape
+    /// added makes this non-exhaustive.
+    fn input_shapes(input: Input) -> u8 {
+        match input {
+            Input::Text(text) => {
+                let _: String = text;
+                0
+            }
+            Input::Blocks(parts) => {
+                let _: Vec<Part> = parts;
+                1
+            }
+            Input::Pictured { media, text } => {
+                let _: (Vec<shiso_ir::MediaSource>, String) = (media, text);
+                2
+            }
+        }
+    }
+    const _: fn(Input) -> u8 = input_shapes;
+
+    fn part_shapes(part: Part) -> u8 {
+        match part {
+            Part::Text(text) => {
+                let _: String = text;
+                0
+            }
+            Part::Image(source) => {
+                let _: shiso_ir::MediaSource = source;
+                1
+            }
+        }
+    }
+    const _: fn(Part) -> u8 = part_shapes;
+
+    fn readout_state_shapes(state: ReadoutState) -> u8 {
+        match state {
+            ReadoutState::Input => 0,
+            ReadoutState::Absent => 1,
+            ReadoutState::Structured { compact, indented } => {
+                let _: (String, String) = (compact, indented);
+                2
+            }
+        }
+    }
+    const _: fn(ReadoutState) -> u8 = readout_state_shapes;
+
+    type QuestionFields = (String, String, QuestionKind, bool);
+    fn question_fields(question: Question) -> QuestionFields {
+        (
+            question.name,
+            question.instructions,
+            question.kind,
+            question.probability_answer,
+        )
+    }
+    const _: fn(Question) -> QuestionFields = question_fields;
+
+    /// Every kind of question, with its payload types. Exhaustive: a kind
+    /// added makes this non-exhaustive.
+    fn question_kinds(kind: QuestionKind) -> u8 {
+        match kind {
+            QuestionKind::Choice(choices) => {
+                let _: Vec<Choice> = choices;
+                0
+            }
+            QuestionKind::YesNo { yes, no } => {
+                let _: (Option<String>, Option<String>) = (yes, no);
+                1
+            }
+            QuestionKind::Score(levels) => {
+                let _: Vec<Level> = levels;
+                2
+            }
+        }
+    }
+    const _: fn(QuestionKind) -> u8 = question_kinds;
+
+    type ChoiceFields = (ChoiceValue, Option<String>);
+    fn choice_fields(choice: Choice) -> ChoiceFields {
+        (choice.value, choice.description)
+    }
+    const _: fn(Choice) -> ChoiceFields = choice_fields;
+
+    type LevelFields = (String, Option<String>);
+    fn level_fields(level: Level) -> LevelFields {
+        (level.label, level.description)
+    }
+    const _: fn(Level) -> LevelFields = level_fields;
+
+    fn choice_values(value: ChoiceValue) -> u8 {
+        match value {
+            ChoiceValue::Str(text) => {
+                let _: String = text;
+                0
+            }
+            ChoiceValue::Bool(flag) => {
+                let _: bool = flag;
+                1
+            }
+        }
+    }
+    const _: fn(ChoiceValue) -> u8 = choice_values;
+
+    type AnswerFields = (
+        String,
+        AnswerKind,
+        bool,
+        ChoiceValue,
+        Vec<(ChoiceValue, f64)>,
+        f64,
+        f64,
+        Option<u32>,
+        Option<f64>,
+        Option<Vec<u32>>,
+        Option<Vec<u32>>,
+    );
+    fn answer_fields(answer: Answer) -> AnswerFields {
+        (
+            answer.name,
+            answer.kind,
+            answer.probability_answer,
+            answer.choice,
+            answer.probabilities,
+            answer.confidence,
+            answer.label_mass,
+            answer.level,
+            answer.expected_score,
+            answer.prompt_token_ids,
+            answer.label_token_ids,
+        )
+    }
+    const _: fn(Answer) -> AnswerFields = answer_fields;
+
+    fn answer_kinds(kind: AnswerKind) -> u8 {
+        match kind {
+            AnswerKind::Choice => 0,
+            AnswerKind::YesNo => 1,
+            AnswerKind::Score => 2,
+        }
+    }
+    const _: fn(AnswerKind) -> u8 = answer_kinds;
+
+    type ResponseFields = (Vec<Answer>, Usage);
+    fn response_fields(response: Response) -> ResponseFields {
+        (response.answers, response.usage)
+    }
+    const _: fn(Response) -> ResponseFields = response_fields;
+
+    type UsageFields = (u64, u64);
+    fn usage_fields(usage: Usage) -> UsageFields {
+        (usage.input_tokens, usage.cached_tokens)
+    }
+    const _: fn(Usage) -> UsageFields = usage_fields;
+
+    const _: fn(Question, Vec<f64>, f64, usize) -> Answer = scored_answer;
+
+    /// The shared validators every wire calls while parsing.
+    const _: fn(Option<&str>) -> Result<(), AppError> = core::check_model;
+    const _: fn(&str) -> Result<(), AppError> = core::check_input;
+    const _: fn(&[Question], bool) -> Result<(), AppError> = core::check_ids;
+    const _: fn(&str, &str, bool) -> Result<(), AppError> = core::check_question_text;
+    const _: fn(&[Choice], &str, usize) -> Result<(), AppError> = core::check_choice_options;
+    const _: fn(&[Level], &str, usize) -> Result<(), AppError> = core::check_score_levels;
+    const _: fn(Option<f64>) -> Result<f64, AppError> = core::check_temperature;
+
+    /// Every error variant a caller matches on, with its payload type. The
+    /// enum is `non_exhaustive`, so the wildcard is the only way to stay
+    /// total; the named arms are what is pinned.
+    fn score_error_variants(error: &ScoreError) -> u8 {
+        match error {
+            ScoreError::Layout(message) => {
+                let _: &String = message;
+                0
+            }
+            ScoreError::Engine(message) => {
+                let _: &String = message;
+                1
+            }
+            _ => u8::MAX,
+        }
+    }
+    const _: fn(&ScoreError) -> u8 = score_error_variants;
+
+    /// The pure steps the server's scheduler builds its decisions route from.
+    type ReadoutRuns = fn(&ReadoutPrompt, &[SchemaQuestion]) -> Result<Vec<ScoreRun>, ScoreError>;
+    type FoldReadout =
+        fn(&ReadoutPrompt, &[ScoreRun], &[RunScore], f64) -> Result<Vec<Scored>, ScoreError>;
+    type FoldHead = fn(&[Vec<f32>], &[Vec<usize>], f64) -> Result<Vec<Scored>, ScoreError>;
+    const _: ReadoutRuns = readout_runs;
+    const _: FoldReadout = fold_readout;
+    const _: FoldHead = fold_head;
+
+    type ScoreRunFields = (Vec<TokenId>, Vec<TokenId>, u32);
+    fn score_run_fields(run: ScoreRun) -> ScoreRunFields {
+        (run.tokens, run.labels, run.shared_prefix)
+    }
+    const _: fn(ScoreRun) -> ScoreRunFields = score_run_fields;
+
+    type RunScoreFields = (Vec<f64>, u64);
+    fn run_score_fields(score: RunScore) -> RunScoreFields {
+        (score.label_logprobs, score.cached_tokens)
+    }
+    const _: fn(RunScore) -> RunScoreFields = run_score_fields;
+
+    /// The literal-aware encoder the vocabulary's decision pieces and chat
+    /// prompts share.
+    type Encode = fn(
+        &tokenizers::Tokenizer,
+        &str,
+        &[std::ops::Range<usize>],
+    ) -> Result<Vec<TokenId>, tokenizers::Error>;
+    const _: Encode = shiso_runtime::decision::literal::encode_piece;
+    const _: Encode = shiso_runtime::decision::literal::encode_with_literals;
+}
+
+/// The hub half of the embedder API: find a model offline, pull it, and hold its
+/// lock.
+mod embedder_hub {
+    use std::path::{Path, PathBuf};
+
+    use shiso_hub::HubConfig;
+    use shiso_runtime::hub::{
+        InstalledModel, PullError, config_for_home, resolve, resolve_serve_dir, resolve_serve_model,
+    };
+    use shiso_runtime::options::{ExplicitlySet, ServeOptions};
+
+    const _: fn(&str, &HubConfig) -> Result<Option<InstalledModel>, PullError> = resolve;
+    type Pull =
+        fn(&str, &HubConfig, &mut dyn FnMut(u64, u64) -> bool) -> Result<InstalledModel, PullError>;
+    const _: Pull = shiso_runtime::hub::pull;
+    const _: fn(&Path) -> HubConfig = config_for_home;
+    const _: fn(&Path, &mut ServeOptions, &ExplicitlySet) -> Result<(), PullError> =
+        resolve_serve_dir;
+    type ResolveServe = fn(
+        &str,
+        &mut ServeOptions,
+        &ExplicitlySet,
+        &HubConfig,
+    ) -> Result<Option<InstalledModel>, PullError>;
+    const _: ResolveServe = resolve_serve_model;
+
+    /// What an installed model tells its holder; the lock is private.
+    fn installed_fields(model: &InstalledModel) -> (&PathBuf, u64) {
+        let InstalledModel {
+            dir, total_bytes, ..
+        } = model;
+        (dir, *total_bytes)
+    }
+    const _: fn(&InstalledModel) -> (&PathBuf, u64) = installed_fields;
+
+    /// What a pull or an open can fail with.
+    fn pull_error_variants(error: &PullError) -> u8 {
+        match error {
+            PullError::NoDevice(_) => 0,
+            PullError::UnknownModel(_) => 1,
+            PullError::InvalidReference { .. } => 2,
+            PullError::ComponentFlagConflict(_) => 3,
+            PullError::NotInstalled(_) => 4,
+            PullError::Inconsistent(_) => 5,
+            PullError::Lock { .. } => 6,
+            PullError::Cancelled => 7,
+            PullError::Request(_) => 8,
+            PullError::Install(_) => 9,
+            PullError::Hub(_) => 10,
+            _ => u8::MAX,
+        }
+    }
+    const _: fn(&PullError) -> u8 = pull_error_variants;
+}
+
+/// The in-process facade: the open path, the three capabilities, and the rules
+/// that make one handle safe to share.
+mod runtime_facade {
+    use std::future::Future;
+    use std::path::{Path, PathBuf};
+
+    use shiso_ir::image::{Edit, Generate, Images, Step};
+    use shiso_ir::{Request, Response, StreamEvent};
+    use shiso_runtime::boot::EngineThread;
+    use shiso_runtime::error::AppError;
+    use shiso_runtime::options::{ExplicitlySet, ServeOptions};
+    use shiso_runtime::state::AppState;
+    use shiso_runtime::{OpenError, Runtime, RuntimeOptions, Source};
+
+    /// Where a model comes from. Exhaustive: a source added makes this
+    /// non-exhaustive.
+    fn source_shapes(source: Source<'_>) -> u8 {
+        match source {
+            Source::Registry(name) => {
+                let _: &str = name;
+                0
+            }
+            Source::Dir(dir) => {
+                let _: &Path = dir;
+                1
+            }
+        }
+    }
+    const _: fn(Source<'_>) -> u8 = source_shapes;
+
+    type OptionsFields = (Option<PathBuf>, bool, ServeOptions, ExplicitlySet);
+    fn options_fields(options: RuntimeOptions) -> OptionsFields {
+        // Exhaustive: a field added makes this fail to compile.
+        let RuntimeOptions {
+            home,
+            pull_if_missing,
+            serve,
+            explicit,
+        } = options;
+        (home, pull_if_missing, serve, explicit)
+    }
+    const _: fn(RuntimeOptions) -> OptionsFields = options_fields;
+    const _: fn() -> RuntimeOptions = RuntimeOptions::default;
+
+    /// What an open can fail with.
+    fn open_error_variants(error: &OpenError) -> u8 {
+        match error {
+            OpenError::Pull(_) => 0,
+            OpenError::Config(_) => 1,
+            OpenError::Boot(_) => 2,
+            OpenError::NothingLoaded => 3,
+            OpenError::Executor(_) => 4,
+            OpenError::WarmUp(_) => 5,
+            _ => u8::MAX,
+        }
+    }
+    const _: fn(&OpenError) -> u8 = open_error_variants;
+
+    /// The open path, blocking, with a pull's progress callback.
+    type Open = for<'a, 'b> fn(
+        Source<'a>,
+        RuntimeOptions,
+        &'b mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<Runtime, OpenError>;
+    const _: Open = Runtime::open;
+    const _: fn(AppState, Option<EngineThread>) -> Result<Runtime, OpenError> = Runtime::from_state;
+    const _: fn(&Runtime) -> bool = Runtime::has_language_model;
+    const _: fn(&Runtime) -> bool = Runtime::has_image_model;
+
+    /// The blocking calls.
+    const _: fn(&Runtime, Request) -> Result<Response, AppError> = Runtime::generate_blocking;
+    const _: fn(
+        &Runtime,
+        shiso_ir::decision::Request,
+    ) -> Result<shiso_ir::decision::Response, AppError> = Runtime::decide_blocking;
+
+    /// The async calls, named so the compiler checks their signatures and that
+    /// every future is `Send`: a caller spawns them on a multi-thread executor.
+    #[expect(
+        dead_code,
+        reason = "named only so the compiler checks the async signatures"
+    )]
+    fn generate_future(
+        runtime: &Runtime,
+        request: Request,
+    ) -> impl Future<Output = Result<Response, AppError>> + Send {
+        runtime.generate(request)
+    }
+    #[expect(dead_code, reason = "named only so the compiler checks the signature")]
+    fn generate_stream_future(
+        runtime: &Runtime,
+        request: Request,
+    ) -> impl Future<Output = Result<(), AppError>> + Send {
+        runtime.generate_stream(request, |_: StreamEvent| true)
+    }
+    #[expect(dead_code, reason = "named only so the compiler checks the signature")]
+    fn images_future(runtime: &Runtime) -> impl Future<Output = Result<Images, AppError>> + Send {
+        runtime.images(blank_generate())
+    }
+    #[expect(dead_code, reason = "named only so the compiler checks the signature")]
+    fn images_stream_future(
+        runtime: &Runtime,
+    ) -> impl Future<Output = Result<(), AppError>> + Send {
+        runtime.images_stream(blank_generate(), |_: Step| true)
+    }
+    #[expect(dead_code, reason = "named only so the compiler checks the signature")]
+    fn edit_image_future(
+        runtime: &Runtime,
+    ) -> impl Future<Output = Result<Images, AppError>> + Send {
+        runtime.edit_image(blank_edit())
+    }
+    #[expect(dead_code, reason = "named only so the compiler checks the signature")]
+    fn edit_image_stream_future(
+        runtime: &Runtime,
+    ) -> impl Future<Output = Result<(), AppError>> + Send {
+        runtime.edit_image_stream(blank_edit(), |_: Step| true)
+    }
+    #[expect(dead_code, reason = "named only so the compiler checks the signature")]
+    fn decide_future(
+        runtime: &Runtime,
+    ) -> impl Future<Output = Result<shiso_ir::decision::Response, AppError>> + Send {
+        runtime.decide(blank_decision())
+    }
+
+    fn blank_generate() -> Generate {
+        Generate {
+            prompt: String::new(),
+            n: None,
+            size: None,
+            aspect_ratio: None,
+            steps: None,
+            seed: None,
+            output_format: None,
+            output_compression: None,
+        }
+    }
+    fn blank_edit() -> Edit {
+        Edit {
+            generate: blank_generate(),
+            references: Vec::new(),
+        }
+    }
+    fn blank_decision() -> shiso_ir::decision::Request {
+        shiso_ir::decision::Request {
+            input: shiso_ir::decision::Input::Text(String::new()),
+            readout_state: shiso_ir::decision::ReadoutState::Input,
+            questions: Vec::new(),
+            temperature: None,
+            preserve_thinking: None,
+            token_ids: false,
+        }
+    }
+
+    /// One handle serves every thread.
+    const fn shared<T: Send + Sync>() {}
+    const _: () = shared::<Runtime>();
+
+    /// Not `Clone`: sharing is an `Arc`, and Drop joins the engine thread once,
+    /// when the last owner lets go. If `Runtime` were `Clone`, `Runtime: Clone`
+    /// would make both impls below apply and the inference ambiguous, which
+    /// does not compile.
+    const _: fn() = || {
+        trait AmbiguousIfClone<A> {
+            fn some_item() {}
+        }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        impl<T: Clone> AmbiguousIfClone<u8> for T {}
+        let _ = <Runtime as AmbiguousIfClone<_>>::some_item;
+    };
+}
+
 /// The contracts above are checked by the compiler, so this file building at
 /// all is the result. The test exists so a target that stopped being built
 /// shows up as a missing test rather than as silence.
@@ -717,6 +1404,11 @@ fn the_contracts_above_are_compiled() {
         }),
         2,
         "a failed decoder is not a decline"
+    );
+    assert_eq!(
+        kv_elem_codes(shiso_core::page::KvElem::default()),
+        (2, "f16", 0),
+        "the default cache element is f16, under the codec name existing disk files carry"
     );
     let parsed_ref = ModelRef::parse("qwen3.5-9b:metal-mlx4").expect("valid model ref");
     assert_eq!(parsed_ref.model.as_str(), "qwen3.5-9b");
@@ -775,3 +1467,88 @@ fn the_moe_rig_opens_and_steps() {
             .expect("a decode number");
     assert!(ms > 0.0 && ms < 1000.0, "a plausible step time, got {ms}");
 }
+
+// ---------------------------------------------------------------------------
+// The Clef backbone.
+//
+// Every Clef GGUF declares one architecture whatever backbone it carries, so
+// the server's factory asks the container which stack it holds before it tries
+// an arm. `None` is "not a Clef GGUF", which every other checkpoint is; a
+// change to that answer would send a non-Clef file through the refusal.
+
+/// The probe the factory calls on the checkpoint path.
+type ClefBackboneAt = fn(&std::path::Path) -> CoreResult<Option<shiso_models::clef::ClefBackbone>>;
+const _: ClefBackboneAt = shiso_models::clef::ClefBackbone::at;
+
+/// The dense backbone's arm: a document and a container in, a model whose
+/// head answers the decision routes out.
+type LlamaFromHf =
+    fn(&shiso_core::HfConfig, &std::path::Path) -> CoreResult<shiso_models::llama::LlamaConfig>;
+const _: LlamaFromHf = shiso_models::llama::LlamaConfig::from_hf;
+
+type LlamaLoad = fn(
+    &std::sync::Arc<dyn Backend>,
+    &std::path::Path,
+    &shiso_models::llama::LlamaConfig,
+    shiso_engine::EngineOptions,
+) -> CoreResult<shiso_models::llama::LlamaModel>;
+const _: LlamaLoad = shiso_models::llama::LlamaModel::load;
+
+// ---------------------------------------------------------------------------
+// The CPU device.
+//
+// A plain CPU answers `None` to `max_block_threads` and exposes no optional
+// capability trait, so the engine launches the kernels listed below by name.
+// The table was measured by wrapping the Metal device that way and running the
+// llama Clef model through every pass it makes; a model change that reaches
+// for another entry must add it here and to `shiso-cpu` in the same commit.
+
+/// How a test opens the CPU device.
+type CpuOpen = fn(shiso_cpu::CpuOptions) -> CoreResult<std::sync::Arc<shiso_cpu::CpuBackend>>;
+const _: CpuOpen = shiso_cpu::CpuBackend::new;
+
+/// Every `(module, entry)` the engine launches for the llama Clef model on a
+/// plain device. The spec's table has 19 rows; the engine also picks the
+/// `mul_mv_ext` `r1_3`, `r1_4` and `r1_5` variants for 3-8 decode rows, which
+/// the measured 2-session batch never reached, so there are 22.
+const CPU_INVENTORY: [(&str, &str); 22] = [
+    ("generic", "kernel_get_rows_q8_0_f32"),
+    ("generic", "kernel_rms_norm_mul_f32_4"),
+    ("generic", "kernel_add_rms_norm_mul_f32_4"),
+    ("generic", "kernel_swiglu_flat_f32"),
+    ("generic", "kernel_mul_mv_q8_0_f32"),
+    ("generic", "kernel_mul_mv_ext_q8_0_f32_r1_2"),
+    ("generic", "kernel_mul_mv_ext_q8_0_f32_r1_3"),
+    ("generic", "kernel_mul_mv_ext_q8_0_f32_r1_4"),
+    ("generic", "kernel_mul_mv_ext_q8_0_f32_r1_5"),
+    ("qwen35", "kernel_mul_mm_q8_0_f32"),
+    ("dense", "kernel_dense_q_rope"),
+    ("dense", "kernel_dense_kv_rope_store"),
+    ("dense", "kernel_dense_attn_decode"),
+    ("dense", "kernel_dense_attn_prefill"),
+    ("audio", "kernel_audio_gemv_q8_0w"),
+    ("audio", "kernel_audio_gemm_q8_0w"),
+    ("audio", "kernel_audio_gemm64_q8_0w"),
+    ("audio", "kernel_audio_split_sum_f32"),
+    ("audio", "kernel_audio_layer_norm_f32"),
+    ("audio", "kernel_audio_window_attn_f32"),
+    ("audio", "kernel_audio_unary_f32"),
+    ("audio", "kernel_audio_axpy_f32"),
+];
+
+#[test]
+fn every_inventory_entry_resolves_on_the_cpu_device() {
+    let missing: Vec<_> = CPU_INVENTORY
+        .iter()
+        .filter(|(module, entry)| !shiso_cpu::has_entry(module, entry))
+        .collect();
+    assert!(missing.is_empty(), "no CPU kernel for {missing:?}");
+}
+
+// The biased routed block's stacks are one enum over the stored codecs, and a
+// streamed IQ4_NL stack is checked against its stream's slot width by the same
+// function the loader calls on a resident one.
+const _: fn(&shiso_engine::moe_biased::ExpertStack) -> CoreResult<()> =
+    shiso_engine::moe_biased::check_stack;
+const _: fn(&shiso_engine::moe_biased::RowIq4NlStack) -> u64 =
+    shiso_engine::moe_biased::RowIq4NlStack::expert_bytes;

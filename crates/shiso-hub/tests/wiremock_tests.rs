@@ -724,3 +724,131 @@ async fn a_nested_hub_file_is_fetched_and_installed_under_its_directory() {
         .join("scheduler_config.json");
     assert_eq!(fs::read(installed).unwrap(), payload);
 }
+
+fn config_for(server: &MockServer, home: &std::path::Path) -> HubConfig {
+    HubConfig {
+        home: home.to_path_buf(),
+        registry: RegistryEndpoint {
+            url: url::Url::parse(&format!("{}/v1", server.uri())).unwrap(),
+        },
+        hf_endpoint: url::Url::parse("http://hf.invalid").unwrap(),
+        hf_token: None,
+        max_parallel_files: NonZeroUsize::new(4).unwrap(),
+    }
+}
+
+fn index_entry_json(name: &str, tasks: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "family": "lfm2",
+        "min_shiso_version": "0.1.0",
+        "description": "d",
+        "tasks": tasks,
+        "inputs": ["text", "smell"],
+        "outputs": ["text"],
+        "updated_at": "2026-10-05T00:00:00Z",
+        "manifest": format!("models/{name}/index.json"),
+        "manifest_sha256": "0".repeat(64),
+        "variants": [],
+    })
+}
+
+#[tokio::test]
+async fn index_with_unknown_task_keeps_the_entry() {
+    let server = MockServer::start().await;
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "generated_at": "2026-10-03T12:00:00Z",
+        "models": [
+            index_entry_json("future", &serde_json::json!(["chat", "telepathy"])),
+            index_entry_json("d1-3b", &serde_json::json!(["decision"])),
+        ],
+    });
+    Mock::given(method("GET"))
+        .and(path("/v1/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_string().into_bytes()))
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().unwrap();
+    let client = RegistryClient::new(config_for(&server, temp.path()));
+    let index = client.fetch_index().await.unwrap();
+    let future = client.resolve_model(&index, "future").unwrap();
+    assert_eq!(future.tasks, vec![shiso_hub::Task::Chat]);
+    assert_eq!(future.inputs, vec![shiso_hub::Modality::Text]);
+    assert!(client.resolve_model(&index, "d1-3b").is_some());
+}
+
+#[test]
+fn an_index_entry_still_refuses_malformed_task_lists() {
+    for tasks in [
+        serde_json::json!("chat"),
+        serde_json::json!([1, "chat"]),
+        serde_json::json!([["chat"]]),
+    ] {
+        let entry = index_entry_json("m", &tasks);
+        assert!(
+            serde_json::from_value::<shiso_hub::recipe::IndexModelEntry>(entry).is_err(),
+            "{tasks}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bad_fresh_index_keeps_the_cache() {
+    let server = MockServer::start().await;
+    let good = serde_json::json!({
+        "schema_version": 1,
+        "generated_at": "2026-10-03T12:00:00Z",
+        "models": [index_entry_json("d1-3b", &serde_json::json!(["decision"]))],
+    })
+    .to_string();
+    Mock::given(method("GET"))
+        .and(path("/v1/index.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"good\"")
+                .set_body_bytes(good.clone().into_bytes()),
+        )
+        .mount(&server)
+        .await;
+    let temp = tempdir().unwrap();
+    let client = RegistryClient::new(config_for(&server, temp.path()));
+    client.fetch_index().await.unwrap();
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/index.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"bad\"")
+                .set_body_bytes(b"{\"schema_version\": 1, \"models\": [".as_slice()),
+        )
+        .mount(&server)
+        .await;
+    let index = client.fetch_index().await.unwrap();
+    assert!(client.resolve_model(&index, "d1-3b").is_some());
+    let cache = temp.path().join("registry");
+    assert_eq!(fs::read_to_string(cache.join("index.json")).unwrap(), good);
+    assert_eq!(
+        fs::read_to_string(cache.join("index.etag")).unwrap(),
+        "\"good\""
+    );
+}
+
+#[tokio::test]
+async fn bad_fresh_index_without_a_cache_is_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"not json".as_slice()))
+        .mount(&server)
+        .await;
+    let temp = tempdir().unwrap();
+    let client = RegistryClient::new(config_for(&server, temp.path()));
+    assert!(matches!(
+        client.fetch_index().await,
+        Err(HubError::Serialization(_))
+    ));
+    assert!(!temp.path().join("registry/index.json").exists());
+}

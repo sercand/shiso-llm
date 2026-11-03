@@ -1,6 +1,6 @@
 /* The one binary op the dense pass reaches for.
  *
- * `crates/shiso-metal/metal/generic/bin.metal` carries a whole fused binary
+ * `kernels/metal/generic/bin.metal` carries a whole fused binary
  * family behind function constants; the engine names exactly one of its plain
  * entries from a dense pass (`crates/shiso-engine/src/layers.rs`, under
  * `launch::GENERIC`), and only that one is twinned here. A module that exported

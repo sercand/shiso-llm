@@ -145,7 +145,7 @@ fn the_pooled_key_pass_launches_a_truncating_divide_plus_one_and_not_a_ceiling()
     let (_backend, recorded) = trace(4);
     let pool = recorded
         .iter()
-        .find(|launch| launch.entry == "q4e_idx_pool_kernel")
+        .find(|launch| launch.entry == "q4e_idx_ring_pool_kernel")
         .expect("an attention layer keeps the pooled plane current");
     assert_eq!(pool.grid.x, 4 / 4 + 1);
     assert_eq!(pool.block.x, 128);
@@ -153,7 +153,7 @@ fn the_pooled_key_pass_launches_a_truncating_divide_plus_one_and_not_a_ceiling()
     let (_backend, recorded) = trace(3);
     let pool = recorded
         .iter()
-        .find(|launch| launch.entry == "q4e_idx_pool_kernel")
+        .find(|launch| launch.entry == "q4e_idx_ring_pool_kernel")
         .expect("an attention layer keeps the pooled plane current");
     // Three rows complete no block, and the launcher still asks for the one
     // that covers the partial block the next token starts.

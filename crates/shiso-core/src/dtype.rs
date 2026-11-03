@@ -29,6 +29,8 @@ pub enum DType {
     Q8_0 = 8,
     /// K-quant 2-bit, 256 elements per block.
     Q2_K = 10,
+    /// K-quant 3-bit, 256 elements per block.
+    Q3_K = 11,
     /// K-quant 4-bit, 256 elements per block.
     Q4_K = 12,
     /// K-quant 5-bit, 256 elements per block.
@@ -68,6 +70,11 @@ pub enum DType {
     Exl3K5 = 69,
     /// Trellis 6-bit codec, one 16x16 tile per block.
     Exl3K6 = 70,
+    /// Trellis 8-bit codec, one 16x16 tile per block.
+    ///
+    /// Not `64 + K` like the narrower widths: 72 was already the n-gram row
+    /// codec when this width arrived.
+    Exl3K8 = 73,
     /// N-gram row codec: 160 weights per row with an fp16 scale word.
     Exl3Ngram6 = 72,
     /// MLX 4-bit affine block quant, group size 64: 32 bytes weights + 2 bytes scale + 2 bytes bias.
@@ -149,6 +156,20 @@ pub enum DType {
     /// re-encoding of a [`DType::Pq2_0`] file, whose scales are `f16`, and a
     /// brain float would round three of their mantissa bits away.
     MlxAffine2Gs128 = 212,
+    /// MXFP8: `e4m3` weights under one power-of-two scale per 32 consecutive
+    /// weights along a row - a `ue8m0` byte, `2^(byte - 127)` - in an array
+    /// beside the codes (a `modelopt` export's `weight_scale`, `[out, in/32]`).
+    ///
+    /// [`block_bytes`] is **32**, the codes of one group without the scale
+    /// byte that covers it, by [`DType::Nvfp4Gs16`]'s convention: the scales
+    /// are a separate array in the file and a separate buffer on the device,
+    /// and `row_bytes` answers the length of the codes buffer. Not one of the
+    /// formats [`DType::is_modelopt`] names: only the sparse engine's
+    /// projection ladder reads it, and the dense family's `modelopt` path
+    /// has no kernel for it.
+    ///
+    /// [`block_bytes`]: DType::block_bytes
+    Mxfp8E4M3G32 = 213,
 }
 
 impl DType {
@@ -164,6 +185,7 @@ impl DType {
             7 => Some(Self::Q5_1),
             8 => Some(Self::Q8_0),
             10 => Some(Self::Q2_K),
+            11 => Some(Self::Q3_K),
             12 => Some(Self::Q4_K),
             13 => Some(Self::Q5_K),
             14 => Some(Self::Q6_K),
@@ -183,6 +205,7 @@ impl DType {
             68 => Some(Self::Exl3K4),
             69 => Some(Self::Exl3K5),
             70 => Some(Self::Exl3K6),
+            73 => Some(Self::Exl3K8),
             72 => Some(Self::Exl3Ngram6),
             142 => Some(Self::Pq2_0),
             143 => Some(Self::Ptq1_0),
@@ -210,6 +233,7 @@ impl DType {
             Self::Q5_1 => "q5_1",
             Self::Q8_0 => "q8_0",
             Self::Q2_K => "q2_k",
+            Self::Q3_K => "q3_k",
             Self::Q4_K => "q4_k",
             Self::Q5_K => "q5_k",
             Self::Q6_K => "q6_k",
@@ -229,6 +253,7 @@ impl DType {
             Self::Exl3K4 => "exl3_k4",
             Self::Exl3K5 => "exl3_k5",
             Self::Exl3K6 => "exl3_k6",
+            Self::Exl3K8 => "exl3_k8",
             Self::Exl3Ngram6 => "exl3_ngram6",
             Self::MlxAffine4Gs64 => "mlx_affine_4_gs64",
             Self::MlxAffine8Gs64 => "mlx_affine_8_gs64",
@@ -240,6 +265,7 @@ impl DType {
             Self::Pq2_0 => "pq2_0",
             Self::Ptq1_0 => "ptq1_0",
             Self::MlxAffine2Gs128 => "mlx_affine_2_gs128",
+            Self::Mxfp8E4M3G32 => "mxfp8_e4m3_g32",
         }
     }
 }
@@ -264,11 +290,13 @@ impl DType {
             | Self::Q8_0
             | Self::IQ4_NL
             | Self::MXFP4
-            | Self::MlxAffine4Gs32 => 32,
+            | Self::MlxAffine4Gs32
+            | Self::Mxfp8E4M3G32 => 32,
             Self::MlxAffine4Gs64 | Self::MlxAffine8Gs64 => 64,
             Self::Exl3Ngram6 => 160,
             Self::Pq2_0 | Self::Ptq1_0 | Self::MlxAffine2Gs128 => 128,
             Self::Q2_K
+            | Self::Q3_K
             | Self::Q4_K
             | Self::Q5_K
             | Self::Q6_K
@@ -283,7 +311,8 @@ impl DType {
             | Self::IQ1_M
             | Self::Exl3K4
             | Self::Exl3K5
-            | Self::Exl3K6 => 256,
+            | Self::Exl3K6
+            | Self::Exl3K8 => 256,
         };
         expect_nonzero(elems)
     }
@@ -308,7 +337,7 @@ impl DType {
             Self::IQ2_XS => 74,
             Self::IQ3_XXS => 98,
             Self::IQ1_S => 50,
-            Self::IQ3_S => 110,
+            Self::IQ3_S | Self::Q3_K => 110,
             Self::IQ2_S => 82,
             Self::IQ4_XS => 136,
             Self::IQ1_M => 56,
@@ -320,6 +349,7 @@ impl DType {
             Self::Exl3K4 => 128,
             Self::Exl3K5 => 160,
             Self::Exl3K6 => 192,
+            Self::Exl3K8 => 256,
             Self::Exl3Ngram6 => 122,
             Self::MlxAffine4Gs64 | Self::MlxAffine2Gs128 => 36,
             Self::MlxAffine8Gs64 => 68,
@@ -331,6 +361,9 @@ impl DType {
             // The two planes of two weights; see the variant.
             Self::F16Pack12 => 3,
             Self::Ptq1_0 => 28,
+            // The codes of one group, without its `ue8m0` scale byte; see the
+            // variant.
+            Self::Mxfp8E4M3G32 => 32,
         };
         expect_nonzero(bytes)
     }

@@ -1,6 +1,7 @@
 //! The hybrid state-space family: selective state-space blocks, attention
 //! blocks with no positional encoding, and routed squared-rectifier
-//! feed-forwards, from an MLX 4-bit export.
+//! feed-forwards, from an MLX 4-bit export or a GGUF export whose routed
+//! experts can be streamed from disk ([`gguf`]).
 //!
 //! [`config`] turns the document into the engine's stack shape - pairing each
 //! routed layer with the mixing layer before it into one slot - and [`model`]
@@ -8,11 +9,12 @@
 
 mod ckpt;
 pub mod config;
+pub mod gguf;
 mod model;
 
 pub use ckpt::NEMOTRON_H_MODEL_ID;
 pub use config::{Mixer, NemotronHConfig, SlotLayers};
-pub use model::NemotronHModel;
+pub use model::{GgufResidency, NemotronHModel};
 
 use crate::catalog::FamilyFacts;
 

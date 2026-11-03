@@ -345,8 +345,23 @@ impl MlxCheckpoint {
             .collect()
     }
 
-    /// A brain-float tensor widened to single precision.
+    /// A brain-float or single-precision tensor, as single precision.
+    ///
+    /// Read by the header's own format rather than by the caller's guess: the
+    /// modelopt mixed export keeps its 100 stream-mix and n-gram norms in
+    /// `F32` beside 203 `BF16` ones, and reading either as the other is a
+    /// norm of finite garbage. Any other format is refused.
     pub(crate) fn floats(&self, name: &str, shape: &[u64]) -> CoreResult<Vec<f32>> {
+        let (_, raw) = self.raw(name)?;
+        if raw.dtype == "F32" {
+            return Ok(self
+                .bytes(name, "F32", shape)?
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| f32::from_le_bytes(*word))
+                .collect());
+        }
         Ok(self
             .bytes(name, "BF16", shape)?
             .as_chunks::<2>()

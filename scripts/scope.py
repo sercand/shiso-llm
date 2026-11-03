@@ -34,6 +34,7 @@ import sys
 # is not here because it is gitignored and so never appears in a diff.
 EXTRA_EDGES = {
     "kernels/": ["shiso-kernels", "shiso-engine"],
+    "kernels/metal/": ["shiso-metal"],
     "crates/shiso-registry/tests/fixtures/": ["shiso-hub", "shiso-server"],
 }
 

@@ -43,7 +43,9 @@ use shiso_core::error::{CoreError, CoreResult};
 
 use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef, WeightSet};
 use crate::sparse::exl3::{self, Fanout};
-use crate::sparse::kernels::{self, Entry, MOD_EXL3, MOD_MODELOPT, MOD_MOE, TemplateArgs};
+use crate::sparse::kernels::{
+    self, Entry, MOD_EXL3, MOD_MODELOPT, MOD_MOE, MOD_NVFP4_A4, TemplateArgs,
+};
 use crate::sparse::matmul::{self, Bound, Device};
 use crate::sparse::plan::{Branch, Plan, Step, TrellisOp};
 use crate::sparse::scratch::Buf;
@@ -307,6 +309,11 @@ pub fn router_logits(
 /// Tokens up to which the routed selection, the sort and its inverse run as
 /// one launch (`Q4E_ROUTE_SORT_TOKENS`).
 pub const ROUTE_SORT_MAX_TOKENS: u32 = 32;
+/// Tokens up to which [`route_sort`] takes the tiny entry
+/// (`Q4E_ROUTE_TINY_TOKENS`).
+pub const ROUTE_TINY_MAX_TOKENS: u32 = 8;
+/// Threads the tiny entry runs (`Q4E_ROUTE_TINY_THREADS`).
+const ROUTE_TINY_THREADS: u32 = 256;
 /// Experts the one-launch selection holds in registers
 /// (`Q4E_ROUTE_SORT_EXPERTS`).
 const ROUTE_SORT_MAX_EXPERTS: u32 = 512;
@@ -327,11 +334,26 @@ pub const fn route_sorts(shape: &SparseShape, n_tok: u32) -> bool {
 /// At a decode step those were seven launches of a block or less each, 17 us a
 /// layer of dependent latency in front of the routed projections.
 #[must_use]
-pub fn route_sort(shape: &SparseShape, n_tok: u32) -> Plan {
+pub fn route_sort(shape: &SparseShape, n_tok: u32, device: Device) -> Plan {
+    // The tiny entry is the small one's results at a shorter serial chain
+    // (GB10: 12.7 -> 7.8 us at one token), for the widths it takes, on a
+    // kernel set that has it.
+    let (entry, threads) = if matches!(
+        device.route_sort,
+        matmul::RouteSort::Tiny | matmul::RouteSort::Fused
+    ) && n_tok <= ROUTE_TINY_MAX_TOKENS
+    {
+        ("q4e_moe_route_sort_tiny_kernel", ROUTE_TINY_THREADS)
+    } else {
+        (
+            "q4e_moe_route_sort_small_kernel",
+            32 * ROUTE_SORT_MAX_TOKENS,
+        )
+    };
     let mut plan = Plan::new();
     plan.launch(
-        Entry::plain(MOD_MOE, "q4e_moe_route_sort_small_kernel"),
-        kernels::Launch::linear(1, 32 * ROUTE_SORT_MAX_TOKENS),
+        Entry::plain(MOD_MOE, entry),
+        kernels::Launch::linear(1, threads),
         // `ids, weights, logits, bounds, active, sorted, pos, n_tok,
         //  n_expert, n_used`
         Args::of(&[
@@ -344,6 +366,184 @@ pub fn route_sort(shape: &SparseShape, n_tok: u32) -> Plan {
             Operand::Scratch(Buf::MoeWsPos),
             Operand::U32(n_tok),
             Operand::U32(shape.moe.experts),
+            Operand::U32(shape.moe.used),
+        ]),
+    );
+    plan
+}
+
+/// Rows up to which a step or verify pass can take [`fused_route`]
+/// (`Q4E_FR_ROWS`): the tiny selection's width.
+pub const FUSED_ROUTE_MAX_TOKENS: u32 = ROUTE_TINY_MAX_TOKENS;
+/// Words of [`Buf::MoeSync`] the fused route launch orders its work through
+/// (`Q4E_FR_SYNC_*`).
+pub const FUSED_ROUTE_SYNC_WORDS: u32 = 4;
+/// Warps a block of the fused route launch runs (`Q4E_FR_WARPS`): each item
+/// is eight shared gate-and-up rows, eight slices of router rows, or sixteen
+/// shared down rows.
+const FUSED_ROUTE_WARPS: u32 = 8;
+/// The widest block input the fused route launch stages a shared row's scales
+/// for (`Q4E_FR_MX_SCALES` groups of 32).
+const FUSED_ROUTE_MAX_IN: u32 = 5_120;
+/// The contraction width the shared gate and up must be whole chunks of
+/// (`Q4E_MX_CHUNK`).
+const FUSED_ROUTE_IN_ALIGN: u32 = 512;
+/// Rows of the shared down projection one fused route item covers: two a
+/// warp (`q4e_mx_rows<NT, 2, 1>`).
+const FUSED_ROUTE_DOWN_ROWS: u32 = 2 * FUSED_ROUTE_WARPS;
+/// Dynamic shared memory a fused route block reserves and never touches: with
+/// the 11 KB it declares, two blocks fill a GB10 multiprocessor's 100 KB.
+///
+/// A throttle, measured: at the three blocks an SM its registers allow, the
+/// gate-and-up items' row pairs and the router's slices all in flight at once
+/// queued the memory system so deep that every item took longer, and the
+/// launch took 46.5 us at one row; at two, 39.3 us (two rows 41.6 -> 39.5).
+/// From three rows on the verify entry's own registers hold it near two
+/// blocks and the reservation measured no better (eight rows 54.2 -> 57.5,
+/// with less of the multiprocessor left to the first-level cache the rows'
+/// activations are read through), so only the passes of at most
+/// [`FUSED_ROUTE_THROTTLED`] rows take it. A launch parameter, not a sum: no
+/// value moves with it. Below the 48 KB a launch takes without opting in.
+pub const FUSED_ROUTE_SMEM: u32 = 36_000;
+/// The widest pass that takes [`FUSED_ROUTE_SMEM`].
+pub const FUSED_ROUTE_THROTTLED: u32 = 2;
+
+/// Whether a pass takes [`fused_route`] in place of the router's projection,
+/// [`route_sort`], the shared expert's branch and its gate logit.
+///
+/// Only where it reproduces them bit for bit: a step or verify pass (a prompt
+/// pass's router takes the tensor-core GEMM, whose sums differ) of at most
+/// [`FUSED_ROUTE_MAX_TOKENS`] rows that [`route_sorts`], on a device whose
+/// brain-float projections take [`kernels::MOD_BF16`]'s step kernels, with a
+/// brain-float router and gate and an MXFP8 shared expert at the widths the
+/// launch is written for. A pass that misses any of these keeps the separate
+/// launches - and since both reproduce the same kernels' arithmetic, which
+/// one a pass takes moves no bit.
+#[must_use]
+pub fn route_fuses(shape: &SparseShape, desc: &ExpertDesc, n_tok: u32, device: Device) -> bool {
+    let hidden = shape.hidden;
+    let inter = shape.moe.intermediate;
+    let bf16 = |w: crate::sparse::weights::WeightDesc, out_dim: u32| {
+        w.dtype == DType::BF16 && w.in_dim == hidden && w.out_dim == out_dim
+    };
+    let mx = |w: crate::sparse::weights::WeightDesc, in_dim: u32, out_dim: u32| {
+        w.dtype == DType::Mxfp8E4M3G32 && w.in_dim == in_dim && w.out_dim == out_dim
+    };
+    device.route_sort == matmul::RouteSort::Fused
+        && matches!(device.prompt_matmul, matmul::PromptMatmul::Tensor)
+        && !device.row_invariant()
+        && (1..=FUSED_ROUTE_MAX_TOKENS).contains(&n_tok)
+        && route_sorts(shape, n_tok)
+        && hidden.is_multiple_of(FUSED_ROUTE_IN_ALIGN)
+        && hidden <= FUSED_ROUTE_MAX_IN
+        && inter.is_multiple_of(32)
+        && bf16(desc.router, shape.moe.experts)
+        && bf16(desc.shared_router, 1)
+        && mx(desc.shared_gate, hidden, inter)
+        && mx(desc.shared_up, hidden, inter)
+        && mx(desc.shared_down, inter, hidden)
+}
+
+/// The router's projection, the shared expert's gate logit, the routed
+/// selection and sort, and the shared expert's gate, up, activation and down,
+/// as one launch over the block input: what [`router_logits`], [`route_sort`],
+/// [`shared_expert`] and [`shared_logit`] write, into the same buffers, bit
+/// for bit. The caller checks [`route_fuses`] first.
+///
+/// At a decode step those were seven launches, two of them on a branch: the
+/// router and the shared expert's gate and up side by side (33 and 35 us in
+/// the model), the one-block selection behind the router (11 us), the
+/// activation, the shared down projection, and the gate logit after the join.
+/// Here they are the work items of one grid (`q4e_ffn_route_kernel`): the
+/// router item that finishes last runs the selection while the shared down
+/// items stream, and nothing the pass reads afterwards changes. GB10, kernel
+/// bench over 24 layers' weights: one row 51.0 -> 39.3 us, two 59.8 -> 39.5,
+/// five 65.1 -> 46.8, eight 74.1 -> 54.2.
+#[must_use]
+pub fn fused_route(shape: &SparseShape, desc: &ExpertDesc, layer: LayerRef, n_tok: u32) -> Plan {
+    let hidden = shape.hidden;
+    let inter = shape.moe.intermediate;
+    // The slice counts the brain-float step kernels take for these weights
+    // (`matmul::project` hands them the same), which fix each logit's sum.
+    let splits = matmul::bf16_split(desc.router.in_dim, desc.router.out_dim);
+    let gate_splits = matmul::bf16_split(desc.shared_router.in_dim, desc.shared_router.out_dim);
+    let blocks = inter.div_ceil(FUSED_ROUTE_WARPS)
+        + shape.moe.experts * splits / FUSED_ROUTE_WARPS
+        + 1
+        + hidden.div_ceil(FUSED_ROUTE_DOWN_ROWS);
+    let at = |role: Role| WeightRef::layer(layer, role);
+    let scales = |role: Role| Operand::Weight(at(role).spanning(WeightPart::GroupScales));
+    let entry = if n_tok == 1 {
+        "q4e_ffn_route_kernel"
+    } else {
+        "q4e_ffn_route_rows_kernel"
+    };
+    let mut plan = Plan::new();
+    plan.launch(
+        Entry::plain(kernels::MOD_FFN, entry),
+        kernels::Launch::new(
+            shiso_core::Extent3::linear(blocks),
+            FUSED_ROUTE_WARPS * kernels::WARP,
+            if n_tok <= FUSED_ROUTE_THROTTLED {
+                FUSED_ROUTE_SMEM
+            } else {
+                0
+            },
+        ),
+        // `logits, gate_logit, mid, shared_out, ids, weights, bounds, active,
+        //  sorted, pos, sync, router, gate, g_codes, g_scales, u_codes,
+        //  u_scales, d_codes, d_scales, x, in_dim, n_expert, n_used, inter,
+        //  splits, gate_splits, rows`
+        Args::of(&[
+            Operand::Scratch(Buf::MoeRouter),
+            Operand::Scratch(Buf::SharedLogit),
+            Operand::Scratch(Buf::SharedMid),
+            Operand::Scratch(Buf::SharedOut),
+            Operand::Scratch(Buf::MoeIds),
+            Operand::Scratch(Buf::MoeWeights),
+            Operand::Scratch(Buf::MoeBounds),
+            Operand::Scratch(Buf::MoeActive),
+            Operand::Scratch(Buf::MoeSorted),
+            Operand::Scratch(Buf::MoeWsPos),
+            Operand::Scratch(Buf::MoeSync),
+            Operand::Weight(at(Role::Router)),
+            Operand::Weight(at(Role::SharedRouter)),
+            Operand::Weight(at(Role::SharedGate)),
+            scales(Role::SharedGate),
+            Operand::Weight(at(Role::SharedUp)),
+            scales(Role::SharedUp),
+            Operand::Weight(at(Role::SharedDown)),
+            scales(Role::SharedDown),
+            Operand::Scratch(Buf::Mixed),
+            Operand::U32(hidden),
+            Operand::U32(shape.moe.experts),
+            Operand::U32(shape.moe.used),
+            Operand::U32(inter),
+            Operand::U32(splits),
+            Operand::U32(gate_splits),
+            Operand::U32(n_tok),
+        ]),
+    );
+    plan
+}
+
+/// [`combine`] then [`shared_add`] as one launch (`q4e_ffn_combine_kernel`):
+/// the same expressions in the same order, the routed sum never stored in
+/// between - the close of a block whose shared expert [`fused_route`] ran.
+#[must_use]
+pub fn fused_close(shape: &SparseShape, n_tok: u32) -> Plan {
+    let mut plan = Plan::new();
+    plan.launch(
+        Entry::plain(kernels::MOD_FFN, "q4e_ffn_combine_kernel"),
+        kernels::moe_combine(shape.hidden, n_tok),
+        // `out, down, weights, shared, logit, n_embd, n_used`
+        Args::of(&[
+            Operand::Scratch(Buf::BlockOut),
+            Operand::Scratch(Buf::MoeDown),
+            Operand::Scratch(Buf::MoeWeights),
+            Operand::Scratch(Buf::SharedOut),
+            Operand::Scratch(Buf::SharedLogit),
+            Operand::U32(shape.hidden),
             Operand::U32(shape.moe.used),
         ]),
     );
@@ -1095,12 +1295,218 @@ pub fn grouped_experts(
 /// Output rows one affine expert threadgroup covers (`Q4E_AFFINE_ROWS`).
 const AFFINE_EXPERT_ROWS: u32 = 8;
 
-/// Weight rows one block of the NVFP4 prompt kernels covers (`Q4E_MO_BM`).
-const NVFP4_GEMM_ROWS: u32 = 64;
+/// Weight rows one block of the NVFP4 prompt kernels covers (`Q4E_MG_BM`):
+/// 256 of down, or the same 128 (`Q4E_MG_HALF`) of gate and of up.
+const NVFP4_GEMM_ROWS: u32 = 256;
 
-/// Threads one block of the NVFP4 prompt kernels runs (`Q4E_MO_THREADS`):
-/// four warps, sixteen rows each.
-const NVFP4_GEMM_THREADS: u32 = 128;
+/// Blocks one row tile of the NVFP4 prompt kernels is split over, column tile
+/// `z` of every `NVFP4_GEMM_SPLIT` to block `z` (`Q4E_MG_SPLIT`).
+const NVFP4_GEMM_SPLIT: u32 = 4;
+
+/// Threads one block of the NVFP4 prompt kernels runs (`Q4E_MG_THREADS`):
+/// sixteen warps, sixteen rows each.
+const NVFP4_GEMM_THREADS: u32 = 512;
+
+/// Dynamic shared memory one block of the NVFP4 prompt kernels takes
+/// (`Q4E_MG_SMEM`): two weight stages, two activation steps, and the output
+/// tile staged over them.
+const NVFP4_GEMM_SMEM: u32 = 92_416;
+
+/// Contraction widths the NVFP4 prompt kernels take: whole multiples of
+/// their two activation steps of 64.
+const NVFP4_GEMM_K_ALIGN: u32 = 128;
+
+/// Weight rows one block of the W4A4 prompt kernels covers (`LP_A4_BW`): 128
+/// of down, or the same 64 of gate and of up.
+const NVFP4_A4_ROWS: u32 = 128;
+
+/// Blocks one row tile of the W4A4 prompt kernels is split over
+/// (`LP_A4_SPLIT`).
+const NVFP4_A4_SPLIT: u32 = 4;
+
+/// Threads one block of the W4A4 prompt kernels runs (`LP_A4_THREADS`).
+const NVFP4_A4_THREADS: u32 = 256;
+
+/// Columns one W4A4 tile covers (`LP_A4_BN`).
+const NVFP4_A4_COLS: u32 = 128;
+
+/// Dynamic shared memory one block of the W4A4 prompt kernels takes
+/// (`LP_A4_SMEM`): two stages of 128 weight rows and 128 columns at 256
+/// contraction elements (codes and scales of both), and three words a column.
+const NVFP4_A4_SMEM: u32 =
+    2 * (128 * 128 + 128 * 16 + NVFP4_A4_COLS * 128 + NVFP4_A4_COLS * 16) + NVFP4_A4_COLS * 12;
+
+/// Rows one block of the NVFP4 quantizer covers, a warp each.
+const NVFP4_A4_QUANT_ROWS: u32 = 4;
+
+/// Bytes of `rows` rows of width `k` quantized for the W4A4 kernels: codes,
+/// block scales and one `f32` global a row.
+const fn nvfp4_a4_bytes(rows: u64, k: u32) -> u64 {
+    rows * (k as u64 / 2 + k as u64 / 16 + 4)
+}
+
+/// Whether a routed stage takes the W4A4 kernels: a target layer's NVFP4
+/// bank in a prompt pass under
+/// [`matmul::PrefillActivations::Lowp`]. The draft head's resident experts
+/// keep the weight-only kernels, as the reference keeps them.
+#[must_use]
+pub fn lowp_routed(desc: &ExpertDesc, layer: LayerRef, device: Device) -> bool {
+    device.lowp_prompt() && layer.set == WeightSet::Target && desc.gate.dtype == DType::Nvfp4Gs16
+}
+
+/// The W4A4 routed stage of a prompt pass: the token rows quantized, gate and
+/// up with the `SwiGLU` fused, the intermediate quantized, down. The quantized
+/// rows take the weight-only stage's gate and up buffers, which this stage
+/// does not otherwise write: a quantized row is a ninth of the bytes of the
+/// `f32` rows they were sized for. The intermediate and the routed rows are
+/// brain floats in the buffers sized for their `f32` forms, and the combine
+/// that reads them is [`combine_lowp`].
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] when a width is not a multiple of 128.
+fn lowp_experts(
+    shape: &SparseShape,
+    layer: LayerRef,
+    n_tok: u32,
+    groups: u32,
+    map: Operand,
+) -> CoreResult<Plan> {
+    let hidden = shape.hidden;
+    let inter = shape.moe.intermediate;
+    if !(hidden.is_multiple_of(NVFP4_GEMM_K_ALIGN) && inter.is_multiple_of(NVFP4_GEMM_K_ALIGN)) {
+        return Err(CoreError::Unsupported {
+            what: "a W4A4 prompt expert stage whose widths are not multiples of 128",
+            backend: "engine",
+        });
+    }
+    let columns = u32::try_from(shape.moe.slot_rows(n_tok)).unwrap_or(u32::MAX);
+    debug_assert!(
+        nvfp4_a4_bytes(u64::from(n_tok), hidden) <= Buf::MoeGate.bytes(shape, n_tok, 1, 0)
+            && nvfp4_a4_bytes(u64::from(columns), inter) <= Buf::MoeUp.bytes(shape, n_tok, 1, 0),
+        "the quantized rows fit the buffers they borrow"
+    );
+    let at = |role: Role, span| Operand::Weight(WeightRef::layer(layer, role).spanning(span));
+    let quant = |entry: &'static str, q: Buf, x: Buf, rows: u32, k: u32| {
+        let mut plan = Plan::new();
+        // `q, x, static_gs, static_idx, rows, k`: dynamic globals.
+        plan.launch(
+            Entry::plain(MOD_NVFP4_A4, entry),
+            kernels::Launch::linear(rows.div_ceil(NVFP4_A4_QUANT_ROWS), 32 * NVFP4_A4_QUANT_ROWS),
+            Args::of(&[
+                Operand::Scratch(q),
+                Operand::Scratch(x),
+                Operand::Null,
+                Operand::Null,
+                Operand::U32(rows),
+                Operand::U32(k),
+            ]),
+        );
+        plan
+    };
+    let tiles = |rows_per: u32, out_dim: u32| {
+        kernels::Launch::new(
+            shiso_core::Extent3::new(NVFP4_A4_SPLIT * out_dim.div_ceil(rows_per), groups, 1),
+            NVFP4_A4_THREADS,
+            NVFP4_A4_SMEM,
+        )
+    };
+    let tail = |in_dim: u32, out_dim: u32, rows: u32| {
+        [
+            Operand::Scratch(Buf::MoeSorted),
+            Operand::Scratch(Buf::MoeBounds),
+            Operand::Scratch(Buf::MoeActive),
+            map,
+            Operand::U32(in_dim),
+            Operand::U32(out_dim),
+            Operand::U32(shape.moe.experts),
+            Operand::U32(shape.moe.used),
+            Operand::U32(rows),
+        ]
+    };
+    let mut plan = quant(
+        "q4e_nvfp4_a4_quant_kernel",
+        Buf::MoeGate,
+        Buf::Mixed,
+        n_tok,
+        hidden,
+    );
+    // `mid, gate_w, gate_s, gate_g, up_w, up_s, up_g, xq, sorted, bounds,
+    //  active, map, in_dim, out_dim, n_expert, n_used, rows`
+    let mut ops = vec![
+        Operand::Scratch(Buf::MoeMid),
+        at(Role::ExpertGate, WeightPart::Whole),
+        at(Role::ExpertGate, WeightPart::GroupScales),
+        at(Role::ExpertGate, WeightPart::GlobalScale),
+        at(Role::ExpertUp, WeightPart::Whole),
+        at(Role::ExpertUp, WeightPart::GroupScales),
+        at(Role::ExpertUp, WeightPart::GlobalScale),
+        Operand::Scratch(Buf::MoeGate),
+    ];
+    ops.extend(tail(hidden, inter, n_tok));
+    plan.launch(
+        Entry::plain(MOD_NVFP4_A4, "q4e_nvfp4_a4_gate_up_kernel"),
+        tiles(NVFP4_A4_ROWS / 2, inter),
+        Args::of(&ops),
+    );
+    plan.append(quant(
+        "q4e_nvfp4_a4_quant_bf16_kernel",
+        Buf::MoeUp,
+        Buf::MoeMid,
+        columns,
+        inter,
+    ));
+    // `out, down_w, down_s, down_g, midq, sorted, bounds, active, map,
+    //  in_dim, out_dim, n_expert, n_used, rows`
+    let mut ops = vec![
+        Operand::Scratch(Buf::MoeDown),
+        at(Role::ExpertDown, WeightPart::Whole),
+        at(Role::ExpertDown, WeightPart::GroupScales),
+        at(Role::ExpertDown, WeightPart::GlobalScale),
+        Operand::Scratch(Buf::MoeUp),
+    ];
+    ops.extend(tail(inter, hidden, columns));
+    plan.launch(
+        Entry::plain(MOD_NVFP4_A4, "q4e_nvfp4_a4_down_kernel"),
+        tiles(NVFP4_A4_ROWS, hidden),
+        Args::of(&ops),
+    );
+    Ok(plan)
+}
+
+/// The recombination of the W4A4 stage's brain-float routed rows into one
+/// `f32` contribution per token, in slot order as [`combine`] sums.
+#[must_use]
+pub fn combine_lowp(shape: &SparseShape, n_tok: u32) -> Plan {
+    let mut plan = Plan::new();
+    plan.launch(
+        Entry::plain(MOD_NVFP4_A4, "q4e_nvfp4_a4_combine_kernel"),
+        kernels::Launch::new(
+            shiso_core::Extent3::new(shape.hidden.div_ceil(512), n_tok, 1),
+            256,
+            0,
+        ),
+        // `out, down, weights, n_embd, n_used`
+        Args::of(&[
+            Operand::Scratch(Buf::BlockOut),
+            Operand::Scratch(Buf::MoeDown),
+            Operand::Scratch(Buf::MoeWeights),
+            Operand::U32(shape.hidden),
+            Operand::U32(shape.moe.used),
+        ]),
+    );
+    plan
+}
+
+/// Output rows a block of the NVFP4 step kernels covers: gate and up one row
+/// a warp (`Q4E_NVFP4_GU_ROWS`), down four (`Q4E_NVFP4_DN_ROWS`), four warps
+/// a block.
+const NVFP4_STEP_GATE_UP_ROWS: u32 = 4;
+/// See [`NVFP4_STEP_GATE_UP_ROWS`].
+const NVFP4_STEP_DOWN_ROWS: u32 = 16;
+
+/// Threads a block of the NVFP4 step kernels runs (`Q4E_NVFP4_WARPS`).
+const NVFP4_STEP_THREADS: u32 = 128;
 
 /// Weight rows one tile of the routed prompt kernels covers
 /// (`Q4E_GEMM_EXPERT_ROWS`).
@@ -1199,39 +1605,83 @@ pub fn affine_experts(
             Operand::U32(shape.moe.used),
         ]
     };
+    if nvfp4 && lowp_routed(desc, layer, device) {
+        return lowp_experts(shape, layer, n_tok, groups, map);
+    }
     if nvfp4 {
         // A prompt pass takes the tensor-core tiles: a column's result then
         // depends on the shape alone, which is the prompt's promise, and an
         // expert's weights are decoded once a tile rather than once a column.
         // A step keeps the warp-per-row kernels.
         let gemm = device.row_invariant();
-        let (gate_up, down, rows, threads) = if gemm {
+        if gemm
+            && !(hidden.is_multiple_of(NVFP4_GEMM_K_ALIGN)
+                && inter.is_multiple_of(NVFP4_GEMM_K_ALIGN))
+        {
+            return Err(CoreError::Unsupported {
+                what: "an NVFP4 prompt expert stage whose widths are not multiples of 128",
+                backend: "engine",
+            });
+        }
+        let (gate_up, down) = if gemm {
             (
                 "q4e_nvfp4_experts_gemm_gate_up_kernel",
                 "q4e_nvfp4_experts_gemm_down_kernel",
-                NVFP4_GEMM_ROWS,
-                NVFP4_GEMM_THREADS,
             )
         } else {
+            // A step applies the activation as gate and up are stored: the
+            // activation launch's bits, without the two intermediate rows. A
+            // wider pass holds each row in registers across an expert's
+            // columns; the two entries sum a row identically, so the choice
+            // by row count moves no bit.
             (
-                "q4e_nvfp4_experts_gate_up_kernel",
+                if n_tok == 1 {
+                    "q4e_nvfp4_experts_gate_up_act_kernel"
+                } else {
+                    "q4e_nvfp4_experts_gate_up_act_held_kernel"
+                },
                 "q4e_nvfp4_experts_down_kernel",
-                AFFINE_EXPERT_ROWS,
-                32 * AFFINE_EXPERT_ROWS,
             )
         };
-        let tiles = |out_dim: u32, copies: u32| {
-            kernels::Launch::new(
-                shiso_core::Extent3::new(copies * out_dim.div_ceil(rows), groups, 1),
-                threads,
-                0,
+        // The prompt grid: a gate-and-up block covers half the rows a down
+        // block does, of both matrices, and every row tile is split over
+        // `NVFP4_GEMM_SPLIT` blocks. The step grid: rows a block, one block
+        // per active expert on the second axis either way.
+        let (gate_up_launch, down_launch) = if gemm {
+            let tiles = |rows: u32| {
+                kernels::Launch::new(
+                    shiso_core::Extent3::new(NVFP4_GEMM_SPLIT * rows, groups, 1),
+                    NVFP4_GEMM_THREADS,
+                    NVFP4_GEMM_SMEM,
+                )
+            };
+            (
+                tiles(inter.div_ceil(NVFP4_GEMM_ROWS / 2)),
+                tiles(hidden.div_ceil(NVFP4_GEMM_ROWS)),
+            )
+        } else {
+            let rows = |out_dim: u32, per: u32| {
+                kernels::Launch::new(
+                    shiso_core::Extent3::new(out_dim.div_ceil(per), groups, 1),
+                    NVFP4_STEP_THREADS,
+                    0,
+                )
+            };
+            (
+                rows(inter, NVFP4_STEP_GATE_UP_ROWS),
+                rows(hidden, NVFP4_STEP_DOWN_ROWS),
             )
         };
         // `out_gate, out_up, gate_w, gate_s, gate_g, up_w, up_s, up_g, x,
-        //  sorted, bounds, active, map, in_dim, out_dim, n_expert, n_used`
-        let mut ops = vec![
-            Operand::Scratch(Buf::MoeGate),
-            Operand::Scratch(Buf::MoeUp),
+        //  sorted, bounds, active, map, in_dim, out_dim, n_expert, n_used`,
+        // and on a step the one output `out_mid` in place of the first two.
+        let outputs: &[Operand] = if gemm {
+            &[Operand::Scratch(Buf::MoeGate), Operand::Scratch(Buf::MoeUp)]
+        } else {
+            &[Operand::Scratch(Buf::MoeMid)]
+        };
+        let mut ops = outputs.to_vec();
+        ops.extend([
             at(Role::ExpertGate, WeightPart::Whole),
             at(Role::ExpertGate, WeightPart::GroupScales),
             at(Role::ExpertGate, WeightPart::GlobalScale),
@@ -1239,21 +1689,22 @@ pub fn affine_experts(
             at(Role::ExpertUp, WeightPart::GroupScales),
             at(Role::ExpertUp, WeightPart::GlobalScale),
             Operand::Scratch(Buf::Mixed),
-        ];
+        ]);
         ops.extend(tail(hidden, inter));
         plan.launch(
             Entry::plain(MOD_MODELOPT, gate_up),
-            // The gemm's grid holds the gate's row tiles, then the up's.
-            tiles(inter, if gemm { 2 } else { 1 }),
+            gate_up_launch,
             Args::of(&ops),
         );
-        plan.append(activate(
-            shape,
-            Operand::Scratch(Buf::MoeGate),
-            Operand::Scratch(Buf::MoeUp),
-            Operand::Scratch(Buf::MoeMid),
-            n_tok,
-        ));
+        if gemm {
+            plan.append(activate(
+                shape,
+                Operand::Scratch(Buf::MoeGate),
+                Operand::Scratch(Buf::MoeUp),
+                Operand::Scratch(Buf::MoeMid),
+                n_tok,
+            ));
+        }
         // `out, down_w, down_s, down_g, mid, sorted, bounds, active, map,
         //  in_dim, out_dim, n_expert, n_used`
         let mut ops = vec![
@@ -1266,7 +1717,7 @@ pub fn affine_experts(
         ops.extend(tail(inter, hidden));
         plan.launch(
             Entry::plain(MOD_MODELOPT, down),
-            tiles(hidden, 1),
+            down_launch,
             Args::of(&ops),
         );
         return Ok(plan);
@@ -1680,6 +2131,14 @@ pub fn shared(
     device: Device,
 ) -> CoreResult<Plan> {
     let mut plan = shared_projections(shape, desc, layer, n_tok, device)?;
+    plan.append(shared_add(shape, n_tok));
+    Ok(plan)
+}
+
+/// The shared expert's gated output added onto [`Buf::BlockOut`].
+#[must_use]
+pub fn shared_add(shape: &SparseShape, n_tok: u32) -> Plan {
+    let mut plan = Plan::new();
     plan.launch(
         Entry::plain(MOD_MOE, "q4e_shared_add_kernel"),
         kernels::moe_combine(shape.hidden, n_tok),
@@ -1691,7 +2150,45 @@ pub fn shared(
             Operand::U32(shape.hidden),
         ]),
     );
-    Ok(plan)
+    plan
+}
+
+/// `main` followed by the shared expert.
+///
+/// On a step or verify pass whose shared expert is MXFP8 group launches, the
+/// shared expert runs as a branch beside `main` (the router, the selection
+/// and the routed stages), as the trellis path runs its own: it reads only
+/// the block input and writes only its own buffers, and on its own it is a
+/// chain of latency-bound launches (the router's selection alone is one
+/// block). Only when neither side carves per-stream scratch, which the two
+/// would share. Its gate logit and the add stay after the join, in the order
+/// the serial plan has them, so no value moves.
+fn with_shared(
+    shape: &SparseShape,
+    desc: &ExpertDesc,
+    layer: LayerRef,
+    n_tok: u32,
+    device: Device,
+    mut main: Plan,
+) -> CoreResult<Plan> {
+    if matmul::groups(&[desc.shared_gate, desc.shared_up], device)
+        && desc.shared_down.dtype == DType::Mxfp8E4M3G32
+    {
+        let branch = shared_expert(shape, desc, layer, n_tok, device)?;
+        if branch.staging().bytes == 0 && main.staging().bytes == 0 {
+            let mut forked = Plan::new();
+            forked.push(Step::Branch(Branch::Fork));
+            forked.append(branch);
+            forked.push(Step::Branch(Branch::Resume));
+            forked.append(main);
+            forked.push(Step::Branch(Branch::Join));
+            forked.append(shared_logit(desc, layer, n_tok, device)?);
+            forked.append(shared_add(shape, n_tok));
+            return Ok(forked);
+        }
+    }
+    main.append(shared(shape, desc, layer, n_tok, device)?);
+    Ok(main)
 }
 
 /// One routed feed-forward, in launch order.
@@ -1711,13 +2208,30 @@ pub fn block(
     if desc.gate.dtype.is_affine()
         || matches!(desc.gate.dtype, DType::Fp8E4M3Block128 | DType::Nvfp4Gs16)
     {
+        // A step or verify pass whose router and shared expert the fused
+        // route launch reads computes all of them, the selection included,
+        // in that one launch; the routed stages follow it on the same stream
+        // and the shared expert's output and gate logit are in place for the
+        // add.
+        if route_fuses(shape, desc, n_tok, device) {
+            let mut plan = fused_route(shape, desc, layer, n_tok);
+            if layer.set == WeightSet::Target {
+                plan.push(Step::Fetch {
+                    layer: layer.index,
+                    ids: u32::try_from(shape.moe.slot_rows(n_tok)).unwrap_or(u32::MAX),
+                });
+            }
+            plan.append(affine_experts(shape, desc, layer, n_tok, device)?);
+            plan.append(fused_close(shape, n_tok));
+            return Ok(plan);
+        }
         // A decode-sized pass routes and sorts in one launch, which is the
         // same answer as the four-launch route and sort bit for bit - so a
         // prompt pass narrow enough to take it still routes a row as a wider
         // one does - at a sixth of the dependent launches.
         let mut plan = if route_sorts(shape, n_tok) {
             let mut plan = router_logits(desc, layer, n_tok, device)?;
-            plan.append(route_sort(shape, n_tok));
+            plan.append(route_sort(shape, n_tok, device));
             plan
         } else {
             let mut plan = route(shape, desc, layer, n_tok, device)?;
@@ -1732,9 +2246,12 @@ pub fn block(
             });
         }
         plan.append(affine_experts(shape, desc, layer, n_tok, device)?);
-        plan.append(combine(shape, n_tok));
-        plan.append(shared(shape, desc, layer, n_tok, device)?);
-        return Ok(plan);
+        plan.append(if lowp_routed(desc, layer, device) {
+            combine_lowp(shape, n_tok)
+        } else {
+            combine(shape, n_tok)
+        });
+        return with_shared(shape, desc, layer, n_tok, device, plan);
     }
     let Some(bits) = matmul::trellis_bits(desc.gate.dtype) else {
         return Err(CoreError::Unsupported {
@@ -1758,7 +2275,7 @@ pub fn block(
         && let Some(main) = {
             let main = if wsd {
                 let mut main = router_logits(desc, layer, n_tok, device)?;
-                main.append(route_sort(shape, n_tok));
+                main.append(route_sort(shape, n_tok, device));
                 main.append(wsd_experts(shape, layer, bits, n_tok)?);
                 main
             } else {
@@ -1796,7 +2313,7 @@ pub fn block(
     // projections run first.
     if wsd {
         let mut plan = router_logits(desc, layer, n_tok, device)?;
-        plan.append(route_sort(shape, n_tok));
+        plan.append(route_sort(shape, n_tok, device));
         plan.append(wsd_experts(shape, layer, bits, n_tok)?);
         plan.append(shared_projections(shape, desc, layer, n_tok, device)?);
         plan.append(wsd_combine(shape, layer, n_tok));
@@ -1813,6 +2330,123 @@ pub fn block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The published geometry, four layers of it.
+    fn sparse_shape() -> SparseShape {
+        use crate::shape::{GdnShape, LayerKind};
+        use crate::sparse::shape::{GqaShape, IndexerShape, MoeShape, MropeSections};
+        SparseShape {
+            layers: vec![
+                LayerKind::Gdn,
+                LayerKind::Gdn,
+                LayerKind::Gdn,
+                LayerKind::Attn,
+            ],
+            hidden: 2_560,
+            vocab: 248_320,
+            streams: 4,
+            stream_rank: 320,
+            gqa: GqaShape::new(24, 2, 256, 64),
+            gdn: GdnShape::new(48, 16, 128, 4),
+            moe: MoeShape::new(512, 10, 1, 640),
+            indexer: IndexerShape::new(4, 128, 2_048, 4),
+            ple: None,
+            mrope: MropeSections::new(11, 11, 10),
+            rms_eps: 1.0e-6,
+            rope_theta: 1.0e7,
+        }
+    }
+
+    /// An NVFP4 routed bank at the published widths; the rest of the
+    /// description is never read by the routed stages.
+    fn nvfp4_desc() -> ExpertDesc {
+        use crate::sparse::weights::WeightDesc;
+        let w = |dtype, in_dim, out_dim| WeightDesc::new(dtype, in_dim, out_dim);
+        ExpertDesc {
+            router: w(DType::BF16, 2_560, 512),
+            gate: w(DType::Nvfp4Gs16, 2_560, 640),
+            up: w(DType::Nvfp4Gs16, 2_560, 640),
+            down: w(DType::Nvfp4Gs16, 640, 2_560),
+            shared_router: w(DType::BF16, 2_560, 1),
+            shared_gate: w(DType::Mxfp8E4M3G32, 2_560, 640),
+            shared_up: w(DType::Mxfp8E4M3G32, 2_560, 640),
+            shared_down: w(DType::Mxfp8E4M3G32, 640, 2_560),
+        }
+    }
+
+    fn entries(plan: &Plan) -> Vec<&'static str> {
+        plan.steps()
+            .iter()
+            .filter_map(Step::entry)
+            .map(|e| e.name())
+            .collect()
+    }
+
+    #[test]
+    fn only_a_target_prompt_pass_under_lowp_takes_the_w4a4_stages() {
+        let shape = sparse_shape();
+        let desc = nvfp4_desc();
+        let base = Device {
+            prefill_activations: matmul::PrefillActivations::Lowp,
+            ..Device::default()
+        };
+        let prompt = Device {
+            role: matmul::PassRole::Prompt { snapshot: None },
+            ..base
+        };
+        let target = LayerRef::target(0);
+        for n_tok in [1, 64, 2_048] {
+            let plan = affine_experts(&shape, &desc, target, n_tok, prompt).expect("plans");
+            assert_eq!(
+                entries(&plan),
+                [
+                    "q4e_nvfp4_a4_quant_kernel",
+                    "q4e_nvfp4_a4_gate_up_kernel",
+                    "q4e_nvfp4_a4_quant_bf16_kernel",
+                    "q4e_nvfp4_a4_down_kernel",
+                ],
+                "{n_tok} tokens"
+            );
+            assert!(lowp_routed(&desc, target, prompt));
+        }
+        // A step under the option, a prompt without it, and the draft head's
+        // resident bank keep the weight-only stages.
+        for (device, layer) in [
+            (base, target),
+            (
+                Device {
+                    prefill_activations: matmul::PrefillActivations::A16,
+                    ..prompt
+                },
+                target,
+            ),
+            (prompt, LayerRef::draft()),
+        ] {
+            assert!(!lowp_routed(&desc, layer, device));
+            let plan = affine_experts(&shape, &desc, layer, 64, device).expect("plans");
+            assert!(
+                entries(&plan).iter().all(|e| !e.contains("_a4_")),
+                "{:?}",
+                entries(&plan)
+            );
+        }
+    }
+
+    #[test]
+    fn the_w4a4_quantized_rows_fit_the_buffers_they_borrow() {
+        let shape = sparse_shape();
+        for rows in [1u32, 64, 2_048, crate::sparse::MAX_PREFILL_CHUNK] {
+            let columns = shape.moe.slot_rows(rows);
+            assert!(
+                nvfp4_a4_bytes(u64::from(rows), shape.hidden)
+                    <= Buf::MoeGate.bytes(&shape, rows, 1, 0)
+            );
+            assert!(
+                nvfp4_a4_bytes(columns, shape.moe.intermediate)
+                    <= Buf::MoeUp.bytes(&shape, rows, 1, 0)
+            );
+        }
+    }
 
     #[test]
     fn segments_carry_up_to_sixty_four_runs_of_any_width() {

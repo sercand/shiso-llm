@@ -3,7 +3,11 @@
 //! The trellis moves, checked on payloads whose every word names where it was
 //! stored, so a word in the wrong place is visible as a wrong label.
 
-use super::{Move, Trellis, assemble, stack};
+use std::collections::HashMap;
+
+use shiso_modelfile::st_header::RawTensor;
+
+use super::{Move, NGRAM_ROW_WORDS, TableRows, Trellis, assemble, stack, table_rows};
 
 /// Bits per weight of the fixtures: the narrowest the kernels decode.
 const BITS: usize = 4;
@@ -174,4 +178,100 @@ fn a_bank_stacks_each_region_across_experts() {
 
     let narrow = labelled(k, 256);
     assert!(stack(&[trellis(k, n, &a), trellis(k, 256, &narrow)]).is_err());
+}
+
+/// The n-gram tensors' prefix in the table file.
+const NGRAM: &str = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
+/// Bytes in one stored n-gram row.
+const ROW_BYTES: u64 = NGRAM_ROW_WORDS * 2;
+
+/// A header entry of `rows` table rows stored from byte `start`.
+fn rows_at(start: u64, rows: u64) -> RawTensor {
+    RawTensor {
+        dtype: "I16".to_string(),
+        shape: vec![rows, NGRAM_ROW_WORDS],
+        data_offsets: [start, start + rows * ROW_BYTES],
+    }
+}
+
+/// A table file's header: the given table tensors after a small tensor that
+/// stands in for the bias, which the row lookup must ignore.
+fn header(table: Vec<(String, RawTensor)>) -> HashMap<String, RawTensor> {
+    let mut map: HashMap<String, RawTensor> = table.into_iter().collect();
+    map.insert(
+        format!("{NGRAM}.head_bias"),
+        RawTensor {
+            dtype: "F16".to_string(),
+            shape: vec![16, 160],
+            data_offsets: [0, 5120],
+        },
+    );
+    map
+}
+
+/// Shards `0..count` of `rows` rows each, stored back to back from byte
+/// 5120, in index order.
+fn shards(count: u64, rows: u64) -> Vec<(String, RawTensor)> {
+    (0..count)
+        .map(|i| {
+            (
+                format!("{NGRAM}.shard_{i}.trellis"),
+                rows_at(5120 + i * rows * ROW_BYTES, rows),
+            )
+        })
+        .collect()
+}
+
+/// The single-tensor table is found as before.
+#[test]
+fn a_single_table_tensor_is_its_own_range() {
+    let map = header(vec![(format!("{NGRAM}.trellis"), rows_at(5120, 1000))]);
+    assert_eq!(
+        table_rows(&map).expect("single table"),
+        TableRows {
+            start: 5120,
+            rows: 1000
+        }
+    );
+}
+
+/// Shards stored back to back are one range from the first shard's start,
+/// whatever order the header lists them in, and past shard 9 (a name order
+/// would put `shard_10` before `shard_2`).
+#[test]
+fn contiguous_shards_join_into_one_range() {
+    let mut parts = shards(12, 7);
+    parts.reverse();
+    let map = header(parts);
+    assert_eq!(
+        table_rows(&map).expect("joined"),
+        TableRows {
+            start: 5120,
+            rows: 84
+        }
+    );
+}
+
+/// A gap between two shards, a missing index, a second layout beside the
+/// shards, or a shard of another width is refused: joining any of them would
+/// read rows from the wrong bytes.
+#[test]
+fn shards_that_are_not_one_range_are_refused() {
+    let mut gap = shards(3, 7);
+    gap[2].1 = rows_at(gap[2].1.data_offsets[0] + 2, 7);
+    assert!(table_rows(&header(gap)).is_err());
+
+    let mut missing = shards(3, 7);
+    missing.remove(1);
+    assert!(table_rows(&header(missing)).is_err());
+
+    let mut both = shards(2, 7);
+    both.push((format!("{NGRAM}.trellis"), rows_at(5120, 14)));
+    assert!(table_rows(&header(both)).is_err());
+
+    let mut wide = shards(2, 7);
+    wide[1].1.shape = vec![7, NGRAM_ROW_WORDS + 1];
+    assert!(table_rows(&header(wide)).is_err());
+
+    assert!(table_rows(&header(Vec::new())).is_err());
 }

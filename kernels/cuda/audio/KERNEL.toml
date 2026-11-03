@@ -1,7 +1,7 @@
 # The audio encoders' kernel set: the CUDA twin of
-# `crates/shiso-metal/metal/audio`, one entry per Metal entry, under the same
+# `kernels/metal/audio`, one entry per Metal entry, under the same
 # names, argument blocks and buffer orders (the launch contract is
-# `crates/shiso-metal/metal/audio/KERNELS.md`). One translation unit, because
+# `kernels/metal/audio/KERNELS.md`). One translation unit, because
 # every entry is dispatched under the one module name `audio`.
 #
 # `--use_fast_math` is dropped, as for the vision set: the layer norm takes its

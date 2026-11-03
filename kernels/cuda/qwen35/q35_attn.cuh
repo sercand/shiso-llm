@@ -1,7 +1,7 @@
 /* Gated attention: the causal GQA pair over the paged f16 cache, and the gate
  * its output takes before the output projection.
  *
- * The CUDA twins of `crates/shiso-metal/metal/qwen35/gated_attn.metal` and
+ * The CUDA twins of `kernels/metal/qwen35/gated_attn.metal` and
  * `gated_attn_prefill.metal`, over the laws `kernels/cuda/q4e/qsa.cu` carries
  * as `q4e_qsa_attention_kernel`, `q4e_qsa_attention_tiled_kernel` and
  * `q4e_qsa_gate_kernel`.

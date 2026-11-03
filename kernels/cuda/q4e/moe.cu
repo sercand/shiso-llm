@@ -3,6 +3,7 @@
  * Deltas against the source, and nothing else: D1 (extern "C" linkage on the non-template kernels), D2 (explicit template instantiations),
  * D3 (external linkage on the template kernels: an explicit instantiation of a `static` template is emitted as a non-`.visible` entry the driver cannot resolve).
  * D4 (shiso): q4e_moe_route_sort_small_kernel, a new kernel that computes what q4e_moe_route_kernel and the sort kernels do, bit for bit.
+ * D5 (shiso): q4e_moe_route_sort_tiny_kernel, the same results again for passes of at most eight tokens, at a shorter serial chain.
  * No line of kernel arithmetic was edited, reordered or
  * reformatted; a change to any of it is a defect, not a cleanup.
  */
@@ -246,6 +247,208 @@ q4e_moe_route_sort_small_kernel(
         const int32_t at = s_bounds[e] + rank;
         sorted[at] = (int32_t)i;
         pos[i] = at;
+    }
+}
+
+/* q4e_moe_route_sort_small_kernel's results for a pass of at most
+ * Q4E_ROUTE_TINY_TOKENS tokens, at a quarter of its latency (shiso).
+ *
+ * The small kernel measured 14.3 us on a GB10 at one token as at five: one
+ * warp's serial chain - ten argmax rounds of a sixteen-long compare chain and
+ * a five-step shuffle fold each, a lane-0 loop of ten exponentials and
+ * divisions, and a one-warp scan walking sixteen experts a lane - with 31
+ * warps waiting at the barriers. The same arithmetic, rearranged so the
+ * chain is short:
+ *   - a lane's best of its sixteen logits is a four-level tree, and the
+ *     warp's best is two warp reductions (the largest value, then the lowest
+ *     expert holding it) instead of a ten-shuffle fold: the same total order
+ *     (value, then the lower id), so the same expert every round for finite
+ *     logits;
+ *   - the max and the softmax sum are the small kernel's lines, so the same
+ *     bits;
+ *   - each chosen weight's exponential is taken by its own lane and lane 0
+ *     adds them in slot order, then each lane divides its own: the small
+ *     kernel's serial loop, operation for operation;
+ *   - the sort is a block-wide scan over two experts a thread (bounds and the
+ *     active list in one packed prefix sum), and a column's rank inside its
+ *     expert is a ballot over the columns before it.
+ * 256 threads; n_expert a multiple of 32 and at most Q4E_ROUTE_SORT_EXPERTS;
+ * n_used at most 16. */
+#define Q4E_ROUTE_TINY_TOKENS 8u
+#define Q4E_ROUTE_TINY_THREADS 256u
+
+/* The orderable unsigned key of a float: larger floats, larger keys; the two
+ * zeros one key (they compare equal, so a tie goes to the lower expert) and
+ * a NaN the lowest (no comparison selects one). */
+__device__ __forceinline__ uint32_t q4e_route_key(float v) {
+    if (v != v) return 0u;
+    const uint32_t b = v == 0.0f ? 0u : __float_as_uint(v);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+extern "C" __global__ void __launch_bounds__(Q4E_ROUTE_TINY_THREADS)
+q4e_moe_route_sort_tiny_kernel(
+        int32_t *ids, float *weights, const float *logits,
+        int32_t *bounds, int32_t *active, int32_t *sorted, int32_t *pos,
+        uint32_t n_tok, uint32_t n_expert, uint32_t n_used) {
+    __shared__ int32_t s_ids[Q4E_ROUTE_TINY_TOKENS * 16u];
+    __shared__ int32_t s_counts[Q4E_ROUTE_SORT_EXPERTS];
+    __shared__ int32_t s_bounds[Q4E_ROUTE_SORT_EXPERTS];
+    __shared__ uint32_t s_warp[Q4E_ROUTE_TINY_THREADS / 32u];
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5u;
+    constexpr uint32_t PER = Q4E_ROUTE_SORT_EXPERTS / 32u;
+
+    for (uint32_t e = threadIdx.x; e < Q4E_ROUTE_SORT_EXPERTS; e += blockDim.x) s_counts[e] = 0;
+
+    if (warp < n_tok) {
+        const float *row = logits + (uint64_t)warp * n_expert;
+        float v[PER];
+        float m = -INFINITY;
+#pragma unroll
+        for (uint32_t j = 0; j < PER; j++) {
+            const uint32_t e = lane + 32u * j;
+            v[j] = e < n_expert ? row[e] : -INFINITY;
+            if (e < n_expert) m = fmaxf(m, v[j]);
+        }
+        m = warp_max_f32(m);
+        const float s_max = __shfl_sync(0xffffffffu, m, 0);
+        /* q4e_moe_route_sort_small_kernel's sum, line for line. */
+        float warp_total = 0.0f;
+#pragma unroll
+        for (uint32_t vw = 0; vw < Q4E_ROUTE_BLOCK / 32u; vw++) {
+            float sum = 0.0f;
+#pragma unroll
+            for (uint32_t k = 0; k < PER / (Q4E_ROUTE_BLOCK / 32u); k++) {
+                const uint32_t j = vw + (Q4E_ROUTE_BLOCK / 32u) * k;
+                if (lane + 32u * j < n_expert) sum += __expf(v[j] - s_max);
+            }
+            sum = warp_sum_f32(sum);
+            const float s_w = __shfl_sync(0xffffffffu, sum, 0);
+            if (lane == vw) warp_total = s_w;
+        }
+        warp_total = warp_sum_f32(warp_total);
+        const float inv_sum = 1.0f / __shfl_sync(0xffffffffu, warp_total, 0);
+
+        /* Slot `s` of this token ends up in lane `s`. */
+        float my_w = 0.0f;
+        int32_t my_i = -1;
+#pragma unroll 1
+        for (uint32_t s = 0; s < 16u; s++) {
+            if (s >= n_used) break;
+            /* The lane's best: a tree over its sixteen, the larger value or
+             * at a tie the lower register (the lower expert). */
+            float bv[PER];
+            uint32_t bj[PER];
+#pragma unroll
+            for (uint32_t j = 0; j < PER; j++) {
+                bv[j] = (lane + 32u * j < n_expert) ? v[j] : -INFINITY;
+                bj[j] = j;
+            }
+            /* One level a constant width apart, so every index is a literal
+             * after unrolling and the arrays stay in registers. */
+#define Q4E_ROUTE_TREE_LEVEL(W)                                                    \
+    _Pragma("unroll") for (uint32_t j = 0; j < (W); j++) {                         \
+        const bool take = bv[j + (W)] > bv[j]                                      \
+                       || (bv[j + (W)] == bv[j] && bj[j + (W)] < bj[j]);           \
+        bv[j] = take ? bv[j + (W)] : bv[j];                                        \
+        bj[j] = take ? bj[j + (W)] : bj[j];                                        \
+    }
+            static_assert(PER == 16u, "the tree below is four levels");
+            Q4E_ROUTE_TREE_LEVEL(8u)
+            Q4E_ROUTE_TREE_LEVEL(4u)
+            Q4E_ROUTE_TREE_LEVEL(2u)
+            Q4E_ROUTE_TREE_LEVEL(1u)
+#undef Q4E_ROUTE_TREE_LEVEL
+            const uint32_t key = q4e_route_key(bv[0]);
+            const uint32_t top_key = __reduce_max_sync(0xffffffffu, key);
+            const uint32_t mine = lane + 32u * bj[0];
+            const uint32_t top_e = __reduce_min_sync(0xffffffffu, key == top_key ? mine : 0xffffffffu);
+            const float top = __shfl_sync(0xffffffffu, bv[0], top_e & 31u);
+            if (lane == s) {
+                my_w = top;
+                my_i = (int32_t)top_e;
+            }
+            /* A select on every register rather than a guarded store: the
+             * guarded form is folded back into one store at a run-time
+             * index, which puts the whole array in local memory. */
+#pragma unroll
+            for (uint32_t j = 0; j < PER; j++) {
+                v[j] = top_e == lane + 32u * j ? -INFINITY : v[j];
+            }
+        }
+        /* The small kernel's lane-0 loop: each weight's exponential, their
+         * sum in slot order, the clamp, the division. */
+        const float e_w = lane < n_used ? __expf(my_w - s_max) * inv_sum : 0.0f;
+        float wsum = 0.0f;
+#pragma unroll
+        for (uint32_t s = 0; s < 16u; s++) {
+            if (s >= n_used) break;
+            wsum += __shfl_sync(0xffffffffu, e_w, s);
+        }
+        wsum = fmaxf(wsum, 1e-20f);
+        if (lane < n_used) {
+            ids[(uint64_t)warp * n_used + lane] = my_i;
+            weights[(uint64_t)warp * n_used + lane] = e_w / wsum;
+            s_ids[warp * n_used + lane] = my_i;
+        }
+    }
+    __syncthreads();
+
+    const uint32_t n_rows = n_tok * n_used;
+    for (uint32_t i = threadIdx.x; i < n_rows; i += blockDim.x) {
+        const int32_t e = s_ids[i];
+        if (e >= 0 && (uint32_t)e < n_expert) atomicAdd(&s_counts[e], 1);
+    }
+    __syncthreads();
+    /* Bounds and the active list: an exclusive scan of (columns, live) over
+     * the experts, two a thread, packed into one word (both at most 128). */
+    const uint32_t e0 = 2u * threadIdx.x;
+    const int32_t c0 = e0 < n_expert ? s_counts[e0] : 0;
+    const int32_t c1 = e0 + 1u < n_expert ? s_counts[e0 + 1u] : 0;
+    const uint32_t mine = ((uint32_t)(c0 + c1) << 16) | (uint32_t)((c0 > 0) + (c1 > 0));
+    uint32_t incl = mine;
+#pragma unroll
+    for (uint32_t d = 1; d < 32u; d <<= 1) {
+        const uint32_t o = __shfl_up_sync(0xffffffffu, incl, d);
+        if (lane >= d) incl += o;
+    }
+    if (lane == 31u) s_warp[warp] = incl;
+    __syncthreads();
+    uint32_t base = 0;
+    for (uint32_t w = 0; w < warp; w++) base += s_warp[w];
+    const uint32_t excl = base + incl - mine;
+    const int32_t at_rows = (int32_t)(excl >> 16);
+    int32_t at_live = (int32_t)(excl & 0xFFFFu);
+    if (e0 < n_expert) {
+        bounds[e0] = at_rows;
+        s_bounds[e0] = at_rows;
+        if (c0 > 0) active[at_live++] = (int32_t)e0;
+    }
+    if (e0 + 1u < n_expert) {
+        bounds[e0 + 1u] = at_rows + c0;
+        s_bounds[e0 + 1u] = at_rows + c0;
+        if (c1 > 0) active[at_live] = (int32_t)(e0 + 1u);
+    }
+    if (threadIdx.x == blockDim.x - 1u) {
+        const uint32_t total = base + incl;
+        bounds[n_expert] = (int32_t)(total >> 16);
+        active[n_expert] = (int32_t)(total & 0xFFFFu);
+    }
+    __syncthreads();
+    /* A column's place: its expert's first slot plus the columns before it
+     * that chose the same expert, counted a warp at a time. */
+    for (uint32_t i = warp; i < n_rows; i += blockDim.x / 32u) {
+        const int32_t e = s_ids[i];
+        int32_t rank = 0;
+        for (uint32_t j0 = 0; j0 < i; j0 += 32u) {
+            const uint32_t j = j0 + lane;
+            rank += __popc(__ballot_sync(0xffffffffu, j < i && s_ids[j] == e));
+        }
+        if (lane == 0u && e >= 0 && (uint32_t)e < n_expert) {
+            const int32_t at = s_bounds[e] + rank;
+            sorted[at] = (int32_t)i;
+            pos[i] = at;
+        }
     }
 }
 

@@ -1,5 +1,5 @@
 /* The ternary set's argument blocks, mirrored from
- * `crates/shiso-metal/metal/ternary/ternary_common.h` and packed by
+ * `kernels/metal/ternary/ternary_common.h` and packed by
  * `crates/shiso-engine/src/launch.rs`. */
 #ifndef SHISO_TERNARY_COMMON_CUH
 #define SHISO_TERNARY_COMMON_CUH

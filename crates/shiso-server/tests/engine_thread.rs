@@ -247,3 +247,84 @@ async fn a_request_to_a_dead_engine_is_reported_and_not_awaited_forever() {
         .expect("the engine thread does not panic")
         .expect("the loop exits cleanly");
 }
+
+/// Runs one request to its end on an engine whose decode steps hand out
+/// device picks `offset` places past their scripted ids, and returns the ids
+/// the caller was given.
+async fn picked_ids(
+    script: Vec<u32>,
+    offset: u32,
+    sampling: SamplingParams,
+    cfg: shiso_server::scheduler::SchedulerConfig,
+) -> Vec<u32> {
+    let (engine, join, _audit) = common::picked_engine(script, offset, cfg);
+    let request = GenerateRequest::new(Arc::from(vec![TokenId::new(1)]), sampling, Seed::new(7), 4);
+    let mut stream = engine
+        .generate(request)
+        .await
+        .expect("the engine accepts the request");
+    let mut builder = ResponseBuilder::new();
+    while let Some(event) = stream.next().await {
+        builder
+            .accept(event)
+            .expect("every event belongs to the turn");
+    }
+    let response = builder.finish().expect("the turn is complete");
+    drop(engine);
+    join.join()
+        .expect("the engine thread does not panic")
+        .expect("the loop exits cleanly");
+    response.token_ids
+}
+
+/// A greedy sequence's decode steps take the token the device picked, read
+/// in four bytes, rather than reading the row back and scanning it. The fake
+/// hands out picks one past each row's scripted spike, so which of the two a
+/// token came from is visible: the first token is the prompt's row (a prompt
+/// hands out no pick), every later one the pick. With honest picks the turn
+/// is the turn the rows alone produce.
+#[tokio::test]
+async fn a_greedy_step_takes_the_devices_pick_and_an_honest_pick_changes_nothing() {
+    let script = vec![10, 11, 12, 13, 14];
+    let cfg = shiso_server::scheduler::SchedulerConfig::new();
+    assert_eq!(
+        picked_ids(script.clone(), 1, argmax(), cfg.clone()).await,
+        vec![10, 12, 13, 14],
+        "a greedy step drew from its row rather than the device's pick"
+    );
+    assert_eq!(
+        picked_ids(script, 0, argmax(), cfg).await,
+        vec![10, 11, 12, 13]
+    );
+}
+
+/// A pick stands for the argmax only. A sampled sequence draws from its row
+/// whatever the device picked, and so does a greedy one whose pick it
+/// suppresses - its own argmax is then some other id, which only the row
+/// knows.
+#[tokio::test]
+async fn a_sampled_step_and_a_suppressed_pick_both_read_the_row() {
+    let script = vec![10, 11, 12, 13, 14];
+    let sampled = SamplingParams {
+        temperature: 1.0,
+        top_k: std::num::NonZeroU32::new(1),
+        ..SamplingParams::neutral()
+    };
+    let cfg = shiso_server::scheduler::SchedulerConfig::new();
+    assert_eq!(
+        picked_ids(script.clone(), 1, sampled, cfg.clone()).await,
+        vec![10, 11, 12, 13],
+        "a sampled step took the device's pick"
+    );
+    let suppressing = shiso_server::scheduler::SchedulerConfig {
+        suppressed: Arc::from([TokenId::new(12)]),
+        ..cfg
+    };
+    // The first decode step's pick (12) is suppressed, so that step reads its
+    // row (11); the picks after it (13, 14) are not, and are taken.
+    assert_eq!(
+        picked_ids(script, 1, argmax(), suppressing).await,
+        vec![10, 11, 13, 14],
+        "a suppressed pick was taken"
+    );
+}

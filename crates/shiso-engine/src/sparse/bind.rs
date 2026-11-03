@@ -41,10 +41,11 @@ use crate::sparse::weights::{SparseWeights, WeightPart};
 
 /// Arguments one launch may carry.
 ///
-/// The widest kernel in this set declares eighteen parameters; the bound is
-/// above that with room, and an argument list that reaches it is refused rather
-/// than truncated.
-pub const MAX_ARGS: usize = 24;
+/// The widest kernel in this set declares twenty-seven parameters (the fused
+/// route launch, `moe::fused_route`, which takes every buffer and weight of
+/// the seven launches it replaces); the bound is above that with room, and an
+/// argument list that reaches it is refused rather than truncated.
+pub const MAX_ARGS: usize = 32;
 
 /// Rows one binder may hold a session for.
 ///
@@ -362,6 +363,22 @@ pub enum Operand {
         /// Which plane.
         plane: Plane,
     },
+    /// One attention rank's raw indexer key ring, of the pass's one session.
+    ///
+    /// Session state rather than a cache plane: the raw keys of the block a
+    /// session's frontier stands inside belong to that session alone, so a
+    /// binder holding a batch refuses this for the reason it refuses
+    /// [`Operand::Pages`].
+    IndexerRing(u32),
+    /// One attention rank's raw indexer key ring, of one row's session: what a
+    /// per-row pooled pass binds inside a batched or segmented pass, in the
+    /// way [`Operand::PagesOf`] names one row's page table.
+    IndexerRingOf {
+        /// The attention rank.
+        rank: u32,
+        /// The row, which is the binder's row.
+        row: u32,
+    },
     /// One recurrent slot's convolution window.
     RecurrentConv(u32),
     /// One recurrent slot's state matrix.
@@ -522,6 +539,8 @@ impl Operand {
                 | Self::RecurrentStateCkpts(_)
                 | Self::NgramWindows
                 | Self::CachePlane { .. }
+                | Self::IndexerRing(_)
+                | Self::IndexerRingOf { .. }
                 | Self::RecurrentConv(_)
                 | Self::RecurrentState(_)
                 | Self::RecurrentConvCkpt(_)
@@ -932,6 +951,10 @@ impl<'a> Binder<'a> {
             Operand::CachePlane { rank, plane } => {
                 KernelArg::Buffer(self.cache.plane(rank, plane)?)
             }
+            Operand::IndexerRing(rank) => KernelArg::Buffer(self.only()?.indexer_ring(rank)?),
+            Operand::IndexerRingOf { rank, row } => {
+                KernelArg::Buffer(self.row(row)?.indexer_ring(rank)?)
+            }
             Operand::RecurrentConv(slot) => KernelArg::Buffer(self.only()?.recurrent(slot)?.0),
             Operand::RecurrentState(slot) => KernelArg::Buffer(self.only()?.recurrent(slot)?.1),
             Operand::RecurrentConvOf { slot, run } => {
@@ -1131,6 +1154,21 @@ impl<'a> Binder<'a> {
                 backend: "engine",
             })
         };
+        // The draft head's own collapsing mix answers to the same three roles
+        // the target's does, and those roles are model-wide: so the set is
+        // read *before* the model-wide table. Read after it, the head's
+        // collapse bound the target's final mix - tensors of exactly the right
+        // shapes, every launch succeeding, and a collapsed row 0.2-0.9 off in
+        // relative L2 that still picked the reference's top token most of the
+        // time, which is what made it look like rounding.
+        if reference.layer.set == WeightSet::Draft {
+            match reference.role {
+                Role::OutputMixNorm => return vector(&head()?.output_mix.norm),
+                Role::OutputMixDown => return head()?.output_mix.down.part(part),
+                Role::OutputMixUp => return head()?.output_mix.up.part(part),
+                _ => {}
+            }
+        }
         if reference.role.is_model_wide() {
             return match reference.role {
                 Role::TokenEmbd => self.weights.token_embd.part(part),
@@ -1153,16 +1191,8 @@ impl<'a> Binder<'a> {
                     .part(part),
             };
         }
-        // The draft head's own mix is model-wide *to the head*, so it answers
-        // to the same three roles the target's collapsing mix does - which is
-        // why the set is read before the role and not after it.
         if reference.layer.set == WeightSet::Draft {
-            return match reference.role {
-                Role::OutputMixNorm => vector(&head()?.output_mix.norm),
-                Role::OutputMixDown => head()?.output_mix.down.part(part),
-                Role::OutputMixUp => head()?.output_mix.up.part(part),
-                _ => Self::layer_weight(&head()?.layer, reference, part),
-            };
+            return Self::layer_weight(&head()?.layer, reference, part);
         }
         if let Some(stream) = self.stream
             && matches!(

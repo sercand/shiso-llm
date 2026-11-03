@@ -370,11 +370,14 @@ fn every_pooled_key_launch_of_a_batch_reaches_the_device_with_its_own_rows_page_
         .collect::<Vec<_>>();
     assert_ne!(want[0], want[1], "the two sessions share a page table");
 
-    let pooled = backend
+    let launches = backend
         .launches()
         .into_iter()
-        .filter(|launch| launch.entry == "q4e_idx_pool_kernel")
-        .map(|launch| match launch.args[4] {
+        .filter(|launch| launch.entry == "q4e_idx_ring_pool_kernel")
+        .collect::<Vec<_>>();
+    let pooled = launches
+        .iter()
+        .map(|launch| match launch.args[5] {
             fixture::Arg::Buffer(id, offset, _) => (id, offset),
             other => panic!("the pooled pass binds a page table: {other:?}"),
         })
@@ -388,6 +391,30 @@ fn every_pooled_key_launch_of_a_batch_reaches_the_device_with_its_own_rows_page_
     for pair in pooled.as_chunks::<2>().0 {
         assert_eq!(pair[0], want[0]);
         assert_eq!(pair[1], want[1]);
+    }
+    // And each launch reaches its own row's raw key ring, at its own rank:
+    // a resolver that answered every row with the first session's ring would
+    // pool one sequence's block out of another's raw keys.
+    let rings = launches
+        .iter()
+        .map(|launch| match launch.args[1] {
+            fixture::Arg::Buffer(id, offset, _) => (id, offset),
+            other => panic!("the pooled pass binds a ring: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    for (slot, pair) in (0_u32..).zip(rings.as_chunks::<2>().0) {
+        for (row, got) in pair.iter().enumerate() {
+            let view = stack
+                .session(sessions[row])
+                .expect("a live session")
+                .indexer_ring(slot)
+                .expect("the ring has a section per attention rank");
+            assert_eq!(
+                *got,
+                (view.id().get(), view.offset()),
+                "slot {slot} row {row}"
+            );
+        }
     }
 }
 

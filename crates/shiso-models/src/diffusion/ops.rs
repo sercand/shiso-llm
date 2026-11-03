@@ -243,6 +243,8 @@ struct RopeHalfArgs {
     tokens: u32,
     heads: u32,
     head_dim: u32,
+    pinned_from: u32,
+    pinned_pos: u32,
 }
 
 #[repr(C)]
@@ -271,6 +273,7 @@ struct GqaArgs {
     q_heads: u32,
     kv_heads: u32,
     head_dim: u32,
+    valid_keys: u32,
 }
 
 #[repr(C)]
@@ -343,9 +346,9 @@ const _: () = assert!(size_of::<QkNormRopeArgs>() == 24);
 const _: () = assert!(size_of::<ConcatArgs>() == 12);
 const _: () = assert!(size_of::<GroupNormArgs>() == 24);
 const _: () = assert!(size_of::<Rope4dArgs>() == 28);
-const _: () = assert!(size_of::<RopeHalfArgs>() == 12);
+const _: () = assert!(size_of::<RopeHalfArgs>() == 20);
 const _: () = assert!(size_of::<SdpaArgs>() == 44);
-const _: () = assert!(size_of::<GqaArgs>() == 16);
+const _: () = assert!(size_of::<GqaArgs>() == 20);
 const _: () = assert!(size_of::<Conv2dArgs>() == 48);
 const _: () = assert!(size_of::<AxpyArgs>() == 8);
 const _: () = assert!(size_of::<GemmFusedArgs>() == 28);
@@ -365,11 +368,75 @@ pub(crate) enum WeightKind {
     /// natively: the codes are widened while the tile stages them and the
     /// row's scale multiplies the accumulator in the epilogue.
     Int8Row,
-    /// GGUF `Q4_K` blocks along each row, decoded while the tile stages
+    /// GGUF `Q2_K` blocks along each row, decoded while the tile stages
     /// them; the reduction length must be a multiple of 256.
+    Q2K,
+    /// GGUF `Q3_K` blocks, as [`WeightKind::Q2K`].
+    Q3K,
+    /// GGUF `Q4_K` blocks, as [`WeightKind::Q2K`].
     Q4K,
-    /// GGUF `Q6_K` blocks, as [`WeightKind::Q4K`].
+    /// GGUF `Q5_K` blocks, as [`WeightKind::Q2K`].
+    Q5K,
+    /// GGUF `Q6_K` blocks, as [`WeightKind::Q2K`].
     Q6K,
+    /// GGUF `Q8_0` blocks, as [`WeightKind::Q2K`] but 32 weights wide: the
+    /// reduction length must be a multiple of 32.
+    Q8_0,
+}
+
+impl WeightKind {
+    /// The weights one stored block covers, which the reduction length of a
+    /// product against this kind must be a multiple of; `None` for the kinds
+    /// that are not stored in blocks.
+    pub(crate) const fn block_elems(self) -> Option<usize> {
+        match self {
+            Self::Q8_0 => Some(32),
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => Some(256),
+            Self::Bf16 | Self::Fp8 | Self::F32 | Self::Int8Row => None,
+        }
+    }
+}
+
+/// Refuses a reduction length `k` a block-stored weight cannot hold whole
+/// blocks of: a partial block would read its neighbour row's bytes.
+pub(crate) fn check_reduction(
+    step: &'static str,
+    kind: WeightKind,
+    k: usize,
+) -> Result<(), ImageGenError> {
+    match kind.block_elems() {
+        Some(block) if !k.is_multiple_of(block) => Err(ImageGenError::Backend(format!(
+            "{step}: a {kind:?} weight needs a reduction length that is a multiple of {block}, \
+             got {k}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The tiled GEMM entry for a block-stored kind: the plain one, or the fused
+/// residual one. `None` for a kind that is not stored in blocks.
+fn block_gemm_entry(kind: WeightKind, fused: bool) -> Option<&'static str> {
+    match (kind, fused) {
+        (WeightKind::Q2K, false) => Some("kernel_dit_gemm64_q2k"),
+        (WeightKind::Q3K, false) => Some("kernel_dit_gemm64_q3k"),
+        (WeightKind::Q4K, false) => Some("kernel_dit_gemm64_q4k"),
+        (WeightKind::Q5K, false) => Some("kernel_dit_gemm64_q5k"),
+        (WeightKind::Q6K, false) => Some("kernel_dit_gemm64_q6k"),
+        (WeightKind::Q8_0, false) => Some("kernel_dit_gemm64_q8_0"),
+        (WeightKind::Q2K, true) => Some("kernel_dit_gemm64_fused_q2k"),
+        (WeightKind::Q3K, true) => Some("kernel_dit_gemm64_fused_q3k"),
+        (WeightKind::Q4K, true) => Some("kernel_dit_gemm64_fused_q4k"),
+        (WeightKind::Q5K, true) => Some("kernel_dit_gemm64_fused_q5k"),
+        (WeightKind::Q6K, true) => Some("kernel_dit_gemm64_fused_q6k"),
+        (WeightKind::Q8_0, true) => Some("kernel_dit_gemm64_fused_q8_0"),
+        _ => None,
+    }
+}
+
+fn no_block_entry(step: &'static str, kind: WeightKind) -> ImageGenError {
+    ImageGenError::Backend(format!(
+        "{step}: {kind:?} is not a block-stored weight kind with a tiled GEMM entry"
+    ))
 }
 
 /// Everything a GEMM entry needs to know about the weight side of a product,
@@ -550,6 +617,25 @@ pub(crate) struct GqaCall<'a> {
     pub q_heads: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
+    /// Keys at or beyond this index are masked for every row; `tokens`
+    /// masks nothing (the plain causal answer). A padded prompt passes its
+    /// real length so the pad rows attend the real keys and no pad key.
+    pub valid_keys: usize,
+}
+
+/// One rotate-half rotation of a (tokens, heads, `head_dim`) tensor.
+pub(crate) struct RopeHalfCall<'a> {
+    pub step: &'static str,
+    pub tensor: DeviceView<'a>,
+    pub freqs: DeviceView<'a>,
+    pub tokens: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    /// Rows from this one on turn by `pinned_pos` instead of their own
+    /// index; `tokens` pins nothing.
+    pub pinned_from: usize,
+    /// The position the pinned rows turn by.
+    pub pinned_pos: u32,
 }
 
 /// One 2D convolution of the VAE decoder.
@@ -746,6 +832,9 @@ pub(crate) struct Ops {
     /// Released [`Scratch`] buffers by byte length, handed out again before
     /// the device is asked for fresh memory. See [`Ops::alloc_f32`].
     pool: Mutex<HashMap<u64, Vec<DeviceBuffer>>>,
+    /// Whether the module carries [`HALF_KV_KERNELS`], so [`Ops::sdpa`]
+    /// narrows K and V once instead of in every query tile.
+    half_kv: bool,
 }
 
 /// A pooled working buffer: derefs to the [`DeviceBuffer`] it holds and goes
@@ -783,12 +872,21 @@ impl Drop for Scratch<'_> {
     }
 }
 
+/// Speed-only entries [`Ops::sdpa`] uses when the module carries both: K
+/// and V narrowed to half once (`kernel_dit_kv_half_f32`), then the 128-wide
+/// bidirectional attention reading those rows. The values are the ones the
+/// f32 entry stages, so the output is the same bits either way; a module
+/// without them (the CUDA set today) keeps the f32 entry rather than being
+/// refused.
+pub(crate) const HALF_KV_KERNELS: [&str; 2] =
+    ["kernel_dit_kv_half_f32", "kernel_dit_flash_sdpa_d128_kvh"];
+
 /// Every diffusion kernel entry this driver launches: the module's full
 /// registration in `metal/diffusion/diffusion.metal`. [`Ops::new`] probes the device
 /// for all of them, so a build or device without the set is refused at load
 /// naming what is missing, and a launch can never fall back to a host twin
 /// unnoticed. A name launched here but absent from this list is a driver bug.
-const REQUIRED_KERNELS: &[&str] = &[
+pub(crate) const REQUIRED_KERNELS: &[&str] = &[
     "kernel_dit_silu_f32",
     "kernel_dit_swiglu_f32",
     "kernel_dit_swiglu2_f32",
@@ -835,6 +933,14 @@ const REQUIRED_KERNELS: &[&str] = &[
     "kernel_dit_gemm64_q6k",
     "kernel_dit_gemm64_fused_q4k",
     "kernel_dit_gemm64_fused_q6k",
+    "kernel_dit_gemm64_q2k",
+    "kernel_dit_gemm64_q3k",
+    "kernel_dit_gemm64_q5k",
+    "kernel_dit_gemm64_q8_0",
+    "kernel_dit_gemm64_fused_q2k",
+    "kernel_dit_gemm64_fused_q3k",
+    "kernel_dit_gemm64_fused_q5k",
+    "kernel_dit_gemm64_fused_q8_0",
     "kernel_dit_hadamard256_f32",
     "kernel_dit_channel_rms_inv_f32",
     "kernel_dit_conv2d_rms_gemm_f32",
@@ -871,6 +977,11 @@ impl Ops {
                 missing.join(", ")
             )));
         }
+        let half_kv = HALF_KV_KERNELS.iter().all(|entry| {
+            backend
+                .max_block_threads(KernelRef::new(MODULE, entry))
+                .is_some()
+        });
         let dummy = alloc(backend, 4).map_err(|e| ImageGenError::Backend(e.to_string()))?;
         backend
             .fill_zero(dummy.view())
@@ -879,6 +990,7 @@ impl Ops {
             backend: Arc::clone(backend),
             dummy,
             pool: Mutex::default(),
+            half_kv,
         })
     }
 
@@ -896,6 +1008,7 @@ impl Ops {
             backend: Arc::clone(backend),
             dummy,
             pool: Mutex::default(),
+            half_kv: false,
         })
     }
 
@@ -1308,20 +1421,21 @@ impl Ops {
         // The simdgroup tile stages whole 16-wide k slices; every linear in
         // the family qualifies, and the scalar kernels keep any other shape.
         let tiled = call.k.is_multiple_of(G64_K);
+        check_reduction(call.step, lw.kind, call.k)?;
         let entry = match (lw.kind, tiled) {
             (WeightKind::Fp8, true) => "kernel_dit_gemm64_fp8",
             (WeightKind::Bf16, true) => "kernel_dit_gemm64_bf16",
             (WeightKind::F32, true) => "kernel_dit_gemm64_f32",
             (WeightKind::Int8Row, true) => "kernel_dit_gemm64_i8",
-            (WeightKind::Q4K, true) => "kernel_dit_gemm64_q4k",
-            (WeightKind::Q6K, true) => "kernel_dit_gemm64_q6k",
-            (WeightKind::Q4K | WeightKind::Q6K, false) => {
-                return Err(ImageGenError::Backend(format!(
-                    "{}: a k-quant weight needs a reduction length that is a multiple of 256, \
-                     got {}",
-                    call.step, call.k
-                )));
-            }
+            (
+                kind @ (WeightKind::Q2K
+                | WeightKind::Q3K
+                | WeightKind::Q4K
+                | WeightKind::Q5K
+                | WeightKind::Q6K
+                | WeightKind::Q8_0),
+                _,
+            ) => block_gemm_entry(kind, false).ok_or_else(|| no_block_entry(call.step, kind))?,
             (WeightKind::Fp8, false) => "kernel_dit_gemm_fp8",
             (WeightKind::Bf16, false) => "kernel_dit_gemm_bf16",
             (WeightKind::F32, false) => "kernel_dit_gemm_f32",
@@ -1420,13 +1534,20 @@ impl Ops {
             gu_offset: swiglu.map_or(0, |s| s.offset) as u32,
             has_bias: u32::from(lw.bias.is_some()),
         };
+        check_reduction(call.step, lw.kind, k)?;
         let entry = match lw.kind {
             WeightKind::Fp8 => "kernel_dit_gemm64_fused_fp8",
             WeightKind::Bf16 => "kernel_dit_gemm64_fused_bf16",
             WeightKind::F32 => "kernel_dit_gemm64_fused_f32",
             WeightKind::Int8Row => "kernel_dit_gemm64_fused_i8",
-            WeightKind::Q4K => "kernel_dit_gemm64_fused_q4k",
-            WeightKind::Q6K => "kernel_dit_gemm64_fused_q6k",
+            kind @ (WeightKind::Q2K
+            | WeightKind::Q3K
+            | WeightKind::Q4K
+            | WeightKind::Q5K
+            | WeightKind::Q6K
+            | WeightKind::Q8_0) => {
+                block_gemm_entry(kind, true).ok_or_else(|| no_block_entry(call.step, kind))?
+            }
         };
         self.launch(
             call.step,
@@ -1729,6 +1850,9 @@ impl Ops {
                 call.step, call.cache_tokens, call.head_dim
             )));
         }
+        if flash && !call.causal && call.head_dim == 128 && self.half_kv {
+            return self.sdpa_half_kv(call, &args, rows);
+        }
         let (entry, grid, block) = if flash {
             (
                 // The 128-wide entries fix the head width at compile time so
@@ -1768,6 +1892,64 @@ impl Ops {
                 KernelArg::Buffer(call.v_img),
                 KernelArg::Buffer(cache_k),
                 KernelArg::Buffer(cache_v),
+            ],
+        )
+    }
+
+    /// [`Ops::sdpa`] through [`HALF_KV_KERNELS`]: K and V (live and cached
+    /// rows) narrowed into packed half scratch, then the attention reading
+    /// them. Bit-identical to the f32 entry; measured on an M4 at a FLUX.3
+    /// single block (4176 rows, 24 heads of 128) 65 + ~1 ms against 77 ms.
+    fn sdpa_half_kv(
+        &self,
+        call: &SdpaCall<'_>,
+        args: &SdpaArgs,
+        rows: u32,
+    ) -> Result<(), ImageGenError> {
+        let width = call.heads * call.head_dim;
+        let all_rows = call.txt_tokens + call.img_tokens + call.cache_tokens;
+        // Halves, two per f32 slot; the width is a multiple of eight.
+        let k_half = self.alloc_f32(call.step, all_rows * width / 2)?;
+        let v_half = self.alloc_f32(call.step, all_rows * width / 2)?;
+        let (cache_k, cache_v) = if call.cache_tokens == 0 {
+            (self.dummy.view(), self.dummy.view())
+        } else {
+            (call.cache_k, call.cache_v)
+        };
+        self.launch(
+            call.step,
+            HALF_KV_KERNELS[0],
+            Extent3::new(grid_for((width / 4) as u32, BLOCK), all_rows as u32, 1),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(args)),
+                KernelArg::Buffer(k_half.view()),
+                KernelArg::Buffer(v_half.view()),
+                KernelArg::Buffer(call.k_txt),
+                KernelArg::Buffer(call.v_txt),
+                KernelArg::Buffer(call.k_img),
+                KernelArg::Buffer(call.v_img),
+                KernelArg::Buffer(cache_k),
+                KernelArg::Buffer(cache_v),
+            ],
+        )?;
+        self.launch(
+            call.step,
+            HALF_KV_KERNELS[1],
+            Extent3::new(grid_for(rows, FA_QROWS), call.heads as u32, 1),
+            Extent3::linear(FA_THREADS),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(args)),
+                KernelArg::Buffer(call.out_txt),
+                KernelArg::Buffer(call.out_img),
+                KernelArg::Buffer(call.q_txt),
+                KernelArg::Buffer(k_half.view()),
+                KernelArg::Buffer(v_half.view()),
+                KernelArg::Buffer(call.q_img),
+                KernelArg::Buffer(self.dummy.view()),
+                KernelArg::Buffer(self.dummy.view()),
+                KernelArg::Buffer(self.dummy.view()),
+                KernelArg::Buffer(self.dummy.view()),
             ],
         )
     }
@@ -1899,11 +2081,18 @@ impl Ops {
 
     /// Causal grouped-query attention (text encoder prefill).
     pub(crate) fn gqa(&self, call: &GqaCall<'_>) -> Result<(), ImageGenError> {
+        if call.valid_keys == 0 || call.valid_keys > call.tokens {
+            return Err(ImageGenError::Backend(format!(
+                "{}: valid_keys {} is outside 1..={} (a row with no key to attend has no answer)",
+                call.step, call.valid_keys, call.tokens
+            )));
+        }
         let args = GqaArgs {
             tokens: call.tokens as u32,
             q_heads: call.q_heads as u32,
             kv_heads: call.kv_heads as u32,
             head_dim: call.head_dim as u32,
+            valid_keys: call.valid_keys as u32,
         };
         self.launch(
             call.step,
@@ -1966,31 +2155,26 @@ impl Ops {
         Ok(())
     }
 
-    /// rotate-half 1-axis `RoPE` on one (tokens, heads, `head_dim`) tensor, with
-    /// the token index as the position.
-    pub(crate) fn rope_half(
-        &self,
-        step: &'static str,
-        tensor: DeviceView<'_>,
-        freqs: DeviceView<'_>,
-        tokens: usize,
-        heads: usize,
-        head_dim: usize,
-    ) -> Result<(), ImageGenError> {
+    /// Rotate-half 1-axis `RoPE` on one (tokens, heads, `head_dim`) tensor,
+    /// with the token index as the position, except that the rows from
+    /// `pinned_from` on turn by one fixed position (a padded prompt's pad rows).
+    pub(crate) fn rope_half(&self, call: &RopeHalfCall<'_>) -> Result<(), ImageGenError> {
         let args = RopeHalfArgs {
-            tokens: tokens as u32,
-            heads: heads as u32,
-            head_dim: head_dim as u32,
+            tokens: call.tokens as u32,
+            heads: call.heads as u32,
+            head_dim: call.head_dim as u32,
+            pinned_from: call.pinned_from.min(call.tokens) as u32,
+            pinned_pos: call.pinned_pos,
         };
         self.launch(
-            step,
+            call.step,
             "kernel_dit_rope_half",
-            Extent3::new(tokens as u32, heads as u32, 1),
+            Extent3::new(call.tokens as u32, call.heads as u32, 1),
             Extent3::linear(BLOCK),
             &[
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                KernelArg::Buffer(tensor),
-                KernelArg::Buffer(freqs),
+                KernelArg::Buffer(call.tensor),
+                KernelArg::Buffer(call.freqs),
             ],
         )
     }

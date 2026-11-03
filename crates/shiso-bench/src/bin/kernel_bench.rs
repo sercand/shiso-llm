@@ -5,6 +5,11 @@
 //! own GPU time with no batching around it. Compare two variants by
 //! registering both as cases and filtering on a shared prefix, or by running
 //! one case before and after an MSL edit with `SHISO_METAL_SOURCE_DIR`.
+//!
+//! `--backend cuda` runs the same cases on an NVIDIA device. That backend has
+//! no per-launch timer, so its numbers come from the host clock over batches
+//! of back-to-back launches ([`time_wall`]); pass `--peak-gbps 273` for a
+//! GB10.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,8 +18,9 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde_json::json;
 use shiso_core::Backend;
+use shiso_cuda::{CudaBackend, CudaOptions};
 use shiso_kerneltest::Gpu;
-use shiso_kerneltest::bench::{CASES, time};
+use shiso_kerneltest::bench::{CASES, time, time_wall};
 use shiso_metal::MetalBackend;
 
 /// CLI arguments.
@@ -43,6 +49,19 @@ struct Args {
     /// Writes every result as JSON here.
     #[arg(long)]
     json: Option<PathBuf>,
+    /// The device to time on: `metal` or `cuda`. Defaults to the one this
+    /// platform has.
+    #[arg(long, default_value = default_backend())]
+    backend: String,
+}
+
+/// The backend this platform has.
+const fn default_backend() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "cuda"
+    } else {
+        "metal"
+    }
 }
 
 fn main() -> Result<()> {
@@ -63,9 +82,20 @@ fn main() -> Result<()> {
     if args.reps == 0 {
         bail!("--reps must be greater than zero");
     }
-    let metal = MetalBackend::new().context("the Metal device")?;
-    let device: Arc<dyn Backend> = metal.clone();
-    let gpu = Gpu::new(device, Box::new(metal));
+    let gpu = match args.backend.as_str() {
+        "metal" => {
+            let metal = MetalBackend::new().context("the Metal device")?;
+            let device: Arc<dyn Backend> = metal.clone();
+            Gpu::new(device, Box::new(metal))
+        }
+        "cuda" => {
+            let cuda = CudaBackend::new(0, CudaOptions::default()).context("the CUDA device")?;
+            let device: Arc<dyn Backend> = cuda.clone();
+            Gpu::new(device, Box::new(cuda))
+        }
+        other => bail!("unknown backend {other:?}; metal or cuda"),
+    };
+    let profiled = gpu.device().as_profiler().is_some();
 
     out(&format!(
         "{:<34} {:>10} {:>10} {:>7} {:>8} {:>6} {:>8} {:>6}",
@@ -74,7 +104,12 @@ fn main() -> Result<()> {
     let mut rows = Vec::with_capacity(selected.len());
     for case in selected {
         let fixture = (case.build)(&gpu);
-        let stat = time(&gpu, &fixture, args.reps).with_context(|| case.name)?;
+        let stat = if profiled {
+            time(&gpu, &fixture, args.reps)
+        } else {
+            time_wall(&gpu, &fixture, args.reps)
+        }
+        .with_context(|| case.name)?;
         let gbps = stat.gb_per_s(fixture.bytes);
         let tflops = stat.tflops(fixture.flops);
         let flops_cols = if fixture.flops == 0 {
@@ -102,7 +137,10 @@ fn main() -> Result<()> {
         }));
     }
     if let Some(path) = args.json.as_deref() {
-        let device = shiso_metal::device_facts().map(|facts| facts.name);
+        let device = match args.backend.as_str() {
+            "metal" => shiso_metal::device_facts().map(|facts| facts.name),
+            _ => Some(args.backend.clone()),
+        };
         let body = json!({ "schema": 1, "device": device, "reps": args.reps, "cases": rows });
         std::fs::write(path, serde_json::to_string_pretty(&body)?)
             .with_context(|| format!("writing {}", path.display()))?;

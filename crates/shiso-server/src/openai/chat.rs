@@ -16,6 +16,7 @@
 //! parse instead of the server's actual complaint. Taking the bytes and parsing
 //! them here means every failure on this route is rendered by the one renderer.
 
+use crate::error::ErrorResponse as _;
 use std::sync::Arc;
 
 use axum::body::Bytes;

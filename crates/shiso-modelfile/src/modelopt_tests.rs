@@ -372,3 +372,41 @@ fn the_real_checkpoint_s_expert_geometry_is_what_the_router_will_index() {
         }
     );
 }
+
+/// One MXFP8 tensor of `[2, 64]` weights: 128 code bytes, 4 `ue8m0` scales.
+fn mxfp8_shard(scale_shape: &str, scale_bytes: usize) -> tempfile::TempDir {
+    let end = 128 + scale_bytes;
+    let header = format!(
+        r#"{{"__metadata__":{{"format":"pt"}},
+        "a.weight":{{"dtype":"F8_E4M3","shape":[2,64],"data_offsets":[0,128]}},
+        "a.weight_scale":{{"dtype":"U8","shape":{scale_shape},"data_offsets":[128,{end}]}}}}"#
+    );
+    let mut payload = vec![0x38_u8; 128];
+    payload.extend((0..scale_bytes).map(|i| 126 + u8::try_from(i).unwrap_or(0)));
+    checkpoint(&header, &payload)
+}
+
+#[test]
+fn an_e4m3_weight_beside_a_ue8m0_matrix_is_mxfp8_and_its_parts_come_back() {
+    let dir = mxfp8_shard("[2,2]", 4);
+    let file = ModeloptFile::open(dir.path(), &[]).expect("one mxfp8 tensor");
+    let tensor = file.get("a").expect("by base name");
+    assert_eq!(tensor.stored(), Stored::Mxfp8);
+    assert_eq!((tensor.rows(), tensor.cols()), (2, 64));
+    assert_eq!(file.census().mxfp8, 1);
+    let parts = file
+        .mxfp8_parts(tensor)
+        .expect("in bounds")
+        .expect("an mxfp8 tensor");
+    assert_eq!((parts.codes.len(), parts.scales.len()), (128, 4));
+    assert_eq!(parts.scales, &[126, 127, 128, 129]);
+    assert_eq!((parts.layout.rows, parts.layout.cols), (2, 64));
+    assert!(file.nvfp4_parts(tensor).expect("in bounds").is_none());
+}
+
+#[test]
+fn a_ue8m0_matrix_that_does_not_cover_the_row_in_groups_of_32_is_refused() {
+    let dir = mxfp8_shard("[2,3]", 6);
+    let err = ModeloptFile::open(dir.path(), &[]).expect_err("a scale group too many");
+    assert!(matches!(err, GgufError::LayoutMismatch { .. }), "{err:?}");
+}

@@ -45,14 +45,21 @@ use super::manifest::{
 };
 use super::mmproj::{self, MmprojTower};
 
-/// Formats the tower loader will move to a device.
+/// Formats the tower loader will move to a device as plain rows.
 ///
 /// A tower stored in a block-quantized format is a different loading problem
 /// rather than a bigger one - the bytes are not rows, and the kernels that read
-/// them are not the ones a float tower uses - so it is refused by name here
-/// rather than uploaded and discovered later. This is the one place to widen if
-/// such a tower ever ships.
+/// them are not the ones a float tower uses - so anything else is refused by
+/// name here rather than uploaded and discovered later, except the two
+/// formats in [`QUANTIZED`].
 const UPLOADABLE: &[DType] = &[DType::F32, DType::F16, DType::BF16];
+
+/// Formats a tower linear may be stored in and served as stored: the
+/// mixed-precision export's MXFP8 attention and NVFP4 feed-forward and merger
+/// weights. Each moves to the device as its codes and its group scales, and
+/// the encoder multiplies them with the projection kernel built for that
+/// format; nothing is decoded on the way.
+const QUANTIZED: &[DType] = &[DType::Mxfp8E4M3G32, DType::Nvfp4Gs16];
 
 /// The prefix a `modelopt` checkpoint writes its tower under.
 ///
@@ -123,6 +130,12 @@ pub struct TowerTensor {
     dtype: DType,
     elements: u64,
     buffer: shiso_core::DeviceBuffer,
+    /// The group scales of a weight in one of the [`QUANTIZED`] formats,
+    /// whose codes are `buffer`; `None` for a plain tensor.
+    scales: Option<shiso_core::DeviceBuffer>,
+    /// The tensor-wide scale an NVFP4 weight's group scales are relative to;
+    /// one for every other tensor.
+    global: f32,
 }
 
 impl TowerTensor {
@@ -150,10 +163,25 @@ impl TowerTensor {
         &self.buffer
     }
 
-    /// A view of the whole tensor.
+    /// A view of the whole tensor: its codes, for a quantized weight.
     #[must_use]
     pub fn view(&self) -> shiso_core::DeviceView<'_> {
         self.buffer.view()
+    }
+
+    /// The group scales of a weight stored as [`DType::Mxfp8E4M3G32`]
+    /// (`ue8m0`, one a 32 weights) or [`DType::Nvfp4Gs16`] (`e4m3`, one a 16),
+    /// `[rows, cols / group]` as the checkpoint stores them; `None` for a
+    /// plain tensor.
+    #[must_use]
+    pub fn scales(&self) -> Option<shiso_core::DeviceView<'_>> {
+        self.scales.as_ref().map(shiso_core::DeviceBuffer::view)
+    }
+
+    /// The tensor-wide scale of an NVFP4 weight; one for every other tensor.
+    #[must_use]
+    pub fn global(&self) -> f32 {
+        self.global
     }
 }
 
@@ -194,7 +222,16 @@ impl VisionWeights {
     /// Device bytes the tower occupies.
     #[must_use]
     pub fn device_bytes(&self) -> u64 {
-        self.tensors.iter().map(|tensor| tensor.buffer.len()).sum()
+        self.tensors
+            .iter()
+            .map(|tensor| {
+                tensor.buffer.len()
+                    + tensor
+                        .scales
+                        .as_ref()
+                        .map_or(0, shiso_core::DeviceBuffer::len)
+            })
+            .sum()
     }
 }
 
@@ -440,6 +477,9 @@ impl Tower {
                 expected: spec.shape().to_vec(),
             });
         };
+        if QUANTIZED.contains(&dtype) && rows == PatchRows::AsStored {
+            return self.upload_quantized(backend, spec, dtype);
+        }
         if !UPLOADABLE.contains(&dtype) {
             return Err(VisionError::TensorDType {
                 name: spec.name().to_owned(),
@@ -458,6 +498,50 @@ impl Tower {
         upload(backend, spec, dtype, &bytes)
     }
 
+    /// A weight in one of the [`QUANTIZED`] formats, moved as its codes and
+    /// its group scales, both as stored.
+    ///
+    /// Only the `modelopt` container describes a tensor so; every other one
+    /// is refused here rather than read as rows.
+    fn upload_quantized(
+        &self,
+        backend: &Arc<dyn Backend>,
+        spec: &TowerTensorSpec,
+        dtype: DType,
+    ) -> Result<TowerTensor, VisionError> {
+        let refuse = || VisionError::TensorDType {
+            name: spec.name().to_owned(),
+            dtype,
+        };
+        let Self::Modelopt { file, .. } = self else {
+            return Err(refuse());
+        };
+        let tensor = file
+            .get(spec.name())
+            .ok_or_else(|| VisionError::MissingTensor {
+                name: spec.name().to_owned(),
+            })?;
+        let fail = |source| VisionError::TowerContainer {
+            path: std::path::PathBuf::from(spec.name()),
+            source,
+        };
+        let (codes, scales, global) = match dtype {
+            DType::Mxfp8E4M3G32 => {
+                let parts = file.mxfp8_parts(tensor).map_err(fail)?.ok_or_else(refuse)?;
+                (parts.codes, parts.scales, 1.0)
+            }
+            DType::Nvfp4Gs16 => {
+                let parts = file.nvfp4_parts(tensor).map_err(fail)?.ok_or_else(refuse)?;
+                (parts.weights, parts.scales, parts.layout.global)
+            }
+            _ => return Err(refuse()),
+        };
+        let mut uploaded = upload(backend, spec, dtype, codes)?;
+        uploaded.scales = Some(upload(backend, spec, dtype, scales)?.buffer);
+        uploaded.global = global;
+        Ok(uploaded)
+    }
+
     /// Format and declared shape of one tensor, with the axis order they are
     /// written in.
     fn describe(&self, name: &str) -> Result<(DType, Vec<u64>, AxisOrder), VisionError> {
@@ -474,20 +558,31 @@ impl Tower {
                 let tensor = file.get(name).ok_or_else(|| VisionError::MissingTensor {
                     name: name.to_owned(),
                 })?;
-                // Every tensor of this tower is plain `BF16`; a quantized one
-                // would be a different loading problem rather than a bigger
-                // one, so it is refused by name here rather than decoded.
-                let Stored::Plain { dtype } = tensor.stored() else {
-                    return Err(VisionError::TensorDType {
+                match tensor.stored() {
+                    Stored::Plain { dtype } => Ok((
+                        st_dtype(name, dtype)?,
+                        tensor.declared().to_vec(),
+                        AxisOrder::SlowestFirst,
+                    )),
+                    // The mixed-precision export quantizes the tower's linears:
+                    // MXFP8 attention, NVFP4 MLP and merger. They are served
+                    // as stored ([`Self::upload_quantized`]) and described at
+                    // their logical shape.
+                    Stored::Mxfp8 => Ok((
+                        DType::Mxfp8E4M3G32,
+                        vec![tensor.rows(), tensor.cols()],
+                        AxisOrder::SlowestFirst,
+                    )),
+                    Stored::Nvfp4 { .. } => Ok((
+                        DType::Nvfp4Gs16,
+                        vec![tensor.rows(), tensor.cols()],
+                        AxisOrder::SlowestFirst,
+                    )),
+                    Stored::Fp8 { .. } => Err(VisionError::TensorDType {
                         name: name.to_owned(),
                         dtype: DType::F32,
-                    });
-                };
-                Ok((
-                    st_dtype(name, dtype)?,
-                    tensor.declared().to_vec(),
-                    AxisOrder::SlowestFirst,
-                ))
+                    }),
+                }
             }
             Self::Trellis(tower) => tower.describe(name),
             Self::Mmproj(tower) => tower.describe(name),
@@ -520,12 +615,13 @@ impl Tower {
                 let tensor = file.get(name).ok_or_else(|| VisionError::MissingTensor {
                     name: name.to_owned(),
                 })?;
-                file.weight_bytes(tensor)
-                    .map(Cow::Borrowed)
-                    .map_err(|source| VisionError::TowerContainer {
-                        path: std::path::PathBuf::from(name),
-                        source,
-                    })
+                let fail = |source| VisionError::TowerContainer {
+                    path: std::path::PathBuf::from(name),
+                    source,
+                };
+                // A quantized weight never reaches here: it moves as its
+                // parts, through `upload_quantized`.
+                file.weight_bytes(tensor).map(Cow::Borrowed).map_err(fail)
             }
             Self::Trellis(tower) => tower.bytes(name),
             Self::Mmproj(tower) => tower.bytes(name),
@@ -857,6 +953,8 @@ fn upload(
         dtype,
         elements: spec.elements(),
         buffer,
+        scales: None,
+        global: 1.0,
     })
 }
 
@@ -933,3 +1031,7 @@ fn check_contract(contract: &SidecarContract, dims: VisionDims) -> Result<(), Vi
 #[cfg(test)]
 #[path = "loader_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "quant_tests.rs"]
+mod quant_tests;

@@ -48,6 +48,11 @@ shape.
 - **Tensor-core chunked delta rule** (`gdn_tc.cu`)
   - WMMA prep kernel, then a scan with one block per head that holds the 128×128 state in accumulators.
   - 21.3 to 6.4 ms per layer. Relative L2 error stays within 5e-4.
+- **Fused prompt pair** (`gdn_fused.cu`): conv + norms + gates + prep in one kernel, scan + output gate in the other, bit-identical to the chain.
+  - 7.0 to 3.3 ms per layer at a 4096-row chunk. Every pass of the chain was already near bandwidth, so the win is bytes: ~1.5 GB to ~0.68 GB of DRAM traffic a layer.
+  - Bytes, not latency, decided it. Better pipelining alone (`cp.async`, warp-local products, staged refills) moved the scan only 2.3 to 2.1 ms; cutting what prep writes (T instead of w, f32 q/k once per key head instead of half q'/k' per value head, triangles packed) gave the rest.
+  - Holding the state transposed (S^T) in raw `mma.sync` accumulators makes it the A operand of every product: no shared-memory copy of the state, and still the WMMA bits.
+  - Small windows that keep prep's scratch in L2 sped the scan (2.06 to 1.49 ms), but a prep of a few runs is one under-filled wave and lost more than that. A per-value-head prep at two blocks per SM was slower too (3.3 ms): the recomputed q/k convolutions exposed L2 latency.
 - **Parallel conv** replaced a 3.9 ms-per-layer sequential walk (`recurrent.rs:~224`).
 - **One launch for all verify runs** (grid `(n_head_v, runs)`). One launch per run gave 32 blocks on 48 SMs and cost 10 ms per step (`gdn.cu:~284`).
 - **Roll back by replay** (113d169). Store the start state plus the per-row inputs instead of one state per drafted row: the slab shrank from depth × 113 MB to ~115 MB.

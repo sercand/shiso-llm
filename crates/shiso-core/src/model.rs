@@ -180,6 +180,7 @@ pub struct Logits<'a> {
     view: DeviceView<'a>,
     rows: u32,
     vocab: u32,
+    picks: Option<DeviceView<'a>>,
 }
 
 impl<'a> Logits<'a> {
@@ -202,7 +203,47 @@ impl<'a> Logits<'a> {
                 got: view.len(),
             });
         }
-        Ok(Self { view, rows, vocab })
+        Ok(Self {
+            view,
+            rows,
+            vocab,
+            picks: None,
+        })
+    }
+
+    /// The same block, carrying the device's greedy pick of every row: one
+    /// little-endian `i32` per row, in row order, the lowest id attaining the
+    /// row's largest logit, or a negative value for a row with no finite
+    /// logit.
+    ///
+    /// A sampler that would take the argmax of a row reads its four bytes
+    /// instead of the whole row - a megabyte at a quarter-million-entry
+    /// vocabulary, and a host scan of it, on every decoded token.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] when `picks` is shorter than four bytes a
+    /// row.
+    pub fn with_picks(self, picks: DeviceView<'a>) -> CoreResult<Self> {
+        let expected = u64::from(self.rows) * 4;
+        if picks.len() < expected {
+            return Err(CoreError::ShapeMismatch {
+                field: "logits picks view",
+                expected,
+                got: picks.len(),
+            });
+        }
+        Ok(Self {
+            picks: Some(picks.slice(0, expected)?),
+            ..self
+        })
+    }
+
+    /// The device's greedy pick of every row, when the pass that wrote the
+    /// block computed one; see [`Logits::with_picks`].
+    #[must_use]
+    pub const fn picks(&self) -> Option<DeviceView<'a>> {
+        self.picks
     }
 
     /// Number of sequences in the block.

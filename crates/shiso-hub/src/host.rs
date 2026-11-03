@@ -34,6 +34,21 @@ impl std::fmt::Display for Backend {
     }
 }
 
+/// The device this process will serve on.
+///
+/// Separate from [`Backend`], which names what a registry variant was built
+/// for: the registry publishes no CPU variant, so the CPU is a property of the
+/// host that relaxes selection, not a value a recipe can name.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServingDevice {
+    /// A GPU backend: a variant must name one the host has.
+    #[default]
+    Gpu,
+    /// The CPU: every variant is a candidate, bounded only by RAM.
+    Cpu,
+}
+
 /// Information about available CUDA hardware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CudaInfo {
@@ -62,7 +77,7 @@ pub struct MetalInfo {
 /// Host profile describing available backends and hardware memory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostProfile {
-    /// Hardware backends compiled into this binary.
+    /// Backends whose device this host has.
     pub backends: Vec<Backend>,
     /// Total physical RAM in bytes.
     pub ram_bytes: u64,
@@ -70,6 +85,10 @@ pub struct HostProfile {
     pub cuda: Option<CudaInfo>,
     /// Metal device facts, when available.
     pub metal: Option<MetalInfo>,
+    /// The device this process will serve on. [`ServingDevice::Cpu`] makes
+    /// every variant a candidate regardless of `backends`.
+    #[serde(default)]
+    pub device: ServingDevice,
 }
 
 impl HostProfile {
@@ -81,7 +100,15 @@ impl HostProfile {
             ram_bytes: probe_ram(),
             cuda,
             metal,
+            device: ServingDevice::Gpu,
         }
+    }
+
+    /// The same host, serving on `device`.
+    #[must_use]
+    pub fn on(mut self, device: ServingDevice) -> Self {
+        self.device = device;
+        self
     }
 }
 

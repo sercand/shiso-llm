@@ -131,3 +131,21 @@ fn a_fixed_schedule_refuses_any_other_step_count() {
     );
     assert!(job_of(1024, 1024, 8).validate(&fixed).is_ok());
 }
+
+#[test]
+fn memory_refusal_names_the_largest_side_or_says_none_fits() {
+    let refusal = |largest_side| {
+        ImageGenError::TooLargeForMemory {
+            width: 1024,
+            height: 1024,
+            needed_mib: 7320,
+            budget_mib: 778,
+            largest_side,
+        }
+        .to_string()
+    };
+    assert!(refusal(1504).ends_with("the largest square image that fits is 1504x1504"));
+    let none = refusal(0);
+    assert!(!none.contains("0x0"), "{none}");
+    assert!(none.contains("no image size fits"), "{none}");
+}

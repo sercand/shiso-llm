@@ -5,6 +5,7 @@
 //! without a router: the interesting question about `/health` is what it says
 //! when the model is missing, not whether axum can call it.
 
+use crate::error::ErrorResponse as _;
 use std::sync::Arc;
 
 use axum::Json;

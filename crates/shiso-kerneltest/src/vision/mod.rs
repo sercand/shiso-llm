@@ -24,4 +24,5 @@
     reason = "a case asserts by panicking; that is its contract, not an edge case"
 )]
 
+pub mod quant;
 pub mod tower;

@@ -24,7 +24,9 @@ use crate::harness::{Gpu, drain, f32_bytes, run};
 use crate::oracle::signal;
 
 /// Every entry point this file's cases launch.
-pub const ENTRIES: [&str; 7] = [
+pub const ENTRIES: [&str; 9] = [
+    "kernel_dit_gqa_f32",
+    "kernel_dit_rope_half",
     "kernel_dit_flash_sdpa_f32",
     "kernel_dit_flash_sdpa_causal_f32",
     "kernel_dit_flash_sdpa_d128_f32",
@@ -77,6 +79,28 @@ struct UnaryArgs {
     count: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct GqaArgs {
+    tokens: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    valid_keys: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct RopeHalfArgs {
+    tokens: u32,
+    heads: u32,
+    head_dim: u32,
+    pinned_from: u32,
+    pinned_pos: u32,
+}
+
+const _: () = assert!(size_of::<GqaArgs>() == 20);
+const _: () = assert!(size_of::<RopeHalfArgs>() == 20);
 const _: () = assert!(size_of::<SdpaArgs>() == 44);
 const _: () = assert!(size_of::<QkNormRopeArgs>() == 24);
 const _: () = assert!(size_of::<UnaryArgs>() == 4);
@@ -417,4 +441,202 @@ pub fn tanh_and_gelu_tanh_match_their_formulas(gpu: &Gpu) {
         1.0,
         "gelu",
     );
+}
+
+/// Grouped-query attention in `f64` over packed `(rows, heads * hd)` q and
+/// `(rows, kv_heads * hd)` k/v: row `t` attends key `s` when `s <= t` and
+/// `s < valid`.
+fn gqa_host(
+    qkv: (&[f32], &[f32], &[f32]),
+    shape: (usize, usize, usize, usize),
+    valid: usize,
+) -> Vec<f32> {
+    let (q, k, v) = qkv;
+    let (rows, q_heads, kv_heads, hd) = shape;
+    let group = q_heads / kv_heads;
+    let scale = 1.0 / (hd as f64).sqrt();
+    let mut out = vec![0f32; rows * q_heads * hd];
+    for t in 0..rows {
+        for h in 0..q_heads {
+            let kvh = h / group;
+            let keys: Vec<usize> = (0..=t).filter(|&s| s < valid).collect();
+            let scores: Vec<f64> = keys
+                .iter()
+                .map(|&s| {
+                    (0..hd)
+                        .map(|d| {
+                            f64::from(q[(t * q_heads + h) * hd + d])
+                                * f64::from(k[(s * kv_heads + kvh) * hd + d])
+                        })
+                        .sum::<f64>()
+                        * scale
+                })
+                .collect();
+            let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let exps: Vec<f64> = scores.iter().map(|&x| (x - max).exp()).collect();
+            let sum: f64 = exps.iter().sum();
+            for d in 0..hd {
+                let acc: f64 = keys
+                    .iter()
+                    .zip(&exps)
+                    .map(|(&s, &p)| p * f64::from(v[(s * kv_heads + kvh) * hd + d]))
+                    .sum();
+                out[(t * q_heads + h) * hd + d] = (acc / sum) as f32;
+            }
+        }
+    }
+    out
+}
+
+fn gqa_device(
+    gpu: &Gpu,
+    qkv: (&[f32], &[f32], &[f32]),
+    shape: (usize, usize, usize, usize),
+    valid: usize,
+) -> Vec<f32> {
+    let (rows, q_heads, kv_heads, hd) = shape;
+    let (q, k, v) = (upload(gpu, qkv.0), upload(gpu, qkv.1), upload(gpu, qkv.2));
+    let out = upload(gpu, &vec![0f32; rows * q_heads * hd]);
+    let args = GqaArgs {
+        tokens: rows as u32,
+        q_heads: q_heads as u32,
+        kv_heads: kv_heads as u32,
+        head_dim: hd as u32,
+        valid_keys: valid as u32,
+    };
+    launch(
+        gpu,
+        "kernel_dit_gqa_f32",
+        Extent3::new(rows as u32, q_heads as u32, 1),
+        Extent3::linear(BLOCK),
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(q.view()),
+            KernelArg::Buffer(k.view()),
+            KernelArg::Buffer(v.view()),
+        ],
+    );
+    drain(gpu);
+    gpu.read_f32(&out)
+}
+
+/// The text encoder's padded prefill: rows at or past `valid_keys` are pad
+/// rows that attend only the real keys (`s < valid`, still causal), rows
+/// before it are untouched, and `valid_keys == tokens` is the plain causal
+/// answer. The pad rows' answer is asserted to differ from the unmasked
+/// causal one, so a kernel that ignored the limit could not pass.
+///
+/// # Panics
+///
+/// When the device answer leaves 1e-4 of the `f64` oracle, or the data does
+/// not tell the masked and unmasked readings apart.
+pub fn gqa_valid_keys_masks_pad_keys(gpu: &Gpu) {
+    let (rows, q_heads, kv_heads, hd) = (9usize, 4usize, 2usize, 16usize);
+    let valid = 5usize;
+    let scaled = |n: usize, seed: u32| -> Vec<f32> {
+        signal(rows * n * hd, seed)
+            .iter()
+            .map(|v| v * 0.8)
+            .collect()
+    };
+    let (q, k, v) = (
+        scaled(q_heads, 61),
+        scaled(kv_heads, 62),
+        scaled(kv_heads, 63),
+    );
+    let shape = (rows, q_heads, kv_heads, hd);
+    let masked = gqa_device(gpu, (&q, &k, &v), shape, valid);
+    close(
+        &masked,
+        &gqa_host((&q, &k, &v), shape, valid),
+        1e-4,
+        1e-3,
+        "gqa valid_keys",
+    );
+    // The real rows are exactly the plain causal answer.
+    let unmasked = gqa_device(gpu, (&q, &k, &v), shape, rows);
+    let real = valid * q_heads * hd;
+    close(
+        &masked[..real],
+        &unmasked[..real],
+        1e-5,
+        1e-3,
+        "gqa real rows",
+    );
+    close(
+        &unmasked,
+        &gqa_host((&q, &k, &v), shape, rows),
+        1e-4,
+        1e-3,
+        "gqa valid_keys == tokens",
+    );
+    differs(
+        &masked[real..],
+        &unmasked[real..],
+        1e-3,
+        "gqa pad rows masked vs unmasked",
+    );
+}
+
+/// Rotate-half `RoPE` with the trailing rows pinned to one position: rows
+/// before `pinned_from` turn by their own index, rows from it on by
+/// `pinned_pos` (the padded text prefill rotates pad rows at position 1).
+///
+/// # Panics
+///
+/// When a row leaves 1e-5 of the `f64` oracle, or pinning changed nothing.
+pub fn rope_half_pins_trailing_rows_to_one_position(gpu: &Gpu) {
+    let (tokens, heads, hd) = (6usize, 3usize, 8usize);
+    let pinned_from = 4usize;
+    let x = signal(tokens * heads * hd, 71);
+    let freqs: Vec<f32> = (0..hd / 2)
+        .map(|i| 10000f32.powf(-(2.0 * i as f32) / hd as f32))
+        .collect();
+    let run_with = |pinned_from: usize| -> Vec<f32> {
+        let dx = upload(gpu, &x);
+        let df = upload(gpu, &freqs);
+        let args = RopeHalfArgs {
+            tokens: tokens as u32,
+            heads: heads as u32,
+            head_dim: hd as u32,
+            pinned_from: pinned_from as u32,
+            pinned_pos: 1,
+        };
+        launch(
+            gpu,
+            "kernel_dit_rope_half",
+            Extent3::new(tokens as u32, heads as u32, 1),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(dx.view()),
+                KernelArg::Buffer(df.view()),
+            ],
+        );
+        drain(gpu);
+        gpu.read_f32(&dx)
+    };
+    let host = |pinned_from: usize| -> Vec<f32> {
+        let mut out = x.clone();
+        for t in 0..tokens {
+            let position = if t >= pinned_from { 1.0 } else { t as f64 };
+            for h in 0..heads {
+                let row = (t * heads + h) * hd;
+                for i in 0..hd / 2 {
+                    let angle = position * f64::from(freqs[i]);
+                    let (c, s) = (angle.cos(), angle.sin());
+                    let (x0, x1) = (f64::from(x[row + i]), f64::from(x[row + i + hd / 2]));
+                    out[row + i] = (x0 * c - x1 * s) as f32;
+                    out[row + i + hd / 2] = (x1 * c + x0 * s) as f32;
+                }
+            }
+        }
+        out
+    };
+    let pinned = run_with(pinned_from);
+    close(&pinned, &host(pinned_from), 1e-5, 1e-3, "rope_half pinned");
+    let plain = run_with(tokens);
+    close(&plain, &host(tokens), 1e-5, 1e-3, "rope_half unpinned");
+    differs(&pinned, &plain, 1e-3, "rope_half pinned vs unpinned");
 }

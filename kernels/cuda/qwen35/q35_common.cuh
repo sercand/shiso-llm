@@ -1,6 +1,6 @@
 /* Shared geometry, reduction shapes and argument blocks for the qwen35 set.
  *
- * The CUDA half of `crates/shiso-metal/metal/qwen35/q35_common.h`, written
+ * The CUDA half of `kernels/metal/qwen35/q35_common.h`, written
  * against the same contract. Unlike `dense`, this family is NOT parametric:
  * the delta rule's state row, its chunk width and its unit split are compiled
  * in, exactly as they are in both the Metal set and the CUDA source below.
@@ -18,7 +18,7 @@
  *     reductions below are their fold order, and
  *     `q35_rope_mrope_interleaved` is `q4e_rope_mrope` with the per-axis pair
  *     budget removed - see that function's own note.
- *   - `crates/shiso-metal/metal/qwen35/q35_common.h` is the Metal port of the
+ *   - `kernels/metal/qwen35/q35_common.h` is the Metal port of the
  *     same helpers, and is what produced the committed goldens.
  *
  * Where the two disagree the Metal one wins, because the oracles in

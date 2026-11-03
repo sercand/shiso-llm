@@ -14,6 +14,11 @@
 //! | plain | `BF16` / `F16` / `F32` | none |
 //! | FP8 | `F8_E4M3` `[out, in]` | `weight_scale` `f32`, `input_scale` `f32` |
 //! | NVFP4 | `U8` `[out, in/2]` | `weight_scale` `F8_E4M3` `[out, in/16]`, `weight_scale_2` `f32` |
+//! | MXFP8 | `F8_E4M3` `[out, in]` | `weight_scale` `U8` `[out, in/32]` (`ue8m0`) |
+//!
+//! FP8 and MXFP8 share a weight format and differ in the scale beside it - one
+//! `f32` for the tensor, or one power of two per 32 weights - so which of the
+//! two a tensor is under is read off that scale's own format and shape.
 //!
 //! # Describing is eager, decoding is not
 //!
@@ -101,6 +106,9 @@ pub enum Stored {
         /// The whole tensor's scale, which the group scales are relative to.
         global: f32,
     },
+    /// MXFP8: `e4m3` codes under one `ue8m0` power of two per 32 weights
+    /// along a row ([`crate::mxfp8`]). No tensor-wide scale.
+    Mxfp8,
 }
 
 impl Stored {
@@ -111,6 +119,7 @@ impl Stored {
             Self::Plain { .. } => "plain",
             Self::Fp8 { .. } => "fp8",
             Self::Nvfp4 { .. } => "nvfp4",
+            Self::Mxfp8 => "mxfp8",
         }
     }
 }
@@ -172,7 +181,7 @@ pub struct ModeloptTensor {
     stored: Stored,
     /// The weight array.
     weight: Span,
-    /// The per-group scale array, for NVFP4 and nothing else.
+    /// The per-group scale array, for NVFP4 and MXFP8.
     group_scales: Option<Span>,
 }
 
@@ -233,6 +242,20 @@ pub struct Nvfp4Parts<'a> {
     pub layout: Nvfp4Layout,
 }
 
+/// The two arrays an MXFP8 tensor is, and its layout.
+///
+/// Named fields for the reason [`Nvfp4Parts`] has them: two byte slices in a
+/// tuple are two a caller can transpose.
+#[derive(Debug, Clone, Copy)]
+pub struct Mxfp8Parts<'a> {
+    /// One `e4m3` byte per weight, row-major.
+    pub codes: &'a [u8],
+    /// One `ue8m0` byte per group of 32 weights along a row.
+    pub scales: &'a [u8],
+    /// The logical geometry.
+    pub layout: crate::mxfp8::Mxfp8Layout,
+}
+
 /// The shard index, when the directory has one.
 #[derive(Debug, Deserialize)]
 struct ShardIndex {
@@ -258,6 +281,8 @@ pub struct Census {
     pub fp8: usize,
     /// Of those, stored as NVFP4 under three levels of scale.
     pub nvfp4: usize,
+    /// Of those, stored as MXFP8 under a power of two per 32 weights.
+    pub mxfp8: usize,
 }
 
 /// An open modelopt checkpoint directory.
@@ -334,6 +359,7 @@ impl ModeloptFile {
                 Stored::Plain { .. } => census.plain += 1,
                 Stored::Fp8 { .. } => census.fp8 += 1,
                 Stored::Nvfp4 { .. } => census.nvfp4 += 1,
+                Stored::Mxfp8 => census.mxfp8 += 1,
             }
         }
         let index = tensors
@@ -349,6 +375,7 @@ impl ModeloptFile {
             plain = census.plain,
             fp8 = census.fp8,
             nvfp4 = census.nvfp4,
+            mxfp8 = census.mxfp8,
             "opened a modelopt checkpoint directory"
         );
         Ok(Self {
@@ -432,6 +459,28 @@ impl ModeloptFile {
                 usize::try_from(tensor.cols).unwrap_or(usize::MAX),
                 global,
             ),
+        }))
+    }
+
+    /// The `e4m3` codes and `ue8m0` group scales of an MXFP8 tensor, and its
+    /// layout, for [`crate::mxfp8::dequant_mxfp8`] or a kernel.
+    ///
+    /// `Ok(None)` for a tensor stored under any other scheme.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`ModeloptFile::weight_bytes`] reports.
+    pub fn mxfp8_parts(&self, tensor: &ModeloptTensor) -> GgufResult<Option<Mxfp8Parts<'_>>> {
+        let (Stored::Mxfp8, Some(scales)) = (tensor.stored, tensor.group_scales) else {
+            return Ok(None);
+        };
+        Ok(Some(Mxfp8Parts {
+            codes: self.span(tensor.weight)?,
+            scales: self.span(scales)?,
+            layout: crate::mxfp8::Mxfp8Layout {
+                rows: usize::try_from(tensor.rows).unwrap_or(usize::MAX),
+                cols: usize::try_from(tensor.cols).unwrap_or(usize::MAX),
+            },
         }))
     }
 
@@ -537,6 +586,9 @@ fn describe_one(
         }
         StDType::F8E4M3 => {
             let (rows, cols) = two_dims(base, &raw.shape)?;
+            if let Some(tensor) = describe_mxfp8(base, rows, cols, &raw.shape, weight, arrays)? {
+                return Ok(tensor);
+            }
             let weight_scale = scalar(base, WEIGHT_SCALE_SUFFIX, arrays, shards)?;
             let input_scale = optional_scalar(base, INPUT_SCALE_SUFFIX, arrays, shards)?;
             Ok(ModeloptTensor {
@@ -607,6 +659,49 @@ fn describe_one(
             got: Box::from("signed byte codes, which are the per-row INT8 image export's"),
         }),
     }
+}
+
+/// Describes an `e4m3` weight as MXFP8 when the scale beside it is a `U8`
+/// matrix of one byte per 32 weights, and returns `None` when it is not one,
+/// leaving the tensor to the per-tensor FP8 arm.
+///
+/// A `U8` scale of any other shape is refused here rather than handed on: it
+/// is not the scalar the FP8 arm wants either, and the FP8 arm's refusal would
+/// name the wrong scheme.
+fn describe_mxfp8(
+    base: &str,
+    rows: u64,
+    cols: u64,
+    declared: &[u64],
+    weight: Span,
+    arrays: &HashMap<String, (usize, RawTensor)>,
+) -> GgufResult<Option<ModeloptTensor>> {
+    let Ok((scale_shard, scale_raw)) = companion(base, WEIGHT_SCALE_SUFFIX, arrays) else {
+        return Ok(None);
+    };
+    if scale_raw.parsed_dtype(base)? != StDType::U8 {
+        return Ok(None);
+    }
+    let group = crate::mxfp8::GROUP as u64;
+    if scale_raw.shape != [rows, cols / group] || !cols.is_multiple_of(group) {
+        return Err(GgufError::LayoutMismatch {
+            tensor: base.into(),
+            want: Box::from("ue8m0 scales, one byte per group of 32 along each row"),
+            got: Box::from(format!(
+                "U8 {:?} beside a [{rows}, {cols}] e4m3 weight",
+                scale_raw.shape
+            )),
+        });
+    }
+    Ok(Some(ModeloptTensor {
+        name: base.into(),
+        rows,
+        cols,
+        declared: declared.to_vec(),
+        stored: Stored::Mxfp8,
+        weight,
+        group_scales: Some(Span::of(scale_shard, scale_raw)),
+    }))
 }
 
 /// Finds one of a tensor's companion arrays.

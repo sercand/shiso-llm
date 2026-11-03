@@ -875,6 +875,23 @@ pub struct ServerDefaults {
     /// (`--solo-prefill-chunk`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub solo_prefill_chunk: Option<usize>,
+    /// Element type of the attention key/value cache (`--kv-cache-dtype`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_cache_dtype: Option<KvCacheDtype>,
+}
+
+/// Element type of the attention key/value cache (`--kv-cache-dtype`).
+///
+/// Typed for the reason [`ExpertResidency`] is: a recipe naming a cache format
+/// this build does not have fails to parse rather than silently serving f16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KvCacheDtype {
+    /// Half precision.
+    F16,
+    /// FP8 E4M3 at a static scale of one.
+    #[serde(alias = "fp8_e4m3")]
+    Fp8,
 }
 
 /// Where a sparse checkpoint's routed expert banks live (`--expert-residency`).
@@ -1159,14 +1176,14 @@ pub struct IndexModelEntry {
     /// Search tags.
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Tasks served.
-    #[serde(default)]
+    /// Tasks served; a name this client does not know is dropped.
+    #[serde(default, deserialize_with = "known_only")]
     pub tasks: Vec<Task>,
-    /// Input modalities.
-    #[serde(default)]
+    /// Input modalities; a name this client does not know is dropped.
+    #[serde(default, deserialize_with = "known_only")]
     pub inputs: Vec<Modality>,
-    /// Output modalities.
-    #[serde(default)]
+    /// Output modalities; a name this client does not know is dropped.
+    #[serde(default, deserialize_with = "known_only")]
     pub outputs: Vec<Modality>,
     /// Last update timestamp.
     pub updated_at: String,
@@ -1181,6 +1198,31 @@ pub struct IndexModelEntry {
     pub manifest_sha256: Sha256,
     /// Variants available for this model.
     pub variants: Vec<IndexVariantEntry>,
+}
+
+/// Reads a list of enum names, dropping the ones this client has no variant
+/// for.
+///
+/// The index is shared by every client version, so one model advertising a
+/// task added later must not make the whole index, and with it every other
+/// model, unreadable. Only unknown names are forgiven: a value that is not a
+/// list of strings is still an error. A [`Recipe`] stays strict, because a
+/// model this client cannot serve is better refused than half understood.
+fn known_only<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    use serde::de::IntoDeserializer;
+    let names = Vec::<String>::deserialize(deserializer)?;
+    Ok(names
+        .into_iter()
+        .filter_map(|name| {
+            let reader: serde::de::value::StringDeserializer<serde::de::value::Error> =
+                name.into_deserializer();
+            T::deserialize(reader).ok()
+        })
+        .collect())
 }
 
 /// The compact registry index (`index.json`).

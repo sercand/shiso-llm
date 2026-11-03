@@ -19,29 +19,45 @@ namespace cg = cooperative_groups;
 #include "exl3_dgemv.cuh"
 
 /* Only the mul1 codebook (cb 2) and fp32 outputs are instantiated: the
- * qwen4exp checkpoint is mul1 throughout, K = 4 for routed experts and the
- * indexer, 5 for the MTP input projections, 6 for every other dense tensor. */
-#define SHS_EXL3_MIN_BITS 4
-#define SHS_EXL3_MAX_BITS 6
+ * qwen4exp checkpoints are mul1 throughout, K = 4 for routed experts and the
+ * indexer, 5 and 6 for the dense tensors, and 8 for every draft-head tensor of
+ * a re-quantized export.  Seven is skipped: no checkpoint uses it, and each
+ * width is a full set of instances in the module. */
+#define SHS_EXL3_N_WIDTHS 4
 
-static fp_exl3_gemm_kernel g_gemm[SHS_EXL3_MAX_BITS - SHS_EXL3_MIN_BITS + 1][EXL3_GEMM_NUM_SHAPES + 1] = {
+/* The instance tables' row for a width, or -1 for a width with no instances. */
+static int exl3_slot(uint32_t bits) {
+    switch (bits) {
+    case 4: return 0;
+    case 5: return 1;
+    case 6: return 2;
+    case 8: return 3;
+    default: return -1;
+    }
+}
+
+static fp_exl3_gemm_kernel g_gemm[SHS_EXL3_N_WIDTHS][EXL3_GEMM_NUM_SHAPES + 1] = {
     { EXL3_GEMM_KERNEL_INSTANCES(4, true, 2) },
     { EXL3_GEMM_KERNEL_INSTANCES(5, true, 2) },
     { EXL3_GEMM_KERNEL_INSTANCES(6, true, 2) },
+    { EXL3_GEMM_KERNEL_INSTANCES(8, true, 2) },
 };
-static fp_exl3_mgemm_kernel g_mgemm[SHS_EXL3_MAX_BITS - SHS_EXL3_MIN_BITS + 1][EXL3_GEMM_NUM_SHAPES + 1] = {
+static fp_exl3_mgemm_kernel g_mgemm[SHS_EXL3_N_WIDTHS][EXL3_GEMM_NUM_SHAPES + 1] = {
     { EXL3_MGEMM_KERNEL_INSTANCES(4, true, 2) },
     { EXL3_MGEMM_KERNEL_INSTANCES(5, true, 2) },
     { EXL3_MGEMM_KERNEL_INSTANCES(6, true, 2) },
+    { EXL3_MGEMM_KERNEL_INSTANCES(8, true, 2) },
 };
 typedef void (*fp_exl3_reconstruct_kernel)(half *, const uint16_t *, const half *, const half *, int, int);
-static fp_exl3_reconstruct_kernel g_reconstruct[SHS_EXL3_MAX_BITS - SHS_EXL3_MIN_BITS + 1] = {
+static fp_exl3_reconstruct_kernel g_reconstruct[SHS_EXL3_N_WIDTHS] = {
     reconstruct_had_kernel<4, 2>, reconstruct_had_kernel<5, 2>, reconstruct_had_kernel<6, 2>,
+    reconstruct_had_kernel<8, 2>,
 };
 /* The routed-expert block: the N = 128 tile, since the intermediate width
  * (640) is not a multiple of 256. */
-static fp_exl3_moe_kernel g_moe[SHS_EXL3_MAX_BITS - SHS_EXL3_MIN_BITS + 1] = {
+static fp_exl3_moe_kernel g_moe[SHS_EXL3_N_WIDTHS] = {
     exl3_moe_kernel<4, 128, 2>, exl3_moe_kernel<5, 128, 2>, exl3_moe_kernel<6, 128, 2>,
+    exl3_moe_kernel<8, 128, 2>,
 };
 #define SHS_EXL3_MOE_BLOCK_DIM (EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
 static const int g_tile_k[] = { EXL3_GEMM_TILESIZE_K };
@@ -82,7 +98,7 @@ static bool exl3_device_init(void) {
     /* Every kernel instance needs the 90 KB dynamic shared memory opt-in
      * before its first launch; a capture would reject the attribute call. */
     int occ = 0;
-    for (int b = 0; b <= SHS_EXL3_MAX_BITS - SHS_EXL3_MIN_BITS; b++) {
+    for (int b = 0; b < SHS_EXL3_N_WIDTHS; b++) {
         for (int s = 1; s <= EXL3_GEMM_NUM_SHAPES; s++) {
             if (exl3_fail(cudaFuncSetAttribute((const void *)g_gemm[b][s],
                                                cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX),
@@ -96,7 +112,7 @@ static bool exl3_device_init(void) {
             occ = (occ == 0 || o < occ) ? o : occ;
         }
     }
-    for (int b = 0; b <= SHS_EXL3_MAX_BITS - SHS_EXL3_MIN_BITS; b++) {
+    for (int b = 0; b < SHS_EXL3_N_WIDTHS; b++) {
         if (exl3_fail(cudaFuncSetAttribute((const void *)g_moe[b],
                                            cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX),
                       "moe shared memory opt-in")) return false;
@@ -191,7 +207,7 @@ static int exl3_select_shape(int size_m, int size_k, int size_n, int K, bool mul
 }
 
 static bool exl3_check_shape(uint32_t k, uint32_t n, uint32_t bits, const char *what) {
-    if (bits < SHS_EXL3_MIN_BITS || bits > SHS_EXL3_MAX_BITS || k == 0 || n == 0 ||
+    if (exl3_slot(bits) < 0 || k == 0 || n == 0 ||
         (k % 16u) != 0u || (n % 128u) != 0u) {
         fprintf(stderr, "shiso: exl3 %s: unsupported shape k=%u n=%u K=%u\n", what, k, n, bits);
         return false;
@@ -209,7 +225,7 @@ extern "C" int shs_exl3_gemm(const float *x, const void *tiles, const void *suh,
 
     const int shape = exl3_select_shape((int)m, (int)k, (int)n, (int)bits, false, 1, 1);
     if (!shape) return 0;
-    fp_exl3_gemm_kernel kernel = g_gemm[bits - SHS_EXL3_MIN_BITS][shape];
+    fp_exl3_gemm_kernel kernel = g_gemm[exl3_slot(bits)][shape];
     /* Blocks sharing an output tile column hand their partial sums down a
      * lock chain, so past about four blocks per column the chain costs more
      * than the extra streams earn: the indexer's 2560 x 128 K = 4 tensor ran
@@ -255,7 +271,7 @@ static int exl3_mgemm_launch(const float *x, int x_per_slot,
     const int bszm_out = (int)total;
     const int shape = exl3_select_shape((int)m, (int)k, (int)n, (int)bits, true, bszm_in, bszm_out);
     if (!shape) return 0;
-    fp_exl3_mgemm_kernel kernel = g_mgemm[bits - SHS_EXL3_MIN_BITS][shape];
+    fp_exl3_mgemm_kernel kernel = g_mgemm[exl3_slot(bits)][shape];
 
     /* Geometry: every slot gets its own block group when the co-resident
      * budget allows, so a decode launch streams all its experts at once
@@ -317,7 +333,7 @@ extern "C" int shs_exl3_reconstruct(const void *tiles, const void *suh, const vo
     }
     /* One block per 128x128 tile; the tile row index is n/16 packed blocks
      * long, the same layout the GEMMs read. */
-    g_reconstruct[bits - SHS_EXL3_MIN_BITS]<<<dim3(n / 128u, k / 128u), RH_THREADS, 0, stream>>>(
+    g_reconstruct[exl3_slot(bits)]<<<dim3(n / 128u, k / 128u), RH_THREADS, 0, stream>>>(
             (half *)w_out, (const uint16_t *)tiles, (const half *)suh, (const half *)svh, (int)(n / 16u), 0);
     return !exl3_fail(cudaGetLastError(), "reconstruct launch");
 }
@@ -385,7 +401,7 @@ extern "C" int shs_exl3_moe(const float *x, float *slot_out, uint32_t n_tok, uin
                      (void *)&uv, (void *)&dt, (void *)&ds, (void *)&dv, (void *)&expert_bounds,
                      (void *)&slot_sorted, (void *)&i_tok, (void *)&i_hidden,
                      (void *)&i_inter, (void *)&i_expert, (void *)&i_used, (void *)&locks };
-    return !exl3_fail(cudaLaunchCooperativeKernel((const void *)g_moe[bits - SHS_EXL3_MIN_BITS],
+    return !exl3_fail(cudaLaunchCooperativeKernel((const void *)g_moe[exl3_slot(bits)],
                                                   dim3(group_size, 1, num_groups),
                                                   dim3(SHS_EXL3_MOE_BLOCK_DIM), args, SMEM_MAX, stream),
                       "moe launch");
@@ -481,6 +497,8 @@ extern "C" int shs_exl3_moe_ws(const float *x, float *slot_out, uint32_t n_tok, 
                                          expert_bounds, slot_sorted, n_expert, n_used, stream, c);
     case 6: return exl3_moe_ws_launch<6>(x, slot_out, n_tok, hidden, inter, gt, gs, gv, ut, us, uv, dt, ds, dv,
                                          expert_bounds, slot_sorted, n_expert, n_used, stream, c);
+    case 8: return exl3_moe_ws_launch<8>(x, slot_out, n_tok, hidden, inter, gt, gs, gv, ut, us, uv, dt, ds, dv,
+                                         expert_bounds, slot_sorted, n_expert, n_used, stream, c);
     default: return 0;
     }
 }
@@ -493,10 +511,14 @@ template __global__ void exl3_moe_ws_down_h<5, 2, SHS_WS_STAGES>(
         const half *, half *, const uint16_t *, const half *, const int32_t *, const int32_t *, int, int);
 template __global__ void exl3_moe_ws_down_h<6, 2, SHS_WS_STAGES>(
         const half *, half *, const uint16_t *, const half *, const int32_t *, const int32_t *, int, int);
+template __global__ void exl3_moe_ws_down_h<8, 2, SHS_WS_STAGES>(
+        const half *, half *, const uint16_t *, const half *, const int32_t *, const int32_t *, int, int);
 
 /* The decode-shaped routed block (exl3_moe_ws.cuh), launched by name as well.
- * Four stages of four warps: 32-40 KB of staging, under the default dynamic
- * limit, so no opt-in is needed and three blocks share an SM. */
+ * Four stages of four warps: 32-40 KB of staging at K = 4..6, under the default
+ * dynamic limit, so no opt-in is needed and three blocks share an SM.  K = 8's
+ * gate+up pair is exactly the 48 KB limit (the kernel has no static shared
+ * memory), two blocks to an SM. */
 #define SHS_WSD_STAGES 4
 #define SHS_WSD_WARPS 4
 #define SHS_WSD_INSTANCES(B)                                                                               \
@@ -508,9 +530,10 @@ template __global__ void exl3_moe_ws_down_h<6, 2, SHS_WS_STAGES>(
 SHS_WSD_INSTANCES(4)
 SHS_WSD_INSTANCES(5)
 SHS_WSD_INSTANCES(6)
+SHS_WSD_INSTANCES(8)
 
 /* The decode-shaped dense projection (exl3_dgemv.cuh), launched by name.
- * 20-28 KB of staging at four stages of four warps. */
+ * 20-28 KB of staging at four stages of four warps (32 KB at K = 8). */
 #define SHS_DG_STAGES 4
 #define SHS_DG_WARPS 4
 #define SHS_DG_INSTANCES(B, MT)                                                                        \
@@ -522,3 +545,5 @@ SHS_DG_INSTANCES(5, 1)
 SHS_DG_INSTANCES(5, 2)
 SHS_DG_INSTANCES(6, 1)
 SHS_DG_INSTANCES(6, 2)
+SHS_DG_INSTANCES(8, 1)
+SHS_DG_INSTANCES(8, 2)

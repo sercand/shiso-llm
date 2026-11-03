@@ -9,7 +9,7 @@
  * Nothing in this directory is a byte copy of anything, so no file here carries
  * a provenance header and `scripts/q4e_ptx_oracle.sh --mode=fidelity` reports
  * it as generated. The arithmetic is the Metal twins' in
- * `crates/shiso-metal/metal/dense`, which is what produced the committed
+ * `kernels/metal/dense`, which is what produced the committed
  * goldens, and the argument blocks are the ones
  * `crates/shiso-engine/src/launch.rs` packs.
  *

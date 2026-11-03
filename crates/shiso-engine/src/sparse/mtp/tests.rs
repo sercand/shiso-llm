@@ -417,25 +417,30 @@ fn a_minimum_longer_than_the_longest_key_is_clamped_rather_than_silently_disabli
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_lookup_is_taken_only_when_it_is_longer_and_the_head_agrees_with_its_first_token() {
+fn the_lookup_is_taken_only_when_it_is_longer_and_extends_the_heads_whole_chain() {
     let history = toks(&[1, 2, 3, 4, 5, 9, 9, 1, 2, 3]);
     let proposal = propose(&history, TokenId::new(4), 0, &FailRing::new(), lookup(4))
         .expect("the key occurs earlier");
-    let head_first = proposal.tokens().first().copied();
+    let echoed = proposal.tokens().to_vec();
     assert!(
-        lookup_beats_head(&proposal, 2, head_first),
-        "four proposed tokens against the head's two, and the first agrees"
+        lookup_beats_head(&proposal, &echoed[..2]),
+        "four proposed tokens extending the head's two"
     );
     assert!(
-        !lookup_beats_head(&proposal, 4, head_first),
+        !lookup_beats_head(&proposal, &echoed),
         "no longer than the head's chain is the same verify width for a worse guess"
     );
     assert!(
-        !lookup_beats_head(&proposal, 2, Some(TokenId::new(123))),
+        !lookup_beats_head(&proposal, &[TokenId::new(123)]),
         "without the agreement there is no evidence that this is the echoed text"
     );
     assert!(
-        !lookup_beats_head(&proposal, 0, None),
+        !lookup_beats_head(&proposal, &[echoed[0], TokenId::new(123)]),
+        "agreeing on the first guess and not the second would replace a guess the \
+         head usually gets right"
+    );
+    assert!(
+        !lookup_beats_head(&proposal, &[]),
         "a step where the head drafted nothing has no evidence either"
     );
 }

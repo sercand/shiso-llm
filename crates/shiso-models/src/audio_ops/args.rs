@@ -1,5 +1,5 @@
 //! Argument blocks of the `audio` kernel set, field for field as
-//! `crates/shiso-metal/metal/audio/audio_common.h` declares them.
+//! `kernels/metal/audio/audio_common.h` declares them.
 //!
 //! Each block is passed as the launch's first argument, and its size is pinned
 //! beside it: a field added on one side only would shift every field after it
@@ -185,6 +185,19 @@ pub(crate) struct RopeArgs {
     pub(crate) theta: f32,
 }
 const _: () = assert!(size_of::<RopeArgs>() == 20);
+
+/// `audio_args_rope_partial`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct RopePartialArgs {
+    pub(crate) rows: u32,
+    pub(crate) heads: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) pos0: u32,
+    pub(crate) theta: f32,
+    pub(crate) rot: u32,
+}
+const _: () = assert!(size_of::<RopePartialArgs>() == 24);
 
 /// `audio_args_lstm`.
 #[repr(C)]

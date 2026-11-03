@@ -118,7 +118,7 @@ pub enum TypedItem {
         /// The call this answers.
         call_id: String,
         /// What the tool produced.
-        output: Value,
+        output: FunctionOutput,
     },
     /// A reasoning item replayed from an earlier turn.
     Reasoning {
@@ -126,6 +126,23 @@ pub enum TypedItem {
         #[serde(default)]
         summary: Vec<SummaryPart>,
     },
+}
+
+/// What a tool produced: a string, content parts, or any other JSON.
+///
+/// The parts are what let a tool hand back a picture; flattening them to JSON
+/// text would show the model the base64 as prose instead of the image. Any
+/// other JSON - including an array that is not a part list - is a structured
+/// answer, kept as the JSON text it is.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum FunctionOutput {
+    /// The whole output as one string.
+    Text(String),
+    /// The output as an ordered list of parts.
+    Parts(Vec<ContentPart>),
+    /// A structured value the tool returned.
+    Json(Value),
 }
 
 /// One piece of a replayed reasoning summary.

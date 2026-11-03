@@ -61,6 +61,7 @@ pub mod pack12;
 pub mod paged;
 pub mod passes;
 pub mod plan;
+mod plancache;
 pub mod ple;
 pub mod qsa;
 pub mod recurrent;
@@ -89,7 +90,7 @@ pub use stack::{
     MAX_DECODE_BATCH, MAX_PREFILL_CHUNK, MAX_PROMPT_RUNS, Pass, SparseOptions, SparseSession,
     SparseStack,
 };
-pub use stream::{EXPERT_MATRICES, ExpertSource, ExpertStream, StreamStats};
+pub use stream::{EXPERT_MATRICES, ExpertSource, ExpertStream, FetchPlan, StreamStats};
 pub use tap::{ResidualTap, TapPoint, TapRecord};
 pub use weights::{
     ExpertBank, Indexer, NgramBlock, Recurrent, SparseAttn, SparseBlock, SparseLayer,

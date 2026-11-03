@@ -73,10 +73,12 @@ fn trellis_payload_is_tiles_plus_scale_vectors() {
     assert_eq!(quant::exl3::k_bits(DType::Exl3K4), Some(4));
     assert_eq!(quant::exl3::k_bits(DType::Exl3K5), Some(5));
     assert_eq!(quant::exl3::k_bits(DType::Exl3K6), Some(6));
+    assert_eq!(quant::exl3::k_bits(DType::Exl3K8), Some(8));
     assert_eq!(quant::exl3::k_bits(DType::Q4_K), None);
     assert_eq!(quant::exl3::tile_bytes(4), 128);
     assert_eq!(quant::exl3::tile_bytes(5), 160);
     assert_eq!(quant::exl3::tile_bytes(6), 192);
+    assert_eq!(quant::exl3::tile_bytes(8), 256);
 
     // [2560, 640]: 6400 tiles of 192 bytes, then two fp16 vectors of 2560 and
     // 640 words, which is 2 * (2560 + 640) = 6400 bytes.

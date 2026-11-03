@@ -46,8 +46,8 @@ pub use workspace::Workspace;
 use args::{
     ArgmaxArgs, AxpyArgs, BiasRowsArgs, CacheAttnArgs, Conv2dArgs, DecodeStepArgs, DwConv1dArgs,
     EmbedRowArgs, GeluMulArgs, GemmArgs, GluArgs, GreedyStepArgs, GreedyWindowArgs, KeepArgs,
-    KvAppendArgs, LstmArgs, NormArgs, RopeArgs, SiluMulArgs, SpanAttnArgs, TransposeArgs,
-    UnaryArgs, UnfoldArgs, WindowAttnArgs,
+    KvAppendArgs, LstmArgs, NormArgs, RopeArgs, RopePartialArgs, SiluMulArgs, SpanAttnArgs,
+    TransposeArgs, UnaryArgs, UnfoldArgs, WindowAttnArgs,
 };
 
 /// The kernel module every launch here names.
@@ -558,6 +558,26 @@ pub struct RopeDesc<'a> {
     pub heads: usize,
     /// Width of one head, even.
     pub head_dim: usize,
+    /// Position of row 0.
+    pub pos0: usize,
+    /// Frequency base.
+    pub theta: f32,
+}
+
+/// Half-split rotary embedding over the first `rot_dims` of each head only, in
+/// place.
+#[derive(Debug, Clone, Copy)]
+pub struct RopePartialDesc<'a> {
+    /// `[rows][heads * head_dim]`.
+    pub x: DeviceView<'a>,
+    /// Rows.
+    pub rows: usize,
+    /// Heads.
+    pub heads: usize,
+    /// Width of one head.
+    pub head_dim: usize,
+    /// Leading dimensions of a head that turn, even and at most `head_dim`.
+    pub rot_dims: usize,
     /// Position of row 0.
     pub pos0: usize,
     /// Frequency base.
@@ -1823,6 +1843,41 @@ impl Ops {
         self.launch(
             "kernel_audio_rope_half_f32",
             linear_grid(total / 2)?,
+            LINEAR_BLOCK,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d.x),
+            ],
+        )
+    }
+
+    /// [`Ops::rope_half`] over the first `rot_dims` of each head only: pairs
+    /// `(m, m + rot_dims/2)` turn at `theta^(-2m/rot_dims)`.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for an odd or over-wide `rot_dims`,
+    /// [`CoreError::ShapeMismatch`] for a short view, or the launch's error.
+    pub fn rope_partial(&self, d: &RopePartialDesc<'_>) -> CoreResult<()> {
+        limit(
+            d.rot_dims.is_multiple_of(2) && d.rot_dims > 0 && d.rot_dims <= d.head_dim,
+            "rope_partial.rot_dims",
+            d.rot_dims,
+        )?;
+        let total = d.rows * d.heads * d.head_dim;
+        need(d.x, total, "rope_partial.x")?;
+        let args = RopePartialArgs {
+            rows: dim(d.rows, "rope_partial.rows")?,
+            heads: dim(d.heads, "rope_partial.heads")?,
+            head_dim: dim(d.head_dim, "rope_partial.head_dim")?,
+            pos0: dim(d.pos0, "rope_partial.pos0")?,
+            theta: d.theta,
+            rot: dim(d.rot_dims, "rope_partial.rot_dims")?,
+        };
+        self.launch(
+            "kernel_audio_rope_partial_f32",
+            linear_grid(d.rows * d.heads * d.rot_dims / 2)?,
             LINEAR_BLOCK,
             0,
             &[

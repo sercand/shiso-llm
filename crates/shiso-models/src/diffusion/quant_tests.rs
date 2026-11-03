@@ -539,3 +539,146 @@ fn a_rotation_on_a_weight_that_is_not_int8_is_refused() {
         "linear_residual",
     );
 }
+
+// --- GGUF block formats ------------------------------------------------------
+
+mod gguf_formats {
+    use super::super::gguf_forge::{ForgedTensor, write_gguf};
+    use super::super::ops::check_reduction;
+    use super::super::weights::{BlockFormat, StStore};
+    use super::{ImageGenError, WeightKind};
+    use shiso_modelfile::st_header::StDType;
+
+    const ALL: [(BlockFormat, usize, usize); 6] = [
+        (BlockFormat::Q2K, 84, 256),
+        (BlockFormat::Q3K, 110, 256),
+        (BlockFormat::Q4K, 144, 256),
+        (BlockFormat::Q5K, 176, 256),
+        (BlockFormat::Q6K, 210, 256),
+        (BlockFormat::Q8_0, 34, 32),
+    ];
+
+    #[test]
+    fn row_bytes_per_format() {
+        for (format, bytes, elems) in ALL {
+            assert_eq!(format.block_bytes(), bytes, "{format:?}");
+            assert_eq!(format.block_elems(), elems, "{format:?}");
+            assert_eq!(format.row_bytes(768), 768 / elems * bytes, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn gguf_open_maps_every_type() {
+        // (name, GGUF type id, bytes per row of 256 weights, expected)
+        let cases: [(&str, u32, usize, Option<BlockFormat>, StDType); 9] = [
+            ("f32", 0, 1024, None, StDType::F32),
+            ("q8_0", 8, 34 * 8, Some(BlockFormat::Q8_0), StDType::U8),
+            ("q2k", 10, 84, Some(BlockFormat::Q2K), StDType::U8),
+            ("q3k", 11, 110, Some(BlockFormat::Q3K), StDType::U8),
+            ("q4k", 12, 144, Some(BlockFormat::Q4K), StDType::U8),
+            ("q5k", 13, 176, Some(BlockFormat::Q5K), StDType::U8),
+            ("q6k", 14, 210, Some(BlockFormat::Q6K), StDType::U8),
+            ("bf16", 30, 512, None, StDType::Bf16),
+            ("f16", 1, 512, None, StDType::F16),
+        ];
+        let payloads: Vec<Vec<u8>> = cases.iter().map(|c| vec![0u8; c.2]).collect();
+        let tensors: Vec<ForgedTensor<'_>> = cases
+            .iter()
+            .zip(&payloads)
+            .map(|(c, bytes)| ForgedTensor {
+                name: c.0,
+                ne: &[256, 1],
+                type_id: c.1,
+                bytes,
+            })
+            .collect();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("m.gguf");
+        write_gguf(&path, &[("general.architecture", "flux")], &tensors);
+        let store = StStore::open(&path).expect("every supported type opens");
+        for (name, _, _, block, dtype) in cases {
+            let entry = store.get(name).expect(name);
+            assert_eq!(entry.block, block, "{name}");
+            assert_eq!(entry.dtype, dtype, "{name}");
+            assert_eq!(
+                entry.shape,
+                vec![1, 256],
+                "{name}: shape is reversed to (out, in)"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_gguf_type_names_the_type() {
+        // IQ4_XS: id 23, 136 bytes per 256 weights.
+        let bytes = vec![0u8; 136];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("m.gguf");
+        write_gguf(
+            &path,
+            &[],
+            &[ForgedTensor {
+                name: "blk.0.attn.weight",
+                ne: &[256, 1],
+                type_id: 23,
+                bytes: &bytes,
+            }],
+        );
+        match StStore::open(&path) {
+            Err(ImageGenError::Checkpoint(message)) => {
+                assert!(message.contains("iq4_xs"), "names the type: {message}");
+                assert!(
+                    message.contains("blk.0.attn.weight"),
+                    "names the tensor: {message}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn q8_0_needs_k_multiple_of_32_others_256() {
+        check_reduction("step.a", WeightKind::Q8_0, 96).expect("96 is three Q8_0 blocks");
+        for kind in [
+            WeightKind::Q2K,
+            WeightKind::Q3K,
+            WeightKind::Q4K,
+            WeightKind::Q5K,
+            WeightKind::Q6K,
+        ] {
+            check_reduction("step.a", kind, 768).expect("768 is three k-blocks");
+            for k in [96, 272] {
+                match check_reduction("step.a", kind, k) {
+                    Err(ImageGenError::Backend(message)) => {
+                        assert!(message.contains("step.a"), "names the step: {message}");
+                        assert!(message.contains(&k.to_string()), "names k: {message}");
+                        assert!(message.contains("256"), "says the multiple: {message}");
+                    }
+                    other => panic!("{kind:?} k={k}: expected a refusal, got {other:?}"),
+                }
+            }
+        }
+        match check_reduction("step.b", WeightKind::Q8_0, 48) {
+            Err(ImageGenError::Backend(message)) => {
+                assert!(
+                    message.contains("step.b") && message.contains("48"),
+                    "{message}"
+                );
+                assert!(message.contains("32"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        check_reduction("step.c", WeightKind::Bf16, 17).expect("plain kinds have no block");
+    }
+}
+
+#[test]
+fn the_document_a_real_export_writes_parses() {
+    // Verbatim from a published per-row ConvRot export: the format name says
+    // tensorwise, `per_row` marks the [out, 1] scale.
+    let doc = br#"{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256, "per_row": true}"#;
+    assert_eq!(
+        parse_quant_spec("blk.w.weight", doc).expect("parses"),
+        Some(RotGroup::Hadamard256)
+    );
+}

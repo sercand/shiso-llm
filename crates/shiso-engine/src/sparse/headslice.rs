@@ -21,6 +21,11 @@
 //! Single rows cannot be lifted out; blocks can, intact, and the gathered
 //! payload then has the layout of an ordinary `(k, n_sel)` tensor that the
 //! ordinary dense launch runs.
+//!
+//! A row-major float head (the brain-float one an export stores unquantized)
+//! has no such mixing: a block is 128 consecutive rows, one contiguous byte
+//! range, and the slice is those ranges copied in order. Blocks are kept for
+//! it anyway, so both heads are cut by the same choice of ids.
 
 use std::sync::Arc;
 
@@ -135,10 +140,6 @@ pub fn blocks_from_counts(counts: &str, vocab: u32, target_ids: u32) -> Vec<u32>
 /// blocks name nothing, and whatever the device reports for the allocation and
 /// the two launches.
 pub fn build(backend: &Arc<dyn Backend>, source: &Weight, blocks: &[u32]) -> CoreResult<HeadSlice> {
-    let bits = quant::exl3::k_bits(source.dtype).ok_or(CoreError::Unsupported {
-        what: "a sliced vocabulary head of a projection that is not a trellis tensor",
-        backend: "engine",
-    })?;
     let kept = u32::try_from(blocks.len()).unwrap_or(0);
     if kept == 0 || !source.out_dim.is_multiple_of(BLOCK) {
         return Err(CoreError::Unsupported {
@@ -146,6 +147,14 @@ pub fn build(backend: &Arc<dyn Backend>, source: &Weight, blocks: &[u32]) -> Cor
             backend: "engine",
         });
     }
+    if let Some(width) = row_bytes(source) {
+        return build_rows(backend, source, blocks, width);
+    }
+    let bits = quant::exl3::k_bits(source.dtype).ok_or(CoreError::Unsupported {
+        what: "a sliced vocabulary head of a projection that is neither a trellis nor a \
+               row-major float tensor",
+        backend: "engine",
+    })?;
     let rows = kept.saturating_mul(BLOCK);
     let bytes = Weight::payload_bytes(source.dtype, source.in_dim, rows).ok_or(
         CoreError::ShapeMismatch {
@@ -205,6 +214,56 @@ pub fn build(backend: &Arc<dyn Backend>, source: &Weight, blocks: &[u32]) -> Cor
     )?;
     backend.sync()?;
 
+    let ids = blocks
+        .iter()
+        .flat_map(|b| (0..BLOCK).map(move |i| b.saturating_mul(BLOCK).saturating_add(i)))
+        .collect();
+    Ok(HeadSlice {
+        weight: Weight::over(source.dtype, source.in_dim, rows, buffer),
+        ids,
+    })
+}
+
+/// Bytes of one row of a row-major float head, `None` for any other format.
+fn row_bytes(source: &Weight) -> Option<u64> {
+    let element = match source.dtype {
+        shiso_core::DType::F32 => 4,
+        shiso_core::DType::F16 | shiso_core::DType::BF16 => 2,
+        _ => return None,
+    };
+    Some(u64::from(source.in_dim) * element)
+}
+
+/// The slice of a row-major float head: each kept block's 128 rows copied in
+/// order, a run of adjacent blocks as one copy.
+fn build_rows(
+    backend: &Arc<dyn Backend>,
+    source: &Weight,
+    blocks: &[u32],
+    width: u64,
+) -> CoreResult<HeadSlice> {
+    let block_bytes = width * u64::from(BLOCK);
+    let rows = u32::try_from(blocks.len())
+        .unwrap_or(0)
+        .saturating_mul(BLOCK);
+    let buffer = alloc(backend, u64::from(rows) * width)?;
+    let whole = source.part(WeightPart::Whole)?;
+    let mut at = 0usize;
+    let mut written = 0u64;
+    while at < blocks.len() {
+        // A run of consecutive block indices is one contiguous range.
+        let mut end = at + 1;
+        while end < blocks.len() && blocks[end] == blocks[end - 1].saturating_add(1) {
+            end += 1;
+        }
+        let len = u64::try_from(end - at).unwrap_or(0) * block_bytes;
+        let from = u64::from(blocks[at]) * block_bytes;
+        let src = whole.slice(from, len)?;
+        backend.copy_d2d(buffer.slice(written, len)?, src)?;
+        written += len;
+        at = end;
+    }
+    backend.sync()?;
     let ids = blocks
         .iter()
         .flat_map(|b| (0..BLOCK).map(move |i| b.saturating_mul(BLOCK).saturating_add(i)))

@@ -2,7 +2,7 @@
  * name on this device.
  *
  * Nothing here is copied. What is preserved from the Metal twin in
- * `crates/shiso-metal/metal/generic/mul_mv_dense.metal` is the contract: the
+ * `kernels/metal/generic/mul_mv_dense.metal` is the contract: the
  * entry name, the `MulMvArgs` block, the buffer order, the `(32, nsg)` block
  * with the output rows divided by `nr0` on `x`, the sixteen-element run each
  * lane takes, the scalar tail over whatever the block tiling did not cover, and

@@ -18,6 +18,14 @@ pub const DEFAULT_HF_ENDPOINT: &str = "https://huggingface.co";
 /// Default maximum parallel file downloads.
 pub const DEFAULT_MAX_PARALLEL_FILES: usize = 4;
 
+/// How long a connection may take to open before the client gives up.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long a response may go without a byte before the client gives up.
+/// Per read, not per request, so a long download that keeps moving is
+/// unaffected.
+pub const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Secret Hugging Face bearer token.
 ///
 /// Implements `Debug` by redacting the secret: `HfToken(***)`.

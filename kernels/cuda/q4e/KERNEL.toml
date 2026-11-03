@@ -18,10 +18,26 @@
 # `modelopt` is the exception to "byte-for-byte copy": the NVFP4 routed stages
 # and the FP8 n-gram decode the NVIDIA export needs are this repository's own,
 # and sit in a unit (and a module) of their own so no upstream unit is edited.
-# `exact` is the other: the tensor-core attention with its softmax weights
+# `exact` is another: the tensor-core attention with its softmax weights
 # carried into the P V product as two fp16 halves, and the fused decode row of
 # a recurrent layer - both derived from ported kernels, and kept out of their
-# units for the same reason.
+# units for the same reason. `kv8` is a third: the key/value store and every
+# attention reader of the K and V planes again, over a cache of FP8 E4M3 bytes
+# instead of f16, selected by `--kv-cache-dtype fp8`. `mxfp8` is a fourth: the
+# dense projections over an MXFP8 weight, read as stored, again this
+# repository's own. `idxring` is a fifth: the indexer's pooled key pass reading
+# raw keys from a per-session ring and the pass's own rows instead of from a
+# per-position raw key plane, which the page no longer carries.
+# `bf16` is a sixth: the dense projections over a brain-float weight on a
+# device with tensor cores - split step kernels and a tensor-core prompt GEMM -
+# beside the ported `matvec` kernel it replaces there. `gdn_fused` is a
+# seventh: a prefill chunk's whole recurrent block between its projections in
+# two kernels, bit for bit what the `gdn`/`gdn_tc` chain computes, with the
+# intermediates the chain writes kept out of memory. `ffn` is an eighth: a
+# decode step's or a verify's router, routed selection and shared expert as
+# one launch of work items, bit for bit what the `bf16`/`moe`/`mxfp8` launches
+# it replaces compute; it shares `mxfp8.cuh` with `mxfp8` so the two run the
+# same MXFP8 arithmetic.
 
 [build]
 sources = [
@@ -38,6 +54,12 @@ sources = [
     "embed.cu",
     "modelopt.cu",
     "exact.cu",
+    "kv8.cu",
+    "mxfp8.cu",
+    "idxring.cu",
+    "bf16.cu",
+    "gdn_fused.cu",
+    "ffn.cu",
 ]
 
 # Every unit includes `q4e.cuh` by bare name, and that header reaches its own
@@ -48,9 +70,10 @@ includes = ["cuda/q4e"]
 # `defines`, `std`, `base_flags` and `outputs` take the tree defaults. `arch`
 # does not, and the reason is the sharpest failure mode in this directory.
 #
-# Five entries - `q4e_idx_score_tc_kernel`, `q4e_qsa_attention_tc_kernel`, its
-# exact twin `q4e_qsa_attention_tc_exact_kernel`, and the two matrix-fragment
-# helpers they call - are guarded on `__CUDA_ARCH__ >= 800`
+# Six entries - `q4e_idx_score_tc_kernel`, `q4e_qsa_attention_tc_kernel`, its
+# exact twin `q4e_qsa_attention_tc_exact_kernel`, that twin's FP8-cache variant
+# `q4e_qsa_attention_tc_exact_fp8_kernel`, and the two matrix-fragment helpers
+# they call - are guarded on `__CUDA_ARCH__ >= 800`
 # and fall back to WRITING ZEROS below it. The host picks between the
 # tensor-core entry and its scalar twin by asking about a shared-memory
 # attribute, not about the architecture. So a module built at the tree default
@@ -83,3 +106,9 @@ misc = "q4e_misc"
 embed = "q4e_embed"
 modelopt = "q4e_modelopt"
 exact = "q4e_exact"
+kv8 = "q4e_kv8"
+mxfp8 = "q4e_mxfp8"
+idxring = "q4e_idxring"
+bf16 = "q4e_bf16"
+gdn_fused = "q4e_gdn_fused"
+ffn = "q4e_ffn"

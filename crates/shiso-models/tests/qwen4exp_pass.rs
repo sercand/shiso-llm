@@ -295,10 +295,12 @@ fn the_indexer_stores_its_keys_on_every_pass_and_selects_on_only_some() {
     let (_dir, _fake, mut model) = loaded();
     let session = model.open_session().expect("a session opens");
     let cold = model.plan_chunk(session, &tokens(0, 1), 1).expect("plans");
-    // Two attention slots, each storing a raw key row and pooling it. Skipping
-    // this would leave a hole in the table for the positions this pass wrote.
-    assert_eq!(cold.plan.count("q4e_idx_store_k_kernel"), 2);
-    assert_eq!(cold.plan.count("q4e_idx_pool_kernel"), 2);
+    // Two attention slots, each pooling over its ring and refilling it - one
+    // launch, since no raw key row is stored per position. Skipping it would
+    // leave a hole in the table for the positions this pass wrote.
+    assert_eq!(cold.plan.count("q4e_idx_store_k_kernel"), 0);
+    assert_eq!(cold.plan.count("q4e_idx_pool_kernel"), 0);
+    assert_eq!(cold.plan.count("q4e_idx_ring_pool_kernel"), 2);
 }
 
 #[test]
@@ -423,21 +425,21 @@ fn a_pass_carries_the_n_gram_gather_it_will_need() {
     assert_eq!(gather.row_count(), 4 * 4);
 }
 
-/// The six kernels that carry per-sequence state through one batched launch.
-const BATCHED: [&str; 5] = [
+/// The kernels that carry per-sequence state through one batched launch. The
+/// raw indexer key store was one; no raw key is stored per position any more,
+/// and the pooled pass that reads the ring instead runs once per row.
+const BATCHED: [&str; 4] = [
     "q4e_gdn_conv_batch_kernel",
     "q4e_gdn_recurrent_batch_kernel",
     "q4e_qsa_store_kv_batch_kernel",
-    "q4e_idx_store_k_batch_kernel",
     "q4e_ple_conv_batch_kernel",
 ];
 
 /// Their scalar siblings, each of which reads one session's state.
-const SCALAR: [&str; 5] = [
+const SCALAR: [&str; 4] = [
     "q4e_gdn_conv_kernel",
     "q4e_gdn_recurrent_kernel",
     "q4e_qsa_store_kv_kernel",
-    "q4e_idx_store_k_kernel",
     "q4e_ple_conv_kernel",
 ];
 
@@ -495,7 +497,7 @@ fn a_wider_batch_dispatches_every_batched_kernel_and_none_of_their_scalar_siblin
     // The pooled key pass has no batched sibling, so it is launched once per
     // row rather than once for the batch - and each launch covers one position.
     assert_eq!(
-        pass.plan.count("q4e_idx_pool_kernel"),
+        pass.plan.count("q4e_idx_ring_pool_kernel"),
         3 * fixture::ATTN_SLOTS,
         "the pooled key pass is planned per row per attention slot"
     );
@@ -526,7 +528,6 @@ fn a_batched_pass_binds_a_per_row_array_where_a_chunk_binds_one_sessions_buffer(
         ),
         ("q4e_ple_conv_batch_kernel", 1, Operand::NgramWindows),
         ("q4e_qsa_store_kv_batch_kernel", 14, Operand::PageTables),
-        ("q4e_idx_store_k_batch_kernel", 3, Operand::PageTables),
     ] {
         let step = pass
             .plan
@@ -539,16 +540,32 @@ fn a_batched_pass_binds_a_per_row_array_where_a_chunk_binds_one_sessions_buffer(
     }
 
     // And the pooled pass, which has no array: each of its launches names one
-    // row's page table, and the two launches name different rows.
+    // row's page table and one row's raw key ring, and the two launches name
+    // different rows.
     let pooled = pass
         .plan
         .steps()
         .iter()
-        .filter(|step| step.name() == "q4e_idx_pool_kernel")
-        .map(|step| step.operands().expect("the list fits a launch")[4])
+        .filter(|step| step.name() == "q4e_idx_ring_pool_kernel")
+        .map(|step| {
+            let ops = step.operands().expect("the list fits a launch");
+            (ops[1], ops[5])
+        })
         .collect::<Vec<_>>();
-    assert_eq!(pooled[0], Operand::PagesOf(0));
-    assert_eq!(pooled[1], Operand::PagesOf(1));
+    assert_eq!(
+        pooled[0],
+        (
+            Operand::IndexerRingOf { rank: 0, row: 0 },
+            Operand::PagesOf(0)
+        )
+    );
+    assert_eq!(
+        pooled[1],
+        (
+            Operand::IndexerRingOf { rank: 0, row: 1 },
+            Operand::PagesOf(1)
+        )
+    );
 
     // The attention is the single-row kernel, once per row, over that row's
     // own page table: a row of a batch attends exactly as a single-row step
@@ -1299,7 +1316,12 @@ mod plan_snapshot;
 /// exception: both tensor-core attention paths moved to the exact-weight
 /// entry (`q4e_exact`, 81,984 bytes of shared memory), and the snapshot was
 /// re-recorded for that and checked to differ in exactly those 24 launches'
-/// module, entry and size.
+/// module, entry and size; and the page lost its raw indexer key plane, and
+/// the snapshot was re-recorded for that and checked to differ in exactly the
+/// indexer's storing half - the 36 raw key stores gone, and each of the 58
+/// pooled passes the ring pass at the same grid with the same operands, the
+/// ring, the pass's key rows and the no-tap pair added - and in nothing else
+/// once island offsets and step counts are set aside.
 #[test]
 fn a_standard_requests_passes_plan_what_they_planned_before_scoring_batched() {
     let got = plan_snapshot::snapshot();

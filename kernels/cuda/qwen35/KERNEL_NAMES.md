@@ -32,7 +32,7 @@ kernel_q35_k_norm_rope_kv
 kernel_q35_k_norm_rope_kv_mrope
 ```
 
-Twins of `crates/shiso-metal/metal/qwen35/rmsnorm_rope.metal`, over the laws
+Twins of `kernels/metal/qwen35/rmsnorm_rope.metal`, over the laws
 `kernels/cuda/q4e/qsa.cu` carries as `q4e_qsa_q_norm_rope_kernel` and
 `q4e_qsa_store_kv_kernel`. Geometry: grid `(n_head, n_tok)` for the query pair
 and `(n_head_kv, n_tok)` for the key pair, block `(128, 1, 1)`, 1156 bytes of
@@ -140,7 +140,7 @@ kernel_q35_attn_prefill
 kernel_q35_attn_gate_mul
 ```
 
-Twins of `crates/shiso-metal/metal/qwen35/gated_attn.metal` and
+Twins of `kernels/metal/qwen35/gated_attn.metal` and
 `gated_attn_prefill.metal`, over the laws `kernels/cuda/q4e/qsa.cu` carries as
 `q4e_qsa_attention_kernel`, `q4e_qsa_attention_tiled_kernel` and
 `q4e_qsa_gate_kernel`. Geometry: decode grid `(n_head, n_tok)`, block
@@ -175,7 +175,7 @@ kernel_q35_gdn_chunk_c8
 kernel_q35_gdn_chunk_hybrid
 ```
 
-Twins of `crates/shiso-metal/metal/qwen35/gdn_conv.metal`,
+Twins of `kernels/metal/qwen35/gdn_conv.metal`,
 `gdn_recurrent.metal`, `gdn_recurrent_hybrid.metal`, `gdn_chunk.metal` and
 `gdn_chunk_hybrid.metal`, over the laws `kernels/cuda/q4e/gdn.cu` carries.
 

@@ -39,6 +39,24 @@
 //! checkpoint is only ever taken at a session's frontier, and the row staged
 //! there is always the last committed one, so the position is `tokens - 1` and a
 //! word carrying it could only ever disagree.
+//!
+//! # The raw indexer keys travel in the blob
+//!
+//! A page carries pooled indexer keys and no raw ones; the raw keys of the
+//! block a frontier stands inside live in the session's ring (see
+//! [`crate::sparse::paged`]). A resume inside a block needs them and no page
+//! can supply them - the page past a checkpoint is the continuing session's to
+//! overwrite - so the blob ends with the ring, canonicalized to the rows a
+//! resume reads ([`paged::RingLayout`]). That section is also what changes the
+//! blob's length, and with it the disk identity: a file from before the ring
+//! is a miss.
+//!
+//! The draft head's rank is the one that needs care. Its rows up to the
+//! position before the frontier are written by a pass that runs *after* the
+//! target's - the warm-up over a prompt chunk, the catch-up after a verify - so
+//! every commit that can admit a checkpoint runs after that pass, and a grid
+//! checkpoint cut inside a chunk takes the head's rows from inside its warm-up
+//! ([`crate::sparse::indexer::RingTap`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +65,7 @@ use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{SessionId, TokenId};
 use shiso_core::media::{MediaKey, MediaSpan};
 use shiso_core::model::Logits;
+use shiso_core::page::KvElem;
 use shiso_kvstore::{
     CacheStats, CommitOpts, KvCache, PathLayout, PersistRefusal, PumpReport, Reason,
 };
@@ -57,32 +76,36 @@ use crate::media_path::{self, SessionKey};
 use crate::shape::LayerKind;
 use crate::sparse::kernels::F32_BYTES;
 use crate::sparse::mtp::SpecDepth;
-use crate::sparse::paged::{self, PagePlanes, conv_state_bytes, ple_window_bytes, state_bytes};
+use crate::sparse::paged::{
+    self, PagePlanes, RingLayout, conv_state_bytes, ple_window_bytes, state_bytes,
+};
 use crate::sparse::scratch::Buf;
 use crate::sparse::shape::SparseShape;
 use crate::sparse::stack::{MAX_PREFILL_CHUNK, SparseSession, SparseStack};
-
-/// Bytes per stored key/value element: this family's cache is half precision end
-/// to end, exactly as the dense one's is.
-const CACHE_ELEMENT_BYTES: u32 = 2;
 
 /// The geometry guard a stored payload carries, derived from the running build.
 ///
 /// Every number is either a count from the shape or a width the cache was built
 /// with, so a file this build writes and a file this build will accept are
 /// described by one function.
+///
+/// `kv_width` is a key row's bytes at the element the attention planes are
+/// stored as, so an f16 build and an fp8 build already disagree here; the
+/// codec name in [`disk_numerics`] is what keeps two elements of the same
+/// width apart.
 #[must_use]
 pub(crate) fn path_layout(
     shape: &SparseShape,
     ctx: u32,
     spec: SpecDepth,
+    kv: KvElem,
     identity: CkptIdentity,
 ) -> PathLayout {
     PathLayout {
         model_id: identity.model_id,
         quant_bits: identity.quant_bits,
         ctx_size: ctx,
-        kv_width: shape.kv_dim().saturating_mul(CACHE_ELEMENT_BYTES),
+        kv_width: shape.kv_dim().saturating_mul(kv.bytes()),
         n_layers: shape.n_layers(),
         n_attn_layers: shape.count(LayerKind::Attn),
         n_gdn_layers: shape.count(LayerKind::Gdn),
@@ -103,6 +126,24 @@ pub(crate) fn path_layout(
         // it, or a row a speculating session invented, are both answers from
         // numbers nothing computed.
         draft_head: spec.is_speculative(),
+    }
+}
+
+/// The arithmetic name the disk tier files this build's pages under: the
+/// device's own, plus the key/value codec when it is not f16.
+///
+/// The codec goes into the name rather than into a new layout word because a
+/// layout word is a format change that would orphan every f16 file already on
+/// disk; f16 keeps exactly the name it always had, so those files stay valid.
+/// The name is hashed into a page file's identity, so two builds whose caches
+/// hold different bytes for the same tokens never read each other's files -
+/// even at an equal page size, which a future codec of the same width (another
+/// one-byte format, or E4M3 under a different scale law) would have.
+#[must_use]
+pub(crate) fn disk_numerics(device: String, kv: KvElem) -> String {
+    match kv {
+        KvElem::F16 => device,
+        KvElem::Fp8E4m3 => format!("{device}+kv={}", kv.codec()),
     }
 }
 
@@ -184,7 +225,14 @@ impl SparseStack {
                 backend: "engine",
             });
         }
-        let layout = path_layout(&self.shape, self.opts.engine.ctx, self.opts.spec, identity);
+        let kv = self.opts.engine.kv_elem;
+        let layout = path_layout(
+            &self.shape,
+            self.opts.engine.ctx,
+            self.opts.spec,
+            kv,
+            identity,
+        );
         // The planes the pool was allocated with, which include a draft head's
         // own four when one is resident: a geometry that left them out handed
         // the store a page buffer one draft layer short of the page, and every
@@ -192,6 +240,7 @@ impl SparseStack {
         let planes = PagePlanes {
             indexer: true,
             draft: self.has_draft_head(),
+            kv,
         };
         let geometry =
             paged::cache_geometry(&self.shape, planes, self.opts.spec).with_layout(layout);
@@ -202,7 +251,7 @@ impl SparseStack {
         let disk = config.options.disk(
             config.dir.clone(),
             geometry.page_bytes_total(pool_pages),
-            self.backend.numerics_id(),
+            disk_numerics(self.backend.numerics_id(), kv),
         )?;
         let budget_bytes = disk.budget_bytes;
         let numerics = disk.numerics.clone();
@@ -281,7 +330,9 @@ impl SparseStack {
     ) -> CoreResult<()> {
         let now = self.now();
         let vocab_row = u64::from(self.shape.vocab).saturating_mul(F32_BYTES);
-        let blob_bytes = paged::ckpt_bytes(&self.shape, self.opts.spec);
+        let planes = self.page_planes();
+        let blob_bytes = paged::ckpt_bytes(&self.shape, self.opts.spec, planes);
+        let ring = RingLayout::of(&self.shape, self.opts.spec, planes);
         let Self {
             backend,
             resident,
@@ -332,6 +383,7 @@ impl SparseStack {
                 ) == Some(q));
         if admit {
             snapshot(backend.as_ref(), live, blob_bytes, &mut staging.ckpt)?;
+            ring.canonicalize(&mut staging.ckpt, q)?;
             if let Some(row) = frontier_row {
                 let at = u64::from(row).saturating_mul(vocab_row);
                 let view = resident.scratch.view(Buf::Logits)?.slice(at, vocab_row)?;
@@ -377,13 +429,46 @@ impl SparseStack {
             .map_err(cache_failure)
     }
 
+    /// Copies the draft row a prompt's final pass leaves for its snapshot row
+    /// into the snapshot buffer: the residual of the position before it, which
+    /// the pass's residual still holds. Called straight after the pass, before
+    /// anything else writes the residual; [`Self::commit_snapshot`] reads the
+    /// buffer back once the draft head has been warmed. A no-op for a session
+    /// that does not speculate.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::UnknownSession`], and whatever the device reports.
+    pub(crate) fn stage_snapshot_row(&mut self, session: SessionId, row: u32) -> CoreResult<()> {
+        let Some(row) = u64::from(row).checked_sub(1) else {
+            return Ok(());
+        };
+        let draft_at = paged::snapshot_draft_offset(&self.shape);
+        let width = paged::draft_row_bytes(&self.shape);
+        let resident = self.resident()?;
+        let Some(snapshot) = resident.snapshot.as_ref() else {
+            return Ok(());
+        };
+        if !self.session(session)?.spec_depth().is_speculative() {
+            return Ok(());
+        }
+        let residual = resident
+            .scratch
+            .view(Buf::Residual)?
+            .slice(row.saturating_mul(width), width)?;
+        self.backend
+            .copy_d2d(snapshot.view().slice(draft_at, width)?, residual)
+    }
+
     /// Commits the span a prompt's final pass wrote up to its snapshot row -
     /// `lead` is those rows' tokens - with the state the pass left in the
     /// snapshot buffer as its checkpoint, filed and persisted as the prompt's
     /// end would have been. `false` when there was nothing to commit it with.
     ///
     /// A speculating session's blob carries the draft row of the position
-    /// before the snapshot, which the pass's residual still holds.
+    /// before the snapshot, which [`Self::stage_snapshot_row`] copied there,
+    /// and the draft head's raw keys up to that position, which the head's
+    /// warm-up tapped into the buffer: so this runs after the warm-up.
     ///
     /// # Errors
     ///
@@ -398,9 +483,9 @@ impl SparseStack {
             return Ok(false);
         };
         let now = self.now();
-        let blob_bytes = paged::ckpt_bytes(&self.shape, self.opts.spec);
-        let draft_at = paged::snapshot_draft_offset(&self.shape);
-        let width = paged::draft_row_bytes(&self.shape);
+        let planes = self.page_planes();
+        let blob_bytes = paged::ckpt_bytes(&self.shape, self.opts.spec, planes);
+        let ring = RingLayout::of(&self.shape, self.opts.spec, planes);
         let Self {
             backend,
             resident,
@@ -418,13 +503,6 @@ impl SparseStack {
         let live = sessions
             .get_mut(&session)
             .ok_or(CoreError::UnknownSession(session))?;
-        if live.spec_depth().is_speculative() {
-            let residual = resident
-                .scratch
-                .view(Buf::Residual)?
-                .slice((row - 1).saturating_mul(width), width)?;
-            backend.copy_d2d(snapshot.view().slice(draft_at, width)?, residual)?;
-        }
         staging
             .ckpt
             .resize(usize::try_from(blob_bytes).unwrap_or(usize::MAX), 0);
@@ -432,6 +510,10 @@ impl SparseStack {
         let q = live
             .written()
             .saturating_add(u32::try_from(row).unwrap_or(u32::MAX));
+        // The target ranks stand on a grid point, a block boundary, and need no
+        // raw key; the head's three come from the warm-up's tap. Everything
+        // else in the section is whatever the last snapshot left.
+        ring.canonicalize(&mut staging.ckpt, q)?;
         if !keyed_at(live, q) {
             return Ok(false);
         }
@@ -470,7 +552,9 @@ impl SparseStack {
             return Ok(SaveOutcome::Disabled);
         };
         let now = self.now();
-        let blob_bytes = paged::ckpt_bytes(&self.shape, self.opts.spec);
+        let planes = self.page_planes();
+        let blob_bytes = paged::ckpt_bytes(&self.shape, self.opts.spec, planes);
+        let ring = RingLayout::of(&self.shape, self.opts.spec, planes);
         let Self {
             backend,
             resident,
@@ -507,6 +591,7 @@ impl SparseStack {
                 return Ok(SaveOutcome::NoDraftRow);
             }
             snapshot(backend.as_ref(), live, blob_bytes, &mut staging.ckpt)?;
+            ring.canonicalize(&mut staging.ckpt, q)?;
             let (frontier, history) = live.commit_parts();
             resident
                 .cache
@@ -796,7 +881,10 @@ fn keyed_at(live: &SparseSession, q: u32) -> bool {
 /// The layout is the one [`restore_state`] reads back, and the two agree because
 /// this is the only function that writes it: every recurrent slot in ordinal
 /// order, each slot's convolution window followed by its state matrix; then the
-/// n-gram block's dilated window; then the pending draft row.
+/// n-gram block's dilated window; then the pending draft row; then the raw
+/// indexer key ring, whole - the caller canonicalizes it with
+/// [`RingLayout::canonicalize`], which needs the position this function does
+/// not know.
 ///
 /// The draft row is present exactly when the stack speculates, which is the same
 /// condition the stored layout's draft-head word carries, so the blob's length
@@ -820,6 +908,7 @@ fn snapshot(
     if let Some(row) = session.pending_draft() {
         append(backend, blob, row)?;
     }
+    append(backend, blob, session.indexer_rings())?;
     let got = u64::try_from(blob.len()).unwrap_or(u64::MAX);
     if got != blob_bytes {
         return Err(CoreError::ShapeMismatch {
@@ -844,7 +933,7 @@ fn append(
 }
 
 /// Copies a checkpoint blob back into a session, in the order [`snapshot`] wrote
-/// it.
+/// it, the raw indexer key ring included.
 ///
 /// Nothing is interpreted: each piece is a byte range whose length the device
 /// buffer itself states, and a blob that does not end exactly where the last
@@ -892,7 +981,10 @@ fn restore_state(
         spec.pending_valid = true;
         at = end;
     }
-    let end = at;
+    // The ring last, as the snapshot wrote it: the raw keys the first pass
+    // after the resume reads for the block its frontier stands inside, and
+    // zeros everywhere a resume reads nothing.
+    let end = write_view(backend, session.ring.view(), blob, at)?;
     if end != blob.len() {
         return Err(CoreError::ShapeMismatch {
             field: "restored session state",
@@ -928,5 +1020,81 @@ fn cache_failure(source: shiso_kvstore::KvError) -> CoreError {
         backend: "engine",
         op: "kv cache",
         source: Box::new(source),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shape::GdnShape;
+    use crate::sparse::shape::{GqaShape, IndexerShape, MoeShape, MropeSections};
+
+    fn shape() -> SparseShape {
+        SparseShape {
+            layers: vec![
+                LayerKind::Gdn,
+                LayerKind::Gdn,
+                LayerKind::Gdn,
+                LayerKind::Attn,
+            ],
+            hidden: 2_560,
+            vocab: 248_320,
+            streams: 4,
+            stream_rank: 320,
+            gqa: GqaShape::new(24, 2, 256, 64),
+            gdn: GdnShape::new(48, 16, 128, 4),
+            moe: MoeShape::new(512, 10, 1, 640),
+            indexer: IndexerShape::new(4, 128, 2_048, 4),
+            ple: None,
+            mrope: MropeSections::new(11, 11, 10),
+            rms_eps: 1.0e-6,
+            rope_theta: 1.0e7,
+        }
+    }
+
+    #[test]
+    fn an_fp8_build_and_an_f16_build_file_their_pages_under_different_identities() {
+        // Both halves of the identity have to move: the layout word, which a
+        // narrower element changes on its own, and the arithmetic name, which
+        // is what would still tell two one-byte codecs apart.
+        let identity = CkptIdentity::new(7, 4);
+        let f16 = path_layout(&shape(), 65_536, SpecDepth::NONE, KvElem::F16, identity);
+        let fp8 = path_layout(&shape(), 65_536, SpecDepth::NONE, KvElem::Fp8E4m3, identity);
+        assert_eq!(
+            f16.kv_width,
+            2 * 2 * 256,
+            "two key heads of 256 f16 elements"
+        );
+        assert_eq!(fp8.kv_width, 2 * 256, "the same row at one byte an element");
+        assert_ne!(f16, fp8);
+        let device = || "cuda-sm121".to_owned();
+        assert_eq!(
+            disk_numerics(device(), KvElem::F16),
+            device(),
+            "an f16 build keeps the name its existing files were written under"
+        );
+        assert_eq!(
+            disk_numerics(device(), KvElem::Fp8E4m3),
+            "cuda-sm121+kv=e4m3s1"
+        );
+    }
+
+    #[test]
+    fn an_fp8_page_is_the_f16_page_less_half_of_every_attention_plane() {
+        // The indexer planes stay f16, and so do the draft head's key and value
+        // planes (`PagePlanes::rank_kv`), so the page shrinks by exactly the
+        // target attention ranks' key and value bytes halved.
+        let shape = shape();
+        let f16 = paged::page_bytes(&shape, PagePlanes::full());
+        let fp8 = paged::page_bytes(
+            &shape,
+            PagePlanes {
+                kv: KvElem::Fp8E4m3,
+                ..PagePlanes::full()
+            },
+        );
+        let ranks = u64::from(shape.count(LayerKind::Attn));
+        let kv_f16 = 2 * u64::from(shiso_core::page::PAGE_TOKENS) * u64::from(shape.kv_dim()) * 2;
+        assert_eq!(f16 - fp8, ranks * kv_f16 / 2);
     }
 }

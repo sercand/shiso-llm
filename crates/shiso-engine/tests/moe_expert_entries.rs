@@ -107,7 +107,7 @@ fn defines(text: &str, name: &str) -> bool {
 #[test]
 fn every_name_expert_entry_can_return_is_defined_by_a_source_that_ships() {
     let cuda = sources("kernels/cuda/qwen35moe", &["cuh", "cu"]);
-    let metal = sources("crates/shiso-metal/metal/qwen35moe", &["metal"]);
+    let metal = sources("kernels/metal/qwen35moe", &["metal"]);
 
     let mut found = 0usize;
     for stage in STAGES {

@@ -1,5 +1,5 @@
 /* Signed blockwise Walsh-Hadamard rotation of f32 rows; the twin of
- * `crates/shiso-metal/metal/ternary/rotate.metal`, whose header comment states
+ * `kernels/metal/ternary/rotate.metal`, whose header comment states
  * the transform. One block per (rotation block, token), the rotation block
  * staged whole in dynamic shared memory before any write, so `src == dst` is
  * safe when nothing is permuted. */

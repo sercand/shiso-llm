@@ -93,6 +93,23 @@ cargo build --release -p shiso-server --features metal --bin shiso
 SHISO_CUDA_COMPILE=1 cargo build --release -p shiso-server --features cuda --bin shiso
 ```
 
+### Devices
+
+Every build also carries a CPU device (the `cpu` feature, on by default), so
+shiso runs on a host with no GPU, only slower. `--device` (`SHISO_DEVICE`)
+picks where models run:
+
+| Build | `--device` values |
+|---|---|
+| default | `auto`, `cpu` |
+| `--features metal` | `auto`, `metal`, `cpu` |
+| `--features cuda` | `auto`, `cuda`, `cpu` |
+
+`auto` (the default) uses the GPU the build was compiled for and falls back to
+the CPU when it is absent, logging why. Naming a GPU that is absent is an
+error, not a fallback. To drop the CPU device from a build, pass
+`--no-default-features --features decode-ffmpeg` (plus `metal` or `cuda`).
+
 ### Serve a model
 
 Point shiso at a checkpoint and the `config.json` of its Hugging Face release.
@@ -205,6 +222,88 @@ curl http://127.0.0.1:8090/v1/audio/transcriptions \
     -F 'keywords[]=Marigold' -F 'keywords[]=Lighthouse'
 ```
 
+## Library use
+
+`shiso-runtime` is the server's engine without the HTTP layer or the
+command-line parser: scheduler, model loading, tokenizer, media, and typed
+cores for chat, images and decisions. `Runtime` is one handle over them. It
+takes and returns the `shiso-ir` types, so the caller never builds a wire
+format. A model directory with a language model, an image model or both is
+served; a call for a capability the model does not have returns a typed
+error.
+
+```rust,ignore
+use shiso_ir::decision::{
+    Choice, ChoiceValue, Input, Question, QuestionKind, ReadoutState, Request,
+};
+use shiso_runtime::{Runtime, RuntimeOptions, Source};
+
+// Opens the model, pulling it first when it is not installed, and warms it.
+let options = RuntimeOptions { pull_if_missing: true, ..RuntimeOptions::default() };
+let runtime = Runtime::open(
+    Source::Registry("smollm2-135m-decision"),
+    options,
+    &mut |done, total| {
+        tracing::info!(done, total, "pulling");
+        true // return false to cancel the pull
+    },
+)?;
+
+let choice = |v: &str| Choice { value: ChoiceValue::Str(v.into()), description: None };
+let response = runtime.decide_blocking(Request {
+    input: Input::Text("cwd: /repo\ntask: unknown\ncmd: ls -la".into()),
+    readout_state: ReadoutState::Input,
+    questions: vec![Question {
+        name: "decision".into(),
+        instructions: "Is this command safe to run without asking?".into(),
+        kind: QuestionKind::Choice(vec![choice("approve"), choice("ask"), choice("deny")]),
+        probability_answer: false,
+    }],
+    temperature: None,
+    preserve_thinking: None,
+    token_ids: false,
+})?;
+tracing::info!(choice = ?response.answers[0].choice, "decided");
+
+// A chat model is a runtime of its own (a decision model has no chat turn).
+let chat = Runtime::open(Source::Registry("a-chat-model"), RuntimeOptions::default(), &mut |_, _| true)?;
+let request = shiso_ir::Request::new("a-chat-model", vec![shiso_ir::Message::user("hello")]);
+let reply = chat.generate_blocking(request)?; // or `chat.generate(request).await` in async code
+```
+
+A model with a decision readout or head answers every question from one
+prompt; any other chat model scores each question's labels from its
+next-token row, as `/v1/decisions` does.
+
+`Source::Dir` opens a local installed variant or checkpoint and never touches
+the network; `Source::Registry` reaches it only with `pull_if_missing`.
+`generate_stream`, `images`, `edit_image` and their streaming forms are the
+other entry points.
+
+- **Warm-up on open.** `open` blocks while the weights load, then runs one
+  throwaway pass (one decision, or one generated token, plus one small image
+  when there is an image model) so the first real call does not pay for
+  kernel compilation. A failed decision or text pass is `OpenError::WarmUp`;
+  a failed image pass is only logged.
+- **Cache size.** Unlike `shiso serve`, which holds a 131072-token KV pool, a
+  `Runtime` sizes the pool to `2 x ctx x max_num_seqs` tokens unless you set
+  `serve.kv_cache_tokens` or `serve.gpu_memory_utilization` (measured: about
+  0.5 GiB resident for the 135M decision model instead of 2.9 GiB).
+- **Async and blocking.** The async methods run on the caller's executor,
+  whichever it is: the runtime keeps a private one-worker tokio runtime for
+  timers and the work itself runs on the engine thread. The `*_blocking`
+  methods park the calling thread on a channel and work from any thread;
+  on an async worker they block that worker, so prefer the async form there.
+  The only refused caller is the runtime's own worker thread, which would wait
+  for itself: it gets an error, not a hang or panic.
+- **Sharing and dropping.** Methods take `&self`; wrap the `Runtime` in an
+  `Arc` to share it. Dropping it joins the engine thread after the step in
+  flight, so do not drop it on an async worker you cannot stall.
+
+Build with `--features metal` or `--features cuda`. The runtime has no HTTP
+server or command-line parser in its dependencies unless you turn on its
+`clap` feature.
+
 ## Configuration
 
 Run `shiso serve --help` for every option. Each flag also reads a `SHISO_*`
@@ -216,6 +315,8 @@ environment variable. The ones you are most likely to want:
 | `--max-num-seqs` | Sequences resident at once (default 4) |
 | `--kv-cache-tokens` | Tokens the shared KV cache holds across all sessions (default 131072) |
 | `--gpu-memory-utilization` | Size the KV cache to fill this share of device memory instead, in (0, 1] |
+| `--kv-cache-dtype` | `f16` (default) or `fp8`: store attention keys and values as FP8 E4M3, about 43% fewer cache bytes per token (sparse models on CUDA only) |
+| `--prefill-activations` | `a16` (default) or `lowp`: quantize prompt activations to NVFP4 (routed experts) and MXFP8 (dense projections) and run those products on the block-scaled tensor-core instructions; faster prefill at a measured accuracy cost; decode and verify unchanged (sparse models on a CUDA build for `sm_121a` only) |
 | `--bind`, `--port` | Listen address (default `127.0.0.1:8090`) |
 | `--model-name` | The name clients use in the `model` field |
 | `--auth-tokens` | Comma-separated bearer tokens required on inference routes |
@@ -240,14 +341,15 @@ environment variable. The ones you are most likely to want:
 | `--asr-max-context-tokens` | Most tokens a transcription's `keywords` and `prompt` may take once tokenized (default 256; at most the recognizer's own cap, 512 for Qwen3-ASR) |
 | `--image-model` | Image generation checkpoint (file or directory); serves the image generation routes |
 | `--image-model-id` | The name the image generator answers to on the wire (default: the name the loaded checkpoint reports) |
-| `--image-assets-dir` | Directory holding shared image assets (`text_encoder`, `vae`, `tokenizer`; for Qwen-Image-2.1 also `model_index.json`, `scheduler/` and `transformer/config.json`, which carry the schedule) when they are not collocated with `--image-model` |
+| `--image-assets-dir` | Directory holding shared image assets (`text_encoder`, `vae` (FLUX.3 Klein: `ae.safetensors`), `tokenizer`; for Qwen-Image-2.1 also `model_index.json`, `scheduler/` and `transformer/config.json`, which carry the schedule) when they are not collocated with `--image-model` |
 | `--image-text-encoder` | Text encoder weights path when it is split from `--image-model`; overrides where the locator would look |
 | `--image-vae` | VAE weights path when it is split from `--image-model`; overrides where the locator would look |
 | `--image-tokenizer` | Tokenizer path when it is split from `--image-model`; overrides where the locator would look |
+| `--image-max-upload-mb` | Largest image edit request body in MiB (default 64); only the edit routes take it |
 | `--image-max-queue` | Image requests that may wait in the queue beyond the one generating (default 16); the next is refused with a 503 a retry can fix |
-| `--image-default-steps` | Denoising steps a request that names none gets (default: the loaded model's own: 4 for FLUX.2-klein; for Qwen-Image-2.1 the length of `model_index.json`'s `sample_sigmas`, fixed, when it ships them (8 for Turbo), else 40) |
-| `--image-default-size` | The image size a request that names none gets, as `WxH` (default: the loaded model's own: 1024x1024 on a 16-pixel grid for FLUX.2-klein, 512x512 on a 32-pixel grid for Qwen-Image-2.1, where sizes must be exact multiples of 32); a size off the model's grid is refused at boot |
-| `--image-residency` | Which image pipeline components stay loaded across jobs: `auto` (default) keeps all of them when they fit the device's working set beside a job and otherwise swaps, `resident` refuses a job that does not fit, `swap` lets the text encoder and the transformer take turns |
+| `--image-default-steps` | Denoising steps a request that names none gets (default: the loaded model's own: 4 for FLUX.2-klein, 16 for FLUX.3 Klein; for Qwen-Image-2.1 the length of `model_index.json`'s `sample_sigmas`, fixed, when it ships them (8 for Turbo), else 40) |
+| `--image-default-size` | The image size a request that names none gets, as `WxH` (default: the loaded model's own: 1024x1024 on a 16-pixel grid for FLUX.2-klein and FLUX.3 Klein (FLUX.3 Klein sides run 64 to 4096), 512x512 on a 32-pixel grid for Qwen-Image-2.1, where sizes must be exact multiples of 32); a size off the model's grid is refused at boot |
+| `--image-residency` | Which image pipeline components stay loaded across jobs: `auto` (default) keeps all of them when they fit the device's working set beside a job and otherwise swaps, `resident` refuses a job that does not fit, `swap` lets the text encoder and the transformer take turns (FLUX.3 Klein and Qwen-Image-2.1; FLUX.2-klein refuses it) |
 | `--image-reserve-gb` | GiB of the device working set the image pipeline leaves to the rest of the host when it plans what stays loaded (default 1.5) |
 | `--image-draft-steps` | Leading denoising steps of every image job run at half the requested resolution, then handed over to the full size (Qwen-Image-2.1 only; default 0). A half-size step costs about a quarter of a full one; at 1024x1024 on an M4, 4 of a 6-step distilled checkpoint's steps take a job from 150 s to 77 s at a small cost in fine detail |
 | `--image-final-reuse` | `START:END`: transformer blocks the last step skips, replaying the residual the step before recorded over them (Qwen-Image-2.1 only; the last two steps must run at full size). Faster, visibly softer |
@@ -264,7 +366,8 @@ Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=d
 | `POST /v1/responses` | OpenAI Responses |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/audio/transcriptions` | OpenAI Audio Transcriptions (also at `/audio/transcriptions`) |
-| `POST /v1/images/generations` | OpenAI Images (also at `/v1/images` and `/images`; serves FLUX.2-klein and Qwen-Image-2.1 (Turbo, base, and fine-tunes in the same format; the schedule is the assets' `model_index.json` `sample_sigmas`, shifted by `scheduler/scheduler_config.json`); `b64_json` only) |
+| `POST /v1/images/generations` | OpenAI Images (also at `/v1/images` and `/images`; serves FLUX.2-klein, the distilled FLUX.3 Klein and Qwen-Image-2.1 (Turbo, base, and fine-tunes in the same format; the schedule is the assets' `model_index.json` `sample_sigmas`, shifted by `scheduler/scheduler_config.json`); `b64_json` only) |
+| `POST /v1/images/edits` | OpenAI Image edits (also at `/images/edits`; FLUX.3 Klein only; multipart `image`/`image[]` (up to 10) or JSON `images` with `data:` URLs, plus `prompt`, `size`, `seed`, `steps`, `output_format`, `output_compression`; `n` must be 1, no `mask`; `b64_json` only; body limit `--image-max-upload-mb`) |
 | `POST /v1/embeddings` | OpenAI and OpenRouter Embeddings (also at `/embeddings`; text, token-id and multimodal `content` inputs, `dimensions`, `encoding_format` `float` or `base64`, `input_type`) |
 | `GET /v1/models` | OpenAI Models |
 | `GET /health`, `GET /metrics`, `GET /cache` | health, metrics, cache report |

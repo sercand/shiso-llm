@@ -35,6 +35,9 @@ shiso-vision = { workspace = true }
 # `bytes_of` is what makes the bytes the struct's own layout rather than a
 # hand-packed array. The families' block launches are here, so this is too.
 bytemuck = { workspace = true }
+# The speech encoder export carries its timestamp tokenizer's model as base64
+# text in its metadata.
+base64 = { workspace = true }
 half = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -60,6 +63,8 @@ image = { workspace = true }
 minijinja = { workspace = true }
 
 [dev-dependencies]
+# The CPU device the Clef parity twins run on. Dev-only, like the Metal one.
+shiso-cpu = { workspace = true }
 # The device the model tests run on, and the vocabulary the golden prompt is
 # encoded with. Dev-only: this crate names no device API.
 shiso-metal = { workspace = true }

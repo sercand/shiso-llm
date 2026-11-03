@@ -104,11 +104,16 @@ pub enum Buf {
     Expanded,
     /// The per-stream logits a combine injects.
     Inject,
+    /// The per-(row, stream) norm scale a prompt pass's combine leaves in
+    /// place of the normed streams, which the next mix's fused launches
+    /// apply as they read the residual.
+    NormScale,
     /// A block's contribution, before the combine folds it in.
     BlockOut,
     /// The recurrent block's fused query, key and value projection.
     GdnQkv,
-    /// The same rows after the causal convolution.
+    /// The same rows after the causal convolution; on the fused prompt path,
+    /// the normalized query rows and then the key rows, per (run, key head).
     GdnConv,
     /// Per-head decay.
     GdnDecay,
@@ -118,14 +123,17 @@ pub enum Buf {
     GdnAlphaProj,
     /// The write-strength projection's output, which the gate pass reads.
     GdnBetaProj,
-    /// The recurrence's output.
+    /// The recurrence's output; on the fused prompt path, the cumulative log
+    /// decays and write scales per (run, head) - two rows of a run's width
+    /// where a token has a whole head row each, so they always fit.
     GdnAttn,
     /// The tensor-core recurrence's `u` per (run, head), in half precision.
     GdnTcU,
-    /// Its `w` per (run, head), in half precision.
+    /// Its `w` per (run, head), in half precision; on the fused prompt path,
+    /// the packed masked query-key products.
     GdnTcW,
     /// Its masked, scaled query-key products per (run, head), in half
-    /// precision.
+    /// precision; on the fused prompt path, the packed inverse `T`.
     GdnTcP,
     /// Its cumulative log decays per (run, head).
     GdnTcG,
@@ -177,6 +185,10 @@ pub enum Buf {
     MoeActive,
     /// The routed columns, sorted by expert.
     MoeSorted,
+    /// The words the fused route launch orders its work items through
+    /// (`moe::fused_route`): zero when allocated, and put back to zero by
+    /// the block that finishes each launch last.
+    MoeSync,
     /// The draft head's normed view of the target hidden state it starts from.
     DraftNormed,
     /// The draft head's projection of that hidden state, per stream.
@@ -188,13 +200,17 @@ pub enum Buf {
     /// A batch of sessions' staged draft rows, side by side, which a batched
     /// draft pass opens from.
     DraftStage,
-    /// The routed gate projection, one row per column.
+    /// The routed gate projection, one row per column. The W4A4 prompt stage
+    /// (`moe::lowp_experts`) holds its quantized token rows here instead.
     MoeGate,
-    /// The routed up projection, one row per column.
+    /// The routed up projection, one row per column. The W4A4 prompt stage
+    /// holds its quantized inner rows here instead.
     MoeUp,
-    /// The activated inner rows the down projection reads, one per column.
+    /// The activated inner rows the down projection reads, one per column:
+    /// `f32`, or brain floats from the W4A4 prompt stage.
     MoeMid,
-    /// The down projection's output, one row per column.
+    /// The down projection's output, one row per column: `f32`, or brain
+    /// floats from the W4A4 prompt stage.
     MoeDown,
     /// The weight-stationary routed block's gate input: every routed column's
     /// row, scaled and transformed, in half precision and expert order.
@@ -262,6 +278,11 @@ pub enum Buf {
     /// multiply returns. It is sized for the widest contraction any projection
     /// in the stack has, which is also what keeps its address still under a
     /// capture.
+    ///
+    /// The low-precision prompt tier's MXFP8 quantizer writes its activations
+    /// here too (`Projection::Mxfp8Lowp`), under the same rule - written
+    /// immediately before the one multiply that reads it - at 33/32 of a byte
+    /// an element against the two this is sized for.
     HalfActivation,
     /// The partial sums a contraction-split projection writes before its fold.
     ///
@@ -273,9 +294,16 @@ pub enum Buf {
     ProjectionPartial,
 }
 
+/// Bytes of the fused prompt path's normalized query and key rows over
+/// `run_rows` rows: whole runs of both, f32. Below a few dozen rows this is
+/// more than the convolution buffer they share needs for the chain.
+fn fused_qk_bytes(shape: &SparseShape, run_rows: u64) -> u64 {
+    run_rows * 2 * u64::from(shape.gdn_qk_dim()) * F32_BYTES
+}
+
 impl Buf {
     /// Every buffer, in allocation order.
-    pub const ALL: [Self; 78] = [
+    pub const ALL: [Self; 80] = [
         Self::Ids,
         Self::Positions,
         Self::Mrope,
@@ -288,6 +316,7 @@ impl Buf {
         Self::LowRank,
         Self::Expanded,
         Self::Inject,
+        Self::NormScale,
         Self::BlockOut,
         Self::GdnQkv,
         Self::GdnConv,
@@ -324,6 +353,7 @@ impl Buf {
         Self::MoeBounds,
         Self::MoeActive,
         Self::MoeSorted,
+        Self::MoeSync,
         Self::DraftNormed,
         Self::DraftHidden,
         Self::ResidualHold,
@@ -383,8 +413,9 @@ impl Buf {
             Self::Embed | Self::Mixed | Self::BlockOut => per_token(shape.hidden),
             Self::Residual | Self::Normed | Self::Expanded => per_token(shape.stream_dim()),
             Self::LowRank => per_token(shape.stream_rank),
-            Self::Inject => per_token(shape.streams),
-            Self::GdnQkv | Self::GdnConv => per_token(shape.gdn_in_dim()),
+            Self::Inject | Self::NormScale => per_token(shape.streams),
+            Self::GdnQkv => per_token(shape.gdn_in_dim()),
+            Self::GdnConv => per_token(shape.gdn_in_dim()).max(fused_qk_bytes(shape, run_rows)),
             Self::GdnDecay | Self::GdnBeta | Self::GdnAlphaProj | Self::GdnBetaProj => {
                 per_token(shape.gdn.v_heads)
             }
@@ -445,6 +476,7 @@ impl Buf {
                 (u64::from(shape.moe.experts) + 1) * I32_BYTES
             }
             Self::MoeSorted => columns * I32_BYTES,
+            Self::MoeSync => u64::from(crate::sparse::moe::FUSED_ROUTE_SYNC_WORDS) * I32_BYTES,
             Self::MoeGate | Self::MoeUp | Self::MoeMid => {
                 columns * u64::from(shape.moe.intermediate) * F32_BYTES
             }
@@ -529,6 +561,7 @@ impl Buf {
             | Self::MoeBounds
             | Self::MoeActive
             | Self::MoeSorted
+            | Self::MoeSync
             | Self::MoeGate
             | Self::MoeUp
             | Self::MoeMid
@@ -646,7 +679,13 @@ impl Scratch {
                 } else {
                     buf.bytes(shape, rows, logit_rows, ctx)
                 };
-                alloc_tagged(backend, buf.tag(), bytes)
+                let buffer = alloc_tagged(backend, buf.tag(), bytes)?;
+                // The fused route launch finds its words at zero and leaves
+                // them so; a fresh allocation holds whatever was there.
+                if *buf == Buf::MoeSync {
+                    backend.fill_zero(buffer.view())?;
+                }
+                Ok(buffer)
             })
             .collect::<CoreResult<Vec<_>>>()?;
         Ok(Self {

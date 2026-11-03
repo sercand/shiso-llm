@@ -51,8 +51,11 @@
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::decision::core::{self, ChoiceOption, Kind, RawQuestion};
+use shiso_ir::decision::{Choice, ChoiceValue, Level, Question, QuestionKind};
+use shiso_runtime::decision::core;
+
 use crate::decision::decisions_wire::{self, InputImageSource};
+use crate::decision::wire_common;
 use crate::error::AppError;
 
 /// How a systemone question is answered, as the official wire spells the
@@ -99,7 +102,7 @@ pub(crate) struct SystemOneBody {
     #[serde(default)]
     pub return_prompt_token_ids: Option<Value>,
     /// Chat-template knobs; the accepted keys and their rules are
-    /// [`super::core::TemplateKwargs`]'s.
+    /// [`super::wire_common::TemplateKwargs`]'s.
     #[serde(default)]
     pub chat_template_kwargs: Option<Map<String, Value>>,
     /// The clef extension: embedded images scored before the state. The
@@ -189,7 +192,7 @@ impl SystemOneBody {
     ///
     /// [`AppError::SchemaViolation`] for a body the schema cannot express,
     /// [`AppError::BadRequest`] naming the field at fault for a bound.
-    pub(crate) fn validate(self) -> Result<Vec<RawQuestion>, AppError> {
+    pub(crate) fn validate(self) -> Result<Vec<Question>, AppError> {
         core::check_model(self.model.as_deref())?;
         // A content-block array as `state` is a caller error, not a document
         // to score: pasting a base64 blob into a scored prompt is refused
@@ -248,7 +251,7 @@ impl SystemOneBody {
     pub(crate) fn state_text(&self) -> String {
         self.state
             .as_ref()
-            .map(core::render_text)
+            .map(wire_common::render_text)
             .unwrap_or_default()
     }
 }
@@ -258,7 +261,7 @@ impl SystemOneBody {
 /// `deny_unknown_fields` on the variants of an internally-tagged enum: each
 /// arm's grammar gets its own strict struct instead, exactly as the decisions
 /// wire's block parser does.
-fn question_from(id: &str, entry: &Value) -> Result<RawQuestion, AppError> {
+fn question_from(id: &str, entry: &Value) -> Result<Question, AppError> {
     let at = format!("questions.{id}");
     let Some(fields) = entry.as_object() else {
         return Err(AppError::SchemaViolation {
@@ -284,40 +287,39 @@ fn question_from(id: &str, entry: &Value) -> Result<RawQuestion, AppError> {
             });
         }
     };
-    let kind = match discriminant {
+    let (instructions, kind) = match discriminant {
         TYPE_NOUL => {
             let wire = NoulWire::deserialize(entry).map_err(|error| question_error(id, &error))?;
             let text = instructions_text(id, &wire.instructions)?;
             core::check_question_text(&text, id, true)?;
             let criteria = wire.criteria.unwrap_or_default();
-            Kind::YesNo {
-                question: text,
-                yes: core::wording(criteria.r#true.as_ref()),
-                no: core::wording(criteria.r#false.as_ref()),
-            }
+            (
+                text,
+                QuestionKind::YesNo {
+                    yes: wire_common::wording(criteria.r#true.as_ref()),
+                    no: wire_common::wording(criteria.r#false.as_ref()),
+                },
+            )
         }
         TYPE_CHOICE => {
             let wire =
                 ChoiceWire::deserialize(entry).map_err(|error| question_error(id, &error))?;
             let text = instructions_text(id, &wire.instructions)?;
             core::check_question_text(&text, id, true)?;
-            let options: Vec<ChoiceOption> = wire
+            let options: Vec<Choice> = wire
                 .criteria
                 .into_iter()
-                .map(|(name, description)| ChoiceOption {
-                    value: core::ChoiceValue::Str(name),
+                .map(|(name, description)| Choice {
+                    value: ChoiceValue::Str(name),
                     // `null` says "no detail"; any other value is the shared
                     // rendering, so a container description is compact JSON
                     // text, never a refusal.
                     description: (description != Value::Null)
-                        .then(|| core::render_text(&description)),
+                        .then(|| wire_common::render_text(&description)),
                 })
                 .collect();
             core::check_choice_options(&options, id, 1)?;
-            Kind::Choice {
-                question: text,
-                options,
-            }
+            (text, QuestionKind::Choice(options))
         }
         TYPE_SCORE => {
             let wire = ScoreWire::deserialize(entry).map_err(|error| question_error(id, &error))?;
@@ -325,10 +327,7 @@ fn question_from(id: &str, entry: &Value) -> Result<RawQuestion, AppError> {
             core::check_question_text(&text, id, true)?;
             let levels = score_levels(id, &wire.criteria)?;
             core::check_score_levels(&levels, id, 1)?;
-            Kind::Score {
-                question: text,
-                levels,
-            }
+            (text, QuestionKind::Score(levels))
         }
         other => {
             return Err(AppError::SchemaViolation {
@@ -343,9 +342,10 @@ fn question_from(id: &str, entry: &Value) -> Result<RawQuestion, AppError> {
     // The noul arm is the only one that renders a yes/no kind, and the
     // design pins "the `noul` answer is the yes probability" - the mark
     // says so at the one place the wire knows it.
-    let probability_answer = matches!(kind, Kind::YesNo { .. });
-    Ok(RawQuestion {
-        id: id.to_owned(),
+    let probability_answer = matches!(kind, QuestionKind::YesNo { .. });
+    Ok(Question {
+        name: id.to_owned(),
+        instructions,
         kind,
         probability_answer,
     })
@@ -377,7 +377,7 @@ fn instructions_text(id: &str, instructions: &Value) -> Result<String, AppError>
             at: format!("questions.{id}"),
         });
     }
-    Ok(core::question_text(Some(instructions)))
+    Ok(wire_common::question_text(Some(instructions)))
 }
 
 /// The score levels as text: a string is itself, any other non-null value is
@@ -386,12 +386,12 @@ fn instructions_text(id: &str, instructions: &Value) -> Result<String, AppError>
 /// scored `"null"` level would sit among the caller's real levels as a level
 /// nobody wrote — and the refusal names the item's index so the caller edits
 /// the right element.
-fn score_levels(id: &str, criteria: &[Value]) -> Result<Vec<core::ScoreLevel>, AppError> {
+fn score_levels(id: &str, criteria: &[Value]) -> Result<Vec<Level>, AppError> {
     criteria
         .iter()
         .enumerate()
         .map(|(index, level)| match level {
-            Value::String(text) => Ok(core::ScoreLevel {
+            Value::String(text) => Ok(Level {
                 label: text.clone(),
                 description: None,
             }),
@@ -402,8 +402,8 @@ fn score_levels(id: &str, criteria: &[Value]) -> Result<Vec<core::ScoreLevel>, A
                 ),
                 at: format!("questions.{id}"),
             }),
-            other => Ok(core::ScoreLevel {
-                label: core::render_text(other),
+            other => Ok(Level {
+                label: wire_common::render_text(other),
                 description: None,
             }),
         })
@@ -550,20 +550,19 @@ fn image_error(index: usize, cause: &dyn std::fmt::Display) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::core::ChoiceOption;
     use serde_json::json;
 
     /// Runs a body down the handler's own path: parse as the wire type, then
     /// `validate`. The refusals under test are `validate`'s, so a body that
     /// cannot even parse fails as a bug in the test, not as a pass.
-    fn validated(body: Value) -> Result<Vec<RawQuestion>, AppError> {
+    fn validated(body: Value) -> Result<Vec<Question>, AppError> {
         serde_json::from_value::<SystemOneBody>(body)
             .expect("the body parses: shape refusals are validate's job")
             .validate()
     }
 
     /// The questions of a body that must pass validation.
-    fn questions_of(body: Value) -> Vec<RawQuestion> {
+    fn questions_of(body: Value) -> Vec<Question> {
         validated(body).expect("the body is valid")
     }
 
@@ -596,12 +595,12 @@ mod tests {
             },
         }));
         assert_eq!(questions.len(), 3);
-        let ids: Vec<&str> = questions.iter().map(|q| q.id.as_str()).collect();
+        let ids: Vec<&str> = questions.iter().map(|q| q.name.as_str()).collect();
         assert_eq!(ids, ["c1", "s1", "n1"]);
         assert!(!questions[0].probability_answer);
         match &questions[0].kind {
-            Kind::Choice { question, options } => {
-                assert_eq!(question, "pick one");
+            QuestionKind::Choice(options) => {
+                assert_eq!(questions[0].instructions, "pick one");
                 let names: Vec<String> = options.iter().map(|o| o.value.text()).collect();
                 assert_eq!(names, ["red", "blue"]);
                 assert!(
@@ -613,16 +612,16 @@ mod tests {
         }
         assert!(!questions[1].probability_answer);
         match &questions[1].kind {
-            Kind::Score { question, levels } => {
-                assert_eq!(question, "how bad");
+            QuestionKind::Score(levels) => {
+                assert_eq!(questions[1].instructions, "how bad");
                 let names: Vec<&str> = levels.iter().map(|l| l.label.as_str()).collect();
                 assert_eq!(names, ["none", "some"]);
             }
             other => panic!("expected a score, got {other:?}"),
         }
         match &questions[2].kind {
-            Kind::YesNo { question, yes, no } => {
-                assert_eq!(question, "ready");
+            QuestionKind::YesNo { yes, no } => {
+                assert_eq!(questions[2].instructions, "ready");
                 assert!(yes.is_none() && no.is_none(), "absent criteria say nothing");
             }
             other => panic!("expected a noul, got {other:?}"),
@@ -714,7 +713,9 @@ mod tests {
             "questions": {"q1": {"type": "noul", "instructions": {"b": 1, "a": [1, 2]}}},
         }));
         match &questions[0].kind {
-            Kind::YesNo { question, .. } => assert_eq!(question, "{\"a\":[1,2],\"b\":1}"),
+            QuestionKind::YesNo { .. } => {
+                assert_eq!(questions[0].instructions, "{\"a\":[1,2],\"b\":1}");
+            }
             other => panic!("expected a noul, got {other:?}"),
         }
     }
@@ -729,14 +730,14 @@ mod tests {
                                  "criteria": {"red": null, "blue": "the sky one"}}},
         }));
         match &questions[0].kind {
-            Kind::Choice { options, .. } => {
+            QuestionKind::Choice(options) => {
                 assert!(
-                    matches!(&options[0], ChoiceOption { value, description: None }
+                    matches!(&options[0], Choice { value, description: None }
                         if value.text() == "red"),
                     "{options:?}"
                 );
                 assert!(
-                    matches!(&options[1], ChoiceOption { value, description }
+                    matches!(&options[1], Choice { value, description }
                         if value.text() == "blue" && description.as_deref() == Some("the sky one")),
                     "{options:?}"
                 );
@@ -796,15 +797,15 @@ mod tests {
             },
         }));
         match &questions[0].kind {
-            Kind::Choice { options, .. } => assert!(
-                matches!(&options[0], ChoiceOption { value, description: None }
+            QuestionKind::Choice(options) => assert!(
+                matches!(&options[0], Choice { value, description: None }
                     if value.text() == "red"),
                 "a null description is no description: {options:?}"
             ),
             other => panic!("expected a choice, got {other:?}"),
         }
         match &questions[1].kind {
-            Kind::YesNo { yes, no, .. } => {
+            QuestionKind::YesNo { yes, no } => {
                 assert!(yes.is_none(), "a null wording is absent wording: {yes:?}");
                 assert!(no.is_none(), "a null wording is absent wording: {no:?}");
             }
@@ -833,7 +834,7 @@ mod tests {
                                  "criteria": {"true": "confirmed", "false": "denied"}}},
         }));
         match &questions[0].kind {
-            Kind::YesNo { yes, no, .. } => {
+            QuestionKind::YesNo { yes, no } => {
                 assert_eq!(yes.as_deref(), Some("confirmed"));
                 assert_eq!(no.as_deref(), Some("denied"));
             }
@@ -847,7 +848,7 @@ mod tests {
                                  "criteria": {"true": "  "}}},
         }));
         match &questions[0].kind {
-            Kind::YesNo { yes, no, .. } => assert!(yes.is_none() && no.is_none()),
+            QuestionKind::YesNo { yes, no } => assert!(yes.is_none() && no.is_none()),
             other => panic!("expected a noul, got {other:?}"),
         }
     }
@@ -861,7 +862,7 @@ mod tests {
             "questions": {"": {"type": "noul", "instructions": "ready"}},
         }));
         assert_eq!(questions.len(), 1);
-        assert_eq!(questions[0].id, "");
+        assert_eq!(questions[0].name, "");
     }
 
     #[test]
@@ -878,7 +879,7 @@ mod tests {
             .validate()
             .expect("one question, no duplicate to refuse");
         assert_eq!(questions.len(), 1);
-        assert_eq!(questions[0].id, "q1");
+        assert_eq!(questions[0].name, "q1");
     }
 
     #[test]
@@ -893,7 +894,7 @@ mod tests {
                 "mid": {"type": "noul", "instructions": "ready"},
             },
         }));
-        let ids: Vec<&str> = questions.iter().map(|q| q.id.as_str()).collect();
+        let ids: Vec<&str> = questions.iter().map(|q| q.name.as_str()).collect();
         assert_eq!(ids, ["zeta", "alpha", "mid"]);
     }
 

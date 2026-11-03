@@ -110,8 +110,7 @@ pub enum MemTag {
     VisionWeights,
     /// The key/value pool's attention planes.
     KvAttention,
-    /// The key/value pool's block-indexer planes: the raw key per position
-    /// and the pooled key per block.
+    /// The key/value pool's block-indexer plane: the pooled key per block.
     KvIndexer,
     /// The key/value pool's planes for a draft head's own attention layer.
     KvDraft,

@@ -140,4 +140,80 @@ extern "C" __global__ void kernel_dense_kv_norm_rope_store(
     }
 }
 
+/* --- rotation without a norm ----------------------------------------------
+ *
+ * The pair below is the two kernels above with the per-head norm taken out,
+ * for a family whose attention rotates its queries and keys and normalizes
+ * neither. A unit weight on the kernels above is NOT this: their division by
+ * the head's root mean square is unconditional, and a unit weight only removes
+ * the multiply after it.
+ *
+ * The argument blocks are the norm pair's, with `eps` and `v_norm` unread, and
+ * the staging row sits where the norm pair's does, so the launches ask for the
+ * same shared memory. These twins mirror `kernels/metal/dense/dense_norm_rope.metal`
+ * and have NOT been compiled or run on a CUDA device yet. */
+
+/* The query half: rotate one head and store it. */
+extern "C" __global__ void kernel_dense_q_rope(
+        const struct dense_args_q_norm_rope args,
+        float *__restrict__ q_out,
+        const float *__restrict__ q_in,
+        const int32_t *__restrict__ pos) {
+    const unsigned head_dim = args.head_dim;
+    const unsigned t = blockIdx.y;
+    const unsigned h = blockIdx.x;
+    const unsigned tid = threadIdx.x;
+    const unsigned nt = blockDim.x;
+    const uint64_t base = ((uint64_t) t * args.n_head + h) * head_dim;
+
+    float *s_q = (float *) dense_smem + DENSE_BLOCK_SUM_SLOTS;
+    for (unsigned i = tid; i < head_dim; i += nt) {
+        s_q[i] = q_in[base + i];
+    }
+    __syncthreads();
+    dense_rope_pairs(s_q, args.n_rot, args.freq_dims, args.rope_base,
+                     (float) (uint32_t) pos[t], tid, nt);
+    __syncthreads();
+    for (unsigned i = tid; i < head_dim; i += nt) {
+        q_out[base + i] = s_q[i];
+    }
+}
+
+/* The key/value half: rotate the key, and write it and the raw value into the
+ * f16 cache row the page table names. */
+extern "C" __global__ void kernel_dense_kv_rope_store(
+        const struct dense_args_kv_norm_rope args,
+        __half *__restrict__ k_cache,
+        __half *__restrict__ v_cache,
+        const float *__restrict__ k_in,
+        const float *__restrict__ v_in,
+        const int32_t *__restrict__ pos,
+        const int32_t *__restrict__ pages) {
+    const unsigned head_dim = args.head_dim;
+    const unsigned t = blockIdx.y;
+    const unsigned h = blockIdx.x;
+    const unsigned tid = threadIdx.x;
+    const unsigned nt = blockDim.x;
+    const uint64_t row = dense_kv_row(
+            dense_row_pages(pages, t, args.page_stride),
+            (uint32_t) pos[t], args.page_tokens);
+    const uint64_t src = ((uint64_t) t * args.n_head_kv + h) * head_dim;
+    const uint64_t slot = ((uint64_t) row * args.n_head_kv + h) * head_dim;
+
+    float *s_row = (float *) dense_smem + DENSE_BLOCK_SUM_SLOTS;
+    for (unsigned i = tid; i < head_dim; i += nt) {
+        s_row[i] = k_in[src + i];
+    }
+    __syncthreads();
+    dense_rope_pairs(s_row, args.n_rot, args.freq_dims, args.rope_base,
+                     (float) (uint32_t) pos[t], tid, nt);
+    __syncthreads();
+    /* The value never touches the staging row, so it is stored in the same
+     * loop as the key. */
+    for (unsigned i = tid; i < head_dim; i += nt) {
+        k_cache[slot + i] = __float2half(s_row[i]);
+        v_cache[slot + i] = __float2half(v_in[src + i]);
+    }
+}
+
 #endif /* SHISO_DENSE_NORM_ROPE_CUH */

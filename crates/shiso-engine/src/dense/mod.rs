@@ -108,13 +108,12 @@ impl BlockKernels for DenseKernels {
                     ),
                 });
             }
-            if !layer.qk_norm && layer.n_rot != 0 {
+            if !layer.qk_norm && shape.v_norm {
                 return Err(CoreError::InvalidValue {
-                    key: "dense rotary width",
+                    key: "dense value norm",
                     value: format!(
-                        "attention slot {rank} rotates {} dimensions but normalizes nothing, and \
-                         the set's rotation is fused into its norm",
-                        layer.n_rot
+                        "attention slot {rank} normalizes its values but not its keys, and the \
+                         set's value norm is the key norm's mean square"
                     ),
                 });
             }
@@ -256,6 +255,25 @@ mod tests {
         assert!(matches!(
             DenseKernels.validate(&shape(attn)),
             Err(CoreError::InvalidValue { key, .. }) if key == "dense rotary width"
+        ));
+    }
+
+    /// A slot that rotates without normalizing has a pair of entries of its own,
+    /// so it is accepted - as long as it carries no value norm, which shares the
+    /// key norm's mean square and has none to share here.
+    #[test]
+    fn a_slot_that_rotates_without_a_norm_is_accepted_without_a_value_norm() {
+        let mut rope_only = shape(vec![
+            AttnLayer::new(9, 3, 64, 64, 64, 1e5).without_qk_norm(),
+        ]);
+        rope_only.v_norm = false;
+        DenseKernels
+            .validate(&rope_only)
+            .expect("rotation without a norm has its own entries");
+        rope_only.v_norm = true;
+        assert!(matches!(
+            DenseKernels.validate(&rope_only),
+            Err(CoreError::InvalidValue { key, .. }) if key == "dense value norm"
         ));
     }
 

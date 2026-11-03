@@ -67,12 +67,14 @@
     reason = "memmap2::Mmap::map is unsafe; see the mmap boundary in the crate docs"
 )]
 
+pub mod csf;
 pub mod fp8;
 pub mod iq_quant;
 pub mod metadata;
 pub mod mlx_quant;
 pub mod modelfile;
 pub mod modelopt;
+pub mod mxfp8;
 pub mod name_map;
 pub mod nvfp4;
 pub mod quant;
@@ -87,7 +89,7 @@ pub use fp8::{Fp8Layout, dequant_fp8, e4m3, quantize_activations, to_e4m3};
 pub use metadata::{GgufMetadata, MetaArray, MetaType, MetaValue};
 pub use mlx_quant::{MlxAffineLayout, dequant_affine};
 pub use modelfile::ModelFile;
-pub use modelopt::{Census, ModeloptFile, ModeloptTensor, Nvfp4Parts, Stored};
+pub use modelopt::{Census, ModeloptFile, ModeloptTensor, Mxfp8Parts, Nvfp4Parts, Stored};
 pub use name_map::{GdnHeads, HeadAxis, HeadPermute, IdentityNames, NameMap, Role, ValueOp};
 pub use nvfp4::{Nvfp4Layout, dequant_nvfp4};
 pub use quant::QuantBlock;

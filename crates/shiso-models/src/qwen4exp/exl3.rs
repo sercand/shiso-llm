@@ -257,6 +257,99 @@ fn read_meta(path: &Path) -> CoreResult<NgramMeta> {
     Ok(header.meta)
 }
 
+/// Where the table's rows lie in the file's payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TableRows {
+    /// Byte offset of the first row, relative to the payload base.
+    start: u64,
+    /// Rows stored, every one [`NGRAM_ROW_WORDS`] words.
+    rows: u64,
+}
+
+/// Finds the table's rows among the file's tensors.
+///
+/// Exporters write the table either as one `trellis` tensor or as
+/// `shard_0.trellis`, `shard_1.trellis`, ... over consecutive row ranges. A
+/// row's bytes do not depend on which shard holds it (its scale word travels
+/// with it), so shards stored back to back in index order are the single
+/// tensor under other names, and the reader is handed their joint range; no
+/// row is copied. Shards with a gap between them, out of order, or of another
+/// width are refused rather than joined, since the reader addresses a row by
+/// its index times the row size from the first one.
+///
+/// # Errors
+///
+/// [`CoreError::ConfigMissing`] when neither layout is present and
+/// [`CoreError::InvalidValue`] for both at once, a missing shard index,
+/// shards that are not contiguous, or a tensor of another dtype or width.
+fn table_rows(tensors: &HashMap<String, RawTensor>) -> CoreResult<TableRows> {
+    let base = format!("{LM}.layers.{PLE_LAYER}.{NGRAM_BASE}");
+    let checked = |name: &str, raw: &RawTensor| -> CoreResult<u64> {
+        if raw.dtype != "I16" || raw.shape.len() != 2 || raw.shape.get(1) != Some(&NGRAM_ROW_WORDS)
+        {
+            return Err(CoreError::InvalidValue {
+                key: "n-gram table layout",
+                value: format!(
+                    "{name} is {} {:?}, the loader expects I16 [rows, {NGRAM_ROW_WORDS}]",
+                    raw.dtype, raw.shape
+                ),
+            });
+        }
+        Ok(raw.shape.first().copied().unwrap_or(0))
+    };
+    let shard_prefix = format!("{base}.shard_");
+    let mut shards: Vec<(u64, &RawTensor)> = Vec::new();
+    for (name, raw) in tensors {
+        let Some(index) = name
+            .strip_prefix(&shard_prefix)
+            .and_then(|rest| rest.strip_suffix(".trellis"))
+        else {
+            continue;
+        };
+        let index = index.parse::<u64>().map_err(|_| CoreError::InvalidValue {
+            key: "n-gram table shard",
+            value: format!("{name} has no shard index"),
+        })?;
+        shards.push((index, raw));
+    }
+    let single_name = format!("{base}.trellis");
+    match (tensors.get(&single_name), shards.is_empty()) {
+        (Some(raw), true) => Ok(TableRows {
+            start: raw.data_offsets[0],
+            rows: checked(&single_name, raw)?,
+        }),
+        (None, true) => Err(CoreError::ConfigMissing { key: single_name }),
+        (Some(_), false) => Err(CoreError::InvalidValue {
+            key: "n-gram table layout",
+            value: format!("the file holds both {single_name} and {shard_prefix}N.trellis"),
+        }),
+        (None, false) => {
+            shards.sort_unstable_by_key(|&(index, _)| index);
+            let mut rows = 0u64;
+            let mut end = None;
+            for (want, &(index, raw)) in (0u64..).zip(&shards) {
+                let name = format!("{shard_prefix}{index}.trellis");
+                if index != want {
+                    return Err(CoreError::InvalidValue {
+                        key: "n-gram table shard",
+                        value: format!("shard {want} is missing; the next stored is {name}"),
+                    });
+                }
+                if end.is_some_and(|end| end != raw.data_offsets[0]) {
+                    return Err(CoreError::InvalidValue {
+                        key: "n-gram table shard",
+                        value: format!("{name} does not start where the shard before it ends"),
+                    });
+                }
+                rows += checked(&name, raw)?;
+                end = Some(raw.data_offsets[1]);
+            }
+            let start = shards.first().map_or(0, |(_, raw)| raw.data_offsets[0]);
+            Ok(TableRows { start, rows })
+        }
+    }
+}
+
 impl Qwen4ExpConfig {
     /// Reads the geometry of the trellis export's directory; see
     /// [`Qwen4ExpConfig::from_mlx`], whose checks this shares. The n-gram hash
@@ -300,17 +393,8 @@ pub fn open_ngram(
     let params = config
         .ngram()
         .params(ple, PleRowType::TrellisK6, Some(Arc::new(bias_words)))?;
-    let table = file.raw("trellis")?;
-    let rows = table.shape.first().copied().unwrap_or(0);
-    if table.dtype != "I16" || table.shape.get(1).copied() != Some(NGRAM_ROW_WORDS) {
-        return Err(CoreError::InvalidValue {
-            key: "n-gram table layout",
-            value: format!(
-                "the table is {} {:?}, the loader expects I16 [rows, {NGRAM_ROW_WORDS}]",
-                table.dtype, table.shape
-            ),
-        });
-    }
+    let table = table_rows(&file.tensors)?;
+    let rows = table.rows;
     // The stored rows may run past the last addressable one (the published
     // table rounds up); fewer than the hash names is a read past the end.
     if params.total_rows() > rows {
@@ -320,7 +404,7 @@ pub fn open_ngram(
             got: params.total_rows(),
         });
     }
-    let offset = file.shard.payload_base() + table.data_offsets[0];
+    let offset = file.shard.payload_base() + table.start;
     let reader = std::fs::File::open(file.shard.path()).map_err(CoreError::Io)?;
     let stream = PleStream::open(
         reader,
@@ -493,9 +577,10 @@ fn trellis_dtype(bits: usize) -> CoreResult<DType> {
         4 => Ok(DType::Exl3K4),
         5 => Ok(DType::Exl3K5),
         6 => Ok(DType::Exl3K6),
+        8 => Ok(DType::Exl3K8),
         other => Err(CoreError::InvalidValue {
             key: "trellis width",
-            value: format!("{other} bits; the kernels decode 4, 5 and 6"),
+            value: format!("{other} bits; the kernels decode 4, 5, 6 and 8"),
         }),
     }
 }

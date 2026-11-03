@@ -18,7 +18,7 @@
  * Nothing in this directory is a byte copy of anything, so no file here carries
  * a provenance header and `scripts/q4e_ptx_oracle.sh --mode=fidelity` reports
  * them as generated. The arithmetic is derived from the Metal twins in
- * `crates/shiso-metal/metal/generic` and from the argument blocks in
+ * `kernels/metal/generic` and from the argument blocks in
  * `crates/shiso-engine/src/launch.rs`, both of which are in this tree.
  */
 
@@ -223,7 +223,7 @@ SHISO_MV_EXT_KQ(iq4_xs, 5, 16)
 
 /* `shiso_kerneltest::dense::iq`'s table-copy argument block, the same four
  * bytes `shs_metal_args_iq_table_copy` carries in
- * `crates/shiso-metal/metal/generic/iq_tables.metal`. */
+ * `kernels/metal/generic/iq_tables.metal`. */
 struct shiso_args_iq_table_copy {
     uint32_t table;
 };
@@ -233,7 +233,7 @@ static_assert(sizeof(struct shiso_args_iq_table_copy) == 4,
 /* Copies one codebook table's raw bytes into a device buffer.
  *
  * The device twin of `kernel_iq_table_copy` in
- * `crates/shiso-metal/metal/generic/iq_tables.metal`, down to the table
+ * `kernels/metal/generic/iq_tables.metal`, down to the table
  * order (0 `SHISO_IQ2XXS_GRID`, 1 `SHISO_IQ2XS_GRID`, 2 `SHISO_IQ2S_GRID`,
  * 3 `SHISO_IQ3XXS_GRID`, 4 `SHISO_IQ3S_GRID`, 5 `SHISO_IQ1S_GRID`,
  * 6 `SHISO_IQ4NL`, 7 `SHISO_KSIGNS_IQ2XS`, 8 `SHISO_KSIGNS64`) and the
