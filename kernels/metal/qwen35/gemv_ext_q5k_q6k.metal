@@ -222,3 +222,12 @@ kernel void kernel_get_rows_q6_K_f32(
         }
     }
 }
+
+// The K-quant walk with two weight rows a lane at every decode blocking; see
+// kernel_mul_mv_ext_kq_f32_nr. A q6_K decode row of any width goes through
+// these, so a row batched with others and the same row alone are one body.
+template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_1_nr2")]] kernel mul_mv_ext_kq_nr_t kernel_mul_mv_ext_kq_f32_nr<1, 2, shs_dense_block_q6_K, deq32_q6_K>;
+template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_2_nr2")]] kernel mul_mv_ext_kq_nr_t kernel_mul_mv_ext_kq_f32_nr<2, 2, shs_dense_block_q6_K, deq32_q6_K>;
+template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_3_nr2")]] kernel mul_mv_ext_kq_nr_t kernel_mul_mv_ext_kq_f32_nr<3, 2, shs_dense_block_q6_K, deq32_q6_K>;
+template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_4_nr2")]] kernel mul_mv_ext_kq_nr_t kernel_mul_mv_ext_kq_f32_nr<4, 2, shs_dense_block_q6_K, deq32_q6_K>;
+template [[host_name("kernel_mul_mv_ext_q6_K_f32_r1_5_nr2")]] kernel mul_mv_ext_kq_nr_t kernel_mul_mv_ext_kq_f32_nr<5, 2, shs_dense_block_q6_K, deq32_q6_K>;

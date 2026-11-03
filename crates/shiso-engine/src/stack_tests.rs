@@ -225,16 +225,16 @@ fn a_batch_of_four_issues_one_set_of_projection_launches() {
 
 /// And the number, so that a regression says how far it regressed.
 ///
-/// A four-row batch costs one pass and three more launches than a one-row
-/// one, and they are worth naming because they are not the page table: the
-/// per-row page table costs a device copy per row, not a launch. The three
-/// are the logits rows. A row of the block is a row of the block, so the
-/// vocabulary projection stays per row whatever else batches. The activation
-/// is one flat launch over every row of the chunk.
+/// A four-row batch costs exactly the launches a one-row one does. The
+/// per-row page table costs a device copy per row, not a launch, and the
+/// vocabulary projection is one launch over every row of the batch: a decode
+/// batch's rows are rows `0 .. n` of its pass, so the logits block is filled by
+/// one projection that reads the matrix once, where it used to take a launch
+/// a row. The activation is one flat launch over every row of the chunk.
 ///
-/// What this pins is the shape: a small additive cost on top of ONE pass,
-/// rather than a multiple of it. A stack with recurrent slots pays more, since
-/// a slot's convolution and recurrence are per session and cost a launch a row
+/// What this pins is the shape: ONE pass whatever the batch width, rather than
+/// a multiple of it. A stack with recurrent slots pays more, since a slot's
+/// convolution and recurrence are per session and cost a launch a row
 /// ([`crate::blocks::GdnStates::PerRow`]); this stack is attention-only,
 /// because `DenseKernels` is the only block launcher this crate carries.
 #[test]
@@ -251,13 +251,10 @@ fn a_batch_of_four_costs_one_pass_and_a_handful_of_launches() {
     let single = count_launches(&recorder, &mut stack, &steps[..1]);
     let quad = count_launches(&recorder, &mut stack, &steps);
 
-    // The logits projection is the one launch that is still per row, because a
-    // row of the block is a row of the block. Everything else is one launch for
-    // the batch.
+    // Every launch, the logits projection included, covers the whole batch.
     assert_eq!(
-        quad,
-        single + 3,
-        "a batch of four should cost one pass plus three logits rows: one row \
+        quad, single,
+        "a batch of four should cost the one pass a single row does: one row \
          issued {single}, four issued {quad}"
     );
 }

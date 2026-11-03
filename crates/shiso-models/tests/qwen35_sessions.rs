@@ -229,15 +229,17 @@ fn each_decode_row_is_the_work_of_the_session_that_asked_for_it() {
         .filter(|(_, launch)| launch.span_in(block).is_some())
         .map(|(index, _)| index)
         .collect();
-    assert_eq!(writes.len(), 3, "each step writes exactly one row");
-    for (row, at) in writes.iter().copied().enumerate() {
-        let offset = log[at].span_in(block).expect("the write was found").offset;
-        assert_eq!(
-            offset,
-            u64::try_from(row).expect("three fits") * LOGITS_ROW_BYTES,
-            "the rows are written in the order the caller listed its steps"
-        );
-    }
+    // One projection fills the block: the pass's rows are the steps in the
+    // caller's order, so logits row `i` is step `i`'s and the vocabulary matrix
+    // is read once for the batch rather than once a row.
+    assert_eq!(writes.len(), 1, "one launch writes the batch's logits rows");
+    let span = log[writes[0]].span_in(block).expect("the write was found");
+    assert_eq!(span.offset, 0, "the batch's rows start the block");
+    assert_eq!(
+        span.len,
+        3 * LOGITS_ROW_BYTES,
+        "the one write covers every step's row and no other"
+    );
 
     every_state_launch_belongs_to_one_member(&log, &owned);
 

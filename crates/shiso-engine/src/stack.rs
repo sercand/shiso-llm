@@ -2271,11 +2271,17 @@ impl HybridStack {
             self.run_batch(steps)?;
             self.absorb_batch(steps)?;
         }
+        // Row `i` of the pass is step `i`, in the caller's own order, so the
+        // logits rows are the pass's rows `0 .. rows` and one projection
+        // writes them all: it reads the vocabulary matrix once for the batch
+        // where a projection a row read it once a row. Measured on an M4
+        // (Qwen3.5-4B, two sessions): the q6_K head's 5.3 ms a row was paid
+        // twice a step, 10.5 of a 51 ms step.
+        if !steps.is_empty() {
+            self.write_logits_rows(rows)?;
+        }
         for (row, step) in steps.iter().enumerate() {
             let row = u32::try_from(row).unwrap_or(u32::MAX);
-            // Row `i` of the pass is step `i`, in the caller's own order, so
-            // the logits row a session commits is its own.
-            self.write_logits(row, row)?;
             // The row this step just produced travels with the checkpoint, so a
             // session saved mid-generation resumes standing on its own frontier row
             // rather than having to re-run the step that made it.

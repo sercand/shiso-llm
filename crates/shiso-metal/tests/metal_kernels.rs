@@ -652,6 +652,26 @@ const HOST_KERNELS: &[KernelRef] = &[
         &MUL_MV_SHAPES,
     ),
     KernelRef::specialized("generic", "kernel_mul_mv_ext_q4_K_f32_r1_2", &MUL_MV_SHAPES),
+    KernelRef::specialized(
+        "generic",
+        "kernel_mul_mv_ext_q4_K_f32_r1_2_nr2",
+        &MUL_MV_SHAPES,
+    ),
+    KernelRef::specialized(
+        "generic",
+        "kernel_mul_mv_ext_q4_K_f32_r1_3_nr2",
+        &MUL_MV_SHAPES,
+    ),
+    KernelRef::specialized(
+        "generic",
+        "kernel_mul_mv_ext_q4_K_f32_r1_4_nr2",
+        &MUL_MV_SHAPES,
+    ),
+    KernelRef::specialized(
+        "generic",
+        "kernel_mul_mv_ext_q4_K_f32_r1_5_nr2",
+        &MUL_MV_SHAPES,
+    ),
     KernelRef::specialized("generic", "kernel_mul_mv_ext_q4_K_f32_r1_3", &MUL_MV_SHAPES),
     KernelRef::specialized("generic", "kernel_mul_mv_ext_q4_K_f32_r1_4", &MUL_MV_SHAPES),
     KernelRef::specialized("generic", "kernel_mul_mv_ext_q4_K_f32_r1_5", &MUL_MV_SHAPES),

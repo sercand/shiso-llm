@@ -607,3 +607,85 @@ pub fn decode_batched_ms_per_step(
     let steady = after_warmup(&per_step, protocol.dropped_decode_steps);
     median(steady).ok_or(RigError::NoSamples { phase: "decode" })
 }
+
+/// The first step and row at which a batched decode's logits differ from the
+/// same session decoded alone.
+///
+/// Every row stands at the end of its own salted prompt. Each session is first
+/// decoded alone for `steps` steps, greedily, keeping every logits row; then a
+/// fresh set of the same sessions is decoded together and each row is compared
+/// with its solo run byte for byte. Both runs pick greedily, so while the rows
+/// agree they read the same tokens.
+///
+/// `Ok(None)` means every row matched at every step: a session's answer did not
+/// depend on how many sessions shared its step. `Ok(Some((step, row)))` names
+/// the first mismatch.
+///
+/// # Errors
+///
+/// Whatever the device or the model reports.
+pub fn first_batch_divergence(
+    rig: &mut Rig,
+    rows: u32,
+    steps: u32,
+) -> Result<Option<(u32, u32)>, RigError> {
+    let width = usize::try_from(rows).unwrap_or(0);
+    let mut solo: Vec<Vec<Vec<u8>>> = Vec::with_capacity(width);
+    for row in 0..rows {
+        let (session, mut token) = rig.stand_at_frontier_salted(row)?;
+        let mut kept = Vec::new();
+        for _ in 0..steps {
+            {
+                let out = rig.model.decode_batch(&[DecodeStep { session, token }])?;
+                rig.backend.copy_d2h(out.row(0)?, &mut rig.row)?;
+            }
+            kept.push(rig.row.clone());
+            token = rig.greedy();
+        }
+        rig.model.close_session(session)?;
+        solo.push(kept);
+    }
+    let mut sessions = Vec::with_capacity(width);
+    let mut tokens = Vec::with_capacity(width);
+    for row in 0..rows {
+        let (session, token) = rig.stand_at_frontier_salted(row)?;
+        sessions.push(session);
+        tokens.push(token);
+    }
+    let mut host = vec![vec![0u8; rig.row.len()]; width];
+    let mut first = None;
+    for step in 0..steps {
+        let batch: Vec<DecodeStep> = sessions
+            .iter()
+            .zip(&tokens)
+            .map(|(session, token)| DecodeStep {
+                session: *session,
+                token: *token,
+            })
+            .collect();
+        {
+            let out = rig.model.decode_batch(&batch)?;
+            for (row, dst) in host.iter_mut().enumerate() {
+                let row = u32::try_from(row).unwrap_or(u32::MAX);
+                rig.backend.copy_d2h(out.row(row)?, dst)?;
+            }
+        }
+        for (row, bytes) in host.iter().enumerate() {
+            let at = usize::try_from(step).unwrap_or(usize::MAX);
+            if first.is_none() && solo.get(row).and_then(|kept| kept.get(at)) != Some(bytes) {
+                first = Some((step, u32::try_from(row).unwrap_or(u32::MAX)));
+            }
+        }
+        for (token, bytes) in tokens.iter_mut().zip(&host) {
+            rig.row.copy_from_slice(bytes);
+            *token = rig.greedy();
+        }
+        if first.is_some() {
+            break;
+        }
+    }
+    for session in sessions {
+        rig.model.close_session(session)?;
+    }
+    Ok(first)
+}

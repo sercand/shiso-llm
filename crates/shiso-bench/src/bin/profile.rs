@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use serde_json::json;
 
-use shiso_bench::decode::{PREFILL_TOKENS, Rig, decode_rep};
+use shiso_bench::decode::{PREFILL_TOKENS, Rig, decode_rep, decode_rep_batched};
 use shiso_bench::measure::{after_warmup, median};
 use shiso_bench::prefill::prefill_once;
 use shiso_bench::profile;
@@ -50,6 +50,9 @@ struct Args {
     /// Decode steps run first, outside the region.
     #[arg(long, default_value_t = 2)]
     warm_steps: u32,
+    /// Sessions a decode step advances together (decode only).
+    #[arg(long, default_value_t = 1)]
+    streams: u32,
     /// Rows of the printed table.
     #[arg(long, default_value_t = 25)]
     top: usize,
@@ -82,10 +85,15 @@ fn main() -> Result<()> {
 
     let (batched_ms, report, per) = match args.phase {
         Phase::Decode => {
-            let steps = decode_rep(&mut rig, args.warm_steps + args.steps)?;
+            let steps = if args.streams > 1 {
+                decode_rep_batched(&mut rig, args.warm_steps + args.steps, args.streams)?
+            } else {
+                decode_rep(&mut rig, args.warm_steps + args.steps)?
+            };
             let batched = median(after_warmup(&steps, args.warm_steps))
                 .context("no decode steps were timed")?;
-            let report = profile::decode_profiled(&mut rig, args.warm_steps, args.steps)?;
+            let report =
+                profile::decode_profiled(&mut rig, args.warm_steps, args.steps, args.streams)?;
             (batched, report, args.steps)
         }
         Phase::Prefill => {

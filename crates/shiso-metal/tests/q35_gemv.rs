@@ -80,7 +80,21 @@ fn k_quant_matvec_batches_match_the_oracle_dot() {
 
 #[test]
 #[ignore = "requires a Metal device"]
-fn two_rows_a_lane_match_one_row_a_lane() {
+fn two_rows_a_lane_match_the_oracle_dot() {
     let Some(gpu) = open() else { return };
-    cases::two_rows_a_lane_match_one_row_a_lane(&gpu);
+    cases::two_rows_a_lane_match_the_oracle_dot(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn decode_rows_answer_what_they_answer_alone() {
+    let Some(gpu) = open() else { return };
+    cases::decode_rows_answer_what_they_answer_alone(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn affine_prefill_gemm_matches_a_triple_loop() {
+    let Some(gpu) = open() else { return };
+    cases::affine_prefill_gemm_matches_a_triple_loop(&gpu);
 }

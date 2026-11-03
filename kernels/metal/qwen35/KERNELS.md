@@ -215,6 +215,19 @@ are instantiations of the generic `kernel_mul_mv_ext_q4_f32_disp` template with
 the `#600:s<nsg>,601:s<nxpsg>` specialization suffix. `r1_N` is the
 rows-per-threadgroup variant: T6 picks the instantiation for its batch remainder.
 
+`kernel_mul_mv_ext_q6_K_f32_r1_{1..5}_nr2` instantiate the generic
+`kernel_mul_mv_ext_kq_f32_nr` (two weight rows a lane), as the
+`kernel_mul_mv_ext_q4_K_f32_r1_{1..5}_nr2` in `mul_mv_ext.metal` do: the same
+argument block and constants as the ext gemv, grid.x over `out_dim / (2 * (32 /
+601) * 600)` row groups and grid.y over token groups. The engine launches every
+decode width at 601 = 16, so a row's chain is the same alone and batched.
+
+`kernel_mul_mm_affine{4,8}_f32` (`gemm_q4k.metal`) are the prefill tile over an
+MLX affine weight: `shs_metal_args_mul_mm`, then `W` (packed codes), `SC`, `BI`
+(bf16 scales and biases, one a group of 64), `src1`, `dst`; the generic GEMM's
+grid, 128 threads and 8192 bytes, with constant 701 on for a partial tile. Stage
+A is the only part not copied from `kernel_mul_mm`.
+
 `kernel_get_rows_q6_K_f32` takes `shs_metal_args_get_rows_q8_0` and mirrors the
 generic q4_K gather: grid.x is the 256-element block index within the row, grid.y
 is the token index, one threadgroup per block, threads striding over `QK_K`. The

@@ -382,7 +382,63 @@ template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_5")]] kernel mul_mv_ext_kq_f
 // q4_K alone, where the two bodies compile to the same bits; the q5_K and q6_K
 // bodies contract one product differently under fast math and land one ulp
 // apart, which a one-token row may not.
-template<short NR, typename q_t, void (*deq32)(device const q_t *, short, thread float4 *, thread float2 &)>
+// The K-quant walk with NR consecutive weight rows a lane and R1 token rows a
+// threadgroup.
+//
+// The walk above gives a lane one weight row and re-decodes its sub-blocks for
+// every token row it carries, and every weight row re-reads the activation run
+// its sub-blocks multiply. Here a lane decodes each of its NR rows' sub-blocks
+// once and multiplies them into all R1 token rows, and loads each token row's
+// activation run once for all NR weight rows. Measured on an M4 over the
+// 9216 x 2560 FFN projections of Qwen3.5-4B (q4_K): one token row ran at
+// ~86 GB/s one weight row a lane and ~90 at two; two token rows through the
+// walk above cost 1.5x one.
+//
+// Every (weight row, token row) sum is one fixed chain, whatever R1 and NR
+// are: per sub-block, `qy = fma(q, y, qy)` over the eight float4 in order,
+// folded `(qy0 + qy1) + (qy2 + qy3)`, then `acc = fma(b, sum(y), fma(a, qy,
+// acc))`, and the same lane reduction. The template is compiled in safe math
+// mode so the optimizer cannot refold the chain differently for one
+// instantiation than another: under fast math a q6_K body at two token rows
+// contracted one product differently from the same body at one and landed an
+// ulp away, and a session's logits must not depend on how many sessions share
+// its step. Every decode width of a format runs one of these bodies at one
+// lane split, so a batched row and the same row alone are the same chain
+// (`decode_rows_answer_what_they_answer_alone`).
+//
+// Only the chain is safe: the two helpers below are, and the sub-block
+// decode around them keeps the library's fast math. Compiling the whole
+// template safe cost a four-row q4_K step 373 us against 286 on an M4, because
+// the decode lost its contractions too.
+#pragma METAL fp math_mode(safe)
+
+/// The eight-float4 dot of one sub-block's codes and activations, folded
+/// `(x + y) + (z + w)`, in one fixed order.
+static inline float shs_kq_dot8(thread const float4 * qv, thread const float4 * yv) {
+    float4 qy = 0.0f;
+    for (short k = 0; k < 8; ++k) {
+        qy = fma(qv[k], yv[k], qy);
+    }
+    return (qy[0] + qy[1]) + (qy[2] + qy[3]);
+}
+
+/// The sub-block's activation sum, in one fixed order.
+static inline float shs_kq_sum8(thread const float4 * yv) {
+    float4 sy = 0.0f;
+    for (short k = 0; k < 8; ++k) {
+        sy = sy + yv[k];
+    }
+    return (sy[0] + sy[1]) + (sy[2] + sy[3]);
+}
+
+/// `acc + a * qs + b * s`, as two fused steps in one fixed order.
+static inline float shs_kq_acc(float acc, float2 ab, float qs, float s) {
+    return fma(ab.y, s, fma(ab.x, qs, acc));
+}
+
+#pragma METAL fp math_mode(fast)
+
+template<short R1, short NR, typename q_t, void (*deq32)(device const q_t *, short, thread float4 *, thread float2 &)>
 kernel void kernel_mul_mv_ext_kq_f32_nr(
         constant shs_metal_args_mul_mv_ext & args,
         device const char * src0,
@@ -400,13 +456,14 @@ kernel void kernel_mul_mv_ext_kq_f32_nr(
     const short ty = tiisg/nxpsg;
 
     const int r0 = (tgpig.x*(nypsg*NSG) + nypsg*sgitg + ty)*NR;
+    const int i11 = tgpig.y*R1;
     const int i1m = tgpig.z;
 
     const int i12 = i1m%args.ne12;
     const int i13 = i1m/args.ne12;
 
     const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
-    const uint64_t offset1 = (i12        )*args.nb12 + (i13        )*args.nb13;
+    const uint64_t offset1 = i11*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
 
     device const q_t * xq[NR];
     for (short r = 0; r < NR; ++r) {
@@ -414,67 +471,85 @@ kernel void kernel_mul_mv_ext_kq_f32_nr(
             ? (device const q_t *) (src0 + offset0 + (uint64_t)(r0 + r)*args.nb01)
             : (device const q_t *) src0;
     }
-    device const float4 * y4 = (device const float4 *) (src1 + offset1);
+    device const float4 * y4[R1];
+    for (short t = 0; t < R1; ++t) {
+        y4[t] = (i11 + t < args.ne11)
+            ? (device const float4 *) (src1 + offset1 + t*args.nb11)
+            : (device const float4 *) src1;
+    }
 
-    float sumf[NR] = { [ 0 ... NR - 1 ] = 0.0f };
+    float sumf[R1][NR];
+    for (short t = 0; t < R1; ++t) {
+        for (short r = 0; r < NR; ++r) {
+            sumf[t][r] = 0.0f;
+        }
+    }
 
     const int nsub = args.ne00/32;
 
     for (int u = tx; u < nsub; u += nxpsg) {
-        device const float4 * y = y4 + u*8;
-        float4 yv[8];
-        float4 sy = 0.0f;
-#pragma unroll(8)
-        for (short k = 0; k < 8; ++k) {
-            yv[k] = y[k];
-            sy += yv[k];
-        }
-        const float ssy = (sy[0] + sy[1]) + (sy[2] + sy[3]);
+        float4 qv[NR][8];
+        float2 ab[NR];
 #pragma unroll(NR)
         for (short r = 0; r < NR; ++r) {
-            float4 qv[8];
-            float2 ab;
-            deq32(xq[r] + u/8, (short)(u%8), qv, ab);
-            float4 qy = 0.0f;
+            deq32(xq[r] + u/8, (short)(u%8), qv[r], ab[r]);
+        }
+#pragma unroll(R1)
+        for (short t = 0; t < R1; ++t) {
+            device const float4 * y = y4[t] + u*8;
+            float4 yv[8];
 #pragma unroll(8)
             for (short k = 0; k < 8; ++k) {
-                qy += qv[k]*yv[k];
+                yv[k] = y[k];
             }
-            sumf[r] += ab.x*((qy[0] + qy[1]) + (qy[2] + qy[3])) + ab.y*ssy;
+            const float ssy = shs_kq_sum8(yv);
+#pragma unroll(NR)
+            for (short r = 0; r < NR; ++r) {
+                sumf[t][r] = shs_kq_acc(sumf[t][r], ab[r], shs_kq_dot8(qv[r], yv), ssy);
+            }
         }
     }
 
-    for (short r = 0; r < NR; ++r) {
-        if (nxpsg >= 32) {
-            sumf[r] += simd_shuffle_down(sumf[r], 16);
-        }
-        if (nxpsg >= 16) {
-            sumf[r] += simd_shuffle_down(sumf[r],  8);
-        }
-        if (nxpsg >= 8) {
-            sumf[r] += simd_shuffle_down(sumf[r],  4);
-        }
-        if (nxpsg >= 4) {
-            sumf[r] += simd_shuffle_down(sumf[r],  2);
-        }
-        if (nxpsg >= 2) {
-            sumf[r] += simd_shuffle_down(sumf[r],  1);
+    for (short t = 0; t < R1; ++t) {
+        for (short r = 0; r < NR; ++r) {
+            if (nxpsg >= 32) {
+                sumf[t][r] += simd_shuffle_down(sumf[t][r], 16);
+            }
+            if (nxpsg >= 16) {
+                sumf[t][r] += simd_shuffle_down(sumf[t][r],  8);
+            }
+            if (nxpsg >= 8) {
+                sumf[t][r] += simd_shuffle_down(sumf[t][r],  4);
+            }
+            if (nxpsg >= 4) {
+                sumf[t][r] += simd_shuffle_down(sumf[t][r],  2);
+            }
+            if (nxpsg >= 2) {
+                sumf[t][r] += simd_shuffle_down(sumf[t][r],  1);
+            }
         }
     }
 
     if (tx == 0) {
-        device float * dst_f32 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1;
-        for (short r = 0; r < NR; ++r) {
-            if (r0 + r < args.ne01) {
-                dst_f32[r0 + r] = sumf[r];
+        for (short t = 0; t < R1 && i11 + t < args.ne11; ++t) {
+            device float * dst_f32 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1
+                + (uint64_t)(i11 + t)*args.ne0;
+            for (short r = 0; r < NR; ++r) {
+                if (r0 + r < args.ne01) {
+                    dst_f32[r0 + r] = sumf[t][r];
+                }
             }
         }
     }
 }
 
-typedef decltype(kernel_mul_mv_ext_kq_f32_nr<2, shs_dense_block_q4_K, deq32_q4_K>) mul_mv_ext_kq_nr_t;
+typedef decltype(kernel_mul_mv_ext_kq_f32_nr<1, 2, shs_dense_block_q4_K, deq32_q4_K>) mul_mv_ext_kq_nr_t;
 
-template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_1_nr2")]] kernel mul_mv_ext_kq_nr_t kernel_mul_mv_ext_kq_f32_nr<2, shs_dense_block_q4_K, deq32_q4_K>;
+template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_1_nr2")]] kernel mul_mv_ext_kq_nr_t kernel_mul_mv_ext_kq_f32_nr<1, 2, shs_dense_block_q4_K, deq32_q4_K>;
+template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_2_nr2")]] kernel mul_mv_ext_kq_nr_t kernel_mul_mv_ext_kq_f32_nr<2, 2, shs_dense_block_q4_K, deq32_q4_K>;
+template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_3_nr2")]] kernel mul_mv_ext_kq_nr_t kernel_mul_mv_ext_kq_f32_nr<3, 2, shs_dense_block_q4_K, deq32_q4_K>;
+template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_4_nr2")]] kernel mul_mv_ext_kq_nr_t kernel_mul_mv_ext_kq_f32_nr<4, 2, shs_dense_block_q4_K, deq32_q4_K>;
+template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_5_nr2")]] kernel mul_mv_ext_kq_nr_t kernel_mul_mv_ext_kq_f32_nr<5, 2, shs_dense_block_q4_K, deq32_q4_K>;
 
 // The mixed i-quant formats and the 2-bit K-quant, on the same kq walk.
 //

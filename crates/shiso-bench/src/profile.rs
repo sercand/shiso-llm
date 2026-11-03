@@ -81,10 +81,13 @@ pub fn write(path: &Path, context: &Value, report: &ProfileReport) -> Result<(),
 }
 
 /// Decode steps from the frontier: `warm` unprofiled, then `steps` inside one
-/// region.
+/// region, with `streams` sessions advancing together.
 ///
 /// The prefill that reaches the frontier and the warm steps run outside the
-/// region, so the report is the steady decode step only.
+/// region, so the report is the steady decode step only. Every stream past the
+/// first stands at the end of a salted prompt of its own, as the batched
+/// throughput phase does, so the rows of a step are different sessions at
+/// different positions rather than copies of one.
 ///
 /// # Errors
 ///
@@ -93,30 +96,63 @@ pub fn decode_profiled(
     rig: &mut Rig,
     warm: u32,
     steps: u32,
+    streams: u32,
 ) -> Result<ProfileReport, ProfileError> {
-    let (session, first) = rig.stand_at_frontier()?;
-    let mut token = first;
+    let mut sessions = Vec::new();
+    let mut tokens = Vec::new();
+    for row in 0..streams.max(1) {
+        let (session, first) = if row == 0 {
+            rig.stand_at_frontier()?
+        } else {
+            rig.stand_at_frontier_salted(row)?
+        };
+        sessions.push(session);
+        tokens.push(first);
+    }
     for _ in 0..warm {
-        token = decode_one(rig, session, token)?;
+        decode_rows(rig, &sessions, &mut tokens)?;
     }
     let backend = std::sync::Arc::clone(&rig.backend);
     let ((), report) = scoped(backend.as_ref(), || -> Result<(), ProfileError> {
         for _ in 0..steps {
-            token = decode_one(rig, session, token)?;
+            decode_rows(rig, &sessions, &mut tokens)?;
         }
         Ok(())
     })?;
-    rig.model.close_session(session)?;
+    for session in sessions {
+        rig.model.close_session(session)?;
+    }
     Ok(report)
 }
 
-/// One step: the launch, the readback the next step's token comes from.
-fn decode_one(rig: &mut Rig, session: SessionId, token: TokenId) -> Result<TokenId, ProfileError> {
+/// One step over every session: the launch, then each row's readback, which is
+/// where each row's next token comes from.
+fn decode_rows(
+    rig: &mut Rig,
+    sessions: &[SessionId],
+    tokens: &mut [TokenId],
+) -> Result<(), ProfileError> {
+    let batch: Vec<DecodeStep> = sessions
+        .iter()
+        .zip(tokens.iter())
+        .map(|(session, token)| DecodeStep {
+            session: *session,
+            token: *token,
+        })
+        .collect();
+    let mut host = vec![vec![0u8; rig.row.len()]; batch.len()];
     {
-        let out = rig.model.decode_batch(&[DecodeStep { session, token }])?;
-        rig.backend.copy_d2h(out.row(0)?, &mut rig.row)?;
+        let out = rig.model.decode_batch(&batch)?;
+        for (row, dst) in host.iter_mut().enumerate() {
+            let row = u32::try_from(row).unwrap_or(u32::MAX);
+            rig.backend.copy_d2h(out.row(row)?, dst)?;
+        }
     }
-    Ok(rig.greedy())
+    for (token, bytes) in tokens.iter_mut().zip(&host) {
+        rig.row.copy_from_slice(bytes);
+        *token = rig.greedy();
+    }
+    Ok(())
 }
 
 /// One prefill of the rig's prompt inside a region, session open to close.
