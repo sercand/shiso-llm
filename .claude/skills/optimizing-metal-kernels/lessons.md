@@ -86,6 +86,24 @@ shapes differ.
 
 ## Bugs to not repeat
 
+- **Fast math refolds one body differently per instantiation** (M4, 2026-11-03):
+  the two-rows-a-lane K-quant matvec matched the one-row walk bit for bit at
+  `q4_K` but landed one ulp off at `q5_K`/`q6_K`, and the `q6_K` body at two
+  token rows differed from itself at one. Whole-template `math_mode(safe)` fixed
+  the bits and cost 30% (373 vs 286 us, four rows), because the inlined decode
+  lost its contractions. What worked: only the dot/accumulate chain as tiny
+  safe-mode helpers (`shs_kq_dot8`, `shs_kq_acc`), the decode left fast. The
+  per-instruction flags survive inlining.
+- **A GEMM fixture without the output guard writes past the matrix**: the
+  broadcast-off constant table (701 = false) stores all 64 rows of a partial
+  tile. The engine runs 701 = true and 8192 bytes of threadgroup memory; a case
+  with a partial tile needs both, or it corrupts the next token's rows and,
+  through out-of-bounds stores, the buffers of tests running beside it - which
+  looks like a race in unrelated kernels.
+- **Batched decode paid the vocabulary head once a row** (M4): `decode_batch`
+  projected logits row by row, 5.3 ms each for a `q6_K` head. One projection
+  over the batch's rows reads the matrix once.
+
 - **950a9bf:**
   - A pipeline reported 448 max threads, not the 512 it was written for, so the verify pass was refused. Probe per pipeline.
   - Scattered (uncoalesced) stores took 417 µs per layer, 19 ms of a 145 ms step.

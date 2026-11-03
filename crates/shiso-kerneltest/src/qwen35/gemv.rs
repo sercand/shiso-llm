@@ -98,6 +98,19 @@ fn gemm_consts(gpu: &Gpu) -> &'static [FnConst] {
     }
 }
 
+/// The engine's prefill GEMM constants (`shiso_engine::launch::mm_consts_for`):
+/// the input tail broadcast off, the output tile guard on.
+const GEMM_GUARDED: [FnConst; 2] = [
+    FnConst {
+        index: 700,
+        value: FnConstValue::Bool(false),
+    },
+    FnConst {
+        index: 701,
+        value: FnConstValue::Bool(true),
+    },
+];
+
 /// The prefill GEMM's two broadcast toggles, both off for a plain `C = A @ B`.
 const GEMM_BROADCAST: [FnConst; 2] = [
     FnConst {
@@ -1118,21 +1131,40 @@ const NR_BLOCKS: usize = 10;
 /// threadgroups, so the last threadgroup's guarded rows are exercised.
 const NR_ROWS: usize = 30;
 
-/// One one-token K-quant matvec over `rows` rows of `blocks` blocks each, on a
-/// grid of `groups` threadgroups.
+/// The lane split the engine gives a K-quant decode matvec over this
+/// fixture's width at any decode row count (`shiso_engine::launch::ext_nxpsg`),
+/// and its constants.
+fn nr_lane_split(_n_tok: usize) -> (usize, &'static [FnConst]) {
+    (16, &EXT_SHAPE)
+}
+
+/// Token rows one threadgroup takes at `n_tok` (`shiso_engine::launch::ext_r1ptg`).
+fn nr_r1ptg(n_tok: usize) -> usize {
+    match n_tok {
+        0 | 1 => 1,
+        2 => 2,
+        3 | 6 => 3,
+        5 => 5,
+        _ => 4,
+    }
+}
+
+/// One K-quant matvec over `NR_ROWS` weight rows of `NR_BLOCKS` blocks and
+/// `n_tok` token rows, on a grid of `groups` row groups.
 fn nr_run(
     gpu: &Gpu,
     module: &'static str,
     entry: &'static str,
     weight_bytes: &[u8],
     x: &[f32],
+    n_tok: usize,
     groups: u32,
 ) -> Vec<f32> {
     let in_dim = NR_BLOCKS * IN;
     let row_bytes = (weight_bytes.len() / NR_ROWS) as u64;
     let weights = gpu.upload(weight_bytes);
     let src = gpu.upload(&f32_bytes(x));
-    let dst = gpu.upload(&[0u8; NR_ROWS * 4]);
+    let dst = gpu.upload(&vec![0u8; NR_ROWS * n_tok * 4]);
     let args = MulMvExtArgs {
         ne00: in_dim as i32,
         ne01: NR_ROWS as i32,
@@ -1143,47 +1175,47 @@ fn nr_run(
         nb02: row_bytes * NR_ROWS as u64,
         nb03: row_bytes * NR_ROWS as u64,
         ne10: in_dim as i32,
-        ne11: 1,
+        ne11: n_tok as i32,
         ne12: 1,
         _pad1: 0,
         nb10: 4,
         nb11: (in_dim * 4) as u64,
-        nb12: (in_dim * 4) as u64,
-        nb13: (in_dim * 4) as u64,
+        nb12: (in_dim * 4 * n_tok) as u64,
+        nb13: (in_dim * 4 * n_tok) as u64,
         ne0: NR_ROWS as i32,
-        ne1: 1,
+        ne1: n_tok as i32,
         r2: 1,
         r3: 1,
         _pad2: [0; 4],
     };
+    let (_, consts) = nr_lane_split(n_tok);
     let params = [
         KernelArg::Bytes(bytemuck::bytes_of(&args)),
         KernelArg::Buffer(weights.view()),
         KernelArg::Buffer(src.view()),
         KernelArg::Buffer(dst.view()),
     ];
+    let token_groups = n_tok.div_ceil(nr_r1ptg(n_tok)) as u32;
     run(
         gpu,
-        KernelRef::specialized(module, entry, &EXT_SHAPE),
-        &LaunchArgs::new(Extent3::new(groups, 1, 1), Extent3::new(32, 2, 1), &params),
+        KernelRef::specialized(module, entry, consts),
+        &LaunchArgs::new(
+            Extent3::new(groups, token_groups, 1),
+            Extent3::new(32, 2, 1),
+            &params,
+        ),
     );
     drain(gpu);
     gpu.read_f32(&dst)
 }
 
-/// The two-rows-a-lane one-token `q4_K` entry answers the one-row walk's bits.
+/// The two-rows-a-lane decode entries against the host dot product of the
+/// dequantized weights, one token row, for `q4_K` and `q6_K`.
 ///
-/// `q5_K` and `q6_K` have no such entry: built the same way, both landed one
-/// ulp from the one-row walk under the library's fast math, and a one-token row
-/// must answer what the same row answers in a two-token batch.
-///
-/// Each row is a different rotation of the fixture's one-block rows, so no two
-/// rows share a block sequence, and the activation is a dense signal rather
-/// than a basis vector: the claim is that the sums are the same sums, not that
-/// the unpack is.
-///
-/// Metal only: a device that names its specializations has no two-row entry.
-pub fn two_rows_a_lane_match_one_row_a_lane(gpu: &Gpu) {
+/// Rows past the first threadgroups are rotations of the one-block fixture
+/// rows (see [`nr_spread`]), so the oracle dequantizes row `r`'s block `j` from
+/// fixture row `(7r + j) % OUT`.
+pub fn two_rows_a_lane_match_the_oracle_dot(gpu: &Gpu) {
     if gpu.device().specializes_by_name() {
         return;
     }
@@ -1195,49 +1227,270 @@ pub fn two_rows_a_lane_match_one_row_a_lane(gpu: &Gpu) {
             qs: oracle::pack_q4_k_dense(&q4_values(row)),
         })
         .collect();
-    let one_q4 = q4_k_bytes(&q4);
-    let block_of = |bytes: &[u8], i: usize| -> Vec<u8> {
-        let width = bytes.len() / OUT;
-        bytes[i * width..(i + 1) * width].to_vec()
-    };
-    let spread = |bytes: &[u8]| -> Vec<u8> {
-        (0..NR_ROWS)
-            .flat_map(|row| (0..NR_BLOCKS).flat_map(move |j| block_of(bytes, (row * 7 + j) % OUT)))
-            .collect()
-    };
-    let x = oracle::signal(NR_BLOCKS * IN, 0x7E57);
-    for (codec, module, one, two, bytes) in [(
-        "q4_K",
+    let q6: Vec<BlockQ6K> = (0..OUT).map(|row| pack_q6_k(&q6_values(row))).collect();
+    let q6_bytes: Vec<u8> = q6.iter().flat_map(bytemuck::bytes_of).copied().collect();
+    let in_dim = NR_BLOCKS * IN;
+    let x = oracle::signal(in_dim, 0x7E57);
+    let groups = NR_ROWS.div_ceil(2 * (32 / 16) * 2) as u32;
+    let q4_got = nr_run(
+        gpu,
         "generic",
-        "kernel_mul_mv_ext_q4_K_f32_r1_1",
         "kernel_mul_mv_ext_q4_K_f32_r1_1_nr2",
-        spread(&one_q4),
-    )] {
-        let alone = nr_run(
-            gpu,
-            module,
-            one,
-            &bytes,
-            &x,
-            NR_ROWS.div_ceil(ROWS_PER_TG) as u32,
+        &nr_spread(&q4_k_bytes(&q4)),
+        &x,
+        1,
+        groups,
+    );
+    let q6_got = nr_run(
+        gpu,
+        "qwen35",
+        "kernel_mul_mv_ext_q6_K_f32_r1_1_nr2",
+        &nr_spread(&q6_bytes),
+        &x,
+        1,
+        groups,
+    );
+    for row in 0..NR_ROWS {
+        let weights = |dequant: &dyn Fn(usize, usize) -> f32| -> Vec<f32> {
+            (0..in_dim)
+                .map(|k| dequant((row * 7 + k / IN) % OUT, k % IN))
+                .collect()
+        };
+        let q4_w = weights(&|block, e| exact_q4_k(&q4[block], e));
+        let q6_w = weights(&|block, e| dequant_q6_k(&q6[block], e));
+        crate::assert_close!(
+            q4_got[row],
+            dot(&q4_w, &x),
+            oracle::TOL_QUANT,
+            "q4_K row {row}"
         );
-        let paired = nr_run(
-            gpu,
-            module,
-            two,
-            &bytes,
-            &x,
-            NR_ROWS.div_ceil(2 * ROWS_PER_TG) as u32,
+        crate::assert_close!(
+            q6_got[row],
+            dot(&q6_w, &x),
+            oracle::TOL_QUANT,
+            "q6_K row {row}"
         );
-        for row in 0..NR_ROWS {
-            assert_eq!(
-                paired[row].to_bits(),
-                alone[row].to_bits(),
-                "{codec} row {row}: two rows a lane {} against one {}",
-                paired[row],
-                alone[row],
-            );
-            assert!(alone[row] != 0.0, "{codec} row {row} wrote nothing");
+    }
+}
+
+/// The two-rows-a-lane `q4_K` decode entries, by token rows a threadgroup.
+const NR_Q4: [&str; 5] = [
+    "kernel_mul_mv_ext_q4_K_f32_r1_1_nr2",
+    "kernel_mul_mv_ext_q4_K_f32_r1_2_nr2",
+    "kernel_mul_mv_ext_q4_K_f32_r1_3_nr2",
+    "kernel_mul_mv_ext_q4_K_f32_r1_4_nr2",
+    "kernel_mul_mv_ext_q4_K_f32_r1_5_nr2",
+];
+
+/// The two-rows-a-lane `q6_K` decode entries, by token rows a threadgroup.
+const NR_Q6: [&str; 5] = [
+    "kernel_mul_mv_ext_q6_K_f32_r1_1_nr2",
+    "kernel_mul_mv_ext_q6_K_f32_r1_2_nr2",
+    "kernel_mul_mv_ext_q6_K_f32_r1_3_nr2",
+    "kernel_mul_mv_ext_q6_K_f32_r1_4_nr2",
+    "kernel_mul_mv_ext_q6_K_f32_r1_5_nr2",
+];
+
+/// Spreads one-block fixture rows into `NR_ROWS` rows of `NR_BLOCKS` blocks,
+/// each row a different rotation, so no two rows share a block sequence.
+fn nr_spread(one: &[u8]) -> Vec<u8> {
+    let width = one.len() / OUT;
+    let mut bytes = Vec::with_capacity(NR_ROWS * NR_BLOCKS * width);
+    for row in 0..NR_ROWS {
+        for j in 0..NR_BLOCKS {
+            let i = (row * 7 + j) % OUT;
+            bytes.extend_from_slice(&one[i * width..(i + 1) * width]);
+        }
+    }
+    bytes
+}
+
+/// Every token row of a two-rows-a-lane decode call, at every width from one to
+/// eight, answers the bits the same row answers alone - for `q4_K` and `q6_K`.
+///
+/// This is the batch invariance a decode step owes its sessions: a session's
+/// logits must not depend on how many others share its step. It holds by
+/// construction here, because every decode width runs one body at one lane
+/// split; the case is what says the compiler kept it so.
+pub fn decode_rows_answer_what_they_answer_alone(gpu: &Gpu) {
+    if gpu.device().specializes_by_name() {
+        return;
+    }
+    let q4: Vec<oracle::Q4K> = (0..OUT)
+        .map(|row| oracle::Q4K {
+            d: ONE_F16,
+            dmin: 0x2C00,
+            scales: GEMM_SCALES,
+            qs: oracle::pack_q4_k_dense(&q4_values(row)),
+        })
+        .collect();
+    let q6: Vec<BlockQ6K> = (0..OUT).map(|row| pack_q6_k(&q6_values(row))).collect();
+    let q6_bytes: Vec<u8> = q6.iter().flat_map(bytemuck::bytes_of).copied().collect();
+    let in_dim = NR_BLOCKS * IN;
+    let groups = NR_ROWS.div_ceil(2 * (32 / 16) * 2) as u32;
+    for (codec, module, entries, bytes) in [
+        ("q4_K", "generic", NR_Q4, nr_spread(&q4_k_bytes(&q4))),
+        ("q6_K", "qwen35", NR_Q6, nr_spread(&q6_bytes)),
+    ] {
+        for n_tok in 1..=8usize {
+            let x = oracle::signal(in_dim * n_tok, 0x5EED + n_tok as u32);
+            let entry = entries[nr_r1ptg(n_tok) - 1];
+            let batched = nr_run(gpu, module, entry, &bytes, &x, n_tok, groups);
+            for t in 0..n_tok {
+                let row = &x[t * in_dim..(t + 1) * in_dim];
+                let alone = nr_run(gpu, module, entries[0], &bytes, row, 1, groups);
+                for (i, want) in alone.iter().enumerate() {
+                    let got = batched[t * NR_ROWS + i];
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{codec}: row {t} of {n_tok}, output {i}: batched {got} against alone {want}",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Rows, tokens and input width of the affine prefill case: a partial 64-row
+/// tile and a partial 32-token tile, four groups of 64 a row.
+const AFF_ROWS: usize = 96;
+const AFF_TOKENS: usize = 40;
+const AFF_K: usize = 256;
+/// Per-group scales and biases of the affine case: signed powers of two, exact
+/// in bf16 and in the half tile.
+const AFF_SCALES: [f32; 4] = [0.25, -0.5, 0.125, 1.0];
+const AFF_BIASES: [f32; 4] = [-1.0, 0.5, 2.0, -0.25];
+
+/// One launch of the affine prefill tile over the case's fixture.
+fn affine_mm_run(
+    gpu: &Gpu,
+    bits: u32,
+    words: &[u32],
+    scales: &[u16],
+    biases: &[u16],
+    x: &[f32],
+) -> Vec<f32> {
+    let word_bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let u16_bytes = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|h| h.to_le_bytes()).collect() };
+    let w_buf = gpu.upload(&word_bytes);
+    let s_buf = gpu.upload(&u16_bytes(scales));
+    let b_buf = gpu.upload(&u16_bytes(biases));
+    let x_buf = gpu.upload(&f32_bytes(x));
+    let dst = gpu.upload(&vec![0u8; AFF_ROWS * AFF_TOKENS * 4]);
+    let row_bytes = (AFF_K * bits as usize / 8) as u64;
+    let args = MulMmArgs {
+        ne00: AFF_K as i32,
+        ne02: 1,
+        nb01: row_bytes,
+        nb02: row_bytes * AFF_ROWS as u64,
+        nb03: row_bytes * AFF_ROWS as u64,
+        ne12: 1,
+        _pad0: 0,
+        nb10: 4,
+        nb11: (AFF_K * 4) as u64,
+        nb12: (AFF_K * AFF_TOKENS * 4) as u64,
+        nb13: (AFF_K * AFF_TOKENS * 4) as u64,
+        ne0: AFF_ROWS as i32,
+        ne1: AFF_TOKENS as i32,
+        r2: 1,
+        r3: 1,
+        _pad2: [0; 4],
+    };
+    let params = [
+        KernelArg::Bytes(bytemuck::bytes_of(&args)),
+        KernelArg::Buffer(w_buf.view()),
+        KernelArg::Buffer(s_buf.view()),
+        KernelArg::Buffer(b_buf.view()),
+        KernelArg::Buffer(x_buf.view()),
+        KernelArg::Buffer(dst.view()),
+    ];
+    let mut launch = LaunchArgs::new(
+        Extent3::new(
+            AFF_TOKENS.div_ceil(TILE_COLS) as u32,
+            AFF_ROWS.div_ceil(TILE_ROWS) as u32,
+            1,
+        ),
+        Extent3::linear(128),
+        &params,
+    );
+    // The partial tiles take the guarded write-back, which stages a whole
+    // 64 x 32 f32 tile in threadgroup memory: the engine's 8192 bytes
+    // (`GEMM_SMEM_BYTES`), not the 6144 the full-tile cases get by with.
+    launch.smem_bytes = 8_192;
+    let entry = if bits == 4 {
+        "kernel_mul_mm_affine4_f32"
+    } else {
+        "kernel_mul_mm_affine8_f32"
+    };
+    // The engine's table: the output tile guard on. The broadcast-off table
+    // the full-tile cases use leaves it off, and a partial 64-row tile
+    // then stores all 64 rows - past the matrix, into the next token's.
+    let consts: &'static [FnConst] = if gpu.device().specializes_by_name() {
+        &[]
+    } else {
+        &GEMM_GUARDED
+    };
+    run(
+        gpu,
+        KernelRef::specialized("qwen35", entry, consts),
+        &launch,
+    );
+    drain(gpu);
+    gpu.read_f32(&dst)
+}
+
+/// The affine prefill tile against a triple loop, at 4 and 8 bits.
+///
+/// Every value is exact in the half tile: scales and biases are signed powers
+/// of two in bf16, codes are small integers, and the activations are small
+/// integers too, so the tile's rounding to half changes nothing and any
+/// disagreement is the decode or the indexing. Ninety-six output rows and forty
+/// tokens leave both the 64-row and the 32-token tile partial, which is the
+/// guarded write-back. Four groups of 64 a row, each with its own scale and
+/// bias, catch a group read at the wrong offset.
+pub fn affine_prefill_gemm_matches_a_triple_loop(gpu: &Gpu) {
+    let bf16 = |v: f32| (v.to_bits() >> 16) as u16;
+    for bits in [4u32, 8] {
+        let per = 32 / bits as usize;
+        let mask = (1u32 << bits) - 1;
+        let code = |row: usize, k: usize| ((row * 5 + k * 3) as u32 % (mask + 1)).min(mask);
+        let mut words = Vec::with_capacity(AFF_ROWS * AFF_K / per);
+        for row in 0..AFF_ROWS {
+            for w in 0..AFF_K / per {
+                let mut word = 0u32;
+                for j in 0..per {
+                    word |= code(row, w * per + j) << (bits as usize * j);
+                }
+                words.push(word);
+            }
+        }
+        let group = |row: usize, g: usize| (row + g) % 4;
+        let scales: Vec<u16> = (0..AFF_ROWS * AFF_K / 64)
+            .map(|i| bf16(AFF_SCALES[group(i / (AFF_K / 64), i % (AFF_K / 64))]))
+            .collect();
+        let biases: Vec<u16> = (0..AFF_ROWS * AFF_K / 64)
+            .map(|i| bf16(AFF_BIASES[group(i / (AFF_K / 64), i % (AFF_K / 64))]))
+            .collect();
+        let x: Vec<f32> = (0..AFF_TOKENS * AFF_K)
+            .map(|i| ((i * 7) % 5) as f32 - 2.0)
+            .collect();
+        let got = affine_mm_run(gpu, bits, &words, &scales, &biases, &x);
+        for tok in 0..AFF_TOKENS {
+            for row in 0..AFF_ROWS {
+                let want: f32 = (0..AFF_K)
+                    .map(|k| {
+                        let g = group(row, k / 64);
+                        (AFF_SCALES[g] * code(row, k) as f32 + AFF_BIASES[g]) * x[tok * AFF_K + k]
+                    })
+                    .sum();
+                crate::assert_close!(
+                    got[tok * AFF_ROWS + row],
+                    want,
+                    oracle::TOL_QUANT,
+                    "{bits}-bit affine tile: token {tok} row {row}",
+                );
+            }
         }
     }
 }
