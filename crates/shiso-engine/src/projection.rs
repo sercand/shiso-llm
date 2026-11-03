@@ -966,22 +966,24 @@ fn dispatch(
     // `cfg`: a CUDA module holds one symbol per instantiation and refuses a
     // launch-time constant outright, so the name has to carry the split there.
     let by_name = backend.specializes_by_name();
-    // A device that names its specializations has no multi-row instantiation,
+    // A device that names its specializations has no two-row instantiation,
     // and keeps the one-row walk below.
-    if n_tok == 1
-        && !by_name
-        && let Some((entry, rows)) = ext_nr_entry(weight.dtype)
+    if !by_name
+        && u64::from(weight.in_dim).is_multiple_of(NR_IN_MULTIPLE)
+        && let Some((entry, rows)) = ext_nr_entry(weight.dtype, r1ptg)
     {
-        let consts = ext_consts_static(nxpsg).ok_or(CoreError::InvalidValue {
+        // One lane split at every decode width, so a row's chain does not
+        // change with the number of rows beside it.
+        let consts = ext_consts_static(NR_LANE_SPLIT).ok_or(CoreError::InvalidValue {
             key: "projection lane split",
-            value: format!("{nxpsg} is not a split the extended family is built with"),
+            value: format!("{NR_LANE_SPLIT} is not a split the extended family is built with"),
         })?;
         let args = ext_args(weight.dtype, weight.in_dim, weight.out_dim, n_tok)?;
-        let per_group = crate::launch::ext_rows_per_threadgroup(nxpsg).saturating_mul(rows);
+        let per_group = crate::launch::ext_rows_per_threadgroup(NR_LANE_SPLIT).saturating_mul(rows);
         return run(
             backend,
             KernelRef::specialized(ext_module(weight.dtype), entry, consts),
-            Extent3::new(weight.out_dim.div_ceil(per_group), 1, 1),
+            Extent3::new(weight.out_dim.div_ceil(per_group), n_tok.div_ceil(r1ptg), 1),
             ext_block(),
             0,
             &[
@@ -1019,25 +1021,47 @@ fn dispatch(
     plain_projection(backend, weight, n_tok, src, dst)
 }
 
-/// The one-token K-quant matvec that gives a lane two consecutive rows, and
-/// the two.
+/// Lanes a two-rows-a-lane decode row is split over, at every decode width.
 ///
-/// The lane loads its activation run once for both rows; each row's sum is
-/// the one-row walk's, term for term. Measured on an M4 (Qwen3.5-4B `Q4_K_M`,
-/// 512-position decode step): 33.2 ms against 33.9 with one row a lane, and
-/// 36.8 with four, where the extra rows' codes cost more occupancy than the
-/// shared activation read saved. `None` keeps the one-row walk.
+/// Sixteen, the split one and two rows took before: measured on an M4 (Qwen3.5-4B
+/// `Q4_K_M`), three to eight sessions ran 5-10% faster a step at sixteen than at
+/// the eight the walk below gives three rows and more, and a fixed split is what
+/// keeps a batched row's chain the chain it runs alone.
+const NR_LANE_SPLIT: u32 = 16;
+
+/// Input widths the two-rows-a-lane entries take: sixteen lanes of one 32-weight
+/// sub-block each, a whole number of times.
+const NR_IN_MULTIPLE: u64 = 256;
+
+/// The K-quant decode matvec that gives a lane two consecutive weight rows, at
+/// the token-row blocking `r1ptg`, and the two.
 ///
-/// `q4_K` only, because only there are the two bodies the same bits: under the
-/// library's fast math the `q5_K` and `q6_K` bodies contract one product
-/// differently and land one ulp apart (see
-/// `two_rows_a_lane_match_one_row_a_lane`), and a one-token row has to answer
-/// what the same row answers inside a two-token batch.
-const fn ext_nr_entry(dtype: DType) -> Option<(&'static str, u32)> {
-    match dtype {
-        DType::Q4_K => Some(("kernel_mul_mv_ext_q4_K_f32_r1_1_nr2", 2)),
-        _ => None,
-    }
+/// The lane decodes each of its two rows' sub-blocks once for every token row
+/// of its threadgroup and loads each token row's activation run once for both
+/// weight rows. Every decode width of a format runs one body at one lane split
+/// ([`NR_LANE_SPLIT`]), compiled in safe math, so a session's logits do not
+/// depend on how many sessions share its step
+/// (`decode_rows_answer_what_they_answer_alone`).
+///
+/// Measured on an M4 (Qwen3.5-4B `Q4_K_M`): one session's step 33.2 ms against
+/// 33.9 through the one-row walk; two sessions' FFN projections 1.12x one
+/// session's, where the walk took 1.5x; and the walk's `q6_K` head cost
+/// 3.4 ms more a session. `None` keeps the walk.
+const fn ext_nr_entry(dtype: DType, r1ptg: u32) -> Option<(&'static str, u32)> {
+    let entry = match (dtype, r1ptg) {
+        (DType::Q4_K, 1) => "kernel_mul_mv_ext_q4_K_f32_r1_1_nr2",
+        (DType::Q4_K, 2) => "kernel_mul_mv_ext_q4_K_f32_r1_2_nr2",
+        (DType::Q4_K, 3) => "kernel_mul_mv_ext_q4_K_f32_r1_3_nr2",
+        (DType::Q4_K, 4) => "kernel_mul_mv_ext_q4_K_f32_r1_4_nr2",
+        (DType::Q4_K, 5) => "kernel_mul_mv_ext_q4_K_f32_r1_5_nr2",
+        (DType::Q6_K, 1) => "kernel_mul_mv_ext_q6_K_f32_r1_1_nr2",
+        (DType::Q6_K, 2) => "kernel_mul_mv_ext_q6_K_f32_r1_2_nr2",
+        (DType::Q6_K, 3) => "kernel_mul_mv_ext_q6_K_f32_r1_3_nr2",
+        (DType::Q6_K, 4) => "kernel_mul_mv_ext_q6_K_f32_r1_4_nr2",
+        (DType::Q6_K, 5) => "kernel_mul_mv_ext_q6_K_f32_r1_5_nr2",
+        _ => return None,
+    };
+    Some((entry, 2))
 }
 
 /// Widest row count the `q8_0` row kernel is instantiated for.
@@ -1839,6 +1863,11 @@ fn affine_projection(
             value: "affine weight is missing auxiliary scales/biases".into(),
         })?;
     let bits = weight.dtype.affine_bits().ok_or_else(unsupported_bits)?;
+    if n_tok >= GEMM_MIN_TOKENS
+        && let Some(entry) = affine_mm_entry(backend, bits, weight.in_dim)
+    {
+        return affine_mm_projection(backend, weight, aux, entry, n_tok, src, dst);
+    }
     if let Some(plan) = exact_affine_plan(bits, n_tok, weight.out_dim, weight.in_dim) {
         let args = ExactAffineArgs {
             in_dim: weight.in_dim,
@@ -1899,6 +1928,84 @@ fn affine_projection(
             KernelArg::Bytes(bytemuck::bytes_of(&args)),
         ],
     )
+}
+
+/// The half-precision prefill tile for an affine weight of `bits`, when the
+/// backend compiles one and the width suits it.
+///
+/// A prompt chunk only: [`GEMM_MIN_TOKENS`] is one past the widest decode
+/// batch, so decode and verify rows keep the row-exact family, whose bits a
+/// serial step reproduces. Measured on an M4 over Qwen3.5-4B MLX 4-bit, the
+/// row-exact f32 tile spent 86% of a 1024-token prefill.
+fn affine_mm_entry(backend: &dyn Backend, bits: u32, in_dim: u32) -> Option<&'static str> {
+    // Sixteen weights a thread a stage, inside one group of 64.
+    if !in_dim.is_multiple_of(64) {
+        return None;
+    }
+    let entry = match bits {
+        4 => "kernel_mul_mm_affine4_f32",
+        8 => "kernel_mul_mm_affine8_f32",
+        _ => return None,
+    };
+    backend
+        .max_block_threads(KernelRef::specialized(
+            Q35,
+            entry,
+            mm_consts_for(backend.specializes_by_name()),
+        ))
+        .is_some_and(|limit| limit >= GEMM_BLOCK)
+        .then_some(entry)
+}
+
+/// [`mm_projection`]'s tile over an affine weight: the same argument block and
+/// grid, the codes, scales and biases bound in that order ahead of the input.
+fn affine_mm_projection(
+    backend: &dyn Backend,
+    weight: &Weight,
+    aux: &AffineAux,
+    entry: &'static str,
+    n_tok: u32,
+    src: DeviceView<'_>,
+    dst: DeviceView<'_>,
+) -> CoreResult<()> {
+    let row = u64::from(weight.in_dim) * u64::from(weight.dtype.affine_bits().unwrap_or(4)) / 8;
+    let plane = row.saturating_mul(u64::from(weight.out_dim));
+    let act_row = u64::from(weight.in_dim).saturating_mul(F32_BYTES);
+    let act_plane = act_row.saturating_mul(u64::from(n_tok));
+    let args = MulMmArgs {
+        ne00: extent(weight.in_dim, "projection in_dim")?,
+        ne02: 1,
+        nb01: row,
+        nb02: plane,
+        nb03: plane,
+        ne12: 1,
+        pad0: 0,
+        nb10: F32_BYTES,
+        nb11: act_row,
+        nb12: act_plane,
+        nb13: act_plane,
+        ne0: extent(weight.out_dim, "projection out_dim")?,
+        ne1: extent(n_tok, "projection n_tok")?,
+        r2: 1,
+        r3: 1,
+        pad2: [0; 4],
+    };
+    run(
+        backend,
+        KernelRef::specialized(Q35, entry, mm_consts_for(backend.specializes_by_name())),
+        mm_grid(weight.out_dim, n_tok),
+        Extent3::linear(GEMM_BLOCK),
+        GEMM_SMEM_BYTES,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(weight.view()),
+            KernelArg::Buffer(aux.scales.view()),
+            KernelArg::Buffer(aux.biases.view()),
+            KernelArg::Buffer(src),
+            KernelArg::Buffer(dst),
+        ],
+    )
+    .map_err(|err| launch_failure(entry, err))
 }
 
 /// The ternary set's product over a `PQ2_0`, `PTQ1_0` or 2-bit affine weight.

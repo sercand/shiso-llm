@@ -2645,10 +2645,9 @@ pub(crate) fn logits_rows(
 /// Projects one normalized row into one logits row, capped where the family caps
 /// it.
 ///
-/// One row at a time on purpose: a prefill wants the last row of its chunk and a
-/// decode step wants one row per session, and neither is a contiguous run of the
-/// normalized block. The projection family covers a single row, so the caller
-/// slices and this launches.
+/// One row at a time on purpose: a prefill wants the last row of its chunk,
+/// which is not the start of the normalized block. A decode batch's rows are
+/// rows `0 .. n` of its pass, and go through [`logits_rows`] instead.
 ///
 /// The cap belongs here rather than at the sampler: it is a fact about the
 /// model's output layer, and a row that reached a caller uncapped would be a row
