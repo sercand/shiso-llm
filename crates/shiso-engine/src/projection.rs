@@ -966,6 +966,32 @@ fn dispatch(
     // `cfg`: a CUDA module holds one symbol per instantiation and refuses a
     // launch-time constant outright, so the name has to carry the split there.
     let by_name = backend.specializes_by_name();
+    // A device that names its specializations has no multi-row instantiation,
+    // and keeps the one-row walk below.
+    if n_tok == 1
+        && !by_name
+        && let Some((entry, rows)) = ext_nr_entry(weight.dtype)
+    {
+        let consts = ext_consts_static(nxpsg).ok_or(CoreError::InvalidValue {
+            key: "projection lane split",
+            value: format!("{nxpsg} is not a split the extended family is built with"),
+        })?;
+        let args = ext_args(weight.dtype, weight.in_dim, weight.out_dim, n_tok)?;
+        let per_group = crate::launch::ext_rows_per_threadgroup(nxpsg).saturating_mul(rows);
+        return run(
+            backend,
+            KernelRef::specialized(ext_module(weight.dtype), entry, consts),
+            Extent3::new(weight.out_dim.div_ceil(per_group), 1, 1),
+            ext_block(),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(weight.view()),
+                KernelArg::Buffer(src),
+                KernelArg::Buffer(dst),
+            ],
+        );
+    }
     if let Some(entry) = ext_name_for(weight.dtype, r1ptg, nxpsg, by_name) {
         let consts: &'static [FnConst] = if by_name {
             &[]
@@ -991,6 +1017,27 @@ fn dispatch(
         );
     }
     plain_projection(backend, weight, n_tok, src, dst)
+}
+
+/// The one-token K-quant matvec that gives a lane two consecutive rows, and
+/// the two.
+///
+/// The lane loads its activation run once for both rows; each row's sum is
+/// the one-row walk's, term for term. Measured on an M4 (Qwen3.5-4B `Q4_K_M`,
+/// 512-position decode step): 33.2 ms against 33.9 with one row a lane, and
+/// 36.8 with four, where the extra rows' codes cost more occupancy than the
+/// shared activation read saved. `None` keeps the one-row walk.
+///
+/// `q4_K` only, because only there are the two bodies the same bits: under the
+/// library's fast math the `q5_K` and `q6_K` bodies contract one product
+/// differently and land one ulp apart (see
+/// `two_rows_a_lane_match_one_row_a_lane`), and a one-token row has to answer
+/// what the same row answers inside a two-token batch.
+const fn ext_nr_entry(dtype: DType) -> Option<(&'static str, u32)> {
+    match dtype {
+        DType::Q4_K => Some(("kernel_mul_mv_ext_q4_K_f32_r1_1_nr2", 2)),
+        _ => None,
+    }
 }
 
 /// Widest row count the `q8_0` row kernel is instantiated for.

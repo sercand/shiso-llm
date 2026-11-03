@@ -17,6 +17,14 @@
 #define Q35_ATTN_LANE_SLOTS 8u
 // Staging stride for the per-simdgroup partials: the attention head_dim bound.
 #define Q35_ATTN_HD 256u
+// Split-K decode attention (kernel_q35_attn_decode_split): simdgroups per
+// threadgroup, the most position splits a row is cut into, and the fewest
+// positions a split may hold. The split count is a function of the row's own
+// position and these two constants only, never of how many rows share the
+// launch, which is what keeps a row's bits independent of its batch.
+#define Q35_SPLIT_WARPS 4u
+#define Q35_SPLIT_MAX 32u
+#define Q35_SPLIT_MIN 64u
 // conv_kernel 4 minus the current token.
 #define Q35_CONV_HIST 3u
 // 32 simdgroup partials plus the broadcast slot; see q35_block_sum.
@@ -347,6 +355,16 @@ static inline uint64_t q35_kv_row(device const int32_t *pages, uint64_t position
     // cost decode attention ~3000 cycles a key on an M1 Max.
     const uint32_t p = (uint32_t) position;
     return (uint64_t) pages[p / page_tokens] * page_tokens + (p % page_tokens);
+}
+
+/// Position splits a decode row covering `n_pos` positions is cut into.
+///
+/// One split per Q35_SPLIT_MIN positions, capped at Q35_SPLIT_MAX. With the
+/// chunk `ceil(n_pos / splits)` every split below the count holds at least one
+/// position: the count only grows past one once n_pos exceeds the minimum, and
+/// 64 positions a split is far above the 31 a 32-way cut could leave idle.
+static inline uint q35_attn_splits(uint n_pos) {
+    return min(Q35_SPLIT_MAX, (n_pos + Q35_SPLIT_MIN - 1u) / Q35_SPLIT_MIN);
 }
 
 /// Row `t`'s own page table inside a packed block of them.

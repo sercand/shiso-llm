@@ -365,6 +365,117 @@ template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_3")]] kernel mul_mv_ext_kq_f
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_4")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<4, shs_dense_block_q4_K, deq32_q4_K>;
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_5")]] kernel mul_mv_ext_kq_f32_t kernel_mul_mv_ext_kq_f32_disp<5, shs_dense_block_q4_K, deq32_q4_K>;
 
+// The one-token K-quant walk with NR consecutive rows a lane.
+//
+// The walk above gives a lane one row, so every row re-reads the activation
+// run its sub-blocks multiply. For a narrow input that read is most of the
+// traffic: a 2560-wide row is 1440 bytes of q4_K and 10 KB of f32 activation,
+// and measured on an M4 the 9216 x 2560 FFN projections of Qwen3.5-4B ran at
+// ~86 GB/s where the 2560 x 9216 one ran at ~150. Here a lane loads the
+// activation run once and multiplies it into NR rows, so the activation read is
+// paid once per NR rows.
+//
+// Each row's sum is the walk above's, expression for expression: the same
+// sub-blocks in the same order, the same `ab.x * sum(q * y) + ab.y * sum(y)`
+// per sub-block, and the same lane reduction. `sum(y)` does not depend on the
+// row and is computed once, which is the only thing shared. Instantiated for
+// q4_K alone, where the two bodies compile to the same bits; the q5_K and q6_K
+// bodies contract one product differently under fast math and land one ulp
+// apart, which a one-token row may not.
+template<short NR, typename q_t, void (*deq32)(device const q_t *, short, thread float4 *, thread float2 &)>
+kernel void kernel_mul_mv_ext_kq_f32_nr(
+        constant shs_metal_args_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG   = FC_mul_mv_nsg;
+    const short nxpsg = FC_mul_mv_nxpsg;
+
+    const short nypsg = (32/nxpsg);
+
+    const short tx = tiisg%nxpsg;
+    const short ty = tiisg/nxpsg;
+
+    const int r0 = (tgpig.x*(nypsg*NSG) + nypsg*sgitg + ty)*NR;
+    const int i1m = tgpig.z;
+
+    const int i12 = i1m%args.ne12;
+    const int i13 = i1m/args.ne12;
+
+    const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+    const uint64_t offset1 = (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const q_t * xq[NR];
+    for (short r = 0; r < NR; ++r) {
+        xq[r] = (r0 + r < args.ne01)
+            ? (device const q_t *) (src0 + offset0 + (uint64_t)(r0 + r)*args.nb01)
+            : (device const q_t *) src0;
+    }
+    device const float4 * y4 = (device const float4 *) (src1 + offset1);
+
+    float sumf[NR] = { [ 0 ... NR - 1 ] = 0.0f };
+
+    const int nsub = args.ne00/32;
+
+    for (int u = tx; u < nsub; u += nxpsg) {
+        device const float4 * y = y4 + u*8;
+        float4 yv[8];
+        float4 sy = 0.0f;
+#pragma unroll(8)
+        for (short k = 0; k < 8; ++k) {
+            yv[k] = y[k];
+            sy += yv[k];
+        }
+        const float ssy = (sy[0] + sy[1]) + (sy[2] + sy[3]);
+#pragma unroll(NR)
+        for (short r = 0; r < NR; ++r) {
+            float4 qv[8];
+            float2 ab;
+            deq32(xq[r] + u/8, (short)(u%8), qv, ab);
+            float4 qy = 0.0f;
+#pragma unroll(8)
+            for (short k = 0; k < 8; ++k) {
+                qy += qv[k]*yv[k];
+            }
+            sumf[r] += ab.x*((qy[0] + qy[1]) + (qy[2] + qy[3])) + ab.y*ssy;
+        }
+    }
+
+    for (short r = 0; r < NR; ++r) {
+        if (nxpsg >= 32) {
+            sumf[r] += simd_shuffle_down(sumf[r], 16);
+        }
+        if (nxpsg >= 16) {
+            sumf[r] += simd_shuffle_down(sumf[r],  8);
+        }
+        if (nxpsg >= 8) {
+            sumf[r] += simd_shuffle_down(sumf[r],  4);
+        }
+        if (nxpsg >= 4) {
+            sumf[r] += simd_shuffle_down(sumf[r],  2);
+        }
+        if (nxpsg >= 2) {
+            sumf[r] += simd_shuffle_down(sumf[r],  1);
+        }
+    }
+
+    if (tx == 0) {
+        device float * dst_f32 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1;
+        for (short r = 0; r < NR; ++r) {
+            if (r0 + r < args.ne01) {
+                dst_f32[r0 + r] = sumf[r];
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mv_ext_kq_f32_nr<2, shs_dense_block_q4_K, deq32_q4_K>) mul_mv_ext_kq_nr_t;
+
+template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_1_nr2")]] kernel mul_mv_ext_kq_nr_t kernel_mul_mv_ext_kq_f32_nr<2, shs_dense_block_q4_K, deq32_q4_K>;
+
 // The mixed i-quant formats and the 2-bit K-quant, on the same kq walk.
 //
 // All nine blocks are 256 weights, so the lane split above needs no change:

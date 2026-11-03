@@ -288,6 +288,19 @@ fn validate_single_variant(variant: &Variant, mode: ValidationMode) -> Result<()
         });
     }
 
+    if let Some(defaults) = &variant.server_defaults
+        && defaults.kv_cache_tokens.is_some()
+        && defaults.gpu_memory_utilization.is_some()
+    {
+        return Err(HubError::Validation {
+            reason: format!(
+                "variant '{}' server_defaults set both kv_cache_tokens and gpu_memory_utilization; \
+                 the server takes one pool setting",
+                variant.key.as_str()
+            ),
+        });
+    }
+
     validate_role_dependencies(variant)?;
     validate_components(variant, mode)?;
     Ok(())
@@ -298,11 +311,13 @@ fn validate_role_shapes(
     variant: &Variant,
     roles: &BTreeMap<Role, RolePath<'_>>,
 ) -> Result<(), HubError> {
-    // `--config`, `--ngram` and the split image files name files; a directory there would be read as
-    // one and fail at boot, so the recipe has to say which file it is.
+    // `--config`, `--ngram`, `--generation-config` and the split image files name files; a
+    // directory there would be read as one and fail at boot, so the recipe has to say which file
+    // it is.
     for role in [
         Role::Config,
         Role::Ngram,
+        Role::GenerationConfig,
         Role::DraftVocab,
         Role::ImageTextEncoder,
         Role::ImageVae,

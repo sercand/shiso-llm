@@ -96,6 +96,7 @@ fn apply_recipe_defaults_precedence() {
         spec_lookup: Some(8),
         capture_verify: Some(true),
         capture_batch: Some(true),
+        kv_cache_tokens: None,
         gpu_memory_utilization: Some(0.88),
         solo_prefill_chunk: Some(4096),
         kv_cache_dtype: Some(shiso_hub::recipe::KvCacheDtype::Fp8),
@@ -145,4 +146,29 @@ fn apply_recipe_defaults_precedence() {
     let builtin_ctx = args.ctx;
     apply_recipe_defaults(&mut args, Some(serve_matches), &empty_defaults);
     assert_eq!(args.ctx, builtin_ctx);
+}
+
+/// A recipe's pool size applies when the operator gave no pool setting, and
+/// either of the operator's own pool flags keeps the recipe's out, since the
+/// two exclude each other.
+#[test]
+fn a_recipe_pool_size_yields_to_either_operator_pool_flag() {
+    let defaults = ServerDefaults {
+        kv_cache_tokens: Some(98_304),
+        ..ServerDefaults::default()
+    };
+    for (extra, tokens, fraction) in [
+        (None, Some(98_304), None),
+        (Some(["--kv-cache-tokens", "65536"]), Some(65_536), None),
+        (Some(["--gpu-memory-utilization", "0.8"]), None, Some(0.8)),
+    ] {
+        let mut command_line = vec!["shiso", "serve", "-m", "/test/model"];
+        command_line.extend(extra.into_iter().flatten());
+        let matches = Cli::command().get_matches_from(command_line);
+        let serve_matches = matches.subcommand_matches("serve").unwrap();
+        let mut serve = ServeArgs::from_arg_matches(serve_matches).unwrap();
+        apply_recipe_defaults(&mut serve, Some(serve_matches), &defaults);
+        assert_eq!(serve.kv_cache_tokens, tokens);
+        assert_eq!(serve.gpu_memory_utilization, fraction);
+    }
 }

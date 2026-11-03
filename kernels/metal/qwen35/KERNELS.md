@@ -51,7 +51,10 @@ directly -- no division by the block size happens at dispatch time.
 | `kernel_q35_q_norm_rope_mrope` | `q_out, gate_out, qkv, w, pos_t, pos_h, pos_w` | `(n_head, n_tok)` | 128 | 1156 |
 | `kernel_q35_k_norm_rope_kv_mrope` | `k_cache, v_cache, k, v, kw, pos, pages, pos_t, pos_h, pos_w` | `(n_head_kv, n_tok)` | 128 | 1156 |
 | `kernel_q35_attn_decode` | `out, q, k_cache, v_cache, pos, pages` | `(n_head, n_tok)` | 256 | 8256 |
+| `kernel_q35_attn_decode_split_g{4,6,8}` | `part_acc, part_ml, q, k_cache, v_cache, pos, pages` | `(n_head_kv, n_tok, 32)` | 128 | 4352 |
+| `kernel_q35_attn_decode_merge` | `out, part_acc, part_ml, pos` | `(n_head, n_tok)` | 256 | 0 |
 | `kernel_q35_attn_prefill` | `out, q, k_cache, v_cache, pos, pages` | `(n_head, ceil(n_tok/16))` | 256 | 16384 |
+| `kernel_q35_attn_prefill_mma` | `out, q, k_cache, v_cache, pos, pages` | `(n_head, ceil(n_tok/32))` | 128 | 0 (17 KiB static) |
 | `kernel_q35_attn_gate_mul` | `x, gate` | `ceil(n_tok*n_head*256/256)` | 256 | 0 |
 
 
@@ -69,6 +72,10 @@ field.
 - The two `_mrope` entry points reuse those two blocks unchanged: three position
   streams are three more buffers, not more fields.
 - `q35_args_attn_decode {head_dim, n_head, n_head_kv, n_tok, page_tokens, page_stride}`
+- The split decode pair reuses `q35_args_attn_decode`. Partials are laid out
+  `[n_tok][n_head][32]`: `head_dim` floats a slot in `part_acc`, `(max, den)`
+  in `part_ml`. A row's split count is `min(32, ceil((pos+1)/64))`
+  (`q35_attn_splits`), so slots past it are never written or read.
 - `q35_args_attn_prefill {head_dim, n_head, n_head_kv, n_tok, page_tokens, page_stride}`
 - `q35_args_attn_gate {head_dim, n_head, n_tok}`
 - `q35_args_gdn_recurrent {head_dim, n_head_k, n_head_v, k_offset, v_offset, stride, n_tok}`

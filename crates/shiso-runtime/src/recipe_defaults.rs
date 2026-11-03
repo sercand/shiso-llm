@@ -172,8 +172,17 @@ fn apply_engine_defaults(
     }
 
     // An `Option` flag has no default value source, so "not given" is `None`.
+    // The two pool settings exclude each other on the command line, so an
+    // operator who gave either keeps it and the recipe's pool is not applied.
+    let pool_given = args.kv_cache_tokens.is_some() || args.gpu_memory_utilization.is_some();
+    if let Some(tokens) = defaults.kv_cache_tokens
+        && !pool_given
+    {
+        args.kv_cache_tokens = Some(tokens);
+        tracing::info!(tokens, "applied recipe default for kv_cache_tokens");
+    }
     if let Some(fraction) = defaults.gpu_memory_utilization
-        && args.gpu_memory_utilization.is_none()
+        && !pool_given
     {
         args.gpu_memory_utilization = Some(fraction);
         tracing::info!(

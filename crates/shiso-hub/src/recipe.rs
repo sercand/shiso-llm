@@ -417,6 +417,13 @@ pub enum Role {
     /// For a checkpoint that keeps the table in a file of its own rather than
     /// inside its shards; the loader reads it from the flag, never by name.
     Ngram,
+    /// Sampling defaults document (`--generation-config`).
+    ///
+    /// For a checkpoint whose publisher states sampling settings that no
+    /// `generation_config.json` of its own carries, such as a fine-tune shipped
+    /// as a GGUF beside the base model's sidecar. Names a file; the registry
+    /// hosts it.
+    GenerationConfig,
     /// Architecture config document (`--config`).
     ///
     /// For a checkpoint whose weights file carries no `config.json` beside it,
@@ -444,6 +451,7 @@ impl Role {
             Self::ImageVae => "--image-vae",
             Self::ImageTokenizer => "--image-tokenizer",
             Self::Ngram => "--ngram",
+            Self::GenerationConfig => "--generation-config",
             Self::Config => "--config",
         }
     }
@@ -465,6 +473,7 @@ impl Role {
             Self::ImageVae => "image_vae",
             Self::ImageTokenizer => "image_tokenizer",
             Self::Ngram => "ngram",
+            Self::GenerationConfig => "generation_config",
             Self::Config => "config",
         }
     }
@@ -493,6 +502,7 @@ impl FromStr for Role {
             "image_vae" => Ok(Self::ImageVae),
             "image_tokenizer" => Ok(Self::ImageTokenizer),
             "ngram" => Ok(Self::Ngram),
+            "generation_config" => Ok(Self::GenerationConfig),
             "config" => Ok(Self::Config),
             _ => Err(HubError::Validation {
                 reason: format!("unknown role '{s}'"),
@@ -851,6 +861,12 @@ pub struct ServerDefaults {
     /// Capture multi-session passes as device graphs (`--capture-batch`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_batch: Option<bool>,
+    /// Tokens the shared KV pool holds (`--kv-cache-tokens`).
+    ///
+    /// Exclusive with `gpu_memory_utilization`, as the two flags are: one
+    /// states the pool, the other derives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_cache_tokens: Option<u64>,
     /// Fraction of device memory the server may claim
     /// (`--gpu-memory-utilization`).
     #[serde(default, skip_serializing_if = "Option::is_none")]

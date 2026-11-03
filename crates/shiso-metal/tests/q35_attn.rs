@@ -68,3 +68,24 @@ fn two_rows_in_two_pages_match_the_rows_run_alone() {
     let Some(gpu) = open() else { return };
     cases::two_rows_in_two_pages_match_the_rows_run_alone(&gpu);
 }
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn split_decode_matches_a_naive_masked_softmax() {
+    let Some(gpu) = open() else { return };
+    cases::split_decode_matches_a_naive_masked_softmax(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn split_decode_rows_match_the_rows_run_alone() {
+    let Some(gpu) = open() else { return };
+    cases::split_decode_rows_match_the_rows_run_alone(&gpu);
+}
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn mma_prefill_matches_a_naive_masked_softmax() {
+    let Some(gpu) = open() else { return };
+    cases::mma_prefill_matches_a_naive_masked_softmax(&gpu);
+}

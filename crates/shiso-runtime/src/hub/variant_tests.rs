@@ -1,6 +1,6 @@
 //! A recipe variant's components become the serve options' paths.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use shiso_hub::{Recipe, Role, ValidationMode, validate_recipe};
 
@@ -250,4 +250,51 @@ fn image_variant_resolves_to_model_and_assets() {
     assert_eq!(args.image_assets_dir, Some(vdir.join("image_assets")));
     assert_eq!(args.image_model_id.as_deref(), Some("flux-test"));
     assert_eq!(args.model, None);
+}
+
+/// A fine-tune shipped as one GGUF: the base model's sidecar is the config, and
+/// the publisher's sampling settings are a registry-hosted file of their own.
+const GGUF_WITH_SAMPLING: &str = r#"{
+    "schema_version": 1, "name": "tuned", "family": "qwen35",
+    "min_shiso_version": "0.2.3", "description": "d", "tasks": ["chat"],
+    "modalities": {"inputs": ["text"], "outputs": ["text"]},
+    "features": {"tools": false, "reasoning": false, "structured_output": false},
+    "variants": [{
+        "key": "q4_k_m", "backends": ["metal"], "quant": "Q4_K_M",
+        "requirements": {"min_ram_bytes": 1, "disk_bytes": 1},
+        "components": {
+            "base": {"provider": "huggingface", "repo": "o/r", "revision": "0123456789abcdef0123456789abcdef01234567",
+                     "entry": "m.gguf", "files": [{"name": "m.gguf", "size": 1, "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}]},
+            "generation_config": {"provider": "shiso", "entry": "generation_config.json",
+                     "files": [{"name": "generation_config.json", "size": 1, "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}]}
+        }
+    }]
+}"#;
+
+/// The recipe's sampling defaults bind `--generation-config`, and an operator's
+/// own file is kept rather than overwritten.
+#[test]
+fn a_generation_config_role_binds_unless_the_option_was_given() {
+    let recipe: Recipe = serde_json::from_str(GGUF_WITH_SAMPLING).expect("fixture parses");
+    let variant = recipe.variants.first().expect("one variant");
+    let vdir = Path::new("/hub/models/tuned/q4_k_m");
+
+    let mut args = ServeOptions::default();
+    fill_options_from_variant(&mut args, vdir, variant, &recipe.name).expect("populates");
+    assert_eq!(
+        args.generation_config,
+        Some(
+            vdir.join("generation_config")
+                .join("generation_config.json")
+        )
+    );
+    assert_eq!(args.model, Some(vdir.join("base").join("m.gguf")));
+
+    let own = PathBuf::from("/etc/my-sampling.json");
+    let mut args = ServeOptions {
+        generation_config: Some(own.clone()),
+        ..ServeOptions::default()
+    };
+    fill_options_from_variant(&mut args, vdir, variant, &recipe.name).expect("populates");
+    assert_eq!(args.generation_config, Some(own));
 }

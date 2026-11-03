@@ -37,10 +37,14 @@ use shiso_core::backend::{Backend, KernelArg, KernelRef};
 use shiso_core::buffer::{DeviceBuffer, DeviceView};
 use shiso_core::error::{CoreError, CoreResult};
 
-use shiso_engine::attn::{Attn, AttnCache, AttnGeometry, AttnScratch, Pages, Positions};
+use shiso_engine::attn::{
+    Attn, AttnCache, AttnGeometry, AttnScratch, DecodePartials, Pages, Positions,
+};
 use shiso_engine::launch::{
-    self, ATTN_DECODE_SMEM_BYTES, ATTN_PREFILL_SMEM_BYTES, ATTN_PREFILL_TILE, AttnArgs,
-    AttnGateArgs, BLOCK_128, BLOCK_LINEAR, KNormRopeArgs, NORM_ROPE_SMEM_BYTES, Q35, QNormRopeArgs,
+    self, ATTN_DECODE_MERGE_ENTRY, ATTN_DECODE_SMEM_BYTES, ATTN_DECODE_SPLIT_BLOCK,
+    ATTN_DECODE_SPLIT_SMEM_BYTES, ATTN_DECODE_SPLITS, ATTN_PREFILL_SMEM_BYTES, ATTN_PREFILL_TILE,
+    AttnArgs, AttnGateArgs, BLOCK_128, BLOCK_LINEAR, KNormRopeArgs, NORM_ROPE_SMEM_BYTES, Q35,
+    QNormRopeArgs,
 };
 use shiso_engine::projection;
 
@@ -174,6 +178,39 @@ fn softmax(
         page_tokens: geometry.page_tokens,
         page_stride: cache.pages.stride(),
     };
+    if n_tok < ATTN_PREFILL_TILE
+        && let Some(split) = split_entry(geometry)
+        && let Some(partials) = scratch.partials.as_ref()
+        && n_tok <= partials.rows
+    {
+        let pass = SplitPass {
+            partials,
+            scratch,
+            cache,
+            pos,
+        };
+        return split_passes(backend, &args, split, geometry, &pass, n_tok);
+    }
+    if n_tok >= ATTN_PREFILL_TILE && geometry.head_dim == 256 && has_mma_prefill(backend) {
+        one_table_per_tile(cache.pages)?;
+        return launch::run(
+            backend,
+            KernelRef::new(Q35, MMA_PREFILL_ENTRY),
+            Extent3::new(geometry.n_head, n_tok.div_ceil(MMA_PREFILL_ROWS), 1),
+            Extent3::new(MMA_PREFILL_BLOCK, 1, 1),
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(scratch.attn.view()),
+                KernelArg::Buffer(scratch.q.view()),
+                KernelArg::Buffer(cache.k),
+                KernelArg::Buffer(cache.v),
+                KernelArg::Buffer(pos),
+                KernelArg::Buffer(cache.pages.table()),
+            ],
+        )
+        .map_err(|err| launch::launch_failure(MMA_PREFILL_ENTRY, err));
+    }
     let (name, grid, smem) = if n_tok >= ATTN_PREFILL_TILE {
         one_table_per_tile(cache.pages)?;
         (
@@ -205,6 +242,102 @@ fn softmax(
         ],
     )
     .map_err(|err| launch::launch_failure(name, err))
+}
+
+/// The simdgroup-matrix prefill softmax, at `head_dim` 256.
+const MMA_PREFILL_ENTRY: &str = "kernel_q35_attn_prefill_mma";
+/// Query rows one threadgroup of it takes (`Q35_FA_QR`).
+const MMA_PREFILL_ROWS: u32 = 32;
+/// Its threadgroup: four simdgroups of eight query rows each.
+const MMA_PREFILL_BLOCK: u32 = 128;
+
+/// Whether `backend` compiles the simdgroup-matrix prefill softmax.
+///
+/// Measured on an M4 over Qwen3.5-4B `Q4_K_M`: a 2048-token prefill's
+/// attention went from 4.40 s (44% of the pass) to 0.14 s, and the whole pass
+/// from 10.06 s to 5.81 s. A backend without the entry keeps the tile.
+fn has_mma_prefill(backend: &dyn Backend) -> bool {
+    backend
+        .max_block_threads(KernelRef::new(Q35, MMA_PREFILL_ENTRY))
+        .is_some_and(|limit| limit >= MMA_PREFILL_BLOCK)
+}
+
+/// The split-K decode entry instantiated for this geometry's head grouping.
+///
+/// `None` sends the pass to the single-pass kernel: the split kernel is
+/// compiled for `head_dim` 256 at 4, 6 and 8 query heads a key/value head, the
+/// groupings of every dense and mixture checkpoint of this family.
+fn split_entry(geometry: &AttnGeometry) -> Option<&'static str> {
+    if geometry.head_dim != 256 || geometry.n_head_kv == 0 {
+        return None;
+    }
+    if !geometry.n_head.is_multiple_of(geometry.n_head_kv) {
+        return None;
+    }
+    match geometry.n_head / geometry.n_head_kv {
+        4 => Some("kernel_q35_attn_decode_split_g4"),
+        6 => Some("kernel_q35_attn_decode_split_g6"),
+        8 => Some("kernel_q35_attn_decode_split_g8"),
+        _ => None,
+    }
+}
+
+/// The views of one split-K decode pass that are not its arguments.
+struct SplitPass<'a> {
+    partials: &'a DecodePartials,
+    scratch: &'a AttnScratch,
+    cache: &'a AttnCache<'a>,
+    pos: DeviceView<'a>,
+}
+
+/// Runs a decode-shaped softmax as split-K partials and their merge.
+///
+/// Two launches where the single-pass kernel is one, and measured on an M4
+/// with Qwen3.5-4B at a 4000-position context: 0.2 ms a layer against 2.0 ms.
+/// The split count is the row's own (see `q35_attn_splits`), so a row answers
+/// the same bits alone and inside a batch, and a captured graph replays at any
+/// context length without a host-side count to go stale.
+fn split_passes(
+    backend: &dyn Backend,
+    args: &AttnArgs,
+    entry: &'static str,
+    geometry: &AttnGeometry,
+    pass: &SplitPass<'_>,
+    n_tok: u32,
+) -> CoreResult<()> {
+    launch::run(
+        backend,
+        KernelRef::new(Q35, entry),
+        Extent3::new(geometry.n_head_kv, n_tok, ATTN_DECODE_SPLITS),
+        Extent3::new(ATTN_DECODE_SPLIT_BLOCK, 1, 1),
+        ATTN_DECODE_SPLIT_SMEM_BYTES,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(args)),
+            KernelArg::Buffer(pass.partials.acc.view()),
+            KernelArg::Buffer(pass.partials.ml.view()),
+            KernelArg::Buffer(pass.scratch.q.view()),
+            KernelArg::Buffer(pass.cache.k),
+            KernelArg::Buffer(pass.cache.v),
+            KernelArg::Buffer(pass.pos),
+            KernelArg::Buffer(pass.cache.pages.table()),
+        ],
+    )
+    .map_err(|err| launch::launch_failure(entry, err))?;
+    launch::run(
+        backend,
+        KernelRef::new(Q35, ATTN_DECODE_MERGE_ENTRY),
+        Extent3::new(geometry.n_head, n_tok, 1),
+        Extent3::new(BLOCK_LINEAR, 1, 1),
+        0,
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(args)),
+            KernelArg::Buffer(pass.scratch.attn.view()),
+            KernelArg::Buffer(pass.partials.acc.view()),
+            KernelArg::Buffer(pass.partials.ml.view()),
+            KernelArg::Buffer(pass.pos),
+        ],
+    )
+    .map_err(|err| launch::launch_failure(ATTN_DECODE_MERGE_ENTRY, err))
 }
 
 /// Refuses a per-row page table on an entry point that tiles rows.

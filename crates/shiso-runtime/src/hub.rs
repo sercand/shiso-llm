@@ -1142,6 +1142,15 @@ fn fill_options_from_variant(
             Role::ImageTextEncoder => options.image_text_encoder = Some(target),
             Role::ImageVae => options.image_vae = Some(target),
             Role::ImageTokenizer => options.image_tokenizer = Some(target),
+            // The publisher's sampling defaults, which an operator's own
+            // `--generation-config` overrides rather than conflicts with: the
+            // file changes no weight and no shape, only what an unset request
+            // field means.
+            Role::GenerationConfig => {
+                if options.generation_config.is_none() {
+                    options.generation_config = Some(target);
+                }
+            }
         }
     }
     if options.image_model.is_some() && options.image_model_id.is_none() {
