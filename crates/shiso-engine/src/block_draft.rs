@@ -11,11 +11,17 @@
 //!
 //! # What the drafter keeps, and what it recomputes
 //!
-//! Its context is keys and values, one attention cache per drafter layer, in a
-//! pool of its own that shares the target session's page table - the same
-//! arrangement [`crate::DraftHead`] uses, for the same reason: the drafter
-//! writes the positions the target writes, so page `p` of its pool is its own
-//! storage for whatever position the target keeps at page `p`. A committed
+//! Its context is keys and values, one attention cache per drafter layer,
+//! handed to every absorb and draft as a [`DraftCache`]: the runs and the page
+//! table that addresses them. Beside the dense stack that is a pool of its own
+//! that shares the target session's page table - the same arrangement
+//! [`crate::DraftHead`] uses, for the same reason: the drafter writes the
+//! positions the target writes, so page `p` of its pool is its own storage for
+//! whatever position the target keeps at page `p`. A target that keeps only
+//! the drafter's window instead hands it a ring of a few pages per session and
+//! a table that folds every page onto it; the attention never reads a key
+//! further back than the window, so the folded pages are never asked for. A
+//! committed
 //! position's keys and values are projected once, from that position's taps
 //! ([`BlockDrafter::absorb`]); the block's own keys and values are written at
 //! the positions it proposes and overwritten by the next absorb, which is
@@ -351,8 +357,9 @@ pub(crate) struct TapSink<'a> {
 #[derive(Debug)]
 pub struct BlockDrafter {
     parts: BlockDraftParts,
-    /// Key and value runs, one attention slot per drafter layer.
-    kv: DeviceKv,
+    /// Key and value runs, one attention slot per drafter layer, when the
+    /// drafter keeps its own; `None` when its target lends them per call.
+    kv: Option<DeviceKv>,
     /// Activation rows at the drafter's widths, `rows` of them.
     scratch: Scratch,
     /// The tapped residual rows of the last target pass, for a target that
@@ -380,11 +387,23 @@ pub struct BlockDrafter {
 }
 
 /// Where a drafter's keys and values come from.
+#[derive(Clone, Copy)]
 enum Pool {
     /// A pool of its own, this many pages deep.
     Open(u32),
-    /// One its target opened beside its own.
-    Given(DeviceKv),
+    /// The target's to hand over with every call, as a [`DraftCache`].
+    Lent,
+}
+
+/// The keys and values one absorb or draft reads and writes: one key and one
+/// value run per drafter layer, and the page table that turns a position into
+/// a row of them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DraftCache<'a> {
+    /// The runs, laid out as [`BlockDraftFootprint::layout`] says.
+    pub(crate) kv: &'a DeviceKv,
+    /// `i32` page ids, one per page of the session's positions.
+    pub(crate) pages: DeviceView<'a>,
 }
 
 /// What a resident drafter adds to the device beside its target: the bytes it
@@ -403,6 +422,10 @@ pub struct BlockDraftFootprint {
     hidden: u32,
     /// Bytes of the drafter's own keys and values per cache page.
     page_bytes: u64,
+    /// Positions a drafted row looks back over; zero for the whole context.
+    window: u32,
+    /// Rows of one block.
+    block: u32,
     /// Drafter layers, each one attention slot of keys and values.
     kv_layers: u32,
     /// Key and value heads of one layer.
@@ -429,10 +452,22 @@ impl BlockDraftFootprint {
         self.hidden
     }
 
-    /// Bytes the drafter's keys and values add to every cache page.
+    /// Bytes of one page of the drafter's keys and values.
     #[must_use]
     pub const fn page_bytes(&self) -> u64 {
         self.page_bytes
+    }
+
+    /// Positions a drafted row looks back over; zero for the whole context.
+    #[must_use]
+    pub const fn window(&self) -> u32 {
+        self.window
+    }
+
+    /// Rows of one block: the positions past the frontier a draft writes.
+    #[must_use]
+    pub const fn block(&self) -> u32 {
+        self.block
     }
 
     /// Bytes the drafter allocates once, beside its cache.
@@ -665,6 +700,8 @@ impl BlockDraftParts {
             n_taps: u32::try_from(shape.taps.len()).unwrap_or(u32::MAX),
             hidden: shape.hidden,
             page_bytes,
+            window: shape.window,
+            block: shape.block,
             kv_layers: layers,
             kv_heads: shape.n_head_kv,
             head_dim: shape.head_dim,
@@ -712,14 +749,13 @@ impl BlockDrafter {
     ///
     /// As [`BlockDrafter::new`].
     ///
-    /// `kv` is the drafter's keys and values, which such a target opens beside
-    /// its own pool from [`BlockDraftFootprint::layout`], so its pages travel
-    /// with the target's.
+    /// Such a target keeps the drafter's keys and values itself, laid out as
+    /// [`BlockDraftFootprint::layout`] says, and lends them with every absorb
+    /// and draft.
     pub(crate) fn new_beside(
         backend: &Arc<dyn Backend>,
         parts: BlockDraftParts,
         target: BesideTarget,
-        kv: DeviceKv,
     ) -> CoreResult<Self> {
         let geometry = beside_geometry(&parts, target.vocab)?;
         // One row of sink: the target keeps the taps, so this one is never
@@ -729,7 +765,7 @@ impl BlockDrafter {
             backend,
             parts,
             (&geometry, target.layers),
-            Pool::Given(kv),
+            Pool::Lent,
             (ABSORB_ROWS, 1),
         )
     }
@@ -759,17 +795,8 @@ impl BlockDrafter {
         let layers = u32::try_from(parts.layers.len()).unwrap_or(u32::MAX);
         let layout = KvLayout::for_attn_slots(layers, shape.n_head_kv, shape.head_dim);
         let (kv, pool_pages) = match pool {
-            Pool::Open(pages) => (DeviceKv::open(backend, &layout, pages)?, pages),
-            Pool::Given(kv) => {
-                if kv.page_bytes() != layout.page_bytes() {
-                    return Err(CoreError::ShapeMismatch {
-                        field: "block drafter cache page bytes",
-                        expected: layout.page_bytes(),
-                        got: kv.page_bytes(),
-                    });
-                }
-                (kv, 0)
-            }
+            Pool::Open(pages) => (Some(DeviceKv::open(backend, &layout, pages)?), pages),
+            Pool::Lent => (None, 0),
         };
         let scratch = Scratch::new(backend, geometry, rows, 1)?;
         let row = u64::from(shape.hidden) * F32_BYTES;
@@ -929,9 +956,22 @@ impl BlockDrafter {
         self.taps.view()
     }
 
+    /// The drafter's own keys and values, addressed by `pages`.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Unsupported`] for a drafter whose target lends them.
+    pub(crate) fn own_cache<'a>(&'a self, pages: DeviceView<'a>) -> CoreResult<DraftCache<'a>> {
+        let kv = self.kv.as_ref().ok_or(CoreError::Unsupported {
+            what: "a block drafter's own cache, on a drafter whose target lends one",
+            backend: "engine",
+        })?;
+        Ok(DraftCache { kv, pages })
+    }
+
     /// Projects rows `from .. from + n` of a target pass's taps, `taps` being
     /// `[row][tap][hidden]` `f32`, into the drafter's context at positions
-    /// `pos ..`, in pieces no wider than the drafter's scratch.
+    /// `pos ..` of `cache`, in pieces no wider than the drafter's scratch.
     ///
     /// # Errors
     ///
@@ -941,7 +981,7 @@ impl BlockDrafter {
         &self,
         backend: &Arc<dyn Backend>,
         taps: DeviceView<'_>,
-        pages: DeviceView<'_>,
+        cache: DraftCache<'_>,
         rows: (u32, u32),
         pos: u32,
     ) -> CoreResult<()> {
@@ -974,7 +1014,7 @@ impl BlockDrafter {
                 shape.eps,
             )?;
             for (rank, layer) in self.parts.layers.iter().enumerate() {
-                let (k, v) = self
+                let (k, v) = cache
                     .kv
                     .layer_runs(u32::try_from(rank).unwrap_or(u32::MAX))?;
                 crate::dense::attn::store(
@@ -985,7 +1025,7 @@ impl BlockDrafter {
                     &AttnCache {
                         k,
                         v,
-                        pages: Pages::shared(pages),
+                        pages: Pages::shared(cache.pages),
                     },
                     crate::dense::attn::StoreRows {
                         pos: self.scratch.positions(),
@@ -1023,7 +1063,7 @@ impl BlockDrafter {
         &self,
         backend: &Arc<dyn Backend>,
         target: &dyn DraftTarget,
-        pages: DeviceView<'_>,
+        cache: DraftCache<'_>,
         at: (TokenId, u32),
         hint: DraftHint,
     ) -> CoreResult<(Vec<TokenId>, Vec<f32>)> {
@@ -1083,7 +1123,7 @@ impl BlockDrafter {
                 be,
                 layer,
                 u32::try_from(rank).unwrap_or(u32::MAX),
-                pages,
+                cache,
                 stream,
             )?;
         }
@@ -1126,10 +1166,10 @@ impl BlockDrafter {
         be: &dyn Backend,
         layer: &BlockDraftLayer,
         rank: u32,
-        pages: DeviceView<'_>,
+        cache: DraftCache<'_>,
         stream: DeviceView<'_>,
     ) -> CoreResult<()> {
-        self.attention_half(be, layer, rank, pages, stream)?;
+        self.attention_half(be, layer, rank, cache, stream)?;
         self.feed_forward_half(be, layer, stream)
     }
 
@@ -1160,7 +1200,7 @@ impl BlockDrafter {
         be: &dyn Backend,
         layer: &BlockDraftLayer,
         rank: u32,
-        pages: DeviceView<'_>,
+        cache: DraftCache<'_>,
         stream: DeviceView<'_>,
     ) -> CoreResult<()> {
         let shape = &self.parts.shape;
@@ -1179,7 +1219,7 @@ impl BlockDrafter {
         projection::projection(be, &layer.attn_conv.projection, b, normed, self.dynk.view())?;
         let before = self.conv_io(normed, base, 0)?;
         dyn_conv(be, shape, before)?;
-        let (k, v) = self.kv.layer_runs(rank)?;
+        let (k, v) = cache.kv.layer_runs(rank)?;
         crate::dense::attn::run(
             be,
             &layer.attn,
@@ -1194,7 +1234,7 @@ impl BlockDrafter {
             &AttnCache {
                 k,
                 v,
-                pages: Pages::shared(pages),
+                pages: Pages::shared(cache.pages),
             },
             b,
         )?;
@@ -1625,7 +1665,8 @@ impl crate::stack::HybridStack {
             backend: "engine",
         })?;
         let target = drafter.dense_target(&resident.weights, geometry);
-        let (drafts, _) = drafter.propose(backend, &target, pages, (first, frontier), hint)?;
+        let cache = drafter.own_cache(pages)?;
+        let (drafts, _) = drafter.propose(backend, &target, cache, (first, frontier), hint)?;
         Ok(drafts)
     }
 
@@ -1644,7 +1685,13 @@ impl crate::stack::HybridStack {
             .kv()
             .view();
         match block.as_mut() {
-            Some(drafter) => drafter.absorb(backend, drafter.own_taps(), pages, (0, n), frontier),
+            Some(drafter) => drafter.absorb(
+                backend,
+                drafter.own_taps(),
+                drafter.own_cache(pages)?,
+                (0, n),
+                frontier,
+            ),
             None => Ok(()),
         }
     }

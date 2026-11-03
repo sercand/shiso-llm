@@ -22,13 +22,20 @@
 //!
 //! # Where its cache lives
 //!
-//! In runs of its own with the stack's page count, addressed by each session's
-//! own page table, so a page the target holds for a position is the drafter's
-//! page for that position too. The runs ride along with the stack's pages
-//! ([`crate::sparse::paged::PagedKv`]): a page the cache copies when a resume
-//! lands inside it, spills to disk or restores from there carries the
-//! drafter's keys and values with the target's, so a resumed conversation
-//! drafts from the context it left off with.
+//! In a ring of a few pages per session ([`ring_pages`]), not in the stack's
+//! pool. The drafter attends over its window and no further, so a key older
+//! than that is never read again: one page table shared by every session
+//! ([`ring_table`]) folds page `p` onto ring page `p % ring_pages`, and the ring
+//! is deep enough that the pages a draft reads never fold onto each other.
+//! Riding along with every pool page instead cost the pool about 40% of its
+//! tokens on Qwen3.8-Flash (5.2 MB of drafter keys and values beside 6.5 MB of
+//! the target's per page), all of it for positions the drafter cannot see.
+//!
+//! What a resumed session needs of the ring travels in its checkpoint blob,
+//! after the indexer's ring: a resume restores the recurrent state at the
+//! position it lands on, and the drafter's window behind that position is the
+//! same kind of state. A resume can only land on a checkpoint, so every
+//! resumed conversation drafts from the context it left off with.
 //!
 //! # What the stack lends it
 //!
@@ -42,19 +49,119 @@ use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{SessionId, TokenId};
 use shiso_core::model::DraftHint;
 
+use std::sync::Arc;
+
+use shiso_core::Backend;
+use shiso_core::buffer::{DeviceBuffer, alloc_tagged};
+use shiso_core::ledger::{self, MemTag};
+use shiso_core::page::{PAGE_TOKENS, pages_for};
+
 use crate::block_draft::{
     ABSORB_ROWS, BesideTarget, BlockDraftFootprint, BlockDraftParts, BlockDrafter, Candidates,
-    DraftTarget,
+    DraftCache, DraftTarget,
 };
+use crate::kv::DeviceKv;
 use crate::sparse::bind::{Args, Operand, Role, WeightRef};
 use crate::sparse::gather;
-use crate::sparse::kernels::{self, Entry, F32_BYTES, MOD_MISC};
+use crate::sparse::kernels::{self, Entry, F32_BYTES, GDN_CHUNK, MOD_MISC};
 use crate::sparse::matmul::{self, Bound};
 use crate::sparse::moe::RowOrigin;
 use crate::sparse::plan::Plan;
 use crate::sparse::scratch::Buf;
 use crate::sparse::shape::SparseShape;
 use crate::sparse::stack::{Pass, SparseStack};
+
+/// Pages of one session's drafter ring.
+///
+/// Deep enough that no two pages a read can reach fold onto one ring page. A
+/// draft at `at` reads from `at + 1 - window` to its block's last row, and a
+/// checkpoint cut on the recurrence's grid inside a prompt chunk is taken after
+/// the drafter absorbed the whole chunk, up to [`GDN_CHUNK`] rows past it - so
+/// the span that must survive is the window and the wider of those two, and
+/// it can straddle one page more than it fills.
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] for a drafter with no window, which attends over
+/// the whole context and so has no ring that would do.
+pub(crate) fn ring_pages(footprint: &BlockDraftFootprint) -> CoreResult<u32> {
+    if footprint.window() == 0 {
+        return Err(CoreError::Unsupported {
+            what: "a block drafter that attends over the whole context beside a stack that \
+                   keeps only a drafter's window",
+            backend: "engine",
+        });
+    }
+    Ok(ring_pages_for(footprint.window(), footprint.block()))
+}
+
+/// [`ring_pages`] for a window and a block.
+fn ring_pages_for(window: u32, block: u32) -> u32 {
+    window
+        .saturating_add(block.max(GDN_CHUNK))
+        .div_ceil(PAGE_TOKENS)
+        .saturating_add(1)
+}
+
+/// Bytes of one session's drafter ring, which is also what it adds to the
+/// session's checkpoint blob.
+///
+/// # Errors
+///
+/// As [`ring_pages`].
+pub(crate) fn ring_bytes(footprint: &BlockDraftFootprint) -> CoreResult<u64> {
+    Ok(u64::from(ring_pages(footprint)?).saturating_mul(footprint.page_bytes()))
+}
+
+/// Opens one session's drafter ring, zeroed.
+///
+/// Zeroed although no draft reads a row nothing wrote: a fresh allocation is
+/// the last tenant's bytes, and a ring restored from a blob is overwritten
+/// whole anyway, so this costs one clear per session for a guarantee that does
+/// not depend on that argument staying true.
+///
+/// # Errors
+///
+/// As [`ring_pages`], and [`CoreError::Backend`] when an allocation fails.
+pub(crate) fn open_ring(
+    backend: &Arc<dyn Backend>,
+    footprint: &BlockDraftFootprint,
+) -> CoreResult<DeviceKv> {
+    let pages = ring_pages(footprint)?;
+    let ring = {
+        let _tag = ledger::scope(MemTag::KvDraft);
+        DeviceKv::open(backend, &footprint.layout(), pages)?
+    };
+    for run in ring.runs() {
+        backend.fill_zero(run)?;
+    }
+    Ok(ring)
+}
+
+/// The page table every session's drafter ring is read through: entry `p` is
+/// ring page `p % ring_pages`, for every page of a `ctx`-position session.
+///
+/// One table for every session, because the ring pages are each session's own
+/// runs and the fold is the same arithmetic for all of them.
+///
+/// # Errors
+///
+/// As [`ring_pages`], and [`CoreError::Backend`] when the allocation or the
+/// upload fails.
+pub(crate) fn ring_table(
+    backend: &Arc<dyn Backend>,
+    footprint: &BlockDraftFootprint,
+    ctx: u32,
+) -> CoreResult<DeviceBuffer> {
+    let ring = ring_pages(footprint)?;
+    let entries = pages_for(ctx);
+    let bytes: Vec<u8> = (0..entries)
+        .flat_map(|page| i32::try_from(page % ring).unwrap_or(0).to_le_bytes())
+        .collect();
+    let table = alloc_tagged(backend, MemTag::PageTables, bytes.len().max(4) as u64)?;
+    backend.copy_h2d(table.view().slice(0, bytes.len() as u64)?, &bytes)?;
+    Ok(table)
+}
 
 /// The launch that writes layer `layer`'s taps for a pass of `n_tok` rows, or
 /// `None` when the drafter does not tap that layer.
@@ -99,7 +206,7 @@ struct SparseTarget<'a> {
 impl DraftTarget for SparseTarget<'_> {
     fn embed(
         &self,
-        backend: &dyn shiso_core::Backend,
+        backend: &dyn Backend,
         ids: &[TokenId],
         _drafter: &crate::layers::Scratch,
         dst: DeviceView<'_>,
@@ -136,7 +243,7 @@ impl DraftTarget for SparseTarget<'_> {
 
     fn candidates(
         &self,
-        backend: &dyn shiso_core::Backend,
+        backend: &dyn Backend,
         normed: DeviceView<'_>,
         rows: u32,
         k: u32,
@@ -252,7 +359,7 @@ impl SparseStack {
     /// whose sessions keep no rollback records, on one that carries a draft
     /// head - a stack drafts one way - and on one whose options did not name
     /// this drafter's footprint, whose passes therefore write no taps and
-    /// whose pool was sized without the drafter's pages;
+    /// whose sessions open no ring for it;
     /// [`CoreError::ShapeMismatch`] for a drafter this stack cannot feed.
     pub fn bind_block_drafter(&mut self, parts: BlockDraftParts) -> CoreResult<()> {
         if !self.opts.spec.is_speculative() {
@@ -272,16 +379,18 @@ impl SparseStack {
         if self.opts.block_draft != Some(footprint) {
             return Err(CoreError::Unsupported {
                 what: "a block drafter the stack was not built for: its options name another \
-                       footprint or none, so its passes tap other layers and its pool has no \
-                       room for the drafter's pages",
+                       footprint or none, so its passes tap other layers and its sessions keep \
+                       no ring for the drafter",
                 backend: "engine",
             });
         }
         let layers = u32::try_from(self.shape.layers.len()).unwrap_or(u32::MAX);
-        let kv = self.block_kv.clone().ok_or(CoreError::Unsupported {
-            what: "a block drafter on a stack that opened no pool for it",
-            backend: "engine",
-        })?;
+        if self.block_table.is_none() {
+            return Err(CoreError::Unsupported {
+                what: "a block drafter on a stack that opened no ring table for it",
+                backend: "engine",
+            });
+        }
         let drafter = BlockDrafter::new_beside(
             &self.backend,
             parts,
@@ -290,7 +399,6 @@ impl SparseStack {
                 layers,
                 vocab: self.shape.vocab,
             },
-            kv,
         )?;
         self.block = Some(drafter);
         Ok(())
@@ -307,6 +415,24 @@ impl SparseStack {
     #[must_use]
     pub fn drafts(&self) -> bool {
         self.has_draft_head() || self.has_block_drafter()
+    }
+
+    /// `session`'s drafter ring, read through the shared ring table.
+    fn ring_cache(&self, session: SessionId) -> CoreResult<DraftCache<'_>> {
+        let missing = CoreError::Unsupported {
+            what: "a block draft for a session opened with no drafter ring",
+            backend: "engine",
+        };
+        let kv = self.session(session)?.block_ring.as_ref().ok_or(missing)?;
+        let pages = self
+            .block_table
+            .as_ref()
+            .ok_or(CoreError::Unsupported {
+                what: "a block draft on a stack that opened no ring table",
+                backend: "engine",
+            })?
+            .view();
+        Ok(DraftCache { kv, pages })
     }
 
     /// Hands the drafter every row of the target pass that just ran, each run
@@ -331,7 +457,8 @@ impl SparseStack {
             if !live.spec_depth().is_speculative() {
                 return Ok(());
             }
-            drafter.absorb(&self.backend, taps, live.pages(), (from, n), live.written())
+            let cache = self.ring_cache(session)?;
+            drafter.absorb(&self.backend, taps, cache, (from, n), live.written())
         };
         let absorbed = match pass.origin {
             RowOrigin::Sequential => {
@@ -391,30 +518,25 @@ impl SparseStack {
             return Ok(None);
         }
         // The block writes its own keys and values at every position it
-        // proposes, in pages of the session's table: claimed before anything
-        // writes. A block that would run past the context drafts nothing; the
-        // target's last few positions decode one at a time.
+        // proposes, in the session's ring, which needs no claim. A block that
+        // would run past the context drafts nothing; the target's last few
+        // positions decode one at a time.
         let reach = frontier.saturating_add(self.block.as_ref().map_or(0, BlockDrafter::block));
         if reach > self.opts.engine.ctx {
             return Ok(None);
-        }
-        if self.reserve_to(session, reach)?
-            && let Some(graphs) = self.backend.as_graph()
-        {
-            graphs.invalidate_all();
         }
         let drafter = self.block.as_ref().ok_or(CoreError::Unsupported {
             what: "a block draft on a stack that carries no block drafter",
             backend: "engine",
         })?;
-        let pages = self.session(session)?.pages();
+        let cache = self.ring_cache(session)?;
         let target = SparseTarget {
             stack: self,
             session,
         };
         let started = std::time::Instant::now();
         let (mut drafts, sure) =
-            drafter.propose(&self.backend, &target, pages, (first, frontier), hint)?;
+            drafter.propose(&self.backend, &target, cache, (first, frontier), hint)?;
         // Cut at the first guess the drafter itself doubts, as a head's chain
         // stops there: every guess after it can only be kept if it is, and
         // each is a verify row, which on this stack is what a drafted round
@@ -433,5 +555,45 @@ impl SparseStack {
             "block drafter proposed"
         );
         Ok(Some(drafts))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GDN_CHUNK, PAGE_TOKENS, ring_pages_for};
+
+    /// Whether the positions `lo .. hi` fold onto distinct ring pages.
+    fn distinct(lo: u32, hi: u32, ring: u32) -> bool {
+        let pages: Vec<u32> = (lo / PAGE_TOKENS..=(hi - 1) / PAGE_TOKENS).collect();
+        let mut folded: Vec<u32> = pages.iter().map(|p| p % ring).collect();
+        folded.sort_unstable();
+        folded.dedup();
+        folded.len() == pages.len()
+    }
+
+    #[test]
+    fn no_page_a_draft_or_a_grid_checkpoint_reads_folds_onto_another() {
+        for (window, block) in [(2048, 8), (2048, 16), (1000, 8), (4096, 8), (256, 8)] {
+            let ring = ring_pages_for(window, block);
+            for at in window..window + 4 * PAGE_TOKENS {
+                // A draft at `at` reads from `at + 1 - window` through its
+                // block's last row.
+                assert!(
+                    distinct(at + 1 - window, at + block, ring),
+                    "window {window} block {block}: a draft at {at} folds"
+                );
+                // A grid checkpoint at `at` keeps its window while the chunk
+                // runs up to a grid's width past it.
+                assert!(
+                    distinct(at + 1 - window, at + GDN_CHUNK, ring),
+                    "window {window} block {block}: a checkpoint at {at} folds"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_qwen38_drafter_keeps_ten_pages_a_session() {
+        assert_eq!(ring_pages_for(2048, 8), 10);
     }
 }

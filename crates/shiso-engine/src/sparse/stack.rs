@@ -201,10 +201,11 @@ pub struct SparseOptions {
     /// built: what its taps are and what it costs.
     ///
     /// Known before the stack is built because both decide the build: every
-    /// target pass writes the taps it names, and the key/value pool, when
-    /// sized to the device, is sized with the drafter's bytes per page beside
-    /// the target's. [`SparseStack::bind_block_drafter`] refuses a drafter
-    /// that is not the one named here.
+    /// target pass writes the taps it names, and every session keeps a ring
+    /// of the drafter's keys and values for its window, which a pool sized to
+    /// the device and every checkpoint blob count.
+    /// [`SparseStack::bind_block_drafter`] refuses a drafter that is not the
+    /// one named here.
     pub block_draft: Option<crate::block_draft::BlockDraftFootprint>,
 }
 
@@ -362,6 +363,9 @@ pub struct SparseSession {
     /// slot `position % IDX_RING`. See [`crate::sparse::paged::ring_bytes`] for
     /// why these are the session's and not the page's.
     pub(crate) ring: DeviceBuffer,
+    /// The block drafter's keys and values for this session's last window of
+    /// positions, when the stack carries one: see [`crate::sparse::block`].
+    pub(crate) block_ring: Option<crate::kv::DeviceKv>,
     /// What this session holds because it may speculate, or `None` on a session
     /// opened for plain decode.
     pub(crate) spec: Option<SpecState>,
@@ -747,9 +751,10 @@ pub struct SparseStack {
     pub(crate) verified: Vec<crate::sparse::draft::VerifiedRound>,
     /// The block drafter, once bound: see [`crate::sparse::block`].
     pub(crate) block: Option<crate::block_draft::BlockDrafter>,
-    /// The drafter's keys and values, opened with the pool before the drafter
-    /// binds and handed to it when it does.
-    pub(crate) block_kv: Option<crate::kv::DeviceKv>,
+    /// The page table every session's drafter ring is read through, opened
+    /// with the stack when its options name a drafter: see
+    /// [`crate::sparse::block::ring_table`].
+    pub(crate) block_table: Option<DeviceBuffer>,
 }
 
 impl std::fmt::Debug for SparseStack {
@@ -779,35 +784,19 @@ impl std::fmt::Debug for SparseStack {
             .field("kept_plans", &self.plans.len())
             .field("verified", &self.verified.len())
             .field("block_drafter", &self.block.is_some())
-            .field("block_kv", &self.block_kv.is_some())
+            .field("block_table", &self.block_table.is_some())
             .field("clock", &self.clock)
             .field("layers", &self.desc.layers.len())
             .finish()
     }
 }
 
-/// The key/value pool, and a block drafter's keys and values riding along
-/// with its pages when the options name one.
-///
-/// The drafter's runs are opened here rather than when it binds, because the
-/// cache is handed its backing when the stack is built and every whole-page
-/// operation it asks for has to cover them: see `crate::sparse::block`.
-fn open_pool(
-    backend: &Arc<dyn Backend>,
-    shape: &SparseShape,
-    planes: PagePlanes,
-    opts: &SparseOptions,
-) -> CoreResult<(PagedKv, Option<crate::kv::DeviceKv>)> {
-    let kv = PagedKv::open(backend, shape, planes, opts.engine.kv_pool_pages)?;
-    let block_kv = opts
-        .block_draft
-        .map(|fp| crate::kv::DeviceKv::open(backend, &fp.layout(), opts.engine.kv_pool_pages))
-        .transpose()?;
-    let kv = match block_kv.as_ref() {
-        Some(extra) => kv.with_extra(extra.clone()),
-        None => kv,
-    };
-    Ok((kv, block_kv))
+/// Bytes a block drafter adds to each session's ring and checkpoint blob, zero
+/// when the options name none.
+fn block_ring_bytes(opts: &SparseOptions) -> CoreResult<u64> {
+    opts.block_draft
+        .as_ref()
+        .map_or(Ok(0), crate::sparse::block::ring_bytes)
 }
 
 /// The line a resident stack announces itself with: its geometry, and what
@@ -831,7 +820,8 @@ fn log_resident(
         page_bytes = kv.page_bytes(),
         kv_bytes_per_token = kv.page_bytes() / u64::from(PAGE_TOKENS),
         kv_elem = %opts.engine.kv_elem,
-        session_bytes = session_bytes(shape, opts.spec, planes),
+        session_bytes = session_bytes(shape, opts.spec, planes)
+            .saturating_add(block_ring_bytes(opts).unwrap_or(0)),
         ckpt_bytes,
         ckpt_slots = opts.engine.kv_ckpt_slots,
         "sparse stack resident"
@@ -976,25 +966,26 @@ impl SparseStack {
         // The pool last, so that a pool sized to the device is sized from what
         // the weights, the scratch and the n-gram tier left of it.
         let mut opts = opts;
-        let geometry = crate::sparse::paged::cache_geometry(
-            &shape,
-            planes,
-            opts.spec,
-            opts.block_draft.map_or(0, |fp| fp.page_bytes()),
-        );
+        // A block drafter's window is session state, not page state: its ring
+        // is a session's, and its checkpoint blob carries a copy.
+        let ring_bytes = block_ring_bytes(&opts)?;
+        let geometry = crate::sparse::paged::cache_geometry(&shape, planes, opts.spec, ring_bytes);
         opts.engine.fit_pool(
             backend.as_ref(),
             crate::options::PoolCost {
-                // A block drafter's keys and values ride along with every
-                // page, and the geometry's page is already that wide.
                 page_bytes: geometry.page_bytes,
-                session_bytes: session_bytes(&shape, opts.spec, planes),
+                session_bytes: session_bytes(&shape, opts.spec, planes).saturating_add(ring_bytes),
                 fixed_bytes: u64::from(opts.engine.kv_ckpt_slots)
                     .saturating_mul(geometry.ckpt_bytes)
                     .saturating_add(opts.block_draft.map_or(0, |fp| fp.fixed_bytes())),
             },
         )?;
-        let (kv, block_kv) = open_pool(backend, &shape, planes, &opts)?;
+        let kv = PagedKv::open(backend, &shape, planes, opts.engine.kv_pool_pages)?;
+        let block_table = opts
+            .block_draft
+            .as_ref()
+            .map(|fp| crate::sparse::block::ring_table(backend, fp, opts.engine.ctx))
+            .transpose()?;
         let cache = KvCache::open(
             &geometry,
             Box::new(kv.clone()),
@@ -1045,7 +1036,7 @@ impl SparseStack {
             plans: crate::sparse::plancache::PlanCache::default(),
             verified: Vec::new(),
             block: None,
-            block_kv,
+            block_table,
         })
     }
 
@@ -1339,6 +1330,12 @@ impl SparseStack {
             ring_bytes(&self.shape, self.page_planes()).max(1),
         )?;
         clear_range(&self.backend, &ring)?;
+        let block_ring = self
+            .opts
+            .block_draft
+            .as_ref()
+            .map(|fp| crate::sparse::block::open_ring(&self.backend, fp))
+            .transpose()?;
         let pages = SessionPages::open(&self.backend, frontier, capacity)?;
         let session = SparseSession {
             id,
@@ -1346,6 +1343,7 @@ impl SparseStack {
             states,
             ngram_window,
             ring,
+            block_ring,
             spec,
             written: 0,
             history: Vec::new(),
@@ -1933,7 +1931,7 @@ impl SparseStack {
         self.plans.clear();
         // The drafter's pool and scratch go with the target's.
         drop(self.block.take());
-        drop(self.block_kv.take());
+        drop(self.block_table.take());
         if let Some(resident) = self.resident.take() {
             let Resident {
                 weights,
