@@ -94,6 +94,7 @@ fn apply_recipe_defaults_precedence() {
         expert_reserve_gb: Some(12),
         expert_slots: Some(4096),
         spec_lookup: Some(8),
+        spec_confidence: Some(0.5),
         capture_verify: Some(true),
         capture_batch: Some(true),
         kv_cache_tokens: None,
@@ -117,6 +118,7 @@ fn apply_recipe_defaults_precedence() {
     assert_eq!(args.expert_reserve_gb, 12);
     assert_eq!(args.expert_slots, 4096);
     assert_eq!(args.spec_lookup, 8);
+    assert!((args.spec_confidence - 0.5).abs() < f32::EPSILON);
     assert!(args.capture_verify);
     assert!(args.capture_batch);
     assert_eq!(args.gpu_memory_utilization, Some(0.88));

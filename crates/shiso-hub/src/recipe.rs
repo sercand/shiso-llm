@@ -855,6 +855,10 @@ pub struct ServerDefaults {
     /// Prompt-lookup speculation depth (`--spec-lookup`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec_lookup: Option<u32>,
+    /// The drafter's own probability under which a step's drafts stop
+    /// (`--spec-confidence`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_confidence: Option<f32>,
     /// Capture verify passes as device graphs (`--capture-verify`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_verify: Option<bool>,
