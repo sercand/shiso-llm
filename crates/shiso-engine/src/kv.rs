@@ -366,6 +366,12 @@ impl DeviceKv {
             .fold(0, u64::saturating_add)
     }
 
+    /// Every allocation of the pool, in the order [`DeviceKv::open`] made
+    /// them: what a copy of the whole pool walks.
+    pub(crate) fn runs(&self) -> impl Iterator<Item = DeviceView<'_>> {
+        self.pool.runs.iter().map(DeviceBuffer::view)
+    }
+
     /// The same total as a host-side length, for the page buffer the cache passes.
     fn host_page_bytes(&self) -> Result<usize, KvError> {
         Self::stride(self.page_bytes())

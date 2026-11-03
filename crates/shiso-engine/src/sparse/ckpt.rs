@@ -51,6 +51,13 @@
 //! blob's length, and with it the disk identity: a file from before the ring
 //! is a miss.
 //!
+//! A block drafter's ring travels the same way and for the same reason: its
+//! keys and values for the window behind the frontier are nowhere in a page
+//! (see [`crate::sparse::block`]), so the blob ends with the ring's pages,
+//! whole, after the indexer's. A row the ring holds past the frontier is
+//! never read after a resume - the resumed session absorbs those positions
+//! again before anything drafts over them - so it is not canonicalized.
+//!
 //! The draft head's rank is the one that needs care. Its rows up to the
 //! position before the frontier are written by a pass that runs *after* the
 //! target's - the warm-up over a prompt chunk, the catch-up after a verify - so
@@ -202,6 +209,24 @@ impl SparseStack {
             .map(|resident| Arc::clone(&resident.cache))
     }
 
+    /// Bytes a block drafter's ring adds to every checkpoint blob; zero
+    /// without one. [`SparseStack::new`] refused every footprint this cannot
+    /// size, so a stack that exists has none.
+    fn block_ring_bytes(&self) -> u64 {
+        self.opts
+            .block_draft
+            .as_ref()
+            .and_then(|fp| crate::sparse::block::ring_bytes(fp).ok())
+            .unwrap_or(0)
+    }
+
+    /// Bytes of one checkpoint blob: the session state [`paged::ckpt_bytes`]
+    /// counts, and a block drafter's ring after it.
+    fn blob_bytes(&self) -> u64 {
+        paged::ckpt_bytes(&self.shape, self.opts.spec, self.page_planes())
+            .saturating_add(self.block_ring_bytes())
+    }
+
     /// Opens the checkpoint tier over `config.dir`, tagged with `identity`.
     ///
     /// The tier is part of the cache rather than a layer above it, so turning it
@@ -242,13 +267,9 @@ impl SparseStack {
             draft: self.has_draft_head(),
             kv,
         };
-        let geometry = paged::cache_geometry(
-            &self.shape,
-            planes,
-            self.opts.spec,
-            self.opts.block_draft.map_or(0, |fp| fp.page_bytes()),
-        )
-        .with_layout(layout);
+        let geometry =
+            paged::cache_geometry(&self.shape, planes, self.opts.spec, self.block_ring_bytes())
+                .with_layout(layout);
         let (pool_pages, ckpt_slots) = (
             self.opts.engine.kv_pool_pages,
             self.opts.engine.kv_ckpt_slots,
@@ -275,11 +296,13 @@ impl SparseStack {
         resident.cache = Arc::new(cache);
         // Sized as one blob and tagged as the recurrent state it holds a copy
         // of. The pool was sized before any tier opened, so this comes out of
-        // what the pool left, never out of the pool.
+        // what the pool left, never out of the pool. A block drafter's ring is
+        // not part of it: a pass never snapshots the ring on the device, and
+        // the commit reads it from the session.
         resident.snapshot = Some(shiso_core::buffer::alloc_tagged(
             &self.backend,
             shiso_core::ledger::MemTag::RecurrentState,
-            geometry.ckpt_bytes,
+            paged::ckpt_bytes(&self.shape, self.opts.spec, planes),
         )?);
         crate::sparse::memory::watch_cache(
             &self.backend,
@@ -336,7 +359,7 @@ impl SparseStack {
         let now = self.now();
         let vocab_row = u64::from(self.shape.vocab).saturating_mul(F32_BYTES);
         let planes = self.page_planes();
-        let blob_bytes = paged::ckpt_bytes(&self.shape, self.opts.spec, planes);
+        let blob_bytes = self.blob_bytes();
         let ring = RingLayout::of(&self.shape, self.opts.spec, planes);
         let Self {
             backend,
@@ -366,8 +389,8 @@ impl SparseStack {
         // resume marks that row usable because the blob carried it. So a session
         // that has not staged one is not checkpointed at all rather than
         // checkpointed with zeros that a later run would draft from. Only a
-        // stack with a draft head stages one: a block drafter reads the
-        // target's taps, which its own cache pages carry.
+        // stack with a draft head stages one: a block drafter's context is its
+        // ring, which the blob carries whole.
         let staged =
             !planes.draft || live.spec_depth().is_speculative() == live.pending_draft().is_some();
         // A prompt's end and a shared boundary are admitted without asking the
@@ -492,7 +515,8 @@ impl SparseStack {
         };
         let now = self.now();
         let planes = self.page_planes();
-        let blob_bytes = paged::ckpt_bytes(&self.shape, self.opts.spec, planes);
+        let base_bytes = paged::ckpt_bytes(&self.shape, self.opts.spec, planes);
+        let blob_bytes = self.blob_bytes();
         let ring = RingLayout::of(&self.shape, self.opts.spec, planes);
         let Self {
             backend,
@@ -514,7 +538,20 @@ impl SparseStack {
         staging
             .ckpt
             .resize(usize::try_from(blob_bytes).unwrap_or(usize::MAX), 0);
-        backend.copy_d2h(snapshot.view().slice(0, blob_bytes)?, &mut staging.ckpt)?;
+        let base = usize::try_from(base_bytes).unwrap_or(usize::MAX);
+        let head = staging
+            .ckpt
+            .get_mut(..base)
+            .ok_or(CoreError::ShapeMismatch {
+                field: "checkpoint blob",
+                expected: base_bytes,
+                got: blob_bytes,
+            })?;
+        backend.copy_d2h(snapshot.view().slice(0, base_bytes)?, head)?;
+        // The drafter's ring from the session itself: the pass that reached
+        // the grid point absorbed the rest of its chunk too, but no more than
+        // the ring is deep enough to keep the window behind the grid point.
+        read_block_ring(backend.as_ref(), live, &mut staging.ckpt, base)?;
         let q = live
             .written()
             .saturating_add(u32::try_from(row).unwrap_or(u32::MAX));
@@ -561,7 +598,7 @@ impl SparseStack {
         };
         let now = self.now();
         let planes = self.page_planes();
-        let blob_bytes = paged::ckpt_bytes(&self.shape, self.opts.spec, planes);
+        let blob_bytes = self.blob_bytes();
         let ring = RingLayout::of(&self.shape, self.opts.spec, planes);
         let Self {
             backend,
@@ -941,7 +978,7 @@ fn keyed_at(live: &SparseSession, q: u32) -> bool {
 /// n-gram block's dilated window; then the pending draft row; then the raw
 /// indexer key ring, whole - the caller canonicalizes it with
 /// [`RingLayout::canonicalize`], which needs the position this function does
-/// not know.
+/// not know; then a block drafter's ring, whole, when the session keeps one.
 ///
 /// The draft row is present exactly when the stack speculates, which is the same
 /// condition the stored layout's draft-head word carries, so the blob's length
@@ -988,6 +1025,7 @@ fn snapshot(
         }
     }
     at = read_into(backend, blob, at, session.indexer_rings())?;
+    at = read_block_ring(backend, session, blob, at)?;
     let got = u64::try_from(at).unwrap_or(u64::MAX);
     if got != blob_bytes {
         return Err(CoreError::ShapeMismatch {
@@ -997,6 +1035,25 @@ fn snapshot(
         });
     }
     Ok(())
+}
+
+/// Reads a block drafter's ring into `blob` at `at`, run by run, and reports
+/// where the next section would start; a session with no ring reads nothing.
+fn read_block_ring(
+    backend: &dyn shiso_core::backend::Backend,
+    session: &SparseSession,
+    blob: &mut [u8],
+    at: usize,
+) -> CoreResult<usize> {
+    let mut at = at;
+    for run in session
+        .block_ring
+        .iter()
+        .flat_map(crate::kv::DeviceKv::runs)
+    {
+        at = read_into(backend, blob, at, run)?;
+    }
+    Ok(at)
 }
 
 /// Reads one device range into `blob` at `at`, and reports where the next one
@@ -1020,7 +1077,7 @@ fn read_into(
 }
 
 /// Copies a checkpoint blob back into a session, in the order [`snapshot`] wrote
-/// it, the raw indexer key ring included.
+/// it, the raw indexer key ring and a block drafter's ring included.
 ///
 /// Nothing is interpreted: each piece is a byte range whose length the device
 /// buffer itself states, and a blob that does not end exactly where the last
@@ -1068,10 +1125,18 @@ fn restore_state(
         spec.pending_valid = true;
         at = end;
     }
-    // The ring last, as the snapshot wrote it: the raw keys the first pass
+    // The ring next, as the snapshot wrote it: the raw keys the first pass
     // after the resume reads for the block its frontier stands inside, and
     // zeros everywhere a resume reads nothing.
-    let end = write_view(backend, session.ring.view(), blob, at)?;
+    let mut end = write_view(backend, session.ring.view(), blob, at)?;
+    // Then the block drafter's window behind the frontier, last.
+    for run in session
+        .block_ring
+        .iter()
+        .flat_map(crate::kv::DeviceKv::runs)
+    {
+        end = write_view(backend, run, blob, end)?;
+    }
     if end != blob.len() {
         return Err(CoreError::ShapeMismatch {
             field: "restored session state",

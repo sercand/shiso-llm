@@ -973,7 +973,7 @@ impl HybridStack {
             drafter.absorb(
                 backend,
                 drafter.own_taps(),
-                live.kv().view(),
+                drafter.own_cache(live.kv().view())?,
                 (0, n_tok),
                 start,
             )?;
@@ -1296,7 +1296,8 @@ impl HybridStack {
                 .ok_or(CoreError::UnknownSession(step.session))?;
             let at = live.written().saturating_sub(1);
             let row = u32::try_from(row).unwrap_or(u32::MAX);
-            drafter.absorb(backend, drafter.own_taps(), live.kv().view(), (row, 1), at)?;
+            let cache = drafter.own_cache(live.kv().view())?;
+            drafter.absorb(backend, drafter.own_taps(), cache, (row, 1), at)?;
         }
         Ok(())
     }
