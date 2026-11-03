@@ -20,7 +20,8 @@
 //!
 //! # Chunking is this file's, not the caller's
 //!
-//! Scratch is sized for [`MAX_PREFILL_CHUNK`] rows. A prompt longer than that is
+//! Scratch is sized for [`EngineOptions::prefill_rows`] rows - [`MAX_PREFILL_CHUNK`]
+//! unless a family asks for wider passes. A prompt longer than that is
 //! split here rather than refused, because the split is invisible in the result:
 //! each sub-chunk advances the session by its own rows and the recurrent state and
 //! the cache carry the prefix across the boundary exactly as they carry it across a
@@ -59,6 +60,26 @@ use crate::vision::{MediaChunk, Streams, VisionPrefill, Walk};
 /// that decides the scratch bill. A prompt longer than this is split rather than
 /// refused.
 pub const MAX_PREFILL_CHUNK: u32 = 512;
+
+/// The widest prefill pass [`EngineOptions::prefill_rows`] may ask for.
+///
+/// Sixteen default chunks: wide enough that ten minutes of audio prompt is one
+/// pass, and a cap so a mistyped width is refused rather than allocated.
+pub const MAX_PREFILL_ROWS: u32 = 8192;
+
+/// Refuses a prefill width [`EngineOptions::prefill_rows`] does not allow.
+fn check_prefill_rows(rows: u32) -> CoreResult<()> {
+    if rows == 0 || rows > MAX_PREFILL_ROWS || !rows.is_multiple_of(MAX_PREFILL_CHUNK) {
+        return Err(CoreError::InvalidValue {
+            key: "prefill rows",
+            value: format!(
+                "{rows} is not a whole number of {MAX_PREFILL_CHUNK}-row chunks up to \
+                 {MAX_PREFILL_ROWS}"
+            ),
+        });
+    }
+    Ok(())
+}
 
 /// Sessions one decode step may carry, which is also the height of the logits
 /// block.
@@ -648,10 +669,11 @@ impl HybridStack {
         let geometry = Geometry::new(&shape, embed)?;
         validate_ple(&geometry, ple.as_ref())?;
         let recurrent_slots = usize::try_from(shape.recurrent_count()).unwrap_or(0);
+        check_prefill_rows(opts.prefill_rows)?;
         let scratch = Scratch::new(
             backend,
             &geometry,
-            MAX_PREFILL_CHUNK,
+            opts.prefill_rows,
             MAX_DECODE_BATCH.max(MAX_PROMPT_RUNS),
         )?;
         let rows = RowPages::new(backend, opts.ctx, MAX_DECODE_BATCH)?;
@@ -1197,9 +1219,10 @@ impl HybridStack {
                 n_tok,
                 None,
                 // A batch records no trail: a rollback winds one session back
-                // along one sequence, and these rows are not one sequence. The
-                // recurrent family refuses the combination; nothing here builds
-                // it.
+                // along one sequence, and these rows are not one sequence.
+                // Every recurrent block - the gated delta net and the
+                // state-space one - refuses the combination; nothing here
+                // builds it.
                 layers::PassExtras {
                     trail: Trail::None,
                     taps: taps_sink,
@@ -1296,11 +1319,6 @@ impl HybridStack {
             &resident.scratch,
             n,
         )
-    }
-
-    /// Projects row `token` of the pass that just ran into logits row `row`.
-    pub(crate) fn write_logits_row(&self, token: u32, row: u32) -> CoreResult<()> {
-        self.write_logits(token, row)
     }
 
     /// Registers the span a speculative step settled on.
@@ -1433,7 +1451,7 @@ impl HybridStack {
             prefill: *prefill,
             walk: Walk::new(prefill.grids(), prefill.pads(), start, positions).at_rotary(rotary),
         });
-        let width = usize::try_from(MAX_PREFILL_CHUNK).unwrap_or(usize::MAX);
+        let width = usize::try_from(self.opts.prefill_rows).unwrap_or(usize::MAX);
         let mut last = 0;
         let mut rest = tokens;
         while !rest.is_empty() {
@@ -1477,7 +1495,21 @@ impl HybridStack {
             // whatever was last at those addresses, so the only thing that
             // shows is a draft the target rarely agrees with: a build that is
             // slower for speculating and correct either way.
-            self.warm_draft(session, head, start)?;
+            //
+            // A placeholder id is not a row of the head's embedding table
+            // either - a family may give its marker an id past the table -
+            // so the head reads id 0 there, as the target's gather did.
+            match run.as_ref() {
+                Some(run) => {
+                    let pads = run.prefill.pads();
+                    let gathered: Vec<TokenId> = head
+                        .iter()
+                        .map(|&t| if pads.matches(t) { TokenId::new(0) } else { t })
+                        .collect();
+                    self.warm_draft(session, &gathered, start)?;
+                }
+                None => self.warm_draft(session, head, start)?,
+            }
             last = n_tok.saturating_sub(1);
             let final_chunk = tail.is_empty();
             let row = (final_chunk && with_logits).then_some(0);
@@ -1655,6 +1687,7 @@ impl HybridStack {
         logits_row: Option<u32>,
     ) -> CoreResult<()> {
         let now = self.now();
+        let stride = self.opts.prefill_rows;
         let Self {
             backend,
             resident,
@@ -1698,11 +1731,17 @@ impl HybridStack {
         // shared boundaries and nowhere else: a snapshot at its end or at
         // its strides is one nothing resumes, and in a full store it takes
         // the slot a sibling's boundary needed.
+        //
+        // The stride is the chunk width the walk actually cuts at. The
+        // frontier stands where the previous chunk ended, and the cache's
+        // stride stop is the next multiple past it: measured against a
+        // narrower stride, a wide chunk's end is never that stop while a slot
+        // is spare, and a wide prefill would keep no periodic checkpoint.
         let hint = live.is_hint(q);
         let (earned, periodic) = if live.scoring() {
             (hint, false)
         } else {
-            (earned || hint, q > 0 && q.is_multiple_of(MAX_PREFILL_CHUNK))
+            (earned || hint, q > 0 && q.is_multiple_of(stride))
         };
         let admit = (earned || periodic)
             && live.keyed_at(q)
@@ -1711,7 +1750,7 @@ impl HybridStack {
                     live.kv().frontier(),
                     live.cache_path(),
                     &[],
-                    MAX_PREFILL_CHUNK,
+                    stride,
                 ) == Some(q));
         if admit {
             snapshot(backend.as_ref(), live, &mut staging.ckpt)?;
@@ -2261,8 +2300,8 @@ impl HybridStack {
     /// [`CoreError::Unsupported`] with [`shiso_core::NO_BATCHED_PROMPT_PASS`]
     /// for a stack that drafts (a draft head warms per chunk, which this pass
     /// does not), and without it for more runs than [`MAX_PROMPT_RUNS`], a
-    /// pass wider than [`MAX_PREFILL_CHUNK`] rows once a shared trunk is
-    /// counted once, a session that read media or keeps a
+    /// pass wider than [`EngineOptions::prefill_rows`] rows once a shared
+    /// trunk is counted once, a session that read media or keeps a
     /// decision capture, and a session named twice; [`CoreError::ShapeMismatch`]
     /// for no runs or an empty one; [`CoreError::UnknownSession`];
     /// [`CoreError::ContextOverflow`]; and whatever the device reports.
@@ -2297,7 +2336,7 @@ impl HybridStack {
             // Measured on the layout rather than the runs: a trunk read once
             // is what lets several prompts of a few hundred tokens share one
             // pass at all.
-            if layout.rows() > MAX_PREFILL_CHUNK {
+            if layout.rows() > self.opts.prefill_rows {
                 return Err(CoreError::Unsupported {
                     what: "a batched prompt pass wider than one prefill chunk",
                     backend: "engine",

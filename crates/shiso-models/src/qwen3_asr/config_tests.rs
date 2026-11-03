@@ -15,6 +15,7 @@ use super::{
     mel_spec, read_merges, read_vocab,
 };
 use crate::audio_ops::store::TensorStore;
+use crate::test_gguf::{Kv, write_gguf};
 
 #[expect(clippy::print_stderr, reason = "a skipped case says why on stderr")]
 pub(crate) fn say(line: &str) {
@@ -215,59 +216,6 @@ fn a_gguf_directory_is_its_one_text_file_and_an_explicit_mmproj_wins() {
     assert_eq!(located.mmproj.as_deref(), Some(explicit.as_path()));
 }
 
-/// One metadata value of a synthetic GGUF.
-enum Kv {
-    Str(&'static str),
-    U32(u32),
-    F32(f32),
-    Bool(bool),
-    Strs(Vec<&'static str>),
-}
-
-fn put_str(out: &mut Vec<u8>, s: &str) {
-    out.extend_from_slice(&u64::try_from(s.len()).expect("fits").to_le_bytes());
-    out.extend_from_slice(s.as_bytes());
-}
-
-/// A GGUF v3 file holding `kvs` and no tensors.
-fn write_gguf(path: &Path, kvs: &[(&str, Kv)]) {
-    let mut out = Vec::new();
-    out.extend_from_slice(b"GGUF");
-    out.extend_from_slice(&3u32.to_le_bytes());
-    out.extend_from_slice(&0u64.to_le_bytes());
-    out.extend_from_slice(&u64::try_from(kvs.len()).expect("fits").to_le_bytes());
-    for (key, value) in kvs {
-        put_str(&mut out, key);
-        match value {
-            Kv::Str(s) => {
-                out.extend_from_slice(&8u32.to_le_bytes());
-                put_str(&mut out, s);
-            }
-            Kv::U32(v) => {
-                out.extend_from_slice(&4u32.to_le_bytes());
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            Kv::F32(v) => {
-                out.extend_from_slice(&6u32.to_le_bytes());
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            Kv::Bool(v) => {
-                out.extend_from_slice(&7u32.to_le_bytes());
-                out.push(u8::from(*v));
-            }
-            Kv::Strs(list) => {
-                out.extend_from_slice(&9u32.to_le_bytes());
-                out.extend_from_slice(&8u32.to_le_bytes());
-                out.extend_from_slice(&u64::try_from(list.len()).expect("fits").to_le_bytes());
-                for s in list {
-                    put_str(&mut out, s);
-                }
-            }
-        }
-    }
-    std::fs::write(path, out).expect("writes");
-}
-
 fn text_gguf(path: &Path) {
     write_gguf(
         path,
@@ -286,6 +234,7 @@ fn text_gguf(path: &Path) {
             ("tokenizer.ggml.model", Kv::Str("gpt2")),
             ("tokenizer.ggml.tokens", Kv::Strs(vec!["a", "b"])),
         ],
+        &[],
     );
 }
 
@@ -304,6 +253,7 @@ fn mmproj_gguf(path: &Path, projection: u32) {
             ("clip.audio.num_mel_bins", Kv::U32(128)),
             ("clip.audio.attention.layer_norm_epsilon", Kv::F32(1e-5)),
         ],
+        &[],
     );
 }
 
@@ -410,7 +360,7 @@ fn other_paths_are_not_this_family() {
     std::fs::write(dir.path().join("config.json"), r#"{"model_type": "other"}"#).expect("writes");
     assert!(locate(dir.path(), None).expect("readable").is_none());
     let gguf = dir.path().join("other.gguf");
-    write_gguf(&gguf, &[("general.architecture", Kv::Str("llama"))]);
+    write_gguf(&gguf, &[("general.architecture", Kv::Str("llama"))], &[]);
     assert!(locate(&gguf, None).expect("readable").is_none());
     let plain = dir.path().join("notes.txt");
     std::fs::write(&plain, "not a checkpoint").expect("writes");

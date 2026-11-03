@@ -41,6 +41,9 @@ half = { workspace = true }
 # names no device API, which is what lets the same forward pass compile for a
 # second backend.
 shiso-metal = { workspace = true }
+# The expert stream's bookkeeping is device-independent, so its tests run on
+# the host device and need no GPU.
+shiso-cpu = { workspace = true }
 # The golden decode is over real text, so the prompt is encoded with the model's
 # own vocabulary rather than hand-picked ids.
 tokenizers = { workspace = true }

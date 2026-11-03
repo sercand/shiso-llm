@@ -59,5 +59,5 @@ pub use recognizer::{
     Language, OfflineBatch, OfflineJob, RecognizerStream, SpanResult, SpeechRecognizer,
     StreamOptions, TokenEvent,
 };
-pub use tower::{AudioClip, AudioTower, clip_for};
+pub use tower::{AudioClip, AudioTower, TimingKey, TimingTicket, WordTimer, WordTiming, clip_for};
 pub use vocab::{Detokenizer, PieceVocab};

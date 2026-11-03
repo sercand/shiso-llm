@@ -1002,8 +1002,13 @@ mod detokenizer_tests {
     fn a_special_id_past_the_logits_width_refuses_boot() {
         let vocabulary = vocabulary_with_specials(&[(900, "<|far|>")]);
         let mut model = BoundCheckingModel::with_width(64);
-        let error = crate::boot::suppress_control_tokens(&mut model, Some(&vocabulary), NO_PARSERS)
-            .expect_err("a special id past the logits width refuses boot");
+        let error = crate::boot::suppress_control_tokens(
+            &mut model,
+            Some(&vocabulary),
+            NO_PARSERS,
+            &crate::boot::KeptTokens::default(),
+        )
+        .expect_err("a special id past the logits width refuses boot");
         let message = shiso_core::chain_of(&error).to_string();
         assert!(
             message.contains("suppressed token id") && message.contains("900 (vocabulary 64)"),
@@ -1013,7 +1018,13 @@ mod detokenizer_tests {
         // same model boots when the special fits inside it.
         let tame = vocabulary_with_specials(&[(2, "<|near|>")]);
         assert!(
-            crate::boot::suppress_control_tokens(&mut model, Some(&tame), NO_PARSERS).is_ok(),
+            crate::boot::suppress_control_tokens(
+                &mut model,
+                Some(&tame),
+                NO_PARSERS,
+                &crate::boot::KeptTokens::default()
+            )
+            .is_ok(),
             "a special inside the logits width still boots"
         );
     }
@@ -1039,8 +1050,13 @@ mod detokenizer_tests {
         let vocabulary = vocabulary_with_specials(&borrowed);
         // Wide enough that every id fits: the refusal can only be the count.
         let mut model = BoundCheckingModel::with_width(8_192);
-        let error = crate::boot::suppress_control_tokens(&mut model, Some(&vocabulary), NO_PARSERS)
-            .expect_err("more specials than the suppression capacity refuses boot");
+        let error = crate::boot::suppress_control_tokens(
+            &mut model,
+            Some(&vocabulary),
+            NO_PARSERS,
+            &crate::boot::KeptTokens::default(),
+        )
+        .expect_err("more specials than the suppression capacity refuses boot");
         let message = shiso_core::chain_of(&error).to_string();
         assert!(
             message.contains("suppressed token count")

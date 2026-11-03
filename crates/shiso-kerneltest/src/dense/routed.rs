@@ -17,13 +17,17 @@
 use crate::harness::{Gpu, drain, f32_bytes, run};
 use bytemuck::{Pod, Zeroable};
 use shiso_core::{Extent3, KernelArg, KernelRef, LaunchArgs};
+use shiso_modelfile::quant::BlockIq4Nl;
+use shiso_modelfile::quant_tables::IQ4NL_VALUES;
 
 /// Every entry point this module's cases launch.
-pub const ENTRIES: [&str; 6] = [
+pub const ENTRIES: [&str; 8] = [
     "kernel_dense_moe_route_sigmoid_f32",
     "kernel_dense_moe_route_sort_sigmoid_f32",
     "kernel_dense_moe_combine_add_f32",
     "kernel_dense_experts_affine4_f32",
+    "kernel_dense_experts_iq4nl_f32",
+    "kernel_dense_experts_iq4nl_gemm_f32",
     "kernel_dense_relu2_f32",
     "kernel_dense_kv_store_f32",
 ];
@@ -408,6 +412,459 @@ pub fn experts_affine4_matches_the_host_product(gpu: &Gpu) {
             }
         }
     }
+}
+
+/// An `IQ4_NL` routed-stage fixture at the decoder's real input width: 2688
+/// inputs is 84 blocks a row, which no lane count divides, so a lane walk that
+/// assumed it would drop or repeat a block.
+struct Iq4NlFixture {
+    experts: usize,
+    in_dim: usize,
+    out_dim: usize,
+    n_tok: usize,
+    used: usize,
+    /// The stack's blocks, `[experts][out_dim][in_dim / 32]`.
+    blocks: Vec<BlockIq4Nl>,
+    /// Each column's expert.
+    ids: Vec<i32>,
+    sorted: Vec<i32>,
+    bounds: Vec<i32>,
+    active: Vec<i32>,
+}
+
+impl Iq4NlFixture {
+    fn new() -> Self {
+        Self::with_tokens(5, 20)
+    }
+
+    /// `n_tok` tokens over `out_dim` rows a projection: the routing of the
+    /// first five tokens is the same whatever `n_tok` is, so their columns can
+    /// be compared across fixtures.
+    fn with_tokens(n_tok: usize, out_dim: usize) -> Self {
+        let (experts, in_dim, used) = (8usize, 2688usize, 6usize);
+        let per_row = in_dim / 32;
+        let scales = signal(experts * out_dim * per_row, 71);
+        let blocks: Vec<BlockIq4Nl> = (0..experts * out_dim * per_row)
+            .map(|b| {
+                let mut qs = [0u8; 16];
+                for (j, q) in qs.iter_mut().enumerate() {
+                    *q = (((b * 16 + j) as u32).wrapping_mul(2_654_435_761) >> 11) as u8;
+                }
+                BlockIq4Nl {
+                    d: half::f16::from_f32(scales[b] * 0.01).to_bits(),
+                    qs,
+                }
+            })
+            .collect();
+        // Five tokens, six distinct experts each out of eight; expert 7 is
+        // never chosen, so the active list is shorter than the bank.
+        let ids: Vec<i32> = (0..n_tok * used)
+            .map(|c| ((c / used + c % used) % (experts - 1)) as i32)
+            .collect();
+        let columns = n_tok * used;
+        let mut sorted = Vec::new();
+        let mut bounds = vec![0i32; experts + 1];
+        let mut active = Vec::new();
+        for e in 0..experts {
+            let cols: Vec<i32> = (0..columns as i32)
+                .filter(|&c| ids[c as usize] == e as i32)
+                .collect();
+            if !cols.is_empty() {
+                active.push(e as i32);
+            }
+            sorted.extend_from_slice(&cols);
+            bounds[e + 1] = sorted.len() as i32;
+        }
+        let n_active = active.len() as i32;
+        active.resize(experts, 0);
+        active.push(n_active);
+        Self {
+            experts,
+            in_dim,
+            out_dim,
+            n_tok,
+            used,
+            blocks,
+            ids,
+            sorted,
+            bounds,
+            active,
+        }
+    }
+
+    /// Row `row` of expert `expert`, dequantized on the host in f64.
+    fn row(&self, expert: usize, row: usize) -> Vec<f64> {
+        let per_row = self.in_dim / 32;
+        let first = (expert * self.out_dim + row) * per_row;
+        self.blocks[first..first + per_row]
+            .iter()
+            .flat_map(|b| {
+                let d = f64::from(half::f16::from_bits(b.d).to_f32());
+                let mut v = [0.0f64; 32];
+                for j in 0..16 {
+                    v[j] = d * f64::from(IQ4NL_VALUES[usize::from(b.qs[j] & 0xf)]);
+                    v[j + 16] = d * f64::from(IQ4NL_VALUES[usize::from(b.qs[j] >> 4)]);
+                }
+                v
+            })
+            .collect()
+    }
+
+    /// Runs the one-column stage over `stack` (whole, or a slot pool when
+    /// `map` is given) on the first projection's input, and returns the
+    /// `[columns, out_dim]` output.
+    fn run(&self, gpu: &Gpu, stack: &[u8], map: Option<&[i32]>, act: u32, x: &[f32]) -> Vec<f32> {
+        let desc = Iq4NlLaunchDesc {
+            map,
+            act,
+            ..Iq4NlLaunchDesc::ONE_COLUMN
+        };
+        self.run_entry(gpu, &desc, stack, x)
+    }
+
+    /// Launches `desc` over `stack` and `x` and returns the `[columns,
+    /// out_dim]` output. `x` holds a row a token when `desc.by_token` is 1 and
+    /// a row a column when it is 0.
+    fn run_entry(
+        &self,
+        gpu: &Gpu,
+        desc: &Iq4NlLaunchDesc<'_>,
+        stack: &[u8],
+        x: &[f32],
+    ) -> Vec<f32> {
+        let Iq4NlLaunchDesc {
+            entry,
+            rows_per_group,
+            map,
+            act,
+            by_token,
+        } = *desc;
+        let columns = self.n_tok * self.used;
+        let w_buf = gpu.upload(stack);
+        let map_buf = gpu.upload(&i32_bytes(map.unwrap_or(&[0])));
+        let x_buf = gpu.upload(&f32_bytes(x));
+        let sorted_buf = gpu.upload(&i32_bytes(&self.sorted));
+        let bounds_buf = gpu.upload(&i32_bytes(&self.bounds));
+        let active_buf = gpu.upload(&i32_bytes(&self.active));
+        let out_buf = gpu.upload(&f32_bytes(&vec![0.0; columns * self.out_dim]));
+        let args = ExpertArgs {
+            in_dim: self.in_dim as u32,
+            out_dim: self.out_dim as u32,
+            n_expert: self.experts as u32,
+            n_used: self.used as u32,
+            by_token,
+            act,
+            // `mapped`, then `layer_base`: the map below is one layer's, so
+            // its base is zero.
+            pad: [u32::from(map.is_some()), 0],
+        };
+        launch(
+            gpu,
+            entry,
+            Extent3::new(
+                (self.out_dim as u32).div_ceil(rows_per_group),
+                columns.min(self.experts) as u32,
+                1,
+            ),
+            128,
+            0,
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(w_buf.view()),
+                KernelArg::Buffer(map_buf.view()),
+                KernelArg::Buffer(x_buf.view()),
+                KernelArg::Buffer(sorted_buf.view()),
+                KernelArg::Buffer(bounds_buf.view()),
+                KernelArg::Buffer(active_buf.view()),
+                KernelArg::Buffer(out_buf.view()),
+            ],
+        );
+        gpu.read_f32(&out_buf)
+    }
+
+    fn input(&self) -> Vec<f32> {
+        signal(self.n_tok * self.in_dim, 73)
+    }
+
+    /// The host product of the dequantized rows for `x` read as `by_token`
+    /// says, through `act`, `[columns, out_dim]`.
+    fn want(&self, x: &[f32], by_token: u32, act: u32) -> Vec<f64> {
+        let mut wanted = vec![0.0f64; self.ids.len() * self.out_dim];
+        for (col, &e) in self.ids.iter().enumerate() {
+            let xr = if by_token == 1 { col / self.used } else { col };
+            let input = &x[xr * self.in_dim..(xr + 1) * self.in_dim];
+            for r in 0..self.out_dim {
+                let dot: f64 = self
+                    .row(e as usize, r)
+                    .iter()
+                    .zip(input)
+                    .map(|(a, b)| a * f64::from(*b))
+                    .sum();
+                wanted[col * self.out_dim + r] = if act == 1 { dot.max(0.0).powi(2) } else { dot };
+            }
+        }
+        wanted
+    }
+}
+
+/// How one launch of the `IQ4_NL` stage is shaped: which entry, how many
+/// output rows its threadgroup covers, and the stage's switches.
+#[derive(Debug, Clone, Copy)]
+struct Iq4NlLaunchDesc<'a> {
+    entry: &'static str,
+    /// Output rows one threadgroup covers, which sets the grid's x extent.
+    rows_per_group: u32,
+    /// The slot map, or `None` to read the whole stack.
+    map: Option<&'a [i32]>,
+    /// 1 fuses `max(v, 0)^2` into the store.
+    act: u32,
+    /// 1 reads a column's token row (the first projection), 0 the column's own
+    /// row (the second).
+    by_token: u32,
+}
+
+impl Iq4NlLaunchDesc<'_> {
+    /// The one-column entry a decode step takes, on the first projection.
+    const ONE_COLUMN: Iq4NlLaunchDesc<'static> = Iq4NlLaunchDesc {
+        entry: "kernel_dense_experts_iq4nl_f32",
+        rows_per_group: 16,
+        map: None,
+        act: 0,
+        by_token: 1,
+    };
+
+    /// The tiled entry a prompt pass takes, on the first projection.
+    const TILED: Iq4NlLaunchDesc<'static> = Iq4NlLaunchDesc {
+        entry: "kernel_dense_experts_iq4nl_gemm_f32",
+        rows_per_group: 64,
+        map: None,
+        act: 0,
+        by_token: 1,
+    };
+}
+
+/// The `IQ4_NL` stage against the host product of the dequantized rows.
+pub fn iq4nl_expert_stage_matches_host_dequant(gpu: &Gpu) {
+    let f = Iq4NlFixture::new();
+    let x = f.input();
+    let got = f.run(gpu, bytemuck::cast_slice(&f.blocks), None, 0, &x);
+    let mut worst = 0.0f64;
+    let mut peak = 0.0f64;
+    let mut wanted = vec![0.0f64; got.len()];
+    for (col, &e) in f.ids.iter().enumerate() {
+        let token = col / f.used;
+        for r in 0..f.out_dim {
+            let w = f.row(e as usize, r);
+            let want: f64 = w
+                .iter()
+                .zip(&x[token * f.in_dim..(token + 1) * f.in_dim])
+                .map(|(a, b)| a * f64::from(*b))
+                .sum();
+            wanted[col * f.out_dim + r] = want;
+            peak = peak.max(want.abs());
+        }
+    }
+    for (have, want) in got.iter().zip(&wanted) {
+        worst = worst.max((f64::from(*have) - want).abs());
+    }
+    assert!(
+        worst <= 1e-3 * peak,
+        "worst error {worst} against a peak of {peak}"
+    );
+}
+
+/// A stage through a slot map reads expert `e` from slot `map[e]`, and is
+/// bit-identical to the same stage over the whole stack.
+pub fn iq4nl_expert_stage_reads_through_the_slot_map(gpu: &Gpu) {
+    let f = Iq4NlFixture::new();
+    let x = f.input();
+    let whole = f.run(gpu, bytemuck::cast_slice(&f.blocks), None, 0, &x);
+    let expert_blocks = f.out_dim * f.in_dim / 32;
+    let slots = 12usize;
+    // Expert e lives in slot (5 * e + 3) % 12; the other slots hold noise.
+    let map: Vec<i32> = (0..f.experts)
+        .map(|e| ((5 * e + 3) % slots) as i32)
+        .collect();
+    let noise = BlockIq4Nl {
+        d: half::f16::from_f32(7.0).to_bits(),
+        qs: [0x5a; 16],
+    };
+    let mut pool = vec![noise; slots * expert_blocks];
+    for (e, &slot) in map.iter().enumerate() {
+        let slot = slot as usize;
+        pool[slot * expert_blocks..(slot + 1) * expert_blocks]
+            .copy_from_slice(&f.blocks[e * expert_blocks..(e + 1) * expert_blocks]);
+    }
+    let mapped = f.run(gpu, bytemuck::cast_slice(&pool), Some(&map), 0, &x);
+    assert!(
+        whole
+            .iter()
+            .zip(&mapped)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "the mapped stage differs from the whole-stack stage"
+    );
+}
+
+/// `act` 1 stores `max(v, 0)^2` of exactly the value `act` 0 stores.
+pub fn iq4nl_expert_stage_relu2_is_fused(gpu: &Gpu) {
+    let f = Iq4NlFixture::new();
+    let x = f.input();
+    let stack: &[u8] = bytemuck::cast_slice(&f.blocks);
+    let plain = f.run(gpu, stack, None, 0, &x);
+    let squared = f.run(gpu, stack, None, 1, &x);
+    for (i, (p, s)) in plain.iter().zip(&squared).enumerate() {
+        let want = p.max(0.0) * p.max(0.0);
+        assert_eq!(
+            s.to_bits(),
+            want.to_bits(),
+            "element {i}: {s} against {want}"
+        );
+    }
+}
+
+/// The tiled `IQ4_NL` stage a prompt pass takes, run over `f`.
+fn gemm(
+    f: &Iq4NlFixture,
+    gpu: &Gpu,
+    stack: &[u8],
+    map: Option<&[i32]>,
+    act: u32,
+    x: &[f32],
+) -> Vec<f32> {
+    let desc = Iq4NlLaunchDesc {
+        map,
+        act,
+        ..Iq4NlLaunchDesc::TILED
+    };
+    f.run_entry(gpu, &desc, stack, x)
+}
+
+/// Both entries read a column's token row when `by_token` is 1 and the
+/// column's own row when it is 0, the second projection's input: one row a
+/// column, each different, so a column that read its token's row (or a
+/// neighbour's) would land on another row's product.
+pub fn iq4nl_expert_stages_read_the_row_by_token_says(gpu: &Gpu) {
+    let f = Iq4NlFixture::with_tokens(40, 100);
+    let columns = f.n_tok * f.used;
+    let stack: &[u8] = bytemuck::cast_slice(&f.blocks);
+    for base in [Iq4NlLaunchDesc::ONE_COLUMN, Iq4NlLaunchDesc::TILED] {
+        for (by_token, act) in [(1u32, 1u32), (0, 0), (0, 1)] {
+            let rows = if by_token == 1 { f.n_tok } else { columns };
+            let x = signal(rows * f.in_dim, 73 + by_token);
+            let desc = Iq4NlLaunchDesc {
+                act,
+                by_token,
+                ..base
+            };
+            let got = f.run_entry(gpu, &desc, stack, &x);
+            let wanted = f.want(&x, by_token, act);
+            let peak = wanted.iter().fold(0.0f64, |m, w| m.max(w.abs()));
+            let worst = got
+                .iter()
+                .zip(&wanted)
+                .fold(0.0f64, |m, (h, w)| m.max((f64::from(*h) - w).abs()));
+            assert!(
+                worst <= 1e-3 * peak,
+                "{} by_token {by_token} act {act}: worst error {worst} against a peak of {peak}",
+                base.entry,
+            );
+        }
+    }
+}
+
+/// The tiled stage against the host product of the dequantized rows, with a
+/// row count that leaves the last 64-row tile ragged and an expert with more
+/// columns than one 16-column tile.
+pub fn iq4nl_expert_gemm_matches_host_dequant(gpu: &Gpu) {
+    let f = Iq4NlFixture::with_tokens(40, 100);
+    let x = signal(f.n_tok * f.in_dim, 73);
+    for act in [0u32, 1] {
+        let got = gemm(&f, gpu, bytemuck::cast_slice(&f.blocks), None, act, &x);
+        let mut peak = 0.0f64;
+        let mut worst = 0.0f64;
+        for (col, &e) in f.ids.iter().enumerate() {
+            let token = col / f.used;
+            for r in 0..f.out_dim {
+                let w = f.row(e as usize, r);
+                let dot: f64 = w
+                    .iter()
+                    .zip(&x[token * f.in_dim..(token + 1) * f.in_dim])
+                    .map(|(a, b)| a * f64::from(*b))
+                    .sum();
+                let want = if act == 1 { dot.max(0.0).powi(2) } else { dot };
+                peak = peak.max(want.abs());
+                worst = worst.max((f64::from(got[col * f.out_dim + r]) - want).abs());
+            }
+        }
+        assert!(
+            worst <= 1e-3 * peak,
+            "act {act}: worst error {worst} against a peak of {peak}"
+        );
+    }
+}
+
+/// The tiled stage through a slot map is bit-identical to it over the whole
+/// stack.
+pub fn iq4nl_expert_gemm_reads_through_the_slot_map(gpu: &Gpu) {
+    let f = Iq4NlFixture::with_tokens(40, 100);
+    let x = signal(f.n_tok * f.in_dim, 73);
+    let whole = gemm(&f, gpu, bytemuck::cast_slice(&f.blocks), None, 0, &x);
+    let expert_blocks = f.out_dim * f.in_dim / 32;
+    let slots = 12usize;
+    let map: Vec<i32> = (0..f.experts)
+        .map(|e| ((5 * e + 3) % slots) as i32)
+        .collect();
+    let noise = BlockIq4Nl {
+        d: half::f16::from_f32(7.0).to_bits(),
+        qs: [0x5a; 16],
+    };
+    let mut pool = vec![noise; slots * expert_blocks];
+    for (e, &slot) in map.iter().enumerate() {
+        let slot = slot as usize;
+        pool[slot * expert_blocks..(slot + 1) * expert_blocks]
+            .copy_from_slice(&f.blocks[e * expert_blocks..(e + 1) * expert_blocks]);
+    }
+    let mapped = gemm(&f, gpu, bytemuck::cast_slice(&pool), Some(&map), 0, &x);
+    assert!(
+        whole
+            .iter()
+            .zip(&mapped)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "the mapped tile differs from the whole-stack tile"
+    );
+}
+
+/// A column's result does not depend on which columns share its tile: the
+/// first five tokens' columns are bit-identical with 35 more tokens beside
+/// them.
+pub fn iq4nl_expert_gemm_column_is_independent_of_its_neighbours(gpu: &Gpu) {
+    let small = Iq4NlFixture::with_tokens(5, 100);
+    let large = Iq4NlFixture::with_tokens(40, 100);
+    let x = signal(large.n_tok * large.in_dim, 73);
+    let a = gemm(
+        &small,
+        gpu,
+        bytemuck::cast_slice(&small.blocks),
+        None,
+        0,
+        &x[..5 * small.in_dim],
+    );
+    let b = gemm(
+        &large,
+        gpu,
+        bytemuck::cast_slice(&large.blocks),
+        None,
+        0,
+        &x,
+    );
+    let n = small.n_tok * small.used * small.out_dim;
+    assert!(
+        a[..n]
+            .iter()
+            .zip(&b[..n])
+            .all(|(p, q)| p.to_bits() == q.to_bits()),
+        "a column's result changed with its tile's other columns"
+    );
 }
 
 /// `max(x, 0)^2`, elementwise.

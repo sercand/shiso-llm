@@ -337,6 +337,12 @@ impl PromptRenderer {
                  a clip will have nowhere to put its rows"
             );
         }
+        // A renderer with no vision tower still has to find the audio
+        // marker in the rendered text to report its span; a vision tower
+        // attached first already answered with the same family's placement.
+        if self.placement.is_none() {
+            self.placement = Some(placement);
+        }
         self.audio = Some(tower);
         self.audio_limits = limits;
         self.audio_decode = decode;

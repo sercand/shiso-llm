@@ -131,6 +131,9 @@ pub struct AppState {
     /// typed "no embedding model" error for a server that serves something
     /// else.
     pub embedding: Option<crate::embed::EmbeddingService>,
+    /// The audio side of a speech decoder: set, transcription is answered by
+    /// the language model through [`crate::api::transcribe`].
+    pub speech: Option<crate::api::transcribe::SpeechDecoder>,
 }
 
 impl AppState {
@@ -155,6 +158,7 @@ impl AppState {
             decision_layout: None,
             decision_readout: None,
             embedding: None,
+            speech: None,
         }
     }
 
@@ -180,6 +184,7 @@ impl AppState {
             decision_layout: None,
             decision_readout: None,
             embedding: None,
+            speech: None,
         }
     }
 

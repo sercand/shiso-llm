@@ -85,7 +85,7 @@ pub use ckpt::{
     ResumeInfo, ResumeSource, SaveOutcome,
 };
 pub use ckpt_layout::CkptIdentity;
-pub use draft::{DraftHead, DraftParts};
+pub use draft::{DraftHead, DraftParts, HeadNorm};
 pub use options::{EngineOptions, KvCheck, KvFit, PoolCost};
 pub use sampling::{argmax, keyed_sample, rng_f32, rng_next, sample_logits, suppress};
 pub use sampling_probs::{build_probabilities, sample_probabilities};
@@ -98,4 +98,6 @@ pub use shiso_kvstore::CacheStats;
 // refused save and a `PumpReport` is what a pump did. A model crate that speaks only
 // to the checkpoint tier should not have to depend on the store to name them.
 pub use shiso_kvstore::{EntryKey, KvCache, PersistRefusal, PumpReport, Reason};
-pub use stack::{HybridStack, MAX_DECODE_BATCH, MAX_PREFILL_CHUNK, MAX_PROMPT_RUNS};
+pub use stack::{
+    HybridStack, MAX_DECODE_BATCH, MAX_PREFILL_CHUNK, MAX_PREFILL_ROWS, MAX_PROMPT_RUNS,
+};

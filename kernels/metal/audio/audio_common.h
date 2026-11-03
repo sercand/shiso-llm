@@ -105,6 +105,7 @@ typedef struct {
     uint has_bias_uv; uint has_q_dim_scale;
 } audio_args_window_attn;
 typedef struct { uint rows; uint heads; uint head_dim; uint pos0; float theta; } audio_args_rope;
+typedef struct { uint rows; uint heads; uint head_dim; uint pos0; float theta; uint rot; } audio_args_rope_partial;
 typedef struct { uint hidden; } audio_args_lstm;
 typedef struct { uint rows; uint cols; uint avail; } audio_args_greedy_window;
 typedef struct { uint rows; uint avail; uint blank; uint max_symbols; uint slot; } audio_args_greedy_step;

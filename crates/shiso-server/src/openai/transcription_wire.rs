@@ -74,6 +74,9 @@ pub struct TranscriptionForm {
     /// empty for neither. Whether the recognizer can use it is checked
     /// when it is encoded, not here.
     pub context: Context,
+    /// The instruction a speech decoder is asked with (`preset`, a shiso
+    /// extension); `None` for its default. A recognizer serves none.
+    pub preset: Option<String>,
 }
 
 fn refuse(param: &str, message: impl Into<String>) -> AppError {
@@ -133,6 +136,7 @@ impl TranscriptionForm {
         let mut granularities = Vec::new();
         let mut stream = false;
         let mut context = Context::default();
+        let mut preset = None;
         for field in fields {
             match field.name.as_str() {
                 "file" => file = Some(field.bytes),
@@ -188,6 +192,10 @@ impl TranscriptionForm {
                     let value = text(&field)?;
                     context.prompt = (!value.is_empty()).then(|| value.to_owned());
                 }
+                "preset" => {
+                    let value = text(&field)?;
+                    preset = (!value.is_empty()).then(|| value.to_owned());
+                }
                 "keywords[]" | "keywords" => {
                     let value = text(&field)?;
                     if value.is_empty() {
@@ -206,6 +214,7 @@ impl TranscriptionForm {
             granularities,
             stream,
             context,
+            preset,
         })
     }
 

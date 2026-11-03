@@ -481,6 +481,10 @@ pub struct MoeScratch {
     pub(crate) bounds: DeviceBuffer,
     /// The experts that received a column, with the count at `[experts]`.
     pub(crate) active: DeviceBuffer,
+    /// Two host-built active lists, `[experts + 1]` each: the experts a
+    /// streamed bank already holds, then the ones still being read, so the
+    /// first half of a stage runs while the second half's bytes arrive.
+    pub(crate) split: DeviceBuffer,
     /// The routed columns in expert order.
     pub(crate) sorted: DeviceBuffer,
     /// The routed gate projection, `[columns, intermediate]`.
@@ -521,6 +525,7 @@ impl MoeScratch {
             cursor: alloc(backend, u64::from(moe.experts).saturating_mul(ids))?,
             bounds: alloc(backend, u64::from(moe.experts + 1).saturating_mul(ids))?,
             active: alloc(backend, u64::from(moe.experts + 1).saturating_mul(ids))?,
+            split: alloc(backend, 2 * u64::from(moe.experts + 1).saturating_mul(ids))?,
             sorted: alloc(backend, columns.saturating_mul(ids))?,
             gate: alloc(backend, floats(columns * u64::from(moe.intermediate)))?,
             up: alloc(backend, floats(columns * u64::from(moe.intermediate)))?,

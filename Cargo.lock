@@ -2735,6 +2735,7 @@ dependencies = [
  "parking_lot",
  "serde_json",
  "shiso-core",
+ "shiso-cpu",
  "shiso-kvstore",
  "shiso-metal",
  "shiso-modelfile",
@@ -2862,6 +2863,7 @@ dependencies = [
 name = "shiso-models"
 version = "0.2.4"
 dependencies = [
+ "base64 0.22.1",
  "bytemuck",
  "half",
  "image",

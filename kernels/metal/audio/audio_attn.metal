@@ -231,6 +231,33 @@ kernel void kernel_audio_rope_half_f32(
     p[m + half_dim] = b * c + a * s;
 }
 
+/// Partial half-split rotary embedding, in place: for m < rot/2,
+/// (x[m], x[m+rot/2]) rotates by (pos0 + row) * theta^(-2m/rot), and the
+/// head's dimensions from `rot` on are left as they are.
+kernel void kernel_audio_rope_partial_f32(
+        constant audio_args_rope_partial & args [[buffer(0)]],
+        device float *x                         [[buffer(1)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint half_rot = args.rot / 2u;
+    const uint i = tgpig.x * AUDIO_LINEAR_BLOCK + tpitg.x;
+    if (i >= args.rows * args.heads * half_rot) {
+        return;
+    }
+    const uint m = i % half_rot;
+    const uint rh = i / half_rot;
+    const uint row = rh / args.heads;
+    device float *p = x + (uint64_t) rh * args.head_dim;
+    const float inv_freq = precise::pow(args.theta, -2.0f * (float) m / (float) args.rot);
+    const float ang = (float) (args.pos0 + row) * inv_freq;
+    float c;
+    const float s = precise::sincos(ang, c);
+    const float a = p[m];
+    const float b = p[m + half_rot];
+    p[m] = a * c - b * s;
+    p[m + half_rot] = b * c + a * s;
+}
+
 /// The rotation above at the decoder state's position: row `row` turns by
 /// `(state[POS] + pos0 + row) * theta^(-2m/hd)`, so a batch of decode steps
 /// rotates each step's row where the step before left the position.
