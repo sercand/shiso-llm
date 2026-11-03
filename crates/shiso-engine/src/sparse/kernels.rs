@@ -1511,6 +1511,22 @@ pub const fn argmax_rows(rows: u32) -> Launch {
     Launch::linear(rows, BLOCK_WIDE)
 }
 
+/// Entries [`Buf::RowTop`](crate::sparse::scratch::Buf::RowTop) keeps of a
+/// logits row.
+///
+/// A keyed draw with a top-k stage looks at the row's top `k` and nothing
+/// else - its nucleus and its floor are cut from those - so a caller whose
+/// `k` is at most this draws from these exactly what it would from the whole
+/// row. Sixty-four covers the top-k every checkpoint here ships (twenty, forty)
+/// at 512 bytes a row against the megabyte the row is.
+pub const ROW_TOP: u32 = 64;
+
+/// The top of each logits row, one wide block per row.
+#[must_use]
+pub const fn top_rows(rows: u32) -> Launch {
+    Launch::linear(rows, BLOCK_WIDE)
+}
+
 /// The one-off expansion of a trellis weight: one block per tile of the
 /// expanded half-precision result.
 ///

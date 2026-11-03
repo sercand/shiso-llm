@@ -45,3 +45,10 @@ fn an_empty_list_leaves_the_rows_alone() {
     let Some(gpu) = open() else { return };
     sample::an_empty_list_leaves_the_rows_alone(&gpu);
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_top_of_a_row_is_its_highest_entries_by_id() {
+    let Some(gpu) = open() else { return };
+    sample::the_top_of_a_row_is_its_highest_entries_by_id(&gpu);
+}

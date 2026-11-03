@@ -800,20 +800,9 @@ impl SparseStack {
         };
         let whole = u32::try_from(prompt.len()).unwrap_or(u32::MAX);
         let want_row = u64::from(vocab).saturating_mul(F32_BYTES);
-        let row = if reused == whole {
-            let mut row = vec![0u8; usize::try_from(want_row).unwrap_or(usize::MAX)];
-            cache
-                .ckpt_logits_into(reference, &mut row)
-                .map_err(cache_failure)?;
-            Some(row)
-        } else {
-            None
-        };
-        let mut blob =
-            vec![0u8; usize::try_from(cache.geometry().ckpt_bytes).unwrap_or(usize::MAX)];
-        cache
-            .ckpt_state_into(reference, &mut blob)
-            .map_err(cache_failure)?;
+        // The stack's staging, taken out and put back: a fresh zeroed ~120 MB
+        // buffer cost every resume some 40 ms of page faults and clearing.
+        let (row, blob) = self.take_stored(&cache, reference, reused == whole, want_row)?;
         let tokens = prompt[..usize::try_from(reused).unwrap_or(prompt.len())].to_vec();
         let source = source_of(resume.source);
         {
@@ -836,7 +825,9 @@ impl SparseStack {
             live.run_origin = shiso_core::media::run_origin(reused, &spans);
             live.written = reused;
             live.resumed_at = reused;
-            restore_state(backend.as_ref(), live, &blob)?;
+            let restored = restore_state(backend.as_ref(), live, &blob);
+            self.staging.ckpt = blob;
+            restored?;
             if let Some(spec) = live.spec.as_mut() {
                 spec.staged_for = reused;
             }
@@ -850,7 +841,9 @@ impl SparseStack {
                     .scratch
                     .view(Buf::Logits)?
                     .slice(0, want_row)?;
-                self.backend.copy_h2d(view, &row)?;
+                let copied = self.backend.copy_h2d(view, &row);
+                self.staging.logits = row;
+                copied?;
                 let view = self
                     .resident()?
                     .scratch
@@ -867,6 +860,62 @@ impl SparseStack {
             "resumed a stored sparse prefix"
         );
         Ok(Some(ResumeInfo::new(reused, tokens, logits, source)))
+    }
+}
+
+impl SparseStack {
+    /// The stored state, and the frontier logits row when `with_row`, read into
+    /// the stack's staging buffers and handed out; the caller puts the state
+    /// buffer back (and the row's, once used). A failed read puts both back.
+    fn take_stored(
+        &mut self,
+        cache: &KvCache,
+        reference: shiso_kvstore::CkptRef,
+        with_row: bool,
+        want_row: u64,
+    ) -> CoreResult<(Option<Vec<u8>>, Vec<u8>)> {
+        let mut row = std::mem::take(&mut self.staging.logits);
+        let mut blob = std::mem::take(&mut self.staging.ckpt);
+        match Self::read_stored(cache, reference, with_row, want_row, &mut row, &mut blob) {
+            Ok(true) => Ok((Some(row), blob)),
+            Ok(false) => {
+                self.staging.logits = row;
+                Ok((None, blob))
+            }
+            Err(error) => {
+                self.staging.logits = row;
+                self.staging.ckpt = blob;
+                Err(error)
+            }
+        }
+    }
+
+    /// Reads a stored checkpoint's state into `blob`, and its frontier logits
+    /// row into `row` when `with_row`; answers whether a row was read. Both
+    /// buffers are sized to what the cache holds and keep their capacity, so a
+    /// buffer that already has it is filled with no allocation and no clearing.
+    fn read_stored(
+        cache: &KvCache,
+        reference: shiso_kvstore::CkptRef,
+        with_row: bool,
+        want_row: u64,
+        row: &mut Vec<u8>,
+        blob: &mut Vec<u8>,
+    ) -> CoreResult<bool> {
+        if with_row {
+            row.resize(usize::try_from(want_row).unwrap_or(usize::MAX), 0);
+            cache
+                .ckpt_logits_into(reference, row)
+                .map_err(cache_failure)?;
+        }
+        blob.resize(
+            usize::try_from(cache.geometry().ckpt_bytes).unwrap_or(usize::MAX),
+            0,
+        );
+        cache
+            .ckpt_state_into(reference, blob)
+            .map_err(cache_failure)?;
+        Ok(with_row)
     }
 }
 
@@ -897,19 +946,24 @@ fn snapshot(
     blob_bytes: u64,
     blob: &mut Vec<u8>,
 ) -> CoreResult<()> {
-    blob.clear();
+    // Sized once and written in place: the buffer is reused for every
+    // checkpoint, so this clears only what it grows by - nothing after the
+    // first - where emptying it and growing it again piece by piece rewrote
+    // about 120 MB of zeros a checkpoint before the copies overwrote them.
+    blob.resize(usize::try_from(blob_bytes).unwrap_or(usize::MAX), 0);
+    let mut at = 0usize;
     for slot in &session.states {
-        append(backend, blob, slot.conv.view())?;
-        append(backend, blob, slot.state.view())?;
+        at = read_into(backend, blob, at, slot.conv.view())?;
+        at = read_into(backend, blob, at, slot.state.view())?;
     }
     if let Some(window) = session.ngram_window() {
-        append(backend, blob, window)?;
+        at = read_into(backend, blob, at, window)?;
     }
     if let Some(row) = session.pending_draft() {
-        append(backend, blob, row)?;
+        at = read_into(backend, blob, at, row)?;
     }
-    append(backend, blob, session.indexer_rings())?;
-    let got = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    at = read_into(backend, blob, at, session.indexer_rings())?;
+    let got = u64::try_from(at).unwrap_or(u64::MAX);
     if got != blob_bytes {
         return Err(CoreError::ShapeMismatch {
             field: "checkpoint blob",
@@ -920,16 +974,24 @@ fn snapshot(
     Ok(())
 }
 
-/// Reads one device range onto the end of `blob`.
-fn append(
+/// Reads one device range into `blob` at `at`, and reports where the next one
+/// starts. A range that would run past the blob is refused rather than cut.
+fn read_into(
     backend: &dyn shiso_core::backend::Backend,
-    blob: &mut Vec<u8>,
+    blob: &mut [u8],
+    at: usize,
     view: shiso_core::buffer::DeviceView<'_>,
-) -> CoreResult<()> {
-    let start = blob.len();
-    let len = usize::try_from(view.len()).unwrap_or(0);
-    blob.resize(start.saturating_add(len), 0);
-    backend.copy_d2h(view, &mut blob[start..])
+) -> CoreResult<usize> {
+    let len = usize::try_from(view.len()).unwrap_or(usize::MAX);
+    let end = at.saturating_add(len);
+    let total = blob.len();
+    let slot = blob.get_mut(at..end).ok_or(CoreError::ShapeMismatch {
+        field: "checkpoint blob",
+        expected: u64::try_from(end).unwrap_or(u64::MAX),
+        got: u64::try_from(total).unwrap_or(u64::MAX),
+    })?;
+    backend.copy_d2h(view, slot)?;
+    Ok(end)
 }
 
 /// Copies a checkpoint blob back into a session, in the order [`snapshot`] wrote

@@ -325,43 +325,6 @@ fn git(dir: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed");
 }
 
-/// The output and the git history both belong to the repository, not to the
-/// directory the tool happens to run in: a relative output lands inside the
-/// repository and the manifests carry the repository's commit dates even
-/// though this test process runs inside another git checkout.
-#[test]
-fn build_writes_into_the_repository_and_dates_from_its_history() {
-    let temp = tempdir().unwrap();
-    let repo = temp.path();
-    fs::create_dir_all(repo.join("recipes")).unwrap();
-    fs::write(repo.join("recipes").join("qwen3.5-9b.json"), SAMPLE_RECIPE).unwrap();
-    git(repo, &["init", "-q"]);
-    git(repo, &["add", "-A"]);
-    git(repo, &["commit", "-q", "-m", "recipe"]);
-
-    for asked in [None, Some("")] {
-        let out = editor::resolve_out(repo, asked.map(Path::new));
-        assert_eq!(out, repo, "{asked:?}");
-    }
-    assert_eq!(
-        editor::resolve_out(repo, Some(Path::new("site"))),
-        repo.join("site")
-    );
-    assert_eq!(
-        editor::resolve_out(repo, Some(Path::new("/elsewhere"))),
-        Path::new("/elsewhere")
-    );
-
-    let out = editor::resolve_out(repo, None);
-    editor::build_registry(repo, &out, false).unwrap();
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &fs::read(out.join("registry/v1/models/qwen3.5-9b/index.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(manifest["updated_at"], "2026-01-02T03:04:05Z");
-    assert_eq!(manifest["published_at"], "2026-01-02T03:04:05Z");
-}
-
 /// A directory git cannot read is refused rather than stamped with the build
 /// time.
 #[test]

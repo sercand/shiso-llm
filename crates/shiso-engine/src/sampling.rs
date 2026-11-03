@@ -733,9 +733,47 @@ mod tests {
 /// consumed from a stream: the key is fixed for the sequence.
 #[must_use]
 pub fn keyed_sample(logits: &[f32], p: &SamplingParams, key: u64, position: u32) -> TokenId {
+    TokenId::new(keyed_index(logits, p, key, position, |index| index))
+}
+
+/// [`keyed_sample`] over a row whose entries are not the whole vocabulary:
+/// entry `i` of `logits` is token `ids[i]`, and `ids` is ascending.
+///
+/// The draw keys its noise by the token id, not the entry's place in the row,
+/// so a drafter scoring a narrowed head lands on the token the target's own
+/// keyed draw over the whole row would - wherever the two rows agree on the
+/// candidates. Ascending ids keep ties breaking to the lower id, as the
+/// whole-row draw breaks them.
+///
+/// An empty row, or one longer than `ids`, draws the row's first entry's id or
+/// the first id: callers pass a row and its own table, and the two disagreeing
+/// is a construction bug the caller has already refused elsewhere.
+#[must_use]
+pub fn keyed_sample_ids(
+    logits: &[f32],
+    ids: &[u32],
+    p: &SamplingParams,
+    key: u64,
+    position: u32,
+) -> TokenId {
+    let id_of = |index: u32| ids.get(index as usize).copied().unwrap_or(0);
+    let row = &logits[..logits.len().min(ids.len())];
+    TokenId::new(id_of(keyed_index(row, p, key, position, id_of)))
+}
+
+/// The index of the entry the keyed rule draws from `logits`, entry `i`
+/// standing for token `id_of(i)`: the shared body of [`keyed_sample`] and
+/// [`keyed_sample_ids`].
+fn keyed_index(
+    logits: &[f32],
+    p: &SamplingParams,
+    key: u64,
+    position: u32,
+    id_of: impl Fn(u32) -> u32,
+) -> u32 {
     let temperature = p.temperature;
     if temperature <= 0.0 || logits.is_empty() {
-        return argmax(logits);
+        return argmax(logits).get();
     }
     let top_p = if p.top_p <= 0.0 || p.top_p > 1.0 {
         1.0
@@ -749,8 +787,9 @@ pub fn keyed_sample(logits: &[f32], p: &SamplingParams, key: u64, position: u32)
             .min(TOP_K_LIMIT)
     });
     let top_k = top_k.min(logits.len());
-    let noise = |id: usize| -> f32 {
-        let u = keyed_uniform(key, position, u32::try_from(id).unwrap_or(u32::MAX));
+    let noise = |index: usize| -> f32 {
+        let id = id_of(u32::try_from(index).unwrap_or(u32::MAX));
+        let u = keyed_uniform(key, position, id);
         -(-u.ln()).ln()
     };
     let inv_t = 1.0 / temperature;
@@ -763,14 +802,16 @@ pub fn keyed_sample(logits: &[f32], p: &SamplingParams, key: u64, position: u32)
                 best = (score, id);
             }
         }
-        return TokenId::new(u32::try_from(best.1).unwrap_or(u32::MAX));
+        return u32::try_from(best.1).unwrap_or(u32::MAX);
     }
     // The candidates, highest first and ties to the lower id: the top-k, or
     // every token within reach of the nucleus. A token more than 40
     // temperature-scaled units below the maximum carries under e^-40 of its
     // mass, which no nucleus below 1 and no min-p floor keeps.
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut cands: Vec<(f32, u32)> = if top_k > 0 {
+    let mut cands: Vec<(f32, u32)> = if top_k > 0 && top_k <= SCAN_TOP_K {
+        scan_top_k(logits, top_k)
+    } else if top_k > 0 {
         let mut all: Vec<(f32, u32)> = logits
             .iter()
             .enumerate()
@@ -817,7 +858,36 @@ pub fn keyed_sample(logits: &[f32], p: &SamplingParams, key: u64, position: u32)
             best = (score, id);
         }
     }
-    TokenId::new(best.1)
+    best.1
+}
+
+/// The widest top-k [`scan_top_k`] answers; a wider one partitions the row.
+///
+/// The scan inserts into a sorted list of `k`, so its worst case - a row whose
+/// every entry beats the list's last - is `k` moves an entry. At the sizes
+/// checkpoints ship (twenty, forty) almost every entry is turned away by one
+/// comparison with the list's last, which is what makes it several times
+/// faster than building and partitioning a pair for every one of a 248k row.
+const SCAN_TOP_K: usize = 64;
+
+/// The `k` largest entries of `logits`, highest first and ties to the lower
+/// id: the set and order a full partition by that rule gives, in one pass and
+/// without a pair per entry.
+fn scan_top_k(logits: &[f32], k: usize) -> Vec<(f32, u32)> {
+    let mut top: Vec<(f32, u32)> = Vec::with_capacity(k + 1);
+    for (i, &l) in logits.iter().enumerate() {
+        // Ids arrive in increasing order, so an entry that only ties the last
+        // kept one ranks below it and is turned away.
+        if top.len() == k && top.last().is_some_and(|last| l.total_cmp(&last.0).is_le()) {
+            continue;
+        }
+        // After every kept entry at or above it: those are higher, or tie it
+        // with a lower id.
+        let at = top.partition_point(|kept| kept.0.total_cmp(&l).is_ge());
+        top.insert(at, (l, u32::try_from(i).unwrap_or(u32::MAX)));
+        top.truncate(k);
+    }
+    top
 }
 
 /// A uniform in `(0, 1)` from `(key, position, id)`: three rounds of the
@@ -844,6 +914,73 @@ pub(crate) fn keyed_uniform(key: u64, position: u32, id: u32) -> f32 {
 #[cfg(test)]
 #[expect(clippy::cast_precision_loss, reason = "small fixture values")]
 mod keyed_tests {
+    use super::keyed_sample_ids;
+    use super::scan_top_k;
+
+    /// Through the identity table the narrowed draw is the whole-row draw,
+    /// and through a sparse one it draws the token the whole-row draw would
+    /// over a row where every other id is out of reach.
+    #[test]
+    fn a_narrowed_row_draws_by_token_id() {
+        let mut state = 0x1234_5678_u32;
+        let row: Vec<f32> = (0..512)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 8) as f32 / 16_777_216.0 * 8.0
+            })
+            .collect();
+        let identity: Vec<u32> = (0..512).collect();
+        let p = params(1.0, 20, 0.95);
+        for pos in 0..64 {
+            assert_eq!(
+                keyed_sample_ids(&row, &identity, &p, 9, pos),
+                keyed_sample(&row, &p, 9, pos)
+            );
+        }
+        // Every other id of a 1024 vocabulary: the whole row carries the same
+        // values at the kept ids and nothing elsewhere.
+        let ids: Vec<u32> = (0..512).map(|i| i * 2).collect();
+        let mut whole = vec![f32::NEG_INFINITY; 1024];
+        for (i, &id) in ids.iter().enumerate() {
+            whole[id as usize] = row[i];
+        }
+        for pos in 0..64 {
+            assert_eq!(
+                keyed_sample_ids(&row, &ids, &p, 9, pos),
+                keyed_sample(&whole, &p, 9, pos)
+            );
+        }
+    }
+
+    /// The scan keeps the set and order a full partition keeps, ties and
+    /// all: rows with repeated values are where an insertion rule and a
+    /// partition rule part ways first.
+    #[test]
+    fn the_scanned_top_k_is_the_partitioned_top_k() {
+        let mut state = 0x9e37_79b9_u32;
+        for case in 0..64_u32 {
+            let len = 50 + (case as usize * 37) % 400;
+            let row: Vec<f32> = (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    // Few distinct values, so ties are common.
+                    ((state >> 24) % 9) as f32 - 4.0
+                })
+                .collect();
+            for k in [1_usize, 2, 7, 20, 40, 64] {
+                let k = k.min(len);
+                let mut all: Vec<(f32, u32)> = row
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &l)| (l, u32::try_from(i).expect("an id")))
+                    .collect();
+                all.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                all.truncate(k);
+                assert_eq!(scan_top_k(&row, k), all, "case {case}, k {k}");
+            }
+        }
+    }
+
     use super::keyed_sample;
     use shiso_core::{SamplingParams, TokenId};
 

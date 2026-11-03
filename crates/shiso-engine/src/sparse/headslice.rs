@@ -68,6 +68,12 @@ impl HeadSlice {
         u32::try_from(self.ids.len()).unwrap_or(u32::MAX)
     }
 
+    /// The vocabulary ids the narrowed matrix's rows stand for, ascending.
+    #[must_use]
+    pub fn ids(&self) -> &[u32] {
+        &self.ids
+    }
+
     /// The vocabulary id at `row` of the narrowed matrix.
     #[must_use]
     pub fn id(&self, row: u32) -> Option<u32> {

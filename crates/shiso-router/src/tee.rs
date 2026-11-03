@@ -102,6 +102,12 @@ pub(crate) struct Usage {
 }
 
 const MAX_SSE_LINE: usize = 64 * 1024;
+/// Line cap for the Responses dialect. Its `response.created` and
+/// `response.completed` frames carry the whole envelope, echoed
+/// `instructions` included, so an agent with a long system prompt sends
+/// frames far past `MAX_SSE_LINE`; the terminal one is the very object a
+/// blocking caller gets, so it gets the same budget as a JSON body.
+const MAX_RESPONSES_SSE_LINE: usize = MAX_JSON_BUFFER;
 const MAX_JSON_BUFFER: usize = 4 * 1024 * 1024;
 /// Size of each edge window kept by `Mode::Edges`. Only needs to cover the
 /// non-payload part of the body (`usage` plus a few scalar fields), so a
@@ -273,7 +279,7 @@ impl UsageAccumulator {
                     if keep_tail {
                         push_window(oversized_tail, rest);
                     }
-                } else if partial.len() + rest.len() > MAX_SSE_LINE {
+                } else if partial.len() + rest.len() > sse_line_cap(self.dialect) {
                     // Give up on parsing this line whole; scan for the next
                     // newline. A line this long carries a payload, so it
                     // is never a prologue.
@@ -358,6 +364,15 @@ impl UsageAccumulator {
             finish_reason: ext.finish_reason,
             error: ext.body_error,
         }
+    }
+}
+
+/// The longest SSE line parsed whole for `dialect`; a longer one is skipped
+/// (`Dialect::Images` recovers usage from its tail).
+fn sse_line_cap(dialect: Dialect) -> usize {
+    match dialect {
+        Dialect::OpenAiResponses => MAX_RESPONSES_SSE_LINE,
+        _ => MAX_SSE_LINE,
     }
 }
 
@@ -990,6 +1005,40 @@ mod tests {
         assert_eq!(usage.completion_tokens, Some(9));
         assert_eq!(usage.cached_tokens, Some(30));
         assert_eq!(usage.finish_reason.as_deref(), Some("completed"));
+    }
+
+    /// Every Responses envelope echoes `instructions`, so an agent with a
+    /// long system prompt sends `response.created` and `response.completed`
+    /// frames far over `MAX_SSE_LINE`. Whether such a frame reached the
+    /// accumulator in one read or several used to decide whether it was
+    /// parsed, so the same conversation logged usage on some turns and not
+    /// others. Both arrivals must read the same.
+    #[test]
+    fn responses_envelope_with_long_instructions_parses_however_it_is_chunked() {
+        let instructions = "x".repeat(80 * 1024);
+        let created = format!(
+            "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"status\":\"in_progress\",\"instructions\":\"{instructions}\",\"usage\":null}}}}\n\n"
+        );
+        let completed = format!(
+            "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"instructions\":\"{instructions}\",\"usage\":{{\"input_tokens\":110389,\"output_tokens\":1180,\"input_tokens_details\":{{\"cached_tokens\":110125}}}}}}}}\n\n"
+        );
+        let whole = feed(
+            Dialect::OpenAiResponses,
+            true,
+            &[created.as_bytes(), completed.as_bytes()],
+        );
+        let pieces: Vec<&[u8]> = created
+            .as_bytes()
+            .chunks(8 * 1024)
+            .chain(completed.as_bytes().chunks(8 * 1024))
+            .collect();
+        let split = feed(Dialect::OpenAiResponses, true, &pieces);
+        for usage in [whole, split] {
+            assert_eq!(usage.prompt_tokens, Some(110389));
+            assert_eq!(usage.completion_tokens, Some(1180));
+            assert_eq!(usage.cached_tokens, Some(110125));
+            assert_eq!(usage.finish_reason.as_deref(), Some("completed"));
+        }
     }
 
     #[test]

@@ -592,17 +592,19 @@ pub struct Speculated {
 }
 
 /// What a drafter may know about how the caller will choose tokens: the
-/// sequence's sampling key and temperature.
+/// sequence's sampling key and the settings its keyed draw runs.
 ///
 /// A drafter that scores its candidates with the same noise the caller's keyed
 /// draw will add proposes the token that draw is likely to land on, rather than
-/// the most likely token. Only acceptance depends on it.
+/// the most likely token; one that draws by the same settings too lands on it
+/// wherever the two rows agree. Only acceptance depends on it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DraftHint {
     /// The key the caller's keyed draw uses.
     pub key: u64,
-    /// The temperature it divides by; zero or below is a greedy caller.
-    pub temperature: f32,
+    /// The settings it draws by; a temperature of zero or below is a greedy
+    /// caller.
+    pub sampling: SamplingParams,
 }
 
 impl DraftHint {
@@ -611,7 +613,12 @@ impl DraftHint {
     pub const fn greedy() -> Self {
         Self {
             key: 0,
-            temperature: 0.0,
+            sampling: SamplingParams {
+                temperature: 0.0,
+                top_k: None,
+                top_p: 1.0,
+                min_p: 0.0,
+            },
         }
     }
 }
@@ -628,10 +635,32 @@ impl DraftHint {
 pub struct VerifiedBlock {
     /// The tokens drafted behind `first`, in order.
     pub drafts: Vec<TokenId>,
-    /// `drafts.len() + 1` rows of `vocab` logits, back to back.
+    /// `drafts.len() + 1` rows of `vocab` logits, back to back - or empty,
+    /// when `tops` carries the rows instead.
     pub logits: Vec<f32>,
     /// Entries in one row.
     pub vocab: usize,
+    /// Each row's highest entries in place of the row: `drafts.len() + 1` of
+    /// them, or empty when `logits` carries the rows.
+    ///
+    /// A family hands these only to a caller whose draw has a top-k stage no
+    /// wider than they are (its [`DraftHint`] says so), because over those the
+    /// draw is the whole row's.
+    pub tops: Vec<RowTop>,
+}
+
+/// One logits row's highest entries, larger first and ties to the lower id,
+/// held ascending by token id: `values[i]` is token `ids[i]`'s logit.
+///
+/// A keyed draw with a top-k stage of `k` reads a row's top `k` and nothing
+/// else - its nucleus and floor are cut from those - so over this it draws what
+/// it would over the row whenever `k <= ids.len()`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowTop {
+    /// The entries' token ids, ascending.
+    pub ids: Vec<TokenId>,
+    /// Their logits, in the same order.
+    pub values: Vec<f32>,
 }
 
 impl VerifiedBlock {
@@ -746,6 +775,74 @@ pub trait Speculating: Model {
             backend: "model",
         })
     }
+
+    /// [`Speculating::verify_block`] for several sessions in one pass over the
+    /// weights: `steps[i]` is session `i`'s, and block `i` of the answer is
+    /// what `verify_block` would have answered for it.
+    ///
+    /// What lets a batch with sampled members speculate together. Each block
+    /// is chosen over by its own sequence's rule, exactly as a solo block is,
+    /// and [`Speculating::settle_blocks`] is then told how many of each were
+    /// kept.
+    ///
+    /// The default is `None`: a family that verifies sessions one at a time
+    /// answers for one session through `verify_block` and for a batch not at
+    /// all.
+    ///
+    /// # Errors
+    ///
+    /// As [`Speculating::verify_block`] for any session.
+    // None: this family has no batched two-phase step.
+    fn verify_blocks(&mut self, steps: &[BlockStep<'_>]) -> CoreResult<Option<Vec<VerifiedBlock>>> {
+        let _ = steps;
+        Ok(None)
+    }
+
+    /// Commits, for every session of the blocks
+    /// [`Speculating::verify_blocks`] returned, its `first` and as many of its
+    /// drafts as `kept` says, in the order the sessions were verified.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Unsupported`] for a family with no batched two-phase step,
+    /// or `kept` that does not name the verified sessions in order;
+    /// [`CoreError::ShapeMismatch`] for more kept drafts than a session
+    /// drafted; and whatever the device reports.
+    fn settle_blocks(&mut self, kept: &[KeptDrafts]) -> CoreResult<()> {
+        let _ = kept;
+        Err(CoreError::Unsupported {
+            what: "a batched two-phase speculative step on a family that has none",
+            backend: "model",
+        })
+    }
+}
+
+/// One session's part of a batched two-phase step: what
+/// [`Speculating::verify_block`] takes for that session alone.
+///
+/// Deliberately NOT `#[non_exhaustive]`: the scheduler builds one per row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlockStep<'a> {
+    /// The session to step.
+    pub session: SessionId,
+    /// The token the step commits unconditionally.
+    pub first: TokenId,
+    /// How the caller will choose this session's tokens.
+    pub hint: DraftHint,
+    /// What the caller already knows comes next, or empty.
+    pub proposal: &'a [TokenId],
+}
+
+/// How many drafts one session of a batched two-phase step kept: see
+/// [`Speculating::settle_blocks`].
+///
+/// Deliberately NOT `#[non_exhaustive]`: the scheduler builds one per row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeptDrafts {
+    /// The session the count is for.
+    pub session: SessionId,
+    /// The drafts it kept, the first `accepted` of its block's.
+    pub accepted: u32,
 }
 
 #[cfg(test)]

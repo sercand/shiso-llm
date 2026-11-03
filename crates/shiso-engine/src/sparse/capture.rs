@@ -415,6 +415,9 @@ pub struct OptionalPaths {
     pub lowp_prefill: bool,
     /// The one-launch routed selection a decode-sized pass takes.
     pub route_sort: crate::sparse::matmul::RouteSort,
+    /// The top-of-row kernel ([`crate::sparse::scratch::Buf::RowTop`]) a
+    /// verify hands a sampling caller in place of whole rows.
+    pub row_top: bool,
 }
 
 /// Asks the device which optional paths it has kernels for.
@@ -464,6 +467,7 @@ pub fn optional_paths(backend: &dyn Backend) -> OptionalPaths {
         } else {
             crate::sparse::matmul::RouteSort::Small
         },
+        row_top: has(kernels::MOD_SAMPLE, "sample_top_rows_kernel"),
     };
     tracing::info!(?paths, "optional sparse kernel paths this device has");
     paths

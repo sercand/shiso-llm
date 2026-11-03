@@ -31,6 +31,7 @@ pub mod matvec;
 pub mod misc;
 pub mod mxfp8;
 pub mod nvfp4;
+pub mod p12;
 pub mod ple;
 pub mod ple_nvfp4;
 pub mod qsa;

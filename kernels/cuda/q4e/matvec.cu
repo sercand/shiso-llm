@@ -330,9 +330,37 @@ __global__ void q4e_matmul_p12_rows_kernel(
 
 /* The packed weight expanded back to its stored halves (or to the floats they
  * are), for the multiply tier a prefill chunk takes: exactly the tensor the
- * checkpoint held.  One block a row. */
+ * checkpoint held.  One block a row.
+ *
+ * Eight columns a thread wherever the contraction is a multiple of eight: one
+ * 8-byte mantissa load, one 4-byte exponent load and 16-byte stores, all
+ * aligned because the mantissa and exponent planes and every row of them start
+ * on such a multiple.  A column at a time, the stores were two bytes a thread
+ * and the expansion ran at ~85 GB/s on a GB10, ~25 ms of every short prompt
+ * pass.  Both paths decode a column the same way (q4e_p12_half), so the
+ * expanded tensor is the same bits. */
 __device__ __forceinline__ static void q4e_p12_put(__half *dst, uint16_t bits) { *dst = __ushort_as_half(bits); }
 __device__ __forceinline__ static void q4e_p12_put(float *dst, uint16_t bits) { *dst = __half2float(__ushort_as_half(bits)); }
+__device__ __forceinline__ static uint32_t q4e_p12_half(uint32_t byte, uint32_t code, int base) {
+    return code ? (((byte & 0x80u) << 8) | ((uint32_t)(base + (int)code) << 10) | ((byte & 0x7fu) << 3)) : 0u;
+}
+/* Eight decoded halves to the destination: one 16-byte store of halves, or
+ * two of the floats they are. */
+__device__ __forceinline__ static void q4e_p12_put8(__half *dst, const uint32_t (&h)[8]) {
+    uint4 v;
+    v.x = h[0] | (h[1] << 16); v.y = h[2] | (h[3] << 16);
+    v.z = h[4] | (h[5] << 16); v.w = h[6] | (h[7] << 16);
+    *(uint4 *)dst = v;
+}
+__device__ __forceinline__ static void q4e_p12_put8(float *dst, const uint32_t (&h)[8]) {
+    float4 a, b;
+    a.x = __half2float(__ushort_as_half((uint16_t)h[0])); a.y = __half2float(__ushort_as_half((uint16_t)h[1]));
+    a.z = __half2float(__ushort_as_half((uint16_t)h[2])); a.w = __half2float(__ushort_as_half((uint16_t)h[3]));
+    b.x = __half2float(__ushort_as_half((uint16_t)h[4])); b.y = __half2float(__ushort_as_half((uint16_t)h[5]));
+    b.z = __half2float(__ushort_as_half((uint16_t)h[6])); b.w = __half2float(__ushort_as_half((uint16_t)h[7]));
+    ((float4 *)dst)[0] = a;
+    ((float4 *)dst)[1] = b;
+}
 template <typename OUT>
 __global__ void q4e_p12_expand_kernel(OUT *dst, const uint8_t *w, uint32_t in_dim, uint32_t out_dim) {
     const uint32_t row = blockIdx.x;
@@ -340,11 +368,27 @@ __global__ void q4e_p12_expand_kernel(OUT *dst, const uint8_t *w, uint32_t in_di
     const Q4eP12 v = q4e_p12_view(w, in_dim, out_dim);
     const int base = v.base[row];
     OUT *dr = dst + (uint64_t)row * in_dim;
-    for (uint32_t c = threadIdx.x; c < in_dim; c += blockDim.x) {
-        const uint32_t byte = v.mant[(uint64_t)row * in_dim + c];
-        const uint32_t code = (v.expo[(uint64_t)row * (in_dim / 2u) + c / 2u] >> ((c & 1u) * 4u)) & 0xfu;
-        const uint32_t h = code ? (((byte & 0x80u) << 8) | ((uint32_t)(base + (int)code) << 10) | ((byte & 0x7fu) << 3)) : 0u;
-        q4e_p12_put(dr + c, (uint16_t)h);
+    if ((in_dim & 7u) == 0u) {
+        const uint8_t *mr = v.mant + (uint64_t)row * in_dim;
+        const uint8_t *er = v.expo + (uint64_t)row * (in_dim / 2u);
+        for (uint32_t g = threadIdx.x; g < in_dim / 8u; g += blockDim.x) {
+            const uint2 m = *(const uint2 *)(mr + (uint64_t)g * 8u);
+            const uint32_t e = *(const uint32_t *)(er + (uint64_t)g * 4u);
+            uint32_t h[8];
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const uint32_t byte = ((i < 4 ? m.x : m.y) >> ((i & 3) * 8)) & 0xffu;
+                const uint32_t code = (e >> (i * 4)) & 0xfu;
+                h[i] = q4e_p12_half(byte, code, base);
+            }
+            q4e_p12_put8(dr + (uint64_t)g * 8u, h);
+        }
+    } else {
+        for (uint32_t c = threadIdx.x; c < in_dim; c += blockDim.x) {
+            const uint32_t byte = v.mant[(uint64_t)row * in_dim + c];
+            const uint32_t code = (v.expo[(uint64_t)row * (in_dim / 2u) + c / 2u] >> ((c & 1u) * 4u)) & 0xfu;
+            q4e_p12_put(dr + c, (uint16_t)q4e_p12_half(byte, code, base));
+        }
     }
     __syncthreads();
     for (uint32_t k = v.ptr[row] + threadIdx.x; k < v.ptr[row + 1u]; k += blockDim.x) q4e_p12_put(dr + v.col[k], v.val[k]);

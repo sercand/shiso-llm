@@ -99,6 +99,17 @@ pub(crate) struct CkptStore {
     cap: u32,
     /// Slots dropped by eviction since the store was built.
     evictions: u64,
+    /// An evicted slot's blob nothing else holds, kept for the next fill.
+    ///
+    /// A blob is tens of mebibytes, and an allocation that size comes straight
+    /// from the operating system: a fill into a new one paid a page fault for
+    /// every page of it, about 40 ms of the engine thread a checkpoint on a
+    /// GB10, where copying into one already mapped costs the copy. One is
+    /// enough - every eviction to make room is followed by the fill it made
+    /// room for - and holding it never exceeds the table's budget: a spare
+    /// exists only while the slot it came from is empty, and the next fill
+    /// takes it before anything else is allocated.
+    spare: Option<Arc<[u8]>>,
 }
 
 impl CkptStore {
@@ -113,6 +124,7 @@ impl CkptStore {
             geometry,
             cap,
             evictions: 0,
+            spare: None,
         }
     }
 
@@ -358,8 +370,18 @@ impl CkptStore {
                 got: state.len(),
             });
         }
+        let stored = match self.spare.take() {
+            Some(mut spare) if spare.len() == state.len() => match Arc::get_mut(&mut spare) {
+                Some(bytes) => {
+                    bytes.copy_from_slice(state);
+                    spare
+                }
+                None => Arc::from(state),
+            },
+            _ => Arc::from(state),
+        };
         let entry = &mut self.slots[slot.index()];
-        entry.state = Some(Arc::from(state));
+        entry.state = Some(stored);
         entry.logits = logits.map(Arc::from);
         entry.node = Some(node);
         entry.hit = now;
@@ -379,11 +401,18 @@ impl CkptStore {
     /// an eviction loop pick the same victim forever.
     pub(crate) fn evict(&mut self, slot: SlotId) -> Option<NodeId> {
         let entry = self.slots.get_mut(slot.index())?;
-        if entry.state.is_some() {
+        if let Some(state) = entry.state.take() {
             self.evictions += 1;
+            // Only a blob no reader still holds: a disk write behind may keep a
+            // clone until it is done, and a spare must be the store's alone.
+            if self.spare.is_none()
+                && Arc::strong_count(&state) == 1
+                && Arc::weak_count(&state) == 0
+            {
+                self.spare = Some(state);
+            }
         }
         let owner = entry.node;
-        entry.state = None;
         entry.logits = None;
         entry.node = None;
         entry.standing = Standing::Earned;
@@ -622,6 +651,57 @@ mod tests {
             }
         ));
         assert!(!store.is_live(slot.slot));
+    }
+
+    /// A fill after an eviction writes into the evicted blob rather than a new
+    /// allocation, and reads back what it was given.
+    #[test]
+    fn a_fill_after_an_eviction_reuses_the_evicted_blob() {
+        let mut store = CkptStore::new(geometry(), 1);
+        let slot = store.alloc(1.0, true, Standing::Earned, &[]).expect("room");
+        fill(&mut store, slot.slot, 3, 1.0);
+        let first = store.slots[slot.slot.index()]
+            .state
+            .as_ref()
+            .map(|state| state.as_ptr())
+            .expect("filled");
+        store.evict(slot.slot);
+        let again = store.alloc(2.0, true, Standing::Earned, &[]).expect("room");
+        let mut other = blob();
+        other[7] = 0xA5;
+        let reference = store
+            .fill(again.slot, NodeId::new(4), 400, &other, None, 2.0)
+            .expect("a whole blob");
+        let reused = store.slots[again.slot.index()]
+            .state
+            .as_ref()
+            .map(|state| state.as_ptr())
+            .expect("filled");
+        assert_eq!(reused, first, "the evicted blob is the new one's storage");
+        let mut back = vec![0u8; other.len()];
+        store.state_into(reference, &mut back).expect("reads");
+        assert_eq!(back, other);
+    }
+
+    /// A blob a reader still holds is never written through: the next fill
+    /// allocates, and the reader's copy keeps what it had.
+    #[test]
+    fn a_blob_a_reader_holds_is_not_reused() {
+        let mut store = CkptStore::new(geometry(), 1);
+        let slot = store.alloc(1.0, true, Standing::Earned, &[]).expect("room");
+        fill(&mut store, slot.slot, 3, 1.0);
+        let held = store.slots[slot.slot.index()]
+            .state
+            .clone()
+            .expect("filled");
+        store.evict(slot.slot);
+        let again = store.alloc(2.0, true, Standing::Earned, &[]).expect("room");
+        let mut other = blob();
+        other[7] = 0xA5;
+        store
+            .fill(again.slot, NodeId::new(4), 400, &other, None, 2.0)
+            .expect("a whole blob");
+        assert_eq!(&held[..], &blob()[..], "the reader's blob is unchanged");
     }
 
     #[test]

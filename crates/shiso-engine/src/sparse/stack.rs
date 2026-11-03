@@ -177,12 +177,36 @@ pub struct SparseOptions {
     /// Tokens the prompt lookup may propose a step, zero for none; at most
     /// [`SparseOptions::spec`]. See [`crate::sparse::mtp::propose`].
     pub lookup_drafts: u32,
+    /// The probability under which the head's chain stops, zero for never.
+    ///
+    /// A guess the head itself thinks unlikely - its temperature-one
+    /// probability for the token it proposes - is a verify row the target
+    /// mostly rejects, and every guess after it is one the target can only
+    /// keep if it kept that one. The head's first guess is always made: a
+    /// step with no guess at all saves only that one head pass.
+    pub draft_confidence: f32,
+    /// What a two-phase verify hands a sampling caller: whole rows, or each
+    /// row's top ([`crate::sparse::scratch::Buf::RowTop`]) where the caller's
+    /// draw only reads a top. [`VerifyRows::Top`] is set by a caller that
+    /// found the kernel on its device; the default keeps reading whole rows,
+    /// which every kernel set can.
+    pub verify_rows: VerifyRows,
     /// Whether the loader repacks half-precision projections to
     /// [`shiso_core::DType::F16Pack12`] (see [`crate::sparse::pack12`]).
     ///
     /// Off by default because only the device kernel set reads the packed form;
     /// a server on a device that has it turns it on.
     pub pack_halves: bool,
+}
+
+/// What a two-phase verify reads back for a caller that draws its own tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyRows {
+    /// Every row whole: a megabyte a row, and any draw at all.
+    Whole,
+    /// Each row's top entries, for a caller whose draw has a top-k stage no
+    /// wider than they are; whole rows for any other.
+    Top,
 }
 
 impl SparseOptions {
@@ -214,6 +238,8 @@ impl SparseOptions {
             prefill_rows: MAX_PREFILL_CHUNK,
             head_drafts: u32::MAX,
             lookup_drafts: 0,
+            draft_confidence: 0.0,
+            verify_rows: VerifyRows::Whole,
             pack_halves: false,
         }
     }
@@ -706,6 +732,9 @@ pub struct SparseStack {
     pub(crate) batch_slots: std::sync::Mutex<HashMap<u64, u32>>,
     /// Step passes kept for reuse; see [`crate::sparse::plancache`].
     pub(crate) plans: crate::sparse::plancache::PlanCache,
+    /// The verify a caller is choosing over, until it settles: see
+    /// [`SparseStack::verify_blocks`].
+    pub(crate) verified: Vec<crate::sparse::draft::VerifiedRound>,
 }
 
 impl std::fmt::Debug for SparseStack {
@@ -733,6 +762,7 @@ impl std::fmt::Debug for SparseStack {
             )
             .field("staging", &self.staging)
             .field("kept_plans", &self.plans.len())
+            .field("verified", &self.verified.len())
             .field("clock", &self.clock)
             .field("layers", &self.desc.layers.len())
             .finish()
@@ -962,6 +992,7 @@ impl SparseStack {
             tap: None,
             batch_slots: std::sync::Mutex::new(HashMap::new()),
             plans: crate::sparse::plancache::PlanCache::default(),
+            verified: Vec::new(),
         })
     }
 

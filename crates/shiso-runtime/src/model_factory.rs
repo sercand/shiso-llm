@@ -1289,6 +1289,7 @@ fn sparse_options(
         head_drafts: args.spec_k,
         pack_halves: !args.no_pack_halves,
         lookup_drafts: if args.spec_k > 0 { args.spec_lookup } else { 0 },
+        draft_confidence: args.spec_confidence,
         graphs: shiso_engine::sparse::island::GraphPolicy {
             spec_depth: depth.get(),
             capture_verify: args.capture_verify,
@@ -1302,6 +1303,11 @@ fn sparse_options(
         prompt_matmul: paths.prompt_matmul,
         prefill_activations,
         route_sort: paths.route_sort,
+        verify_rows: if paths.row_top {
+            shiso_engine::sparse::stack::VerifyRows::Top
+        } else {
+            shiso_engine::sparse::stack::VerifyRows::Whole
+        },
         chunk: shiso_engine::sparse::recurrent::ChunkPolicy {
             available: paths.chunked_recurrence,
             fused: paths.fused_recurrence,

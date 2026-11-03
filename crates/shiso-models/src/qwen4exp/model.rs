@@ -72,7 +72,8 @@ use shiso_core::ids::{SessionId, TokenId};
 use shiso_core::ledger::{self, MemTag};
 use shiso_core::media::{MediaModel, VisionPrefill};
 use shiso_core::model::{
-    DecodeStep, Logits, Model, ModelInfo, PromptRun, Speculated, Speculating, StopTokens,
+    BlockStep, DecodeStep, DraftHint, KeptDrafts, Logits, Model, ModelInfo, PromptRun, Speculated,
+    Speculating, StopTokens, VerifiedBlock,
 };
 
 use shiso_engine::sparse::headslice;
@@ -1219,6 +1220,44 @@ impl Speculating for Qwen4ExpModel {
             [(session, first)] => Ok(vec![self.stack.speculate(*session, *first, eos)?]),
             _ => self.stack.speculate_batch(steps, eos),
         }
+    }
+
+    // None never: the stack verifies any session in two phases, the head
+    // drawing its guesses by the caller's rule.
+    fn verify_block(
+        &mut self,
+        session: SessionId,
+        first: TokenId,
+        hint: DraftHint,
+        proposal: &[TokenId],
+    ) -> CoreResult<Option<VerifiedBlock>> {
+        self.verify_blocks(&[BlockStep {
+            session,
+            first,
+            hint,
+            proposal,
+        }])
+        .map(|blocks| blocks.and_then(|mut blocks| blocks.pop()))
+    }
+
+    fn settle_block(
+        &mut self,
+        session: SessionId,
+        block: VerifiedBlock,
+        accepted: u32,
+    ) -> CoreResult<()> {
+        let _ = block;
+        self.settle_blocks(&[KeptDrafts { session, accepted }])
+    }
+
+    // None never: one segmented pass verifies every session.
+    fn verify_blocks(&mut self, steps: &[BlockStep<'_>]) -> CoreResult<Option<Vec<VerifiedBlock>>> {
+        let eos = self.info.stop_tokens.primary();
+        self.stack.verify_blocks(steps, eos).map(Some)
+    }
+
+    fn settle_blocks(&mut self, kept: &[KeptDrafts]) -> CoreResult<()> {
+        self.stack.settle_verified(kept)
     }
 }
 

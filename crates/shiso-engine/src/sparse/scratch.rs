@@ -36,7 +36,7 @@ use shiso_core::page::MROPE_BACK;
 use crate::sparse::inputs::MROPE_AXES;
 use crate::sparse::kernels::{
     ATTN_GSPLITS, ATTN_QT, ATTN_SPLITS, F16_BYTES, F32_BYTES, I32_BYTES, IDX_DIM, IDX_QUERY_BLOCK,
-    IDX_WIDTH,
+    IDX_WIDTH, ROW_TOP,
 };
 use crate::sparse::shape::SparseShape;
 
@@ -262,6 +262,13 @@ pub enum Buf {
     Logits,
     /// The greedy pick of every logits row.
     Argmax,
+    /// The [`crate::sparse::kernels::ROW_TOP`] highest entries of every
+    /// logits row, ascending by token id: that many `f32` values a row, then
+    /// that many `u32` ids a row, each half back to back over the rows.
+    ///
+    /// What a caller that draws its own tokens reads in place of a whole row,
+    /// wherever its draw only ever looks at the top of one.
+    RowTop,
     /// The token ids no pick may land on, as `[count, id...]` with room for
     /// [`SUPPRESS_CAPACITY`] ids.
     ///
@@ -303,7 +310,7 @@ fn fused_qk_bytes(shape: &SparseShape, run_rows: u64) -> u64 {
 
 impl Buf {
     /// Every buffer, in allocation order.
-    pub const ALL: [Self; 80] = [
+    pub const ALL: [Self; 81] = [
         Self::Ids,
         Self::Positions,
         Self::Mrope,
@@ -381,6 +388,7 @@ impl Buf {
         Self::RowPointers,
         Self::Logits,
         Self::Argmax,
+        Self::RowTop,
         Self::Suppress,
         Self::HalfActivation,
         Self::ProjectionPartial,
@@ -393,6 +401,11 @@ impl Buf {
         reason = "one arm per buffer group is the point: two buffers that happen \
                   to be the same width today are still two different formulas, and \
                   merging them would hide the next divergence"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per buffer, and every buffer the scratch holds has one: \
+                  the length is the buffer count"
     )]
     pub fn bytes(self, shape: &SparseShape, rows: u32, logit_rows: u32, ctx: u32) -> u64 {
         let rows = u64::from(rows);
@@ -524,6 +537,7 @@ impl Buf {
             }
             Self::Logits => u64::from(logit_rows) * u64::from(shape.vocab) * F32_BYTES,
             Self::Argmax => u64::from(logit_rows) * I32_BYTES,
+            Self::RowTop => u64::from(logit_rows) * u64::from(ROW_TOP) * 2 * F32_BYTES,
             Self::Suppress => (u64::from(SUPPRESS_CAPACITY) + 1) * I32_BYTES,
             // The two split projections bound their own partial sets: the
             // single-precision one keeps the output width times the split at or
