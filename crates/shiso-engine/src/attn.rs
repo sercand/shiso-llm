@@ -31,7 +31,7 @@
 use std::sync::Arc;
 
 use crate::shape::AttnLayer;
-use shiso_core::backend::Backend;
+use shiso_core::backend::{Backend, KernelRef};
 use shiso_core::buffer::{DeviceBuffer, DeviceView, alloc};
 use shiso_core::error::{CoreError, CoreResult};
 
@@ -129,6 +129,23 @@ impl AttnGeometry {
     pub(crate) fn out_row_bytes(&self) -> u64 {
         u64::from(self.n_head)
             .saturating_mul(u64::from(self.head_dim))
+            .saturating_mul(F32_BYTES)
+    }
+
+    /// Bytes of one token's split-K decode value sums: for every query head,
+    /// [`crate::launch::ATTN_DECODE_SPLITS`] slots of `head_dim` floats.
+    #[must_use]
+    pub(crate) fn partial_acc_row_bytes(&self) -> u64 {
+        self.out_row_bytes()
+            .saturating_mul(u64::from(crate::launch::ATTN_DECODE_SPLITS))
+    }
+
+    /// Bytes of one token's split-K decode (max, denominator) pairs.
+    #[must_use]
+    pub(crate) fn partial_ml_row_bytes(&self) -> u64 {
+        u64::from(self.n_head)
+            .saturating_mul(u64::from(crate::launch::ATTN_DECODE_SPLITS))
+            .saturating_mul(2)
             .saturating_mul(F32_BYTES)
     }
 
@@ -366,6 +383,10 @@ pub struct AttnScratchSizes {
     pub kv_row_bytes: u64,
     /// Bytes of one token's attention output, before the output projection.
     pub out_row_bytes: u64,
+    /// Bytes of one token's split-K decode value sums.
+    pub partial_acc_row_bytes: u64,
+    /// Bytes of one token's split-K decode (max, denominator) pairs.
+    pub partial_ml_row_bytes: u64,
 }
 
 impl AttnScratchSizes {
@@ -380,6 +401,11 @@ impl AttnScratchSizes {
             sizes.q_row_bytes = sizes.q_row_bytes.max(slot.q_row_bytes());
             sizes.kv_row_bytes = sizes.kv_row_bytes.max(slot.kv_row_bytes());
             sizes.out_row_bytes = sizes.out_row_bytes.max(slot.out_row_bytes());
+            sizes.partial_acc_row_bytes = sizes
+                .partial_acc_row_bytes
+                .max(slot.partial_acc_row_bytes());
+            sizes.partial_ml_row_bytes =
+                sizes.partial_ml_row_bytes.max(slot.partial_ml_row_bytes());
         }
         sizes
     }
@@ -400,6 +426,26 @@ pub struct AttnScratch {
     pub gate: DeviceBuffer,
     /// The softmax's output, which the gate scales in place.
     pub attn: DeviceBuffer,
+    /// Split-K decode partials, for the rows a decode-shaped pass carries.
+    ///
+    /// `None` on a backend that has no merge entry, which runs the single-pass
+    /// decode softmax instead and so never reads one.
+    pub partials: Option<DecodePartials>,
+}
+
+/// The two halves of the split-K decode attention's partial scratch.
+///
+/// Sized for the widest decode-shaped pass, which is the prefill tile less one
+/// row: a pass of a full tile or more runs the tiled softmax, which keeps no
+/// partials.
+#[derive(Debug)]
+pub struct DecodePartials {
+    /// Weighted value sums, `[rows][n_head][splits][head_dim]` floats.
+    pub acc: DeviceBuffer,
+    /// Running (max, denominator) pairs, `[rows][n_head][splits][2]` floats.
+    pub ml: DeviceBuffer,
+    /// Rows the two buffers hold.
+    pub rows: u32,
 }
 
 impl AttnScratch {
@@ -420,6 +466,29 @@ impl AttnScratch {
         let qkv = sizes.q_row_bytes.saturating_mul(tokens);
         let kv = sizes.kv_row_bytes.saturating_mul(tokens);
         let out = sizes.out_row_bytes.saturating_mul(tokens);
+        let partials = if sizes.partial_acc_row_bytes > 0
+            && backend
+                .max_block_threads(KernelRef::new(
+                    crate::launch::Q35,
+                    crate::launch::ATTN_DECODE_MERGE_ENTRY,
+                ))
+                .is_some()
+        {
+            let rows = n_tok.clamp(1, crate::launch::ATTN_PREFILL_TILE - 1);
+            Some(DecodePartials {
+                acc: alloc(
+                    backend,
+                    sizes.partial_acc_row_bytes.saturating_mul(u64::from(rows)),
+                )?,
+                ml: alloc(
+                    backend,
+                    sizes.partial_ml_row_bytes.saturating_mul(u64::from(rows)),
+                )?,
+                rows,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             qkv: alloc(backend, qkv)?,
             k: alloc(backend, kv)?,
@@ -427,6 +496,7 @@ impl AttnScratch {
             q: alloc(backend, out)?,
             gate: alloc(backend, out)?,
             attn: alloc(backend, out)?,
+            partials,
         })
     }
 }

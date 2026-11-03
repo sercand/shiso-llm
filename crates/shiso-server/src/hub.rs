@@ -282,6 +282,15 @@ fn populate_serve_args_from_variant(
             Role::ImageTextEncoder => args.image_text_encoder = Some(target_path),
             Role::ImageVae => args.image_vae = Some(target_path),
             Role::ImageTokenizer => args.image_tokenizer = Some(target_path),
+            // The publisher's sampling defaults, which an operator's own
+            // `--generation-config` overrides rather than conflicts with: the
+            // file changes no weight and no shape, only what an unset request
+            // field means.
+            Role::GenerationConfig => {
+                if args.generation_config.is_none() {
+                    args.generation_config = Some(target_path);
+                }
+            }
         }
     }
 
@@ -766,13 +775,13 @@ pub fn run_rm(args: &RmArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use clap::{CommandFactory as _, FromArgMatches as _};
     use shiso_hub::recipe::{Recipe, Role};
     use shiso_hub::validate::{ValidationMode, validate_recipe};
 
-    use super::populate_serve_args_from_variant;
+    use super::{check_component_flag_conflicts, populate_serve_args_from_variant};
     use crate::cli::{Cli, ServeArgs, apply_recipe_defaults};
 
     /// The recipe the registry fixture carries for the sparse family: the
@@ -989,5 +998,58 @@ mod tests {
         assert_eq!(args.image_assets_dir, Some(vdir.join("image_assets")));
         assert_eq!(args.image_model_id.as_deref(), Some("flux-test"));
         assert_eq!(args.model, None);
+    }
+
+    /// A fine-tune shipped as one GGUF: the base model's sidecar is the
+    /// config, and the publisher's sampling settings are a registry-hosted
+    /// file of their own.
+    const GGUF_WITH_SAMPLING: &str = r#"{
+        "schema_version": 1, "name": "tuned", "family": "qwen35",
+        "min_shiso_version": "0.2.3", "description": "d", "tasks": ["chat"],
+        "modalities": {"inputs": ["text"], "outputs": ["text"]},
+        "features": {"tools": false, "reasoning": false, "structured_output": false},
+        "variants": [{
+            "key": "q4_k_m", "backends": ["metal"], "quant": "Q4_K_M",
+            "requirements": {"min_ram_bytes": 1, "disk_bytes": 1},
+            "components": {
+                "base": {"provider": "huggingface", "repo": "o/r", "revision": "0123456789abcdef0123456789abcdef01234567",
+                         "entry": "m.gguf", "files": [{"name": "m.gguf", "size": 1, "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}]},
+                "generation_config": {"provider": "shiso", "entry": "generation_config.json",
+                         "files": [{"name": "generation_config.json", "size": 1, "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}]}
+            }
+        }]
+    }"#;
+
+    /// The recipe's sampling defaults bind `--generation-config`, and an
+    /// operator's own flag is kept rather than refused or overwritten.
+    #[test]
+    fn a_generation_config_role_binds_unless_the_flag_was_given() {
+        let recipe: Recipe = serde_json::from_str(GGUF_WITH_SAMPLING).expect("fixture parses");
+        let variant = recipe.variants.first().expect("one variant");
+        let vdir = Path::new("/hub/models/tuned/q4_k_m");
+
+        let matches = Cli::command().get_matches_from(["shiso", "serve"]);
+        let serve = matches.subcommand_matches("serve").expect("serve");
+        let mut args = ServeArgs::from_arg_matches(serve).expect("args");
+        populate_serve_args_from_variant(&mut args, vdir, variant, &recipe.name)
+            .expect("populates");
+        assert_eq!(
+            args.generation_config,
+            Some(
+                vdir.join("generation_config")
+                    .join("generation_config.json")
+            )
+        );
+        assert_eq!(args.model, Some(vdir.join("base").join("m.gguf")));
+
+        let own = "/etc/my-sampling.json";
+        let matches =
+            Cli::command().get_matches_from(["shiso", "serve", "--generation-config", own]);
+        let serve = matches.subcommand_matches("serve").expect("serve");
+        let mut args = ServeArgs::from_arg_matches(serve).expect("args");
+        check_component_flag_conflicts(&args, "tuned").expect("not a component flag");
+        populate_serve_args_from_variant(&mut args, vdir, variant, &recipe.name)
+            .expect("populates");
+        assert_eq!(args.generation_config, Some(PathBuf::from(own)));
     }
 }

@@ -1110,3 +1110,134 @@ fn batched_run(gpu: &Gpu, desc: &BatchedDesc<'_>) -> Vec<f32> {
     drain(gpu);
     gpu.read_f32(&dst)
 }
+
+/// Blocks a row of the two-rows-a-lane fixture spans: 2560 weights, the
+/// hidden width of the checkpoint the entry was measured on.
+const NR_BLOCKS: usize = 10;
+/// Rows of the two-rows-a-lane fixture: not a whole number of its eight-row
+/// threadgroups, so the last threadgroup's guarded rows are exercised.
+const NR_ROWS: usize = 30;
+
+/// One one-token K-quant matvec over `rows` rows of `blocks` blocks each, on a
+/// grid of `groups` threadgroups.
+fn nr_run(
+    gpu: &Gpu,
+    module: &'static str,
+    entry: &'static str,
+    weight_bytes: &[u8],
+    x: &[f32],
+    groups: u32,
+) -> Vec<f32> {
+    let in_dim = NR_BLOCKS * IN;
+    let row_bytes = (weight_bytes.len() / NR_ROWS) as u64;
+    let weights = gpu.upload(weight_bytes);
+    let src = gpu.upload(&f32_bytes(x));
+    let dst = gpu.upload(&[0u8; NR_ROWS * 4]);
+    let args = MulMvExtArgs {
+        ne00: in_dim as i32,
+        ne01: NR_ROWS as i32,
+        ne02: 1,
+        _pad0: 0,
+        nb00: row_bytes,
+        nb01: row_bytes,
+        nb02: row_bytes * NR_ROWS as u64,
+        nb03: row_bytes * NR_ROWS as u64,
+        ne10: in_dim as i32,
+        ne11: 1,
+        ne12: 1,
+        _pad1: 0,
+        nb10: 4,
+        nb11: (in_dim * 4) as u64,
+        nb12: (in_dim * 4) as u64,
+        nb13: (in_dim * 4) as u64,
+        ne0: NR_ROWS as i32,
+        ne1: 1,
+        r2: 1,
+        r3: 1,
+        _pad2: [0; 4],
+    };
+    let params = [
+        KernelArg::Bytes(bytemuck::bytes_of(&args)),
+        KernelArg::Buffer(weights.view()),
+        KernelArg::Buffer(src.view()),
+        KernelArg::Buffer(dst.view()),
+    ];
+    run(
+        gpu,
+        KernelRef::specialized(module, entry, &EXT_SHAPE),
+        &LaunchArgs::new(Extent3::new(groups, 1, 1), Extent3::new(32, 2, 1), &params),
+    );
+    drain(gpu);
+    gpu.read_f32(&dst)
+}
+
+/// The two-rows-a-lane one-token `q4_K` entry answers the one-row walk's bits.
+///
+/// `q5_K` and `q6_K` have no such entry: built the same way, both landed one
+/// ulp from the one-row walk under the library's fast math, and a one-token row
+/// must answer what the same row answers in a two-token batch.
+///
+/// Each row is a different rotation of the fixture's one-block rows, so no two
+/// rows share a block sequence, and the activation is a dense signal rather
+/// than a basis vector: the claim is that the sums are the same sums, not that
+/// the unpack is.
+///
+/// Metal only: a device that names its specializations has no two-row entry.
+pub fn two_rows_a_lane_match_one_row_a_lane(gpu: &Gpu) {
+    if gpu.device().specializes_by_name() {
+        return;
+    }
+    let q4: Vec<oracle::Q4K> = (0..OUT)
+        .map(|row| oracle::Q4K {
+            d: ONE_F16,
+            dmin: 0x2C00,
+            scales: GEMM_SCALES,
+            qs: oracle::pack_q4_k_dense(&q4_values(row)),
+        })
+        .collect();
+    let one_q4 = q4_k_bytes(&q4);
+    let block_of = |bytes: &[u8], i: usize| -> Vec<u8> {
+        let width = bytes.len() / OUT;
+        bytes[i * width..(i + 1) * width].to_vec()
+    };
+    let spread = |bytes: &[u8]| -> Vec<u8> {
+        (0..NR_ROWS)
+            .flat_map(|row| (0..NR_BLOCKS).flat_map(move |j| block_of(bytes, (row * 7 + j) % OUT)))
+            .collect()
+    };
+    let x = oracle::signal(NR_BLOCKS * IN, 0x7E57);
+    for (codec, module, one, two, bytes) in [(
+        "q4_K",
+        "generic",
+        "kernel_mul_mv_ext_q4_K_f32_r1_1",
+        "kernel_mul_mv_ext_q4_K_f32_r1_1_nr2",
+        spread(&one_q4),
+    )] {
+        let alone = nr_run(
+            gpu,
+            module,
+            one,
+            &bytes,
+            &x,
+            NR_ROWS.div_ceil(ROWS_PER_TG) as u32,
+        );
+        let paired = nr_run(
+            gpu,
+            module,
+            two,
+            &bytes,
+            &x,
+            NR_ROWS.div_ceil(2 * ROWS_PER_TG) as u32,
+        );
+        for row in 0..NR_ROWS {
+            assert_eq!(
+                paired[row].to_bits(),
+                alone[row].to_bits(),
+                "{codec} row {row}: two rows a lane {} against one {}",
+                paired[row],
+                alone[row],
+            );
+            assert!(alone[row] != 0.0, "{codec} row {row} wrote nothing");
+        }
+    }
+}

@@ -772,6 +772,7 @@ function renderVariantsList() {
               <option value="image_tokenizer">image_tokenizer</option>
               <option value="config">config</option>
               <option value="ngram">ngram</option>
+              <option value="generation_config">generation_config</option>
             </select>
             <button class="sm primary" onclick="addComponentToVariant(${vIdx})">+ Add Role</button>
           </div>
@@ -854,6 +855,10 @@ function renderVariantsList() {
           <div class="col form-group">
             <label>GPU Memory Utilization (--gpu-memory-utilization)</label>
             <input type="number" step="0.01" value="${v.server_defaults?.gpu_memory_utilization ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'gpu_memory_utilization', this.value)">
+          </div>
+          <div class="col form-group">
+            <label>KV Cache Tokens (--kv-cache-tokens)</label>
+            <input type="number" value="${v.server_defaults?.kv_cache_tokens ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'kv_cache_tokens', this.value)">
           </div>
           <div class="col form-group">
             <label>Solo Prefill Chunk (--solo-prefill-chunk)</label>
@@ -1062,7 +1067,7 @@ function updateCompRev(vIdx, role, val) {
 }
 
 // Roles a file can hand itself to with `binds`: the flag-bearing ones.
-const BINDABLE_ROLES = ['base', 'draft', 'draft_vocab', 'vision', 'asr', 'asr_mmproj', 'diarization', 'image', 'config', 'ngram'];
+const BINDABLE_ROLES = ['base', 'draft', 'draft_vocab', 'vision', 'asr', 'asr_mmproj', 'diarization', 'image', 'config', 'ngram', 'generation_config'];
 
 // The `binds` dropdown for one file: which other role's flag it is passed to.
 // Disabled for a file that is not selected, since only selected files are
@@ -1336,7 +1341,7 @@ function liveValidateForm() {
         supplied[f.binds] = f.name;
       }
     }
-    for (const r of ['config', 'ngram', 'draft_vocab']) {
+    for (const r of ['config', 'ngram', 'draft_vocab', 'generation_config']) {
       if (r in supplied && !supplied[r]) errors.push(`Variant '${v.key}': role '${r}' must name its file as entry`);
     }
     if (!('base' in supplied) && !('asr' in supplied) && !('image' in supplied)) {

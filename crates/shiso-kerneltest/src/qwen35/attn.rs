@@ -481,3 +481,208 @@ pub fn two_rows_in_two_pages_match_the_rows_run_alone(gpu: &Gpu) {
         }
     }
 }
+
+/// Cache depth for the split-K cases: past the 32-split cap, which a row
+/// reaches above 31 * 64 = 1984 positions.
+const SPLIT_POS: usize = 2_112;
+/// Splits a row is cut into at most, as `Q35_SPLIT_MAX`.
+const SPLITS: usize = 32;
+/// Positions the split cases put their rows at: one split, the edges of the
+/// first boundary, a mid count, just under the cap, and the cap.
+const SPLIT_ROWS: [i32; 8] = [0, 5, 63, 64, 65, 700, 1_983, 2_111];
+
+/// One split-K decode pass: the split launch then the merge, rows sharing one
+/// page table.
+fn decode_split(gpu: &Gpu, out: &DeviceBuffer, inputs: [&DeviceBuffer; 5], n_tok: u32) {
+    let [q, k_cache, v_cache, pos, pages] = inputs;
+    let rows = n_tok as usize;
+    let acc = gpu.upload(&f32_bytes(&vec![0.0; rows * N_HEAD * SPLITS * HD]));
+    let ml = gpu.upload(&f32_bytes(&vec![0.0; rows * N_HEAD * SPLITS * 2]));
+    let args = attn_args(N_HEAD as u32, N_HEAD_KV as u32, n_tok, 0);
+    run(
+        gpu,
+        KernelRef::new("qwen35", "kernel_q35_attn_decode_split_g4"),
+        &LaunchArgs {
+            grid: Extent3::new(N_HEAD_KV as u32, n_tok, SPLITS as u32),
+            block: Extent3::linear(128),
+            smem_bytes: (4 * 256 + 2 * 4 * 8) * 4,
+            args: &[
+                KernelArg::Bytes(&args),
+                KernelArg::Buffer(acc.view()),
+                KernelArg::Buffer(ml.view()),
+                KernelArg::Buffer(q.view()),
+                KernelArg::Buffer(k_cache.view()),
+                KernelArg::Buffer(v_cache.view()),
+                KernelArg::Buffer(pos.view()),
+                KernelArg::Buffer(pages.view()),
+            ],
+        },
+    );
+    run(
+        gpu,
+        KernelRef::new("qwen35", "kernel_q35_attn_decode_merge"),
+        &LaunchArgs {
+            grid: Extent3::new(N_HEAD as u32, n_tok, 1),
+            block: Extent3::linear(BLOCK),
+            smem_bytes: 0,
+            args: &[
+                KernelArg::Bytes(&args),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(acc.view()),
+                KernelArg::Buffer(ml.view()),
+                KernelArg::Buffer(pos.view()),
+            ],
+        },
+    );
+    drain(gpu);
+}
+
+/// The split-K fixture: a query row per entry of [`SPLIT_ROWS`] and a cache
+/// [`SPLIT_POS`] deep, with its identity page table.
+fn split_fixtures(gpu: &Gpu) -> (Vec<f32>, Vec<u16>, Vec<u16>, [DeviceBuffer; 3]) {
+    let q = fixture(SPLIT_ROWS.len() * N_HEAD * HD, 1);
+    let k = f16_bits(&fixture(SPLIT_POS * N_HEAD_KV * HD, 2));
+    let v = f16_bits(&fixture(SPLIT_POS * N_HEAD_KV * HD, 3));
+    let pages = gpu.upload(&page_bytes(&identity_pages(
+        SPLIT_POS.div_ceil(PAGE_TOKENS as usize),
+    )));
+    let k_cache = gpu.upload(&f16_bytes(&k));
+    let v_cache = gpu.upload(&f16_bytes(&v));
+    (q, k, v, [k_cache, v_cache, pages])
+}
+
+/// The split-K pair against the naive masked softmax, at every split count from
+/// one to the cap.
+pub fn split_decode_matches_a_naive_masked_softmax(gpu: &Gpu) {
+    let (q, k_bits, v_bits, [k_cache, v_cache, pages]) = split_fixtures(gpu);
+    let rows = SPLIT_ROWS.len();
+    let out = gpu.upload(&f32_bytes(&vec![0.0; rows * N_HEAD * HD]));
+    decode_split(
+        gpu,
+        &out,
+        [
+            &gpu.upload(&f32_bytes(&q)),
+            &k_cache,
+            &v_cache,
+            &gpu.upload(&pos_bytes(&SPLIT_ROWS)),
+            &pages,
+        ],
+        rows as u32,
+    );
+    let got = gpu.read_f32(&out);
+    for (t, last) in SPLIT_ROWS.iter().enumerate() {
+        for h in 0..N_HEAD {
+            let expected = attn_oracle(&q, &k_bits, &v_bits, *last, t, h);
+            for d in 0..HD {
+                crate::assert_close!(
+                    got[(t * N_HEAD + h) * HD + d],
+                    expected[d],
+                    oracle::TOL_QUANT,
+                    "position {last} head {h} dim {d}",
+                );
+            }
+        }
+    }
+}
+
+/// A row's split-K answer is the same bits alone as inside a batch of rows at
+/// other positions, because its split count is its own.
+///
+/// The budget is **0.0** and the comparison is on bits, as for the single-pass
+/// kernel's batched case.
+pub fn split_decode_rows_match_the_rows_run_alone(gpu: &Gpu) {
+    let (q, _, _, [k_cache, v_cache, pages]) = split_fixtures(gpu);
+    let rows = SPLIT_ROWS.len();
+    let batched_out = gpu.upload(&f32_bytes(&vec![0.0; rows * N_HEAD * HD]));
+    decode_split(
+        gpu,
+        &batched_out,
+        [
+            &gpu.upload(&f32_bytes(&q)),
+            &k_cache,
+            &v_cache,
+            &gpu.upload(&pos_bytes(&SPLIT_ROWS)),
+            &pages,
+        ],
+        rows as u32,
+    );
+    let batched = gpu.read_f32(&batched_out);
+    for (row, last) in SPLIT_ROWS.iter().enumerate() {
+        let out = gpu.upload(&f32_bytes(&vec![0.0; N_HEAD * HD]));
+        decode_split(
+            gpu,
+            &out,
+            [
+                &gpu.upload(&f32_bytes(&q[row * N_HEAD * HD..][..N_HEAD * HD])),
+                &k_cache,
+                &v_cache,
+                &gpu.upload(&pos_bytes(&[*last])),
+                &pages,
+            ],
+            1,
+        );
+        let alone = gpu.read_f32(&out);
+        for (i, expected) in alone.iter().enumerate() {
+            let got = batched[row * N_HEAD * HD + i];
+            assert_eq!(
+                got.to_bits(),
+                expected.to_bits(),
+                "position {last} element {i}: batched {got} against {expected} run alone",
+            );
+        }
+    }
+}
+
+/// Rows of the simdgroup-matrix prefill case: one full 32-row tile and a
+/// ragged one of eight.
+const MMA_ROWS: usize = 40;
+/// Where the case's chunk starts: past the first positions, as a later chunk of
+/// a long prompt does, so every row reads keys staged from earlier chunks.
+const MMA_START: i32 = 1_000;
+
+/// The simdgroup-matrix prefill softmax against the naive masked softmax, over
+/// a chunk that starts deep in the cache and ends on a ragged tile.
+pub fn mma_prefill_matches_a_naive_masked_softmax(gpu: &Gpu) {
+    let (_, k_bits, v_bits, [k_cache, v_cache, pages]) = split_fixtures(gpu);
+    let q = fixture(MMA_ROWS * N_HEAD * HD, 5);
+    let positions: Vec<i32> = (0..MMA_ROWS)
+        .map(|t| MMA_START + i32::try_from(t).expect("a fixture row fits an i32"))
+        .collect();
+    let out = gpu.upload(&f32_bytes(&vec![0.0; MMA_ROWS * N_HEAD * HD]));
+    let q_buf = gpu.upload(&f32_bytes(&q));
+    let pos_buf = gpu.upload(&pos_bytes(&positions));
+    let args = attn_args(N_HEAD as u32, N_HEAD_KV as u32, MMA_ROWS as u32, 0);
+    run(
+        gpu,
+        KernelRef::new("qwen35", "kernel_q35_attn_prefill_mma"),
+        &LaunchArgs {
+            grid: Extent3::new(N_HEAD as u32, MMA_ROWS.div_ceil(32) as u32, 1),
+            block: Extent3::linear(128),
+            smem_bytes: 0,
+            args: &[
+                KernelArg::Bytes(&args),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(q_buf.view()),
+                KernelArg::Buffer(k_cache.view()),
+                KernelArg::Buffer(v_cache.view()),
+                KernelArg::Buffer(pos_buf.view()),
+                KernelArg::Buffer(pages.view()),
+            ],
+        },
+    );
+    drain(gpu);
+    let got = gpu.read_f32(&out);
+    for (t, last) in positions.iter().enumerate() {
+        for h in 0..N_HEAD {
+            let expected = attn_oracle(&q, &k_bits, &v_bits, *last, t, h);
+            for d in 0..HD {
+                crate::assert_close!(
+                    got[(t * N_HEAD + h) * HD + d],
+                    expected[d],
+                    oracle::TOL_QUANT,
+                    "position {last} head {h} dim {d}",
+                );
+            }
+        }
+    }
+}

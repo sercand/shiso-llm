@@ -316,6 +316,42 @@ impl PackedMatrix {
     }
 }
 
+/// The head's pair-to-layer projection, in the form its container wrote it.
+///
+/// Two forms, because two producers disagree about this one matrix. The
+/// sidecar's head keeps it BF16 beside six packed matrices; a head published on
+/// its own packs it like the others, at the same codec. Both decode to the same
+/// `[hidden, 2 * hidden]` matrix, and which one a container holds is read off
+/// the container (a `fc.scales` beside the words) rather than from a document,
+/// because no document in either release states it.
+#[derive(Debug, Clone)]
+pub enum FcMatrix {
+    /// BF16 rows, cast to `f16` at residency.
+    Half(HeadTensor),
+    /// An affine triple, imported exactly as the container wrote it.
+    Packed(PackedMatrix),
+}
+
+impl FcMatrix {
+    /// The logical matrix's `[out_rows, in_dim]`, whichever form it is in.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] for a BF16 tensor of rank below two.
+    pub fn logical_shape(&self) -> CoreResult<[u64; 2]> {
+        match self {
+            Self::Half(tensor) => Ok([tensor.axis(0)?, tensor.axis(1)?]),
+            Self::Packed(matrix) => {
+                let layout = matrix.layout();
+                Ok([
+                    u64::try_from(layout.out_rows).unwrap_or(u64::MAX),
+                    u64::try_from(layout.in_dim).unwrap_or(u64::MAX),
+                ])
+            }
+        }
+    }
+}
+
 /// The head's single attention block.
 #[derive(Debug)]
 pub struct MtpAttn {
@@ -375,12 +411,12 @@ pub struct MtpLayer {
 pub struct MtpWeights {
     /// The container, mapped.
     shard: Shard,
-    /// `mtp.fc.weight`: the pair-to-layer projection, `[hidden, 2 * hidden]`.
+    /// `fc`: the pair-to-layer projection, `[hidden, 2 * hidden]`.
     ///
-    /// BF16 and not packed, which is the container's own choice: it is the one
-    /// matrix of the head that reads a concatenation, and the producer left it
-    /// unquantized.
-    pub fc: HeadTensor,
+    /// BF16 in the sidecar's head, which left the one matrix that reads a
+    /// concatenation unquantized; packed at the head's codec in a head
+    /// published as a container of its own. See [`FcMatrix`].
+    pub fc: FcMatrix,
     /// `mtp.pre_fc_norm_embedding.weight`: the norm over the token embedding.
     pub pre_fc_norm_embedding: HeadTensor,
     /// `mtp.pre_fc_norm_hidden.weight`: the norm over the target hidden state.
@@ -391,6 +427,8 @@ pub struct MtpWeights {
     pub layer: MtpLayer,
     /// The codec the manifest stated, which every triple here was read under.
     pub quant: AffineQuant,
+    /// Tensors the container held, every one of them claimed by a field.
+    tensors: u32,
 }
 
 impl MtpWeights {
@@ -423,47 +461,74 @@ impl MtpWeights {
                 },
             );
         }
+        // The sidecar's head names every tensor under `mtp.`, the prefix the
+        // full checkpoint stores it at; a head split out into a container of
+        // its own drops the prefix. Which one this is is read off the
+        // container, and only these two spellings are accepted: a third would
+        // fail on the first `take` below, naming the tensor it looked for.
+        let prefix = if table.contains_key("mtp.fc.weight") {
+            "mtp."
+        } else if table.contains_key("fc.weight") {
+            ""
+        } else {
+            return Err(CoreError::ConfigMissing {
+                key: "mtp.fc.weight or fc.weight, the draft head's pair projection".to_owned(),
+            });
+        };
+        let fc_packed = table.contains_key(&format!("{prefix}fc.scales"));
+        let expected = if fc_packed {
+            HEAD_TENSORS + PACKED_FC_EXTRA
+        } else {
+            HEAD_TENSORS
+        };
         let found = u32::try_from(table.len()).unwrap_or(u32::MAX);
-        if found != HEAD_TENSORS {
+        if found != expected {
             return Err(CoreError::ShapeMismatch {
                 field: "draft head tensor count",
-                expected: u64::from(HEAD_TENSORS),
+                expected: u64::from(expected),
                 got: u64::from(found),
             });
         }
         let quant = manifest.quant;
+        let name = |rest: &str| format!("{prefix}{rest}");
+        let fc = if fc_packed {
+            FcMatrix::Packed(triple(&mut table, &name("fc"), quant)?)
+        } else {
+            FcMatrix::Half(take(&mut table, &name("fc.weight"))?)
+        };
         let bound = Self {
             shard,
-            fc: take(&mut table, "mtp.fc.weight")?,
-            pre_fc_norm_embedding: take(&mut table, "mtp.pre_fc_norm_embedding.weight")?,
-            pre_fc_norm_hidden: take(&mut table, "mtp.pre_fc_norm_hidden.weight")?,
-            norm: take(&mut table, "mtp.norm.weight")?,
+            fc,
+            pre_fc_norm_embedding: take(&mut table, &name("pre_fc_norm_embedding.weight"))?,
+            pre_fc_norm_hidden: take(&mut table, &name("pre_fc_norm_hidden.weight"))?,
+            norm: take(&mut table, &name("norm.weight"))?,
             layer: MtpLayer {
-                input_layernorm: take(&mut table, "mtp.layers.0.input_layernorm.weight")?,
+                input_layernorm: take(&mut table, &name("layers.0.input_layernorm.weight"))?,
                 post_attention_layernorm: take(
                     &mut table,
-                    "mtp.layers.0.post_attention_layernorm.weight",
+                    &name("layers.0.post_attention_layernorm.weight"),
                 )?,
                 self_attn: MtpAttn {
-                    q_proj: triple(&mut table, "mtp.layers.0.self_attn.q_proj", quant)?,
-                    k_proj: triple(&mut table, "mtp.layers.0.self_attn.k_proj", quant)?,
-                    v_proj: triple(&mut table, "mtp.layers.0.self_attn.v_proj", quant)?,
-                    o_proj: triple(&mut table, "mtp.layers.0.self_attn.o_proj", quant)?,
-                    q_norm: take(&mut table, "mtp.layers.0.self_attn.q_norm.weight")?,
-                    k_norm: take(&mut table, "mtp.layers.0.self_attn.k_norm.weight")?,
+                    q_proj: triple(&mut table, &name("layers.0.self_attn.q_proj"), quant)?,
+                    k_proj: triple(&mut table, &name("layers.0.self_attn.k_proj"), quant)?,
+                    v_proj: triple(&mut table, &name("layers.0.self_attn.v_proj"), quant)?,
+                    o_proj: triple(&mut table, &name("layers.0.self_attn.o_proj"), quant)?,
+                    q_norm: take(&mut table, &name("layers.0.self_attn.q_norm.weight"))?,
+                    k_norm: take(&mut table, &name("layers.0.self_attn.k_norm.weight"))?,
                 },
                 mlp: MtpMlp {
-                    gate_proj: triple(&mut table, "mtp.layers.0.mlp.gate_proj", quant)?,
-                    up_proj: triple(&mut table, "mtp.layers.0.mlp.up_proj", quant)?,
-                    down_proj: triple(&mut table, "mtp.layers.0.mlp.down_proj", quant)?,
+                    gate_proj: triple(&mut table, &name("layers.0.mlp.gate_proj"), quant)?,
+                    up_proj: triple(&mut table, &name("layers.0.mlp.up_proj"), quant)?,
+                    down_proj: triple(&mut table, &name("layers.0.mlp.down_proj"), quant)?,
                 },
             },
             quant,
+            tensors: expected,
         };
         // Every tensor the container held was claimed by a field. The count
-        // above says the container holds 29; this says the 29 it holds are the
-        // 29 this head is, rather than 29 of somebody else's under names that
-        // happen to be absent here.
+        // above says how many the container holds; this says the ones it holds
+        // are the ones this head is, rather than as many of somebody else's
+        // under names that happen to be absent here.
         if !table.is_empty() {
             let mut left: Vec<&str> = table.keys().map(String::as_str).collect();
             left.sort_unstable();
@@ -474,7 +539,7 @@ impl MtpWeights {
         }
         tracing::info!(
             file = %bound.shard.path().display(),
-            tensors = HEAD_TENSORS,
+            tensors = bound.tensors,
             bits = quant.bits,
             group_size = quant.group_size,
             "draft head bound"
@@ -482,10 +547,10 @@ impl MtpWeights {
         Ok(bound)
     }
 
-    /// Tensors the head ships, which is the census its own document states.
+    /// Tensors the head ships: 29 with a BF16 `fc`, 31 with a packed one.
     #[must_use]
     pub const fn tensor_count(&self) -> u32 {
-        HEAD_TENSORS
+        self.tensors
     }
 
     /// The head's seven packed matrices, in binding order.
@@ -516,8 +581,12 @@ impl MtpWeights {
     }
 }
 
-/// Tensors a head of this family ships, which its own document also states.
+/// Tensors a head of this family ships with a BF16 `fc`, which its own
+/// document also states.
 const HEAD_TENSORS: u32 = 29;
+
+/// The scales and biases a packed `fc` adds to [`HEAD_TENSORS`].
+const PACKED_FC_EXTRA: u32 = 2;
 
 /// Words one 32-bit packed word holds at `bits` per weight.
 fn weights_per_word(bits: u32) -> CoreResult<u64> {
@@ -658,8 +727,7 @@ pub fn resident(
         down: packed(head, backend, &head.layer.mlp.down_proj)?,
     };
     let pair = u64::from(hidden).saturating_mul(2);
-    let rows = head.fc.axis(0)?;
-    let cols = head.fc.axis(1)?;
+    let [rows, cols] = head.fc.logical_shape()?;
     if rows != u64::from(hidden) || cols != pair {
         return Err(CoreError::ShapeMismatch {
             field: "draft head fc shape",
@@ -667,8 +735,12 @@ pub fn resident(
             got: cols,
         });
     }
+    let fc = match &head.fc {
+        FcMatrix::Half(tensor) => half_matrix(head, backend, tensor)?,
+        FcMatrix::Packed(matrix) => packed(head, backend, matrix)?,
+    };
     Ok(DraftParts {
-        fc: half_matrix(head, backend, &head.fc)?,
+        fc,
         norm_embed: norm(head, backend, &head.pre_fc_norm_embedding)?,
         norm_hidden: norm(head, backend, &head.pre_fc_norm_hidden)?,
         input_norm: norm(head, backend, &head.layer.input_layernorm)?,

@@ -323,6 +323,25 @@ pub const GDN_NORM_EPS: f32 = 1e-6;
 /// Threadgroup memory of the decode attention kernel.
 pub const ATTN_DECODE_SMEM_BYTES: u32 = 8_256;
 
+/// The most position splits the split-K decode attention cuts one row into
+/// (`Q35_SPLIT_MAX` in `q35_common.h`): the partial scratch holds this many
+/// slots per query head per row.
+pub const ATTN_DECODE_SPLITS: u32 = 32;
+
+/// Lanes of one split-K decode attention threadgroup: four simdgroups
+/// (`Q35_SPLIT_WARPS`).
+pub const ATTN_DECODE_SPLIT_BLOCK: u32 = 128;
+
+/// Threadgroup memory of the split-K decode attention kernel: one head's
+/// four simdgroup sums of 256 floats, and a (max, denominator) pair per
+/// simdgroup for up to eight query heads.
+pub const ATTN_DECODE_SPLIT_SMEM_BYTES: u32 = (4 * 256 + 2 * 4 * 8) * 4;
+
+/// The entry that folds split-K decode partials. Its presence on a backend is
+/// what the partial scratch is allocated on: a backend without it runs the
+/// single-pass decode kernel and never reads a partial.
+pub const ATTN_DECODE_MERGE_ENTRY: &str = "kernel_q35_attn_decode_merge";
+
 /// Threadgroup memory of the prefill attention kernel.
 pub const ATTN_PREFILL_SMEM_BYTES: u32 = 16_384;
 

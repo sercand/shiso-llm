@@ -1,7 +1,7 @@
 //! What the sidecar says about the draft head, and what the head's container
 //! turns out to hold.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::*;
 
@@ -102,7 +102,7 @@ fn the_head_binds_twenty_nine_tensors() {
     let manifest = read_manifest(&dir).expect("reads").expect("ships a head");
     let bound = MtpWeights::bind(&manifest).expect("the head binds");
     assert_eq!(bound.tensor_count(), 29);
-    assert_eq!(bound.fc.shape(), &[2560, 5120]);
+    assert_eq!(bound.fc.logical_shape().expect("rank two"), [2560, 5120]);
     assert_eq!(bound.layer.mlp.gate_proj.packed_shape(), &[9216, 320]);
     assert_eq!(bound.layer.self_attn.q_norm.shape(), &[256]);
 }
@@ -133,4 +133,130 @@ fn every_packed_tensor_agrees_with_its_declared_group_size() {
             packed.name()
         );
     }
+}
+
+/// Writes a safetensors container of zeros: `(name, dtype, shape)` per tensor.
+fn write_container(path: &Path, tensors: &[(String, &str, Vec<u64>)]) {
+    let mut header = serde_json::Map::new();
+    let mut offset = 0u64;
+    for (name, dtype, shape) in tensors {
+        let width = if *dtype == "U32" { 4 } else { 2 };
+        let bytes = shape.iter().product::<u64>() * width;
+        header.insert(
+            name.clone(),
+            serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + bytes]}),
+        );
+        offset += bytes;
+    }
+    let mut text = serde_json::Value::Object(header).to_string();
+    while !text.len().is_multiple_of(8) {
+        text.push(' ');
+    }
+    let mut file = Vec::new();
+    file.extend_from_slice(&u64::try_from(text.len()).expect("fits").to_le_bytes());
+    file.extend_from_slice(text.as_bytes());
+    file.resize(file.len() + usize::try_from(offset).expect("fits"), 0);
+    std::fs::write(path, file).expect("the container writes");
+}
+
+/// The tensors of a miniature head, `hidden` 64 wide, at 4 bits and group 64.
+///
+/// `prefix` is the namespace the names are stored under, and `packed_fc`
+/// chooses between the two forms the pair projection ships in.
+fn miniature_head(prefix: &str, packed_fc: bool) -> Vec<(String, &'static str, Vec<u64>)> {
+    let hidden = 64u64;
+    let mut out = Vec::new();
+    let mut triple = |name: &str, rows: u64, cols: u64| {
+        out.push((
+            format!("{prefix}{name}.weight"),
+            "U32",
+            vec![rows, cols / 8],
+        ));
+        out.push((
+            format!("{prefix}{name}.scales"),
+            "BF16",
+            vec![rows, cols / 64],
+        ));
+        out.push((
+            format!("{prefix}{name}.biases"),
+            "BF16",
+            vec![rows, cols / 64],
+        ));
+    };
+    if packed_fc {
+        triple("fc", hidden, hidden * 2);
+    }
+    for (name, rows, cols) in [
+        ("layers.0.self_attn.q_proj", hidden * 2, hidden),
+        ("layers.0.self_attn.k_proj", hidden, hidden),
+        ("layers.0.self_attn.v_proj", hidden, hidden),
+        ("layers.0.self_attn.o_proj", hidden, hidden),
+        ("layers.0.mlp.gate_proj", hidden * 2, hidden),
+        ("layers.0.mlp.up_proj", hidden * 2, hidden),
+        ("layers.0.mlp.down_proj", hidden, hidden * 2),
+    ] {
+        triple(name, rows, cols);
+    }
+    if !packed_fc {
+        out.push((
+            format!("{prefix}fc.weight"),
+            "BF16",
+            vec![hidden, hidden * 2],
+        ));
+    }
+    for name in [
+        "pre_fc_norm_embedding.weight",
+        "pre_fc_norm_hidden.weight",
+        "norm.weight",
+        "layers.0.input_layernorm.weight",
+        "layers.0.post_attention_layernorm.weight",
+        "layers.0.self_attn.q_norm.weight",
+        "layers.0.self_attn.k_norm.weight",
+    ] {
+        out.push((format!("{prefix}{name}"), "BF16", vec![hidden]));
+    }
+    out
+}
+
+/// Binds a miniature head written under `prefix`, with `fc` in either form.
+fn bind_miniature(prefix: &str, packed_fc: bool) -> CoreResult<MtpWeights> {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let file = dir.path().join("head.safetensors");
+    write_container(&file, &miniature_head(prefix, packed_fc));
+    MtpWeights::bind(&MtpManifest {
+        file,
+        layers: 1,
+        quant: AffineQuant::family_default(),
+    })
+}
+
+/// The sidecar's layout: `mtp.` names and a BF16 `fc`, 29 tensors.
+#[test]
+fn a_prefixed_head_with_a_half_fc_binds() {
+    let bound = bind_miniature("mtp.", false).expect("the head binds");
+    assert_eq!(bound.tensor_count(), 29);
+    assert!(matches!(bound.fc, FcMatrix::Half(_)));
+    assert_eq!(bound.fc.logical_shape().expect("rank two"), [64, 128]);
+}
+
+/// A head published on its own: bare names and a packed `fc`, 31 tensors.
+#[test]
+fn a_bare_head_with_a_packed_fc_binds() {
+    let bound = bind_miniature("", true).expect("the head binds");
+    assert_eq!(bound.tensor_count(), 31);
+    let FcMatrix::Packed(fc) = &bound.fc else {
+        panic!("fc should bind packed");
+    };
+    assert_eq!(fc.name(), "fc.weight");
+    assert_eq!(bound.fc.logical_shape().expect("rank two"), [64, 128]);
+}
+
+/// A namespace other than the two this family ships under refuses by name.
+#[test]
+fn a_head_under_another_namespace_refuses() {
+    let error = bind_miniature("model.mtp.", true).expect_err("refuses");
+    assert!(
+        error.to_string().contains("fc.weight"),
+        "the refusal names a tensor it looked for, got {error}"
+    );
 }

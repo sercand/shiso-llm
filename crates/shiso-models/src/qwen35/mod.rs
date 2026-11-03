@@ -80,7 +80,8 @@ pub use config::Qwen35Config;
 pub use kernels::Qwen35Kernels;
 pub use model::Qwen35Model;
 pub use mtp::{
-    AffineQuant, HeadTensor, MtpAttn, MtpLayer, MtpManifest, MtpMlp, MtpWeights, PackedMatrix,
+    AffineQuant, FcMatrix, HeadTensor, MtpAttn, MtpLayer, MtpManifest, MtpMlp, MtpWeights,
+    PackedMatrix,
 };
 pub use st_names::Qwen35Names;
 pub use vision::Qwen35Tower;
