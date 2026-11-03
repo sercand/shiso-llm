@@ -1338,6 +1338,9 @@ pub struct SparseWeights {
     pub layers: Vec<SparseLayer>,
     /// The draft head, on a build that speculates.
     pub draft: Option<DraftHead>,
+    /// The vocabulary head narrowed for a block drafter's candidates, on a
+    /// build that drafts with one and was given the counts to narrow by.
+    pub block_vocabulary: Option<crate::sparse::headslice::HeadSlice>,
     /// The identity expert-to-slot map the affine expert stages read when the
     /// routed banks are resident: `map[e] = e`, one `u32` per expert.
     ///

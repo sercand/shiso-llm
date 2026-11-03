@@ -74,3 +74,17 @@ fn the_single_token_gather_tiles_its_row() {
     let Some(gpu) = open() else { return };
     misc::the_single_token_gather_tiles_its_row(&gpu);
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_stream_mean_lands_in_its_tap_slot() {
+    let Some(gpu) = open() else { return };
+    misc::the_stream_mean_lands_in_its_tap_slot(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_sliced_top_keeps_each_slice_best_first() {
+    let Some(gpu) = open() else { return };
+    misc::the_sliced_top_keeps_each_slice_best_first(&gpu);
+}

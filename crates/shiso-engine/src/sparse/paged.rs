@@ -479,15 +479,22 @@ impl RingLayout {
     }
 }
 
-/// The cache geometry this shape implies.
+/// The cache geometry this shape implies, each page `extra_page_bytes` wider
+/// for a block drafter's keys and values riding along ([`PagedKv`]'s `extra`),
+/// zero for none.
 #[must_use]
-pub fn cache_geometry(shape: &SparseShape, planes: PagePlanes, spec: SpecDepth) -> CacheGeometry {
+pub fn cache_geometry(
+    shape: &SparseShape,
+    planes: PagePlanes,
+    spec: SpecDepth,
+    extra_page_bytes: u64,
+) -> CacheGeometry {
     // A prompt pass is summed the same way wherever it is cut, provided every
     // cut is on the recurrence's run grid; a prompt-final checkpoint off it
     // answers its own prompt and nothing longer.
     CacheGeometry::new(
         PAGE_TOKENS,
-        page_bytes(shape, planes),
+        page_bytes(shape, planes).saturating_add(extra_page_bytes),
         ckpt_bytes(shape, spec, planes),
         ESTIMATED_PREFILL_S_PER_TOKEN,
         UTILITY_DECAY_S,
@@ -523,6 +530,11 @@ struct Pool {
 #[derive(Debug, Clone)]
 pub struct PagedKv {
     pool: Arc<Pool>,
+    /// A block drafter's own keys and values, page for page with this pool:
+    /// a second set of runs every whole-page operation the cache asks for
+    /// covers too, so a page copied, spilled or restored carries the
+    /// drafter's context for its positions with the target's.
+    extra: Option<crate::kv::DeviceKv>,
 }
 
 impl PagedKv {
@@ -535,6 +547,21 @@ impl PagedKv {
             .iter()
             .map(|run| run.stride)
             .fold(0, u64::saturating_add)
+            .saturating_add(
+                self.extra
+                    .as_ref()
+                    .map_or(0, crate::kv::DeviceKv::page_bytes),
+            )
+    }
+
+    /// The same pool with a block drafter's keys and values riding along: see
+    /// [`PagedKv`]'s `extra`. `kv` must be `pool_pages` deep, as this pool is.
+    #[must_use]
+    pub(crate) fn with_extra(self, kv: crate::kv::DeviceKv) -> Self {
+        Self {
+            extra: Some(kv),
+            ..self
+        }
     }
 
     /// Allocates the pool: [`PLANES`] allocations per attention layer, in layer
@@ -592,6 +619,7 @@ impl PagedKv {
                 runs,
                 planes: PLANES.len(),
             }),
+            extra: None,
         })
     }
 
@@ -660,7 +688,10 @@ impl Backing for PagedKv {
                 .copy_d2d(into, from)
                 .map_err(|e| transfer_failure("copy_page", e))?;
         }
-        Ok(())
+        match self.extra.as_mut() {
+            Some(extra) => extra.copy_page(dst, src),
+            None => Ok(()),
+        }
     }
 
     /// Writes the page's runs end to end, in allocation order.
@@ -686,7 +717,10 @@ impl Backing for PagedKv {
                 .map_err(|e| transfer_failure("page_to_host", e))?;
             at = end;
         }
-        Ok(())
+        match self.extra.as_ref() {
+            Some(extra) => extra.page_to_host(page, buf.get_mut(at..).unwrap_or(&mut [])),
+            None => Ok(()),
+        }
     }
 
     fn page_from_host(&mut self, page: PageId, buf: &[u8]) -> Result<(), KvError> {
@@ -707,7 +741,10 @@ impl Backing for PagedKv {
                 .map_err(|e| transfer_failure("page_from_host", e))?;
             at = end;
         }
-        Ok(())
+        match self.extra.as_mut() {
+            Some(extra) => extra.page_from_host(page, buf.get(at..).unwrap_or(&[])),
+            None => Ok(()),
+        }
     }
 }
 

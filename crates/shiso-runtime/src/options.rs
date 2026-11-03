@@ -396,9 +396,11 @@ pub struct ServeOptions {
         arg(long, env = "SHISO_NO_PACK_HALVES", default_value_t = false)
     )]
     pub no_pack_halves: bool,
-    /// The draft head: a sidecar weights file beside the checkpoint.
+    /// The draft head: a sidecar weights file beside the checkpoint, or a
+    /// block drafter (its GGUF file or its directory), which drafts in place of
+    /// a head the checkpoint carries itself.
     ///
-    /// Absent means one token a step. Present, and with `--spec-k` above zero,
+    /// Absent means one token a step, or the checkpoint's own head. Present, and with `--spec-k` above zero,
     /// a decode step proposes that many tokens and verifies them in one pass.
     /// The two go together: a head with no depth drafts nothing, and a depth
     /// with no head has nothing to draft with, so either alone is refused

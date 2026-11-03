@@ -39,6 +39,7 @@
 //! [`stack::SparseStack`] is what puts them in order.
 
 pub mod bind;
+pub mod block;
 pub mod capture;
 pub mod ckpt;
 pub mod draft;

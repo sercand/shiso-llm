@@ -153,3 +153,117 @@ pub fn dyn_conv_matches_the_host_rule(gpu: &Gpu) {
         }
     }
 }
+
+/// The CUDA-only multi-row projections a block drafter's `q4_0` and `q8_0`
+/// weights opt into (`dense_rows_mv.cuh`). Not in [`ENTRIES`]: the Metal set
+/// has no twin, and reads those weights through its extended matvec.
+pub const ROWS_MV_ENTRIES: [&str; 6] = [
+    "kernel_dense_rows_mv_q4_0_f32_r2",
+    "kernel_dense_rows_mv_q4_0_f32_r4",
+    "kernel_dense_rows_mv_q4_0_f32_r8",
+    "kernel_dense_rows_mv_q8_0_f32_r2",
+    "kernel_dense_rows_mv_q8_0_f32_r4",
+    "kernel_dense_rows_mv_q8_0_f32_r8",
+];
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct RowsMvArgs {
+    in_dim: u32,
+    out_dim: u32,
+    n_rows: u32,
+    pad0: u32,
+}
+
+/// `count` quant blocks of 32 weights with varied scales, as stored: an `f16`
+/// scale and then `q4_0` nibbles (`bytes == 18`) or `q8_0` bytes
+/// (`bytes == 34`); and every weight decoded, block after block.
+fn quant_blocks(count: usize, bytes: usize, seed: u32) -> (Vec<u8>, Vec<f32>) {
+    let mut raw = Vec::with_capacity(count * bytes);
+    let mut values = Vec::with_capacity(count * 32);
+    for b in 0..count {
+        let h = (b as u32).wrapping_mul(2_654_435_761) ^ seed;
+        let d = half::f16::from_f32(0.002 + (h % 97) as f32 * 0.0005);
+        raw.extend_from_slice(&d.to_le_bytes());
+        let d = d.to_f32();
+        let q = |j: u32| h.wrapping_add(j.wrapping_mul(40_503)).rotate_left(j % 31);
+        if bytes == 18 {
+            let mut decoded = [0.0f32; 32];
+            for j in 0..16u32 {
+                let byte = (q(j) & 0xff) as u8;
+                raw.push(byte);
+                decoded[j as usize] = (i32::from(byte & 0x0f) - 8) as f32 * d;
+                decoded[j as usize + 16] = (i32::from(byte >> 4) - 8) as f32 * d;
+            }
+            values.extend_from_slice(&decoded);
+        } else {
+            for j in 0..32u32 {
+                let byte = (q(j) & 0xff) as u8;
+                raw.push(byte);
+                values.push(f32::from(byte.cast_signed()) * d);
+            }
+        }
+    }
+    (raw, values)
+}
+
+/// Both multi-row projections, at one to eight rows and at widths that leave a
+/// partial chunk of the contraction and a partial block of outputs, within a
+/// float tolerance of a host product over the decoded weights.
+///
+/// # Panics
+///
+/// When an output strays from the host product.
+pub fn rows_mv_matches_the_host_product(gpu: &Gpu) {
+    for (i, entry) in ROWS_MV_ENTRIES.iter().copied().enumerate() {
+        let bytes = if i < 3 { 18usize } else { 34usize };
+        let per_warp = [2u32, 4, 8][i % 3];
+        for (in_dim, out_dim) in [(2560u32, 640u32), (1088, 37), (4096, 1024), (2560, 4096)] {
+            let blocks = (in_dim / 32) as usize;
+            let (raw, weights) = quant_blocks(blocks * out_dim as usize, bytes, in_dim ^ out_dim);
+            let w_dev = gpu.upload(&raw);
+            for n_rows in 1..=8u32 {
+                let x = signal((n_rows * in_dim) as usize, 7 + n_rows);
+                let x_dev = gpu.upload(&f32_bytes(&x));
+                let out_dev = gpu.upload(&vec![0u8; (n_rows * out_dim * 4) as usize]);
+                let args = RowsMvArgs {
+                    in_dim,
+                    out_dim,
+                    n_rows,
+                    pad0: 0,
+                };
+                run(
+                    gpu,
+                    KernelRef::new("dense", entry),
+                    &LaunchArgs {
+                        grid: Extent3::linear(out_dim.div_ceil(4 * per_warp)),
+                        block: Extent3::linear(128),
+                        smem_bytes: 0,
+                        args: &[
+                            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                            KernelArg::Buffer(w_dev.view()),
+                            KernelArg::Buffer(x_dev.view()),
+                            KernelArg::Buffer(out_dev.view()),
+                        ],
+                    },
+                );
+                drain(gpu);
+                let got = gpu.read_f32(&out_dev);
+                let k = in_dim as usize;
+                for n in 0..n_rows as usize {
+                    for o in 0..out_dim as usize {
+                        let want: f64 = (0..k)
+                            .map(|i| f64::from(weights[o * k + i]) * f64::from(x[n * k + i]))
+                            .sum();
+                        let g = f64::from(got[n * out_dim as usize + o]);
+                        assert!(
+                            (g - want).abs() <= 1e-4 * (1.0 + want.abs()),
+                            "{entry} {in_dim}x{out_dim} rows {n_rows}: out[{n}][{o}] = {g}, \
+                             expected {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

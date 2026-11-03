@@ -72,3 +72,88 @@ extern "C" __global__ void q4e_copy_row_kernel(float *dst, const float *src, uin
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = src[i];
 }
+
+// The mean over the hyper-connection streams of a pass's residual rows, into
+// one slot of a wider row: a block drafter reads a tapped layer's hidden state
+// as that mean, every tap of one token side by side. Also this tree's own.
+// res[t][h][e]; dst[t * dst_stride + dst_offset + e]. The streams are summed
+// in order and divided once, as a mean over the stream axis is.
+extern "C" __global__ void q4e_stream_mean_rows_kernel(
+        float *dst, const float *res, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok,
+        uint32_t dst_stride, uint32_t dst_offset) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (uint64_t)n_tok * n_embd) return;
+    const uint32_t e = (uint32_t)(idx % n_embd);
+    const uint64_t t = idx / n_embd;
+    const float *row = res + t * n_hc * n_embd + e;
+    float sum = 0.0f;
+    for (uint32_t h = 0; h < n_hc; h++) sum += row[(uint64_t)h * n_embd];
+    dst[t * dst_stride + dst_offset + e] = sum / (float)n_hc;
+}
+
+// The `k` highest entries of each slice of each logits row, highest first,
+// ties to the lower id - the order a total order on the values gives. One block
+// a (slice, row); `k` rounds, each taking the best entry strictly below the
+// last one taken, so nothing but the threshold is kept between rounds and the
+// answer does not depend on which thread saw what. A slice with fewer than `k`
+// entries pads with id 0xffffffff and -inf. Also this tree's own: a block
+// drafter reads sixteen candidates from each of seven rows, which the one
+// block a row top pass reads in 715 us on a GB10 and this in a few dozen.
+// values/ids: [row][slice][k].
+static __device__ __forceinline__ uint32_t q4e_order_key(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+static __device__ __forceinline__ bool q4e_top_better(uint32_t ka, uint32_t ia, uint32_t kb, uint32_t ib) {
+    return ka > kb || (ka == kb && ia < ib);
+}
+
+extern "C" __global__ void __launch_bounds__(256) q4e_top_slices_kernel(
+        const float *logits, uint32_t n_vocab, uint32_t k, uint32_t slices,
+        float *values, uint32_t *ids) {
+    __shared__ uint32_t s_key[8];
+    __shared__ uint32_t s_id[8];
+    __shared__ uint32_t t_key;
+    __shared__ uint32_t t_id;
+    const uint32_t row = blockIdx.y;
+    const uint32_t slice = blockIdx.x;
+    const uint32_t span = (n_vocab + slices - 1u) / slices;
+    const uint32_t lo = slice * span;
+    const uint32_t hi = min(lo + span, n_vocab);
+    const float *r = logits + (uint64_t)row * n_vocab;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    uint32_t th_key = 0u, th_id = 0u;
+    for (uint32_t t = 0; t < k; t++) {
+        uint32_t bk = 0u, bi = 0xffffffffu;
+        for (uint32_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+            const uint32_t key = q4e_order_key(r[i]);
+            const bool below = t == 0u || key < th_key || (key == th_key && i > th_id);
+            if (below && q4e_top_better(key, i, bk, bi)) { bk = key; bi = i; }
+        }
+        for (uint32_t off = 16u; off > 0u; off >>= 1) {
+            const uint32_t ok = __shfl_xor_sync(0xffffffffu, bk, off);
+            const uint32_t oi = __shfl_xor_sync(0xffffffffu, bi, off);
+            if (q4e_top_better(ok, oi, bk, bi)) { bk = ok; bi = oi; }
+        }
+        if (lane == 0u) { s_key[warp] = bk; s_id[warp] = bi; }
+        __syncthreads();
+        if (threadIdx.x == 0u) {
+            uint32_t ck = s_key[0], ci = s_id[0];
+            for (uint32_t w = 1u; w < (blockDim.x >> 5); w++) {
+                if (q4e_top_better(s_key[w], s_id[w], ck, ci)) { ck = s_key[w]; ci = s_id[w]; }
+            }
+            const uint64_t at = ((uint64_t)row * slices + slice) * k + t;
+            values[at] = ci < n_vocab ? r[ci] : -INFINITY;
+            ids[at] = ci;
+            t_key = ck;
+            t_id = ci;
+        }
+        __syncthreads();
+        th_key = t_key;
+        th_id = t_id;
+        // Read before the next round's thread 0 may write it again.
+        __syncthreads();
+    }
+}

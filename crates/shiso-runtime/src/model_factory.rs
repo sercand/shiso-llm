@@ -1429,7 +1429,9 @@ fn load_qwen4exp_streamed(
 }
 
 /// The sparse family's trellis export, as published: a directory that carries
-/// its own draft head, loaded when speculation is asked for.
+/// its own draft head, loaded when speculation is asked for - or, when
+/// `--draft-model` names a block drafter, the target alone with that drafter
+/// bound beside it.
 fn load_qwen4exp_exl3(
     backend: &Arc<dyn Backend>,
     path: &Path,
@@ -1438,17 +1440,31 @@ fn load_qwen4exp_exl3(
     opts: EngineOptions,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
-    // The head is in the directory; a second one named beside it would be a
-    // head nobody can say which of the two is serving.
-    if args.draft_model.is_some() {
-        return Err(FactoryError::Load(CoreError::InvalidValue {
-            key: "--draft-model",
-            value: format!(
-                "{} carries its own draft head under mtp.*; drop --draft-model and set --spec-k",
-                path.display()
-            ),
-        }));
-    }
+    // The head is in the directory; a second head named beside it would be a
+    // head nobody can say which of the two is serving. A block drafter is not
+    // a head: it drafts in the head's place, and the head is then not loaded.
+    let drafter = match args.draft_model.as_deref() {
+        Some(file) if shiso_models::qwen35::block_draft::is_block_drafter(file) => {
+            shiso_models::qwen4exp::Drafter::Block {
+                path: file,
+                counts: draft_vocab_of(args),
+            }
+        }
+        Some(_) => {
+            return Err(FactoryError::Load(CoreError::InvalidValue {
+                key: "--draft-model",
+                value: format!(
+                    "{} carries its own draft head under mtp.*; drop --draft-model and set \
+                     --spec-k, or name a block drafter",
+                    path.display()
+                ),
+            }));
+        }
+        None if args.spec_k > 0 => shiso_models::qwen4exp::Drafter::Head {
+            counts: draft_vocab_of(args),
+        },
+        None => shiso_models::qwen4exp::Drafter::None,
+    };
     let ngram = args.ngram.as_deref().ok_or_else(|| {
         FactoryError::Load(CoreError::ConfigMissing {
             key: format!(
@@ -1462,8 +1478,7 @@ fn load_qwen4exp_exl3(
         path,
         ngram,
         config,
-        args.spec_k > 0,
-        draft_vocab_of(args),
+        drafter,
         sparse_options(args, opts, backend)?,
     )
     .map_err(FactoryError::Load)?;

@@ -72,8 +72,11 @@ fn load_served(backend: &Arc<dyn Backend>, draft: bool) -> Option<Qwen4ExpModel>
             &dir,
             &dir.join("ngram_embedding.safetensors"),
             &hf,
-            draft,
-            None,
+            if draft {
+                shiso_models::qwen4exp::Drafter::Head { counts: None }
+            } else {
+                shiso_models::qwen4exp::Drafter::None
+            },
             opts,
         )
         .expect("the export loads"),

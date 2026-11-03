@@ -113,6 +113,42 @@ const SUPPORTED: &[DType] = &[
     DType::Exl3K8,
 ];
 
+/// What drafts the speculative steps of a checkpoint as it loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drafter<'a> {
+    /// Nothing: the build decodes a token a step.
+    None,
+    /// The checkpoint's own draft head, its vocabulary narrowed by the counts
+    /// file when one is named.
+    Head {
+        /// The `id count` list the head's vocabulary is narrowed from.
+        counts: Option<&'a Path>,
+    },
+    /// A block drafter - its GGUF file or its directory - bound beside the
+    /// target, which then loads without its own head.
+    Block {
+        /// The drafter's file or directory.
+        path: &'a Path,
+        /// The `id count` list its candidates' vocabulary is narrowed from.
+        counts: Option<&'a Path>,
+    },
+}
+
+/// Reads the block drafter at `path` for a target of `config`'s geometry and
+/// puts it on the device.
+///
+/// The drafter reads the target's residual, so it is held to the target's
+/// width, depth and vocabulary here rather than at its first draft.
+fn open_block_drafter(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    config: &Qwen4ExpConfig,
+) -> CoreResult<shiso_engine::block_draft::BlockDraftParts> {
+    let shape = config.shape();
+    let _tag = ledger::scope(MemTag::DraftWeights);
+    crate::qwen35::block_draft::load(backend, path, (shape.hidden, shape.n_layers(), shape.vocab))
+}
+
 /// A loaded checkpoint of this family.
 #[derive(Debug)]
 pub struct Qwen4ExpModel {
@@ -499,25 +535,27 @@ impl Qwen4ExpModel {
     /// `ngram` is the n-gram table file, which the export keeps beside its
     /// shards and the caller names; nothing here looks for it by name.
     ///
-    /// The export carries its own draft head; `draft` loads it, and `counts`
-    /// narrows its vocabulary as [`Qwen4ExpModel::load_with`] does. The
-    /// trellis kernels exist on one backend, and a device without them refuses
-    /// the first projection the stack is built over.
+    /// The export carries its own draft head, which [`Drafter::Head`] loads,
+    /// its vocabulary narrowed as [`Qwen4ExpModel::load_with`] does; a block
+    /// drafter ([`Drafter::Block`]) drafts in its place. The trellis kernels
+    /// exist on one backend, and a device without them refuses the first
+    /// projection the stack is built over.
     ///
     /// # Errors
     ///
     /// Whatever [`exl3::open`], [`exl3::NgramFile::open`],
-    /// [`Qwen4ExpConfig::from_exl3`], the imports and [`SparseStack::new`]
-    /// report, and [`CoreError::Backend`] when the counts file cannot be read.
+    /// [`Qwen4ExpConfig::from_exl3`], the imports, the block drafter's loader
+    /// and [`SparseStack::new`] report, and [`CoreError::Backend`] when the
+    /// counts file cannot be read.
     pub fn load_exl3(
         backend: &Arc<dyn Backend>,
         dir: &Path,
         ngram: &Path,
         hf: &shiso_core::config::HfConfig,
-        draft: bool,
-        counts: Option<&Path>,
+        drafter: Drafter<'_>,
         opts: SparseOptions,
     ) -> CoreResult<Self> {
+        let mut opts = opts;
         let ck = exl3::open(dir)?;
         let table = exl3::NgramFile::open(ngram)?;
         let config = Qwen4ExpConfig::from_exl3(hf, dir, &table)?;
@@ -526,11 +564,27 @@ impl Qwen4ExpModel {
             exl3::open_ngram(backend, &table, &config, &opts)?
         };
         let mut weights = exl3::import(backend, &ck, &config, opts.pack_halves)?;
-        if draft {
-            let rank = config.shape().count(shiso_engine::shape::LayerKind::Attn);
-            weights.draft = Some(exl3::import_draft(backend, &ck, rank, opts.pack_halves)?);
-            if let Some(list) = counts {
-                narrow_draft_head(backend, &mut weights, list, config.shape().vocab)?;
+        let mut block = None;
+        match drafter {
+            Drafter::None => {}
+            Drafter::Head { counts } => {
+                let rank = config.shape().count(shiso_engine::shape::LayerKind::Attn);
+                weights.draft = Some(exl3::import_draft(backend, &ck, rank, opts.pack_halves)?);
+                if let Some(list) = counts {
+                    narrow_draft_head(backend, &mut weights, list, config.shape().vocab)?;
+                }
+            }
+            Drafter::Block { path, counts } => {
+                if let Some(list) = counts {
+                    weights.block_vocabulary =
+                        narrow_head(backend, &weights, list, config.shape().vocab)?;
+                }
+                let parts = open_block_drafter(backend, path, &config)?;
+                opts.block_draft = Some(
+                    parts
+                        .footprint(config.shape().vocab, shiso_engine::block_draft::ABSORB_ROWS)?,
+                );
+                block = Some(parts);
             }
         }
         let expert_gate = weights
@@ -538,7 +592,11 @@ impl Qwen4ExpModel {
             .first()
             .map_or(DType::Exl3K4, |layer| layer.experts.gate.dtype);
         drop(ck);
-        let stack = SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
+        let mut stack =
+            SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
+        if let Some(parts) = block {
+            stack.bind_block_drafter(parts)?;
+        }
         Ok(Self {
             info: ModelInfo {
                 context_capacity: stack.context_capacity(),
@@ -886,6 +944,7 @@ fn import(
         output_mix,
         layers,
         draft: None,
+        block_vocabulary: None,
         expert_map: None,
     })
 }
@@ -1161,9 +1220,10 @@ impl Model for Qwen4ExpModel {
     }
 
     fn spec_mut(&mut self) -> Option<&mut dyn Speculating> {
-        // The head is what makes a session speculative, and a build without one
-        // answers no here rather than one verify pass later.
-        self.stack.has_draft_head().then_some(self)
+        // A drafter - the head or a block drafter - is what makes a session
+        // speculative, and a build without one answers no here rather than one
+        // verify pass later.
+        self.stack.drafts().then_some(self)
     }
 
     /// The stack masks every logits row on the device right after the
@@ -1273,6 +1333,23 @@ fn narrow_draft_head(
     counts: &Path,
     vocab: u32,
 ) -> CoreResult<()> {
+    let slice = narrow_head(backend, weights, counts, vocab)?;
+    if let Some(head) = weights.draft.as_mut() {
+        head.head = slice;
+    }
+    Ok(())
+}
+
+/// The vocabulary head narrowed to the ids `counts` ranks first.
+// None: the counts name no block, and a draft then projects through the whole
+// head - which works; no logger in this crate, so the caller that supplied the
+// path is the one that can say so.
+fn narrow_head(
+    backend: &Arc<dyn Backend>,
+    weights: &SparseWeights,
+    counts: &Path,
+    vocab: u32,
+) -> CoreResult<Option<headslice::HeadSlice>> {
     let text = std::fs::read_to_string(counts).map_err(|source| CoreError::Backend {
         backend: "qwen4exp",
         op: "reading the draft vocabulary counts",
@@ -1280,15 +1357,9 @@ fn narrow_draft_head(
     })?;
     let blocks = headslice::blocks_from_counts(&text, vocab, headslice::DEFAULT_IDS);
     if blocks.is_empty() {
-        // No logger in this crate: the caller that supplied the path is the one
-        // that can say so, and it gets the whole head - which works.
-        return Ok(());
+        return Ok(None);
     }
-    let slice = headslice::build(backend, weights.output_matrix(), &blocks)?;
-    if let Some(head) = weights.draft.as_mut() {
-        head.head = Some(slice);
-    }
-    Ok(())
+    headslice::build(backend, weights.output_matrix(), &blocks).map(Some)
 }
 
 /// The two exports whose routed experts are always streamed.

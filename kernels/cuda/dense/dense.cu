@@ -25,4 +25,5 @@
 #include "dense_affine.cuh"
 #include "dense_exact_affine.cuh"
 #include "dense_block_draft.cuh"
+#include "dense_rows_mv.cuh"
 #include "dense_vision.cuh"
