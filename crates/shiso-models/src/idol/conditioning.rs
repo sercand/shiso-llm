@@ -22,6 +22,22 @@ pub struct Conditioning {
     pub rows: usize,
 }
 
+impl Conditioning {
+    /// A conditioning of `rows` zero rows in both streams.
+    ///
+    /// This is the negative pass: the reference guides away from *zero*
+    /// conditioning rather than from a second encode, so the unconditional
+    /// velocity is the model's answer to "no picture at all".
+    #[must_use]
+    pub fn zero(rows: usize) -> Self {
+        Self {
+            dinov3: vec![0.0; rows * DINO_WIDTH],
+            vae: vec![0.0; rows * VAE_WIDTH],
+            rows,
+        }
+    }
+}
+
 /// A conditioning stream of the wrong shape.
 ///
 /// Refused rather than reshaped: a stream of the wrong length means an encoder

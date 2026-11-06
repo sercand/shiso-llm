@@ -8,6 +8,7 @@
 pub mod conditioning;
 pub mod dinov3;
 pub mod gaussian;
+pub mod generator;
 pub mod latent;
 pub mod octree;
 pub mod ply;

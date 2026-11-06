@@ -56,6 +56,19 @@ impl GaussianCloud {
     pub fn is_empty(&self) -> bool {
         self.xyz.is_empty()
     }
+
+    /// Keeps the first `count` Gaussians.
+    ///
+    /// The decoder answers one group per anchor and the request counts
+    /// Gaussians; this is where the two are reconciled when the anchor budget
+    /// rounds up.
+    pub fn truncate(&mut self, count: usize) {
+        self.xyz.truncate(count);
+        self.features_dc.truncate(count);
+        self.scaling.truncate(count);
+        self.rotation.truncate(count);
+        self.opacity.truncate(count);
+    }
 }
 
 /// A cloud the writer refuses.
