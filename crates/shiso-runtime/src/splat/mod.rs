@@ -8,12 +8,19 @@
 //! a per-request token count.
 
 mod core;
+mod worker;
 
 pub use core::build_job;
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use shiso_vision::splat::{
-    GAUSSIANS_PER_ANCHOR, MAX_GAUSSIANS, MAX_STEPS, MIN_GAUSSIANS, SplatGenError, SplatLimits,
+    GAUSSIANS_PER_ANCHOR, GeneratedSplat, MAX_GAUSSIANS, MAX_STEPS, MIN_GAUSSIANS, SplatGenError,
+    SplatGenerator, SplatJob, SplatLimits, SplatStepEvent,
 };
+use tokio::sync::{mpsc, oneshot};
 
 use crate::error::AppError;
 
@@ -138,6 +145,195 @@ pub fn refuse(error: SplatGenError) -> AppError {
     }
 }
 
+/// A queued generation and where its answer and its progress go.
+#[derive(Debug)]
+struct Queued {
+    job: SplatJob,
+    /// Where step events go for a streaming caller; `None` for a plain one.
+    progress: Option<mpsc::UnboundedSender<SplatStepEvent>>,
+    reply: oneshot::Sender<Result<GeneratedSplat, AppError>>,
+}
+
+/// What the worker thread is started with.
+#[derive(Debug)]
+pub struct SplatServiceDesc {
+    /// The generator, loaded on the splat backend.
+    pub generator: Arc<dyn SplatGenerator>,
+    /// The name the generator answers to on the wire.
+    pub model_id: String,
+    /// The most generations that may wait in the queue beyond the running
+    /// one; the next is refused.
+    pub max_queue: usize,
+    /// Where per-generation profile reports go; `None` unless `--profile-dir`.
+    pub profile: Option<crate::profile::ProfileSink>,
+}
+
+/// The handle the HTTP handlers hold.
+#[derive(Debug, Clone)]
+pub struct SplatService {
+    tx: mpsc::Sender<Queued>,
+    model_id: String,
+    limits: SplatLimits,
+    defaults: SplatDefaults,
+}
+
+impl SplatService {
+    /// Starts the worker thread.
+    ///
+    /// The thread is not joined: it ends when the last handle is dropped,
+    /// which is when the process is done serving, and the queue closing is
+    /// what ends its loop.
+    ///
+    /// # Errors
+    ///
+    /// The operating system's refusal to start a thread.
+    pub fn start(desc: SplatServiceDesc) -> std::io::Result<Self> {
+        // A queue of zero would admit nothing beyond the running job and
+        // refuse everything else; the floor of one is the image service's,
+        // and `ServeOptions::validate` is what refuses a configured zero.
+        let (tx, rx) = mpsc::channel(desc.max_queue.max(1));
+        let limits = desc.generator.limits();
+        let service = Self {
+            tx,
+            model_id: desc.model_id.clone(),
+            limits,
+            defaults: SplatDefaults::of(&limits),
+        };
+        std::thread::Builder::new()
+            .name("shiso-splat".to_owned())
+            .spawn(move || worker::run_worker(&desc, rx))?;
+        Ok(service)
+    }
+
+    /// What the loaded model accepts.
+    #[must_use]
+    pub const fn limits(&self) -> SplatLimits {
+        self.limits
+    }
+
+    /// What a request that names no steps or Gaussians gets.
+    #[must_use]
+    pub const fn defaults(&self) -> SplatDefaults {
+        self.defaults
+    }
+
+    /// The name the generator answers to on the wire.
+    #[must_use]
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    /// Queues a generation and waits for the splat.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::BadRequest`] for a job [`SplatJob::validate`] refuses -
+    /// refused here, before it costs a queue slot. [`AppError::Overloaded`]
+    /// when the queue is full: a caller that backs off and retries is served.
+    /// [`AppError::Internal`] when the worker thread is gone, or the generator
+    /// failed on the device side.
+    pub async fn generate(&self, job: SplatJob) -> Result<GeneratedSplat, AppError> {
+        self.submit(job, None).await
+    }
+
+    /// Queues a generation, forwards each step event to `progress` while it
+    /// runs, and waits for the splat.
+    ///
+    /// A caller that stops reading `progress` does not stop the generation;
+    /// its final answer still arrives on the returned future.
+    ///
+    /// # Errors
+    ///
+    /// The same refusals as [`Self::generate`].
+    pub async fn generate_stream(
+        &self,
+        job: SplatJob,
+        progress: mpsc::UnboundedSender<SplatStepEvent>,
+    ) -> Result<GeneratedSplat, AppError> {
+        self.submit(job, Some(progress)).await
+    }
+
+    /// The one path both entry points take: admit, then await the answer.
+    async fn submit(
+        &self,
+        job: SplatJob,
+        progress: Option<mpsc::UnboundedSender<SplatStepEvent>>,
+    ) -> Result<GeneratedSplat, AppError> {
+        self.admit(job, progress)?.await
+    }
+
+    /// Validates and queues a generation without waiting for the splat: the
+    /// synchronous half of [`Self::generate`], for a caller that must know
+    /// whether it was admitted before it commits to anything - the stream
+    /// handler, which answers a refusal with a status code and only then
+    /// spends its 200.
+    ///
+    /// The returned future is the answer, exactly what [`Self::generate`]
+    /// would have awaited.
+    ///
+    /// # Errors
+    ///
+    /// The admission refusals of [`Self::generate`]: [`AppError::BadRequest`]
+    /// for a job [`SplatJob::validate`] refuses, and [`AppError::Overloaded`]
+    /// when the queue is full. Both are in hand without an await.
+    pub fn admit(
+        &self,
+        job: SplatJob,
+        progress: Option<mpsc::UnboundedSender<SplatStepEvent>>,
+    ) -> Result<SplatAnswer, AppError> {
+        // Checked before the queue: a job the generator would refuse must not
+        // cost a waiting slot.
+        job.validate().map_err(refuse)?;
+        let (reply, answer) = oneshot::channel();
+        // `try_send`, not `send`: a full queue is refused now rather than
+        // awaited, because a splat that arrives behind a queue nobody bounded
+        // is an answer no client is still waiting for.
+        self.tx
+            .try_send(Queued {
+                job,
+                progress,
+                reply,
+            })
+            .map_err(|err| match err {
+                mpsc::error::TrySendError::Full(_queued) => AppError::Overloaded {
+                    what: "the splat queue is full",
+                },
+                mpsc::error::TrySendError::Closed(_queued) => {
+                    AppError::internal("the splat queue is closed", WorkerGone)
+                }
+            })?;
+        Ok(Box::pin(async move {
+            answer.await.map_err(|_dropped| {
+                AppError::internal("the splat worker dropped the request", WorkerGone)
+            })?
+        }))
+    }
+}
+
+/// The answer to an admitted generation: what the worker reports, or the
+/// 500 saying it is gone.
+///
+/// Boxed so [`SplatService::admit`] can hand the same future to every caller:
+/// the worker-gone mapping lives in `admit` alone, and the two entry points
+/// that await it cannot drift apart in wording.
+pub type SplatAnswer = Pin<Box<dyn Future<Output = Result<GeneratedSplat, AppError>> + Send>>;
+
+/// The worker thread is not there any more.
+///
+/// A unit error type rather than a string, so the two places that report it
+/// cannot drift apart in wording.
+#[derive(Debug, thiserror::Error)]
+#[error("the splat worker thread is not running")]
+struct WorkerGone;
+
+/// A generation panicked inside the generator.
+///
+/// The worker catches the panic so one bad job does not end the thread; this
+/// is what the caller's 500 keeps as its cause.
+#[derive(Debug, thiserror::Error)]
+#[error("the splat generator panicked")]
+struct GeneratorPanicked;
+
 #[cfg(test)]
 mod tests {
     use shiso_core::ids::Seed;
@@ -245,5 +441,164 @@ mod tests {
                 ..
             } if field == "image"
         ));
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use shiso_core::ids::Seed;
+    use shiso_vision::splat::{
+        GeneratedSplat, SplatGenError, SplatGenerator, SplatJob, SplatLimits, SplatMode,
+        SplatStepEvent,
+    };
+    use tokio::sync::mpsc;
+
+    use super::{SplatService, SplatServiceDesc};
+    use crate::error::AppError;
+
+    fn job() -> SplatJob {
+        SplatJob {
+            image: vec![0x89, b'P', b'N', b'G'],
+            mode: SplatMode::Synthetic,
+            seed: Seed::new(42),
+            steps: 1,
+            cfg_strength: 3.0,
+            rescale_t: 3.0,
+            num_gaussians: 262_144,
+            crop_margin: 1.2,
+        }
+    }
+
+    #[derive(Debug)]
+    struct Fake {
+        calls: AtomicUsize,
+        panic: bool,
+        steps: u32,
+    }
+
+    impl Fake {
+        fn new(panic: bool) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                panic,
+                steps: 1,
+            })
+        }
+    }
+
+    impl SplatGenerator for Fake {
+        fn model_id(&self) -> &'static str {
+            "fake"
+        }
+
+        fn limits(&self) -> SplatLimits {
+            SplatLimits::default()
+        }
+
+        fn generate(
+            &self,
+            _job: &SplatJob,
+            progress: Option<&dyn Fn(SplatStepEvent)>,
+        ) -> Result<GeneratedSplat, SplatGenError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic, "boom");
+            if let Some(callback) = progress {
+                callback(SplatStepEvent {
+                    step: 0,
+                    total_steps: self.steps,
+                });
+            }
+            Ok(GeneratedSplat {
+                bytes: b"ply".to_vec(),
+                media_type: "model/ply",
+                num_gaussians: 262_144,
+                completion_tokens: 614_700,
+            })
+        }
+    }
+
+    fn start(fake: &Arc<Fake>) -> SplatService {
+        SplatService::start(SplatServiceDesc {
+            generator: {
+                let generator: Arc<dyn SplatGenerator> = Arc::<Fake>::clone(fake);
+                generator
+            },
+            model_id: "fake".to_owned(),
+            max_queue: 1,
+            profile: None,
+        })
+        .expect("thread")
+    }
+
+    #[tokio::test]
+    async fn a_queued_job_runs_on_the_worker_thread() {
+        let fake = Fake::new(false);
+        let service = start(&fake);
+        let out = service.generate(job()).await.expect("runs");
+        assert_eq!(out.media_type, "model/ply");
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_bad_job_is_refused_before_it_costs_a_queue_slot() {
+        let fake = Fake::new(false);
+        let service = start(&fake);
+        let mut bad = job();
+        bad.steps = 0;
+        let Err(err) = service.admit(bad, None) else {
+            panic!("a zero-step job must not be admitted");
+        };
+        assert!(matches!(
+            err,
+            AppError::BadRequest {
+                param: Some(ref field),
+                ..
+            } if field == "steps"
+        ));
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_panic_ends_the_job_not_the_thread() {
+        let fake = Fake::new(true);
+        let service = start(&fake);
+        assert!(matches!(
+            service.generate(job()).await,
+            Err(AppError::Internal { .. })
+        ));
+        assert!(
+            service.generate(job()).await.is_err(),
+            "the second job still runs"
+        );
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn progress_events_reach_a_streaming_caller() {
+        let fake = Fake::new(false);
+        let service = start(&fake);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let out = service.generate_stream(job(), tx).await.expect("runs");
+        assert_eq!(out.completion_tokens, 614_700);
+        let event = rx.recv().await.expect("one event");
+        assert_eq!((event.step, event.total_steps), (0, 1));
+        assert!(
+            rx.recv().await.is_none(),
+            "the channel closes after the job"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_service_reports_the_model_identity_and_defaults() {
+        let fake = Fake::new(false);
+        let service = start(&fake);
+        assert_eq!(service.model_id(), "fake");
+        assert_eq!(
+            service.defaults().steps,
+            SplatLimits::default().default_steps
+        );
     }
 }

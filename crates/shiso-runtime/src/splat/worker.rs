@@ -1,0 +1,92 @@
+//! The splat thread: take a job, run it to its end, report.
+//!
+//! One generation at a time, in arrival order: a denoising step saturates the
+//! device, so interleaving two would make both slower and double the peak.
+//! The loop ends when every service handle is dropped, which is when the
+//! process is done serving.
+
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::time::Instant;
+
+use shiso_vision::splat::SplatStepEvent;
+use tokio::sync::mpsc;
+
+use super::{GeneratorPanicked, Queued, SplatServiceDesc, refuse};
+use crate::error::AppError;
+
+/// The thread body: runs until every service handle is gone.
+pub(super) fn run_worker(desc: &SplatServiceDesc, mut rx: mpsc::Receiver<Queued>) {
+    let mut served: u64 = 0;
+    while let Some(request) = rx.blocking_recv() {
+        let Queued {
+            job,
+            progress,
+            reply,
+        } = request;
+        // A caller that hung up while its job waited is not worth a full
+        // generation: nothing is listening for the answer any more.
+        if reply.is_closed() {
+            continue;
+        }
+        let began = Instant::now();
+        let emit = progress.as_ref().map(|sink| {
+            move |event: SplatStepEvent| {
+                // A streaming caller that stopped reading does not stop the
+                // generation; its final answer still goes to its reply.
+                let _gone = sink.send(event);
+            }
+        });
+        // Coerced at a binding rather than with `as`: the cast form is what
+        // the compiler calls a trivial cast and warns about.
+        let progress_cb: Option<&dyn Fn(SplatStepEvent)> = match &emit {
+            Some(emit) => Some(emit),
+            None => None,
+        };
+        // A panic inside the generator ends that job, not the thread: the
+        // queue holds other callers who did nothing wrong.
+        served += 1;
+        let region = desc
+            .profile
+            .as_ref()
+            .and_then(|sink| sink.begin(format!("{served:06}")));
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            desc.generator.generate(&job, progress_cb)
+        }));
+        let outcome = match outcome {
+            Ok(Ok(splat)) => Ok(splat),
+            Ok(Err(error)) => Err(refuse(error)),
+            Err(payload) => {
+                // The payload is whatever `panic!` was handed; the two string
+                // forms are almost all of it, and the named fallback keeps a
+                // non-string payload from erasing the fact of the panic from
+                // the log.
+                let detail = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "panicked with non-string payload".to_owned());
+                tracing::error!(
+                    detail = detail.as_str(),
+                    "a splat generation panicked; the worker goes on"
+                );
+                Err(AppError::internal(
+                    "splat generation panicked",
+                    GeneratorPanicked,
+                ))
+            }
+        };
+        if let Some(region) = region
+            && let Some(sink) = desc.profile.as_ref()
+        {
+            sink.end(region, "splat");
+        }
+        tracing::info!(
+            seconds = began.elapsed().as_secs_f64(),
+            ok = outcome.is_ok(),
+            "splat generation finished"
+        );
+        // `Err` here is a caller that hung up mid-generation; there is nowhere
+        // left to report to.
+        let _gone = reply.send(outcome);
+    }
+}
