@@ -50,6 +50,7 @@ pub mod recipe_defaults;
 pub mod response_store;
 pub mod runtime;
 pub mod scheduler;
+pub mod splat;
 pub mod state;
 pub mod tokenizer;
 pub mod vision;
