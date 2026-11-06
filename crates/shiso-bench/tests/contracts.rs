@@ -53,6 +53,9 @@ use shiso_vision::generator::{
     GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageLimits,
     ImageOutputFormat, ImageStepEvent, InputReferenceImage,
 };
+use shiso_vision::splat::{
+    GeneratedSplat, SplatGenError, SplatGenerator, SplatJob, SplatMode, SplatStepEvent,
+};
 
 use shiso_hub::{HostProfile, HubError, ModelRef, ProgressEvent, Recipe};
 
@@ -833,6 +836,158 @@ mod image_core {
     }
     const _: fn(Step) -> StepFields = step_fields;
 }
+
+// ---------------------------------------------------------------------------
+// 3D splat generation.
+//
+// The same seam as image generation, one modality over: the wire handler
+// builds a job, the runtime's splat worker holds the generator as a trait
+// object and answers the job with encoded bytes, and the job carries the
+// core `Seed` newtype rather than a raw integer. Losing object safety, or a
+// field type drifting on the job, the splat or the service description, would
+// surface here rather than in the wire adapter.
+
+const _: Option<&dyn SplatGenerator> = None;
+
+/// A generation takes the validated job and an optional progress callback and
+/// answers with the encoded splat - the one door between the worker and a
+/// family.
+type GenerateSplat = fn(
+    &(dyn SplatGenerator + 'static),
+    &SplatJob,
+    Option<&dyn Fn(SplatStepEvent)>,
+) -> Result<GeneratedSplat, SplatGenError>;
+const _: GenerateSplat = <dyn SplatGenerator>::generate;
+
+/// A job read apart: the picture's bytes, the mode, the core `Seed` newtype,
+/// the step count, the two sampler knobs, the Gaussian count and the crop
+/// margin. A raw `u64` seed, or a Gaussian count that became a float, stops
+/// here.
+type SplatJobFields = (Vec<u8>, SplatMode, Seed, u32, f32, f32, u32, f32);
+fn splat_job_fields(job: SplatJob) -> SplatJobFields {
+    (
+        job.image,
+        job.mode,
+        job.seed,
+        job.steps,
+        job.cfg_strength,
+        job.rescale_t,
+        job.num_gaussians,
+        job.crop_margin,
+    )
+}
+const _: fn(SplatJob) -> SplatJobFields = splat_job_fields;
+const _: fn(&SplatJob) -> Result<(), SplatGenError> = SplatJob::validate;
+
+/// A finished splat read apart: the encoded bytes with the MIME string and
+/// the Gaussian and token counts the wire response reports.
+type GeneratedSplatFields = (Vec<u8>, &'static str, u32, u32);
+fn generated_splat_fields(splat: GeneratedSplat) -> GeneratedSplatFields {
+    (
+        splat.bytes,
+        splat.media_type,
+        splat.num_gaussians,
+        splat.completion_tokens,
+    )
+}
+const _: fn(GeneratedSplat) -> GeneratedSplatFields = generated_splat_fields;
+
+/// What the worker thread is started with, read apart: the generator as the
+/// trait object the server holds, its wire name, the queue ceiling and where
+/// profile reports go.
+type SplatServiceDescFields = (
+    std::sync::Arc<dyn SplatGenerator>,
+    String,
+    usize,
+    Option<shiso_runtime::profile::ProfileSink>,
+);
+fn splat_service_desc_fields(
+    desc: shiso_runtime::splat::SplatServiceDesc,
+) -> SplatServiceDescFields {
+    (desc.generator, desc.model_id, desc.max_queue, desc.profile)
+}
+const _: fn(shiso_runtime::splat::SplatServiceDesc) -> SplatServiceDescFields =
+    splat_service_desc_fields;
+
+/// The answer to an admitted generation: the boxed future the worker's report
+/// resolves to. Both awaiting entry points and the streaming handler's
+/// admission path speak it, so the worker-gone mapping cannot drift between
+/// them.
+const _: Option<shiso_runtime::splat::SplatAnswer> = None;
+
+/// Every variant of the generator's error, named with its payload type: the
+/// wire handlers map them onto HTTP statuses and quote the payloads into the
+/// response, so a rename, a removed variant or a retyped payload must stop
+/// here rather than in a downstream match arm. The match is exhaustive in both
+/// directions: a variant added upstream makes it non-exhaustive.
+fn splat_gen_error_variants(error: &SplatGenError) -> (u8, u32) {
+    match error {
+        SplatGenError::UndecodableImage(msg) => {
+            let _: &String = msg;
+            (0, 0)
+        }
+        SplatGenError::EmptyAlpha => (1, 0),
+        SplatGenError::InvalidSteps { steps } => (2, *steps),
+        SplatGenError::InvalidGaussians { count } => (3, *count),
+        SplatGenError::InvalidCfg { value } => (4, value.to_bits()),
+        SplatGenError::InvalidRescale { value } => (5, value.to_bits()),
+        SplatGenError::InvalidCropMargin { value } => (6, value.to_bits()),
+        SplatGenError::Matting(msg) => {
+            let _: &String = msg;
+            (7, 0)
+        }
+        SplatGenError::Backend(msg) => {
+            let _: &String = msg;
+            (8, 0)
+        }
+        SplatGenError::Checkpoint(msg) => {
+            let _: &String = msg;
+            (9, 0)
+        }
+        SplatGenError::Encoding(msg) => {
+            let _: &String = msg;
+            (10, 0)
+        }
+    }
+}
+const _: fn(&SplatGenError) -> (u8, u32) = splat_gen_error_variants;
+
+/// The IR request read apart, and the two entry points the wire calls: the
+/// request loses its wire vocabulary at the IR boundary, and the job builder
+/// is the one place a request's omitted knobs become the model's defaults.
+type SplatRequestFields = (
+    Vec<u8>,
+    shiso_ir::splat::Mode,
+    Option<u64>,
+    Option<u32>,
+    Option<f32>,
+    Option<f32>,
+    Option<u32>,
+    Option<f32>,
+);
+fn splat_request_fields(request: shiso_ir::splat::Generate) -> SplatRequestFields {
+    (
+        request.image,
+        request.mode,
+        request.seed,
+        request.steps,
+        request.cfg_strength,
+        request.rescale_t,
+        request.num_gaussians,
+        request.crop_margin,
+    )
+}
+const _: fn(shiso_ir::splat::Generate) -> SplatRequestFields = splat_request_fields;
+type BuildSplatJob = fn(
+    shiso_ir::splat::Generate,
+    shiso_runtime::splat::SplatDefaults,
+    Seed,
+) -> Result<SplatJob, shiso_runtime::error::AppError>;
+const _: BuildSplatJob = shiso_runtime::splat::build_job;
+fn splat_limits(generator: &dyn SplatGenerator) -> shiso_vision::splat::SplatLimits {
+    generator.limits()
+}
+const _: fn(&dyn SplatGenerator) -> shiso_vision::splat::SplatLimits = splat_limits;
 
 // ---------------------------------------------------------------------------
 // Embeddings.
