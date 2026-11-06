@@ -24,6 +24,7 @@ pub mod embedding_gemma2;
 pub mod flux2;
 pub mod flux3;
 pub mod gemma4;
+pub mod idol;
 pub mod image_registry;
 #[cfg(test)]
 mod image_registry_tests;
