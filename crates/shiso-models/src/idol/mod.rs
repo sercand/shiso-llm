@@ -10,3 +10,4 @@ pub mod dinov3;
 pub mod latent;
 pub mod ply;
 pub mod preprocess;
+pub mod sampler;
