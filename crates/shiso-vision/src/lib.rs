@@ -74,12 +74,15 @@ mod image;
 mod item;
 mod mp4;
 pub mod shard;
+pub mod splat;
 mod steps;
 mod tower;
 mod video;
 
 #[cfg(test)]
 mod generator_tests;
+#[cfg(test)]
+mod splat_tests;
 #[cfg(test)]
 mod testing;
 
