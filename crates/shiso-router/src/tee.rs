@@ -39,6 +39,11 @@ pub(crate) enum Dialect {
     /// so it is recovered from a bounded tail window rather than a whole
     /// parse.
     Images,
+    /// 3D generation (`/v1/3d/generations`). Bodies are mostly base64
+    /// `.ply` data, and the usage object rides at the end of the response
+    /// (or of the streamed `splat_generation.completed` frame), so it is
+    /// recovered from a bounded tail window rather than a whole parse.
+    Splat,
     Anthropic,
 }
 
@@ -56,6 +61,8 @@ impl Dialect {
             Dialect::Scoring
         } else if path.ends_with("/v1/images/generations") {
             Dialect::Images
+        } else if path.ends_with("/v1/3d/generations") {
+            Dialect::Splat
         } else {
             Dialect::OpenAiChat
         }
@@ -187,7 +194,10 @@ impl UsageAccumulator {
                 },
                 false,
             )
-        } else if matches!(dialect, Dialect::OpenAiEmbeddings | Dialect::Images) {
+        } else if matches!(
+            dialect,
+            Dialect::OpenAiEmbeddings | Dialect::Images | Dialect::Splat
+        ) {
             (
                 Mode::Edges {
                     head: Vec::new(),
@@ -253,7 +263,7 @@ impl UsageAccumulator {
                 skipping_oversized,
                 oversized_tail,
             } => {
-                let keep_tail = self.dialect == Dialect::Images;
+                let keep_tail = matches!(self.dialect, Dialect::Images | Dialect::Splat);
                 let mut rest = chunk;
                 while let Some(pos) = rest.iter().position(|&b| b == b'\n') {
                     let (head, tail) = rest.split_at(pos);
@@ -594,7 +604,7 @@ fn apply_event(dialect: Dialect, ext: &mut Extracted, v: &Value) {
         Dialect::Scoring => apply_openai_usage(ext, &v["usage"]),
         // Streamed usage is cumulative over the request's images, so the
         // last completed frame's value is the total.
-        Dialect::Images => apply_openai_usage(ext, &v["usage"]),
+        Dialect::Images | Dialect::Splat => apply_openai_usage(ext, &v["usage"]),
         Dialect::Anthropic => match v["type"].as_str() {
             Some("message_start") => {
                 apply_anthropic_usage(ext, &v["message"]["usage"]);

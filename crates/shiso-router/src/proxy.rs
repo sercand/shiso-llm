@@ -641,8 +641,8 @@ fn deadline_ms(headers: &HeaderMap, qos: &RouteQos) -> Option<i64> {
 /// The API kind an inbound endpoint speaks (same mapping as
 /// `Dialect::for_path`): `/v1/messages` is Anthropic wire format,
 /// `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`,
-/// `/v1/audio/transcriptions`, `/v1/decisions`, `/v1/systemone` and
-/// `/v1/images/generations` are OpenAI.
+/// `/v1/audio/transcriptions`, `/v1/decisions`, `/v1/systemone`,
+/// `/v1/images/generations` and `/v1/3d/generations` are OpenAI.
 fn required_kind(path: &str) -> BackendKind {
     if path.ends_with("/v1/messages") {
         BackendKind::Anthropic
@@ -669,6 +669,9 @@ fn canonical_path(path: &str) -> &str {
         // OpenRouter one) and `/v1/images` are the shorthands clients reach
         // for. All of them go upstream as the OpenAI path.
         "/images" | "/v1/images" | "/images/generations" => "/v1/images/generations",
+        // The 3D surface has one spelling upstream; the unprefixed form is
+        // the convenience alias, as it is for every other endpoint here.
+        "/3d/generations" => "/v1/3d/generations",
         other => other,
     }
 }
@@ -787,6 +790,9 @@ fn token_limit_field(
         Dialect::Scoring => None,
         // An image's cost is its step count and size, not a token budget.
         Dialect::Images => None,
+        // A splat's cost is its step count and Gaussian count, neither of
+        // which is a token budget the backend can clamp.
+        Dialect::Splat => None,
     }
 }
 
@@ -1156,6 +1162,24 @@ mod tests {
         }
         assert_eq!(Dialect::for_path("/v1/images/generations"), Dialect::Images);
         assert_eq!(required_kind("/v1/images/generations"), BackendKind::Openai);
+    }
+
+    #[test]
+    fn canonical_paths_fold_the_splat_spelling() {
+        assert_eq!(canonical_path("/3d/generations"), "/v1/3d/generations");
+        assert_eq!(canonical_path("/v1/3d/generations"), "/v1/3d/generations");
+        assert_eq!(Dialect::for_path("/v1/3d/generations"), Dialect::Splat);
+        assert_eq!(required_kind("/v1/3d/generations"), BackendKind::Openai);
+    }
+
+    /// The splat wire has no token limit: its cost is steps and Gaussians,
+    /// neither of which is a token budget the backend can clamp.
+    #[test]
+    fn clamp_does_not_apply_to_splats() {
+        let body = Bytes::from_static(br#"{"model":"m","image":"aGk=","steps":20}"#);
+        let out = prepare_body(&body, &clamp(Dialect::Splat, 512)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v.as_object().unwrap().len(), 3, "nothing was added: {v}");
     }
 
     /// The image wire has no token limit; an injected `max_tokens` would
