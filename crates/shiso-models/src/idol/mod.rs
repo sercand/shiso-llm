@@ -5,4 +5,7 @@
 //! 1024-square RGB image the encoders read. The device stages arrive with
 //! their own plans, which is why this module has no backend in it yet.
 
+pub mod conditioning;
+pub mod dinov3;
+pub mod latent;
 pub mod preprocess;
