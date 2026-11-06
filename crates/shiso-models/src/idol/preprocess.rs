@@ -20,6 +20,18 @@ use image::{Rgba, RgbaImage};
 /// The model's input side: every preprocessed picture is this square.
 pub const IMAGE_SIZE: u32 = 1024;
 
+/// The longest side the first resize may produce.
+///
+/// A picture whose short side is tiny but whose long side is enormous - a
+/// 100000x1 strip is a few hundred compressed bytes - would otherwise scale to
+/// a hundred million pixels wide and abort the process on the allocation. The
+/// reference lets its allocator raise; a server that a single request can kill
+/// has to refuse instead.
+pub const MAX_SCALED_SIDE: u32 = 65_536;
+
+/// The largest area the first resize may produce, in pixels.
+pub const MAX_SCALED_PIXELS: u64 = 64_000_000;
+
 /// A preprocessing refusal.
 #[derive(Debug, thiserror::Error)]
 pub enum PreprocessError {
@@ -33,6 +45,22 @@ pub enum PreprocessError {
     /// The image has no real alpha and no background remover is loaded.
     #[error("{0}")]
     Matting(String),
+    /// Scaling the short side to the model's input size would produce a
+    /// picture no host can hold.
+    #[error(
+        "a {width}x{height} picture scales to {scaled_width}x{scaled_height}, over this stage's \
+         {MAX_SCALED_SIDE}-pixel side or {MAX_SCALED_PIXELS}-pixel area ceiling"
+    )]
+    TooLarge {
+        /// The source width.
+        width: u32,
+        /// The source height.
+        height: u32,
+        /// The width after the first resize.
+        scaled_width: u32,
+        /// The height after the first resize.
+        scaled_height: u32,
+    },
 }
 
 /// Background removal, as the preprocessing stage needs it.
@@ -96,11 +124,29 @@ pub fn preprocess(
     // the scale the remover was trained at and the crop arithmetic below works
     // on the picture the encoders will actually see.
     let scale = f64::from(IMAGE_SIZE) / f64::from(width.min(height));
-    let scaled_w = ((f64::from(width) * scale).round() as u32).max(1);
-    let scaled_h = ((f64::from(height) * scale).round() as u32).max(1);
+    // Python's `round` is half-to-even, and the reference uses it: a 2049x2048
+    // picture scales to 1024.5 wide, which the reference rounds *down* to
+    // 1024. Rounding half away from zero would shift the crop by a column.
+    let scaled_w = ((f64::from(width) * scale).round_ties_even() as u32).max(1);
+    let scaled_h = ((f64::from(height) * scale).round_ties_even() as u32).max(1);
+    if scaled_w > MAX_SCALED_SIDE
+        || scaled_h > MAX_SCALED_SIDE
+        || u64::from(scaled_w) * u64::from(scaled_h) > MAX_SCALED_PIXELS
+    {
+        return Err(PreprocessError::TooLarge {
+            width,
+            height,
+            scaled_width: scaled_w,
+            scaled_height: scaled_h,
+        });
+    }
     let mut working = resize_lanczos3(&decoded, scaled_w, scaled_h);
 
-    if !has_real_alpha(&working) {
+    // The reference asks whether Pillow's *mode* is RGBA and some alpha is not
+    // 255. `to_rgba8` cannot answer that: it turns a palette PNG with a `tRNS`
+    // chunk into RGBA, which Pillow keeps as mode `P` and therefore mattes. The
+    // PNG header's colour type is what tells the two apart.
+    if !(is_rgba_png(image) && has_transparent_pixel(&working)) {
         let matting = matting.ok_or_else(|| {
             PreprocessError::Matting(
                 "the image has no alpha and no background remover is loaded".to_owned(),
@@ -130,13 +176,26 @@ pub fn preprocess(
     })
 }
 
-/// Whether the image carries an alpha channel that is not fully opaque.
+/// Whether the encoded picture is a true-colour PNG with an alpha channel.
+///
+/// PNG's IHDR colour type lives at byte 25 of the file: an 8-byte signature, a
+/// 4-byte chunk length, the 4-byte `IHDR` tag, the 4-byte width, the 4-byte
+/// height, one byte of bit depth, then the colour type. Type 6 is RGBA, which
+/// is the only PNG Pillow opens as mode `RGBA`; a palette PNG with a `tRNS`
+/// chunk is mode `P` and is matted by the reference even though it carries
+/// transparency.
+#[must_use]
+pub(crate) fn is_rgba_png(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.get(25) == Some(&6)
+}
+
+/// Whether any pixel is not fully opaque.
 ///
 /// A fully opaque alpha is the same as no alpha at all: the reference treats
-/// it that way, so a PNG saved with an all-255 alpha still goes through
+/// it that way, so an RGBA PNG saved with an all-255 alpha still goes through
 /// matting rather than being cropped to its whole frame.
 #[must_use]
-pub(crate) fn has_real_alpha(image: &RgbaImage) -> bool {
+pub(crate) fn has_transparent_pixel(image: &RgbaImage) -> bool {
     image.pixels().any(|pixel| pixel.0[3] < 255)
 }
 
@@ -501,12 +560,24 @@ mod tests {
     }
 
     #[test]
-    fn a_fully_opaque_rgba_image_has_no_real_alpha() {
+    fn a_fully_opaque_alpha_is_not_a_real_alpha() {
         let image = RgbaImage::from_pixel(4, 4, Rgba([1, 2, 3, 255]));
-        assert!(!has_real_alpha(&image));
+        assert!(!has_transparent_pixel(&image));
         let mut image = image;
         image.put_pixel(0, 0, Rgba([1, 2, 3, 254]));
-        assert!(has_real_alpha(&image));
+        assert!(has_transparent_pixel(&image));
+    }
+
+    #[test]
+    fn only_a_true_colour_png_counts_as_rgba() {
+        // A 1x1 RGBA PNG's IHDR colour type is 6.
+        let rgba = png_with_alpha(1, 1, 0..1);
+        assert!(is_rgba_png(&rgba));
+        // The same picture without an alpha channel is colour type 2.
+        let rgb = opaque_png(1, 1);
+        assert!(!is_rgba_png(&rgb));
+        // Anything that is not a PNG cannot be Pillow's mode `RGBA`.
+        assert!(!is_rgba_png(b"\xff\xd8\xff\xe0"));
     }
 
     #[test]
@@ -534,6 +605,19 @@ mod tests {
             bottom: 6,
         };
         assert_eq!(crop_box(bbox, 1.2), (1, 2, 4, 4));
+    }
+
+    #[test]
+    fn a_negative_edge_truncates_toward_zero_not_down() {
+        // centre 0.5, half 1.8: left = int(-1.3) = -1 (a floor would say -2),
+        // right = int(2.3) = 2 -> 3 wide.
+        let bbox = Bbox {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        };
+        assert_eq!(crop_box(bbox, 3.6), (-1, -1, 3, 3));
     }
 
     #[test]
@@ -584,7 +668,7 @@ mod tests {
             .expect("encodes");
         let decoded = decode_rgba(buffer.get_ref()).expect("decodes");
         assert_eq!(decoded.dimensions(), (2, 2));
-        assert!(!has_real_alpha(&decoded));
+        assert!(!has_transparent_pixel(&decoded));
     }
 
     #[test]
@@ -615,9 +699,13 @@ mod tests {
     #[test]
     fn downscaling_tracks_a_pillow_golden() {
         // A 4x4 grey ramp scaled to 2x2. The expected values are what Pillow's
-        // Image.LANCZOS produces for this exact input. The comparison is exact
-        // because the arithmetic is `f64` throughout and so is deterministic; a
-        // drift here means the geometry moved.
+        // Image.LANCZOS produces for this exact input, and this implementation
+        // reproduces them exactly. Pillow's 8-bit path quantises its
+        // coefficients to 22-bit fixed point and rounds to `u8` between the two
+        // passes where this one keeps `f64` throughout, so the two can differ
+        // by one unit on other inputs; the geometry, which is what the model
+        // depends on, is identical. The comparison is exact because this
+        // implementation is deterministic.
         let mut image = RgbaImage::new(4, 4);
         for y in 0..4u32 {
             for x in 0..4u32 {
@@ -714,11 +802,25 @@ mod tests {
     struct SquareMatte {
         lo: u32,
         hi: u32,
+        /// The dimensions the matte was handed, so a test can prove the stage
+        /// resized *before* matting rather than after.
+        seen: std::cell::Cell<Option<(u32, u32)>>,
+    }
+
+    impl SquareMatte {
+        fn new(lo: u32, hi: u32) -> Self {
+            Self {
+                lo,
+                hi,
+                seen: std::cell::Cell::new(None),
+            }
+        }
     }
 
     impl Matting for SquareMatte {
         fn alpha(&self, rgb: &RgbImage) -> Result<Vec<u8>, String> {
             let (width, height) = rgb.dimensions();
+            self.seen.set(Some((width, height)));
             let mut alpha = vec![0u8; (width * height) as usize];
             for y in self.lo..self.hi.min(height) {
                 for x in self.lo..self.hi.min(width) {
@@ -745,7 +847,7 @@ mod tests {
 
     #[test]
     fn the_output_is_always_square_and_black_outside_the_object() {
-        let matte = SquareMatte { lo: 200, hi: 824 };
+        let matte = SquareMatte::new(200, 824);
         let out = preprocess(&opaque_png(1200, 800), 1.2, Some(&matte)).expect("runs");
         assert_eq!(out.rgb.dimensions(), (IMAGE_SIZE, IMAGE_SIZE));
         assert_eq!(out.rgb.get_pixel(0, 0).0, [0, 0, 0], "corner is background");
@@ -753,21 +855,21 @@ mod tests {
 
     #[test]
     fn a_large_photo_is_scaled_before_the_crop() {
-        let matte = SquareMatte { lo: 400, hi: 700 };
+        let matte = SquareMatte::new(400, 700);
         let out = preprocess(&opaque_png(4000, 3000), 1.7, Some(&matte)).expect("runs");
         assert_eq!(out.rgb.dimensions(), (IMAGE_SIZE, IMAGE_SIZE));
     }
 
     #[test]
     fn an_object_touching_the_edge_is_padded_not_refused() {
-        let matte = SquareMatte { lo: 0, hi: 300 };
+        let matte = SquareMatte::new(0, 300);
         let out = preprocess(&opaque_png(1024, 1024), 1.7, Some(&matte)).expect("runs");
         assert_eq!(out.rgb.dimensions(), (IMAGE_SIZE, IMAGE_SIZE));
     }
 
     #[test]
     fn a_matte_that_finds_nothing_is_refused() {
-        let matte = SquareMatte { lo: 0, hi: 0 };
+        let matte = SquareMatte::new(0, 0);
         let err = preprocess(&opaque_png(512, 512), 1.2, Some(&matte))
             .expect_err("an empty matte leaves nothing to crop");
         assert!(matches!(err, PreprocessError::EmptyAlpha));

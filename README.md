@@ -368,6 +368,7 @@ Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=d
 | `POST /v1/audio/transcriptions` | OpenAI Audio Transcriptions (also at `/audio/transcriptions`) |
 | `POST /v1/images/generations` | OpenAI Images (also at `/v1/images` and `/images`; serves FLUX.2-klein, the distilled FLUX.3 Klein and Qwen-Image-2.1 (Turbo, base, and fine-tunes in the same format; the schedule is the assets' `model_index.json` `sample_sigmas`, shifted by `scheduler/scheduler_config.json`); `b64_json` only) |
 | `POST /v1/images/edits` | OpenAI Image edits (also at `/images/edits`; FLUX.3 Klein only; multipart `image`/`image[]` (up to 10) or JSON `images` with `data:` URLs, plus `prompt`, `size`, `seed`, `steps`, `output_format`, `output_compression`; `n` must be 1, no `mask`; `b64_json` only; body limit `--image-max-upload-mb`) |
+| `POST /v1/3d/generations` | 3D Gaussian-splat generation: one image in, one binary `.ply` out, `b64_ply` only; `mode`, `seed`, `steps`, `cfg_strength`, `rescale_t`, `num_gaussians`, `crop_margin`, `stream`; requires a splat model (`--splat-model`, landing with the model itself) |
 | `POST /v1/embeddings` | OpenAI and OpenRouter Embeddings (also at `/embeddings`; text, token-id and multimodal `content` inputs, `dimensions`, `encoding_format` `float` or `base64`, `input_type`) |
 | `GET /v1/models` | OpenAI Models |
 | `GET /health`, `GET /metrics`, `GET /cache` | health, metrics, cache report |

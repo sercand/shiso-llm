@@ -61,20 +61,14 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
         )
     })?;
     let stream = parsed.stream.unwrap_or(false);
-    let ir = parsed.into_ir().map_err(|message| {
-        // The wire's own refusal names the field it is about; the message says
-        // which one, so the `param` is read back out of it rather than guessed.
-        let param = if message.starts_with("mode") {
-            "mode"
-        } else {
-            "image"
-        };
-        AppError::bad_request(message, Some(param), "invalid_request")
+    let ir = parsed.into_ir().map_err(|refusal| {
+        AppError::bad_request(refusal.message, Some(refusal.field), "invalid_request")
     })?;
-    // The service is asked before the job is built, so a server without a
-    // splat model answers 503 rather than 400 for a request it could never
-    // have run: the flag is the operator's to fix, and a well-formed request
-    // is not the caller's fault.
+    // The knobs are judged before the model question, as the image route judges
+    // them: a body this server will never act on is the caller's fault whether
+    // or not a splat model is loaded, and answering 503 first would send a
+    // caller to fix a flag only for the same request to start failing 400.
+    shiso_runtime::splat::validate(&ir, shiso_vision::splat::SplatLimits::default())?;
     let service = state.splat()?;
     let seed = ir.seed.unwrap_or_else(shiso_runtime::ids::entropy_u64);
     let job =
@@ -246,12 +240,11 @@ fn completed_frame(created: u64, splat: &Splat, usage: shiso_ir::splat::Usage) -
         r#type: "splat_generation.completed",
         created,
         b64_ply: BASE64_STANDARD.encode(&splat.bytes),
-        media_type: Some(splat.media_type.clone()),
-        usage: Some(SplatGenerationUsage {
+        usage: SplatGenerationUsage {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
             total_tokens: usage.total_tokens(),
-        }),
+        },
     };
     Frame::named(
         "splat_generation.completed",
@@ -260,13 +253,21 @@ fn completed_frame(created: u64, splat: &Splat, usage: shiso_ir::splat::Usage) -
 }
 
 /// The frame a failure after the 200 is spent goes out as.
+///
+/// The same error object every other failure on this server sends: a client
+/// that parses every frame as JSON should not have to special-case the one
+/// frame that says what went wrong.
 fn error_frame(error: &AppError) -> Frame {
+    let message = match error {
+        AppError::Internal { .. } => "internal server error".to_owned(),
+        other => other.to_string(),
+    };
     Frame::data(
         serde_json::json!({
-            "type": "error",
             "error": {
-                "message": error.to_string(),
+                "message": message,
                 "type": crate::error::type_for_status(error.status()),
+                "param": serde_json::Value::Null,
                 "code": error.code(),
             }
         })

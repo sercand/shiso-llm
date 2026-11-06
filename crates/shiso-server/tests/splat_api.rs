@@ -152,6 +152,17 @@ async fn a_blocking_request_answers_with_the_encoded_splat() {
 }
 
 #[tokio::test]
+async fn a_bad_knob_is_a_400_even_without_a_model() {
+    // A body this server will never act on is the caller's fault whether or
+    // not a splat model is loaded; answering 503 first would send the caller
+    // to fix a flag only for the same request to start failing 400.
+    let state = Arc::new(AppState::without_language_model());
+    let (status, body) = post_json(state, json!({"image": "aGVsbG8=", "steps": 0})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["param"], "steps");
+}
+
+#[tokio::test]
 async fn a_server_without_a_splat_model_answers_503() {
     let state = Arc::new(AppState::without_language_model());
     let (status, body) = post_json(state, body()).await;
@@ -211,6 +222,92 @@ async fn real_mode_moves_the_crop_margin_and_an_explicit_one_wins() {
     assert!((generator.recorded().pop().expect("one job").crop_margin - 1.4).abs() < f32::EPSILON);
 }
 
+/// A generator that reports it has started and then waits until the test
+/// releases it: how a job is caught occupying the worker while the queue
+/// behind it fills.
+#[derive(Debug)]
+struct BlockingGenerator {
+    started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    gate: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl SplatGenerator for BlockingGenerator {
+    fn model_id(&self) -> &'static str {
+        "blocking"
+    }
+
+    fn limits(&self) -> SplatLimits {
+        SplatLimits::default()
+    }
+
+    fn generate(
+        &self,
+        _job: &SplatJob,
+        _progress: Option<&dyn Fn(SplatStepEvent)>,
+    ) -> Result<GeneratedSplat, SplatGenError> {
+        if let Some(started) = self.started.lock().expect("lock").take() {
+            let _sent = started.send(());
+        }
+        let _released = self.gate.lock().expect("lock").recv();
+        Ok(GeneratedSplat {
+            bytes: ply_bytes(),
+            media_type: "model/ply",
+            num_gaussians: 262_144,
+            completion_tokens: 1,
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_streamed_request_refused_by_a_full_queue_answers_503() {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+    let generator = Arc::new(BlockingGenerator {
+        started: Mutex::new(Some(started_tx)),
+        gate: Mutex::new(gate_rx),
+    });
+    let boxed: Arc<dyn SplatGenerator> = Arc::<BlockingGenerator>::clone(&generator);
+    let service = SplatService::start(SplatServiceDesc {
+        generator: boxed,
+        model_id: "blocking".to_owned(),
+        max_queue: 1,
+        profile: None,
+    })
+    .expect("starts splat service");
+    let state = Arc::new(AppState::without_language_model().with_splat(service));
+
+    // The first request occupies the worker; the second fills the queue.
+    let first = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move { post_json(state, body()).await }
+    });
+    started_rx.await.expect("the first job starts");
+    let second = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move { post_json(state, body()).await }
+    });
+    // Give the second request time to reach the queue before the third is
+    // sent; it is a queue slot, not a device call, so this is short.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // A streamed request that the queue refuses must answer with a status
+    // code, not a 200 and an error frame.
+    let (status, body) = post_json(
+        Arc::clone(&state),
+        json!({"image": "aGVsbG8=", "stream": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "server_overloaded");
+
+    // Dropping the sender releases every blocked job: the queued one runs
+    // after the first, and a second `send` would leave it waiting for a
+    // message that never comes.
+    drop(gate_tx);
+    let _ = first.await.expect("the first request finishes");
+    let _ = second.await.expect("the second request finishes");
+}
+
 #[tokio::test]
 async fn a_streamed_request_sends_admitted_progress_completed_and_done() {
     let (state, _generator) = state_with_mock();
@@ -257,5 +354,8 @@ async fn a_streamed_request_sends_admitted_progress_completed_and_done() {
         .find(|value| value["type"] == "splat_generation.completed")
         .expect("a completed frame");
     assert_eq!(completed["usage"]["completion_tokens"], 12_294 * 2);
-    assert_eq!(completed["media_type"], "model/ply");
+    assert_eq!(
+        completed["b64_ply"],
+        base64::engine::general_purpose::STANDARD.encode(ply_bytes())
+    );
 }

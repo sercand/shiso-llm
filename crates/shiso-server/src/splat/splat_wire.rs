@@ -2,7 +2,7 @@
 //!
 //! One picture in, one encoded `.ply` out. Like every other wire module here,
 //! this one owns its serde types and hands them to
-//! [`crate::splat::splat`], which converts toward the IR; nothing between the
+//! [`crate::splat::generate`], which converts toward the IR; nothing between the
 //! parse and the encode knows these names exist.
 //!
 //! Unknown fields are accepted, as on every other surface here: a client
@@ -11,7 +11,30 @@
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+
 use shiso_ir::splat::{Generate, Mode};
+
+/// A refusal this wire can make on the body alone, naming the field at fault.
+///
+/// A typed refusal rather than a bare message because the handler has to fill
+/// in the `OpenAI` error's `param`: recovering the field by matching on the
+/// message's first word would silently mislabel the next refusal added here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireRefusal {
+    /// The request field at fault.
+    pub field: &'static str,
+    /// What is wrong, in words a caller can act on.
+    pub message: String,
+}
+
+impl WireRefusal {
+    fn new(field: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            field,
+            message: message.into(),
+        }
+    }
+}
 
 /// Request payload for `POST /v1/3d/generations`.
 #[derive(Debug, Clone, Deserialize)]
@@ -57,16 +80,20 @@ impl SplatGenerationRequest {
     ///
     /// # Errors
     ///
-    /// A human-readable sentence naming the field at fault: `image` for bytes
-    /// that are not base64, `mode` for a value that is neither `synthetic` nor
-    /// `real`.
-    pub fn into_ir(self) -> Result<Generate, String> {
+    /// A [`WireRefusal`] naming `image` for bytes that are not base64, or
+    /// `mode` for a value that is neither `synthetic` nor `real`.
+    pub fn into_ir(self) -> Result<Generate, WireRefusal> {
         let image = decode_image(&self.image)?;
         let mode = match self.mode.as_deref() {
             None => Mode::Synthetic,
             Some(text) if text.eq_ignore_ascii_case("synthetic") => Mode::Synthetic,
             Some(text) if text.eq_ignore_ascii_case("real") => Mode::Real,
-            Some(_) => return Err("mode must be 'synthetic' or 'real'".to_owned()),
+            Some(_) => {
+                return Err(WireRefusal::new(
+                    "mode",
+                    "mode must be 'synthetic' or 'real'",
+                ));
+            }
         };
         Ok(Generate {
             image,
@@ -88,7 +115,7 @@ impl SplatGenerationRequest {
 /// decoder that runs next reads the bytes and refuses what it cannot decode,
 /// so a mislabelled prefix costs nothing and a correct one is not a promise
 /// this server has to keep.
-fn decode_image(text: &str) -> Result<Vec<u8>, String> {
+fn decode_image(text: &str) -> Result<Vec<u8>, WireRefusal> {
     let payload = match text.strip_prefix("data:") {
         Some(rest) => rest
             .split_once(',')
@@ -97,11 +124,11 @@ fn decode_image(text: &str) -> Result<Vec<u8>, String> {
     };
     base64::engine::general_purpose::STANDARD
         .decode(payload.trim())
-        .map_err(|_err| "image must be base64 or a data: URL".to_owned())
+        .map_err(|_err| WireRefusal::new("image", "image must be base64 or a data: URL"))
 }
 
 /// One finished splat in a blocking answer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SplatData {
     /// The encoded `.ply` file, base64.
     pub b64_ply: String,
@@ -119,7 +146,7 @@ pub struct SplatGenerationUsage {
 }
 
 /// A finished blocking request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SplatGenerationResponse {
     /// Unix time the request finished.
     pub created: u64,
@@ -156,10 +183,6 @@ pub struct SplatCompletedEvent {
     pub created: u64,
     /// The encoded `.ply` file, base64.
     pub b64_ply: String,
-    /// The file's MIME type.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub media_type: Option<String>,
     /// The request's token accounting.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<SplatGenerationUsage>,
+    pub usage: SplatGenerationUsage,
 }

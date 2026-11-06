@@ -1,7 +1,7 @@
 //! The 3D generation wire: `POST /v1/3d/generations`.
 //!
 //! One picture in, one encoded `.ply` out. This module owns its serde types
-//! and hands them to [`crate::splat::splat`], which converts toward the IR;
+//! and hands them to [`crate::splat::generate`], which converts toward the IR;
 //! nothing between the parse and the encode knows these names exist.
 
 pub mod generate;
@@ -38,7 +38,8 @@ mod tests {
         let request: SplatGenerationRequest =
             serde_json::from_str(r#"{"image":"aGk=","mode":"cartoon"}"#).expect("parses");
         let err = request.into_ir().expect_err("refused");
-        assert!(err.contains("mode"), "{err}");
+        assert_eq!(err.field, "mode");
+        assert!(err.message.contains("synthetic"), "{}", err.message);
     }
 
     #[test]
@@ -65,7 +66,8 @@ mod tests {
         let request: SplatGenerationRequest =
             serde_json::from_str(r#"{"image":"not base64!!"}"#).expect("parses");
         let err = request.into_ir().expect_err("refused");
-        assert!(err.contains("base64"), "{err}");
+        assert_eq!(err.field, "image");
+        assert!(err.message.contains("base64"), "{}", err.message);
     }
 
     #[test]
@@ -74,12 +76,11 @@ mod tests {
             r#type: "splat_generation.completed",
             created: 7,
             b64_ply: "cGx5".to_owned(),
-            media_type: Some("model/ply".to_owned()),
-            usage: Some(SplatGenerationUsage {
+            usage: SplatGenerationUsage {
                 prompt_tokens: 0,
                 completion_tokens: 614_700,
                 total_tokens: 614_700,
-            }),
+            },
         })
         .expect("serializes");
         assert_eq!(json["type"], "splat_generation.completed");

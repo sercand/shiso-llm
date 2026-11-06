@@ -16,6 +16,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use shiso_core::ids::Seed;
+use shiso_ir::splat::Generate;
 use shiso_vision::splat::{
     GAUSSIANS_PER_ANCHOR, GeneratedSplat, MAX_GAUSSIANS, MAX_STEPS, MIN_GAUSSIANS, SplatGenError,
     SplatGenerator, SplatJob, SplatLimits, SplatStepEvent,
@@ -110,6 +112,21 @@ impl SplatOverrides {
     }
 }
 
+/// Judges a request's knobs without a loaded model.
+///
+/// The wire calls this before it asks for the service, so a malformed request
+/// is a 400 whether or not a splat model is loaded. The defaults come from
+/// [`SplatLimits::default`] because none of the checks depend on them: an
+/// omitted knob is filled from a default that is valid by construction.
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] naming the first field that is out of range, or
+/// `image` when the request carries no bytes.
+pub fn validate(request: &Generate, defaults: SplatLimits) -> Result<(), AppError> {
+    build_job(request.clone(), SplatDefaults::of(&defaults), Seed::new(0)).map(|_job| ())
+}
+
 /// The HTTP failure a [`SplatGenError`] answers with.
 ///
 /// The caller-side refusals (an undecodable picture, an alpha that matting or
@@ -189,8 +206,8 @@ impl SplatService {
     /// The operating system's refusal to start a thread.
     pub fn start(desc: SplatServiceDesc) -> std::io::Result<Self> {
         // A queue of zero would admit nothing beyond the running job and
-        // refuse everything else; the floor of one is the image service's,
-        // and `ServeOptions::validate` is what refuses a configured zero.
+        // refuse everything else; the floor of one is the image service's, and
+        // the operator's flag is refused at boot rather than reaching here.
         let (tx, rx) = mpsc::channel(desc.max_queue.max(1));
         let limits = desc.generator.limits();
         let service = Self {
@@ -205,10 +222,15 @@ impl SplatService {
         Ok(service)
     }
 
-    /// What the loaded model accepts.
-    #[must_use]
-    pub const fn limits(&self) -> SplatLimits {
-        self.limits
+    /// The same service with the operator's default step and Gaussian counts
+    /// applied over the model's own.
+    ///
+    /// # Errors
+    ///
+    /// [`OverrideError`] for an override the model would refuse.
+    pub fn with_overrides(mut self, overrides: SplatOverrides) -> Result<Self, OverrideError> {
+        self.defaults = overrides.resolve(self.limits)?;
+        Ok(self)
     }
 
     /// What a request that names no steps or Gaussians gets.
@@ -589,6 +611,92 @@ mod service_tests {
             rx.recv().await.is_none(),
             "the channel closes after the job"
         );
+    }
+
+    /// A generator that reports it has started and then waits until the test
+    /// releases it: how a job is caught occupying the worker while the queue
+    /// behind it fills.
+    #[derive(Debug)]
+    struct Blocking {
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        gate: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl SplatGenerator for Blocking {
+        fn model_id(&self) -> &'static str {
+            "blocking"
+        }
+
+        fn limits(&self) -> SplatLimits {
+            SplatLimits::default()
+        }
+
+        fn generate(
+            &self,
+            _job: &SplatJob,
+            _progress: Option<&dyn Fn(SplatStepEvent)>,
+        ) -> Result<GeneratedSplat, SplatGenError> {
+            if let Some(started) = self
+                .started
+                .lock()
+                .expect("the started lock is never poisoned")
+                .take()
+            {
+                let _sent = started.send(());
+            }
+            let _released = self
+                .gate
+                .lock()
+                .expect("the gate lock is never poisoned")
+                .recv();
+            Ok(GeneratedSplat {
+                bytes: b"ply".to_vec(),
+                media_type: "model/ply",
+                num_gaussians: 262_144,
+                completion_tokens: 1,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_is_overloaded_rather_than_awaited() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let generator = Arc::new(Blocking {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            gate: std::sync::Mutex::new(gate_rx),
+        });
+        let boxed: Arc<dyn SplatGenerator> = Arc::<Blocking>::clone(&generator);
+        let service = SplatService::start(SplatServiceDesc {
+            generator: boxed,
+            model_id: "blocking".to_owned(),
+            max_queue: 1,
+            profile: None,
+        })
+        .expect("thread");
+
+        let first = tokio::spawn({
+            let service = service.clone();
+            async move { service.generate(job()).await }
+        });
+        started_rx
+            .await
+            .expect("the first job reaches the generator");
+
+        // The queue holds one beyond the running job; the next is refused now
+        // rather than awaited, because an answer behind a queue nobody bounded
+        // is one no client is still waiting for.
+        let queued = service
+            .admit(job(), None)
+            .expect("the queue has room for one");
+        let Err(err) = service.admit(job(), None) else {
+            panic!("a full queue must refuse the third job");
+        };
+        assert!(matches!(err, AppError::Overloaded { .. }), "{err:?}");
+
+        drop(queued);
+        gate_tx.send(()).expect("the gate is open");
+        let _ = first.await.expect("the first job finishes");
     }
 
     #[tokio::test]
