@@ -32,6 +32,7 @@ pub mod hub;
 pub mod openai;
 pub mod router;
 pub mod shutdown;
+pub mod splat;
 
 // The engine moved to `shiso-runtime`; these keep `crate::scheduler::...` and
 // `shiso_server::state::...` naming the same items.

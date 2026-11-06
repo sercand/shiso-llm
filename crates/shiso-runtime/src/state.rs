@@ -118,6 +118,11 @@ pub struct AppState {
     /// [`AppState::image`], which answers the typed "no image model" error
     /// for a server that serves language or transcription alone.
     pub image: Option<crate::image::ImageService>,
+    /// The 3D splat generation service, when a splat model is loaded.
+    ///
+    /// Handlers reach it through [`AppState::splat`], which answers the typed
+    /// "no splat model" error for a server that serves something else.
+    pub splat: Option<crate::splat::SplatService>,
     /// The prompt layout of the loaded model's schema decision head, when it
     /// carries one: what answers `/v1/decisions` and `/v1/systemone` then.
     pub decision_layout: Option<Arc<dyn shiso_core::DecisionLayout>>,
@@ -155,6 +160,7 @@ impl AppState {
             memory: None,
             audio: None,
             image: None,
+            splat: None,
             decision_layout: None,
             decision_readout: None,
             embedding: None,
@@ -181,6 +187,7 @@ impl AppState {
             memory: None,
             audio: None,
             image: None,
+            splat: None,
             decision_layout: None,
             decision_readout: None,
             embedding: None,
@@ -225,6 +232,22 @@ impl AppState {
     /// [`AppError::NoImageModel`] when no image generator is loaded.
     pub fn image(&self) -> Result<&crate::image::ImageService, AppError> {
         self.image.as_ref().ok_or(AppError::NoImageModel)
+    }
+
+    /// The same state with the 3D splat generation service attached.
+    #[must_use]
+    pub fn with_splat(mut self, splat: crate::splat::SplatService) -> Self {
+        self.splat = Some(splat);
+        self
+    }
+
+    /// The splat queue.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::NoSplatModel`] when no splat model is loaded.
+    pub fn splat(&self) -> Result<&crate::splat::SplatService, AppError> {
+        self.splat.as_ref().ok_or(AppError::NoSplatModel)
     }
 
     /// The engine queue.

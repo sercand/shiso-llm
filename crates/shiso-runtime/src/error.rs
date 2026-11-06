@@ -85,6 +85,13 @@ pub enum AppError {
     /// was missing.
     #[error("no image model is loaded")]
     NoImageModel,
+    /// The server is running with no 3D splat model loaded.
+    ///
+    /// Its own variant for [`Self::NoImageModel`]'s reason: the operator
+    /// fixing the 503 needs to know that this route wants a splat model, not
+    /// a picture generator.
+    #[error("no splat model is loaded")]
+    NoSplatModel,
     /// The server is running with no embedding model loaded.
     ///
     /// Its own variant for [`Self::NoImageModel`]'s reason: the operator
@@ -246,6 +253,7 @@ impl AppError {
         match self {
             Self::NoModel
             | Self::NoImageModel
+            | Self::NoSplatModel
             | Self::NoEmbeddingModel
             | Self::NotReady { .. }
             | Self::Overloaded { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -278,6 +286,7 @@ impl AppError {
         match self {
             Self::NoModel => "model_not_loaded",
             Self::NoImageModel => "image_model_not_loaded",
+            Self::NoSplatModel => "splat_model_not_loaded",
             Self::NoEmbeddingModel => "embedding_model_not_loaded",
             Self::NotReady { .. } => "server_not_ready",
             Self::Overloaded { .. } => "server_overloaded",
