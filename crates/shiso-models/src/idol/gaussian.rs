@@ -2,7 +2,10 @@
 //!
 //! The decoder's last layer answers fifteen numbers per Gaussian - an offset, a
 //! colour, a scale, a rotation, an opacity and an offset scale - and none of
-//! them is usable until it is activated. The activations are the reference's,
+//! them is usable until it is activated. They arrive **blocked by field**, not
+//! interleaved by Gaussian: an anchor's row is the 32 offsets, then the 32
+//! colours, the 32 scales, the 32 rotations, the 32 opacities and the 32 offset
+//! scales ([`Field`]). The activations are the reference's,
 //! including the two biases baked into the checkpoint's representation config:
 //! an object whose opacities started at zero would be invisible, and one whose
 //! scales started at zero would be points.
@@ -61,6 +64,46 @@ impl RepresentationConfig {
 /// Fifteen numbers per Gaussian: offset 3, colour 3, scale 3, rotation 4,
 /// opacity 1, offset scale 1.
 pub const OUTPUTS_PER_GAUSSIAN: usize = 15;
+
+/// One block of an anchor's output row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    /// The offset from the anchor, 3 per Gaussian.
+    Offset,
+    /// The colour (degree-0 harmonics), 3 per Gaussian.
+    Colour,
+    /// The scale, 3 per Gaussian.
+    Scale,
+    /// The rotation quaternion, 4 per Gaussian.
+    Rotation,
+    /// The opacity, 1 per Gaussian.
+    Opacity,
+    /// The offset's reach, 1 per Gaussian.
+    OffsetScale,
+}
+
+impl Field {
+    /// Values per Gaussian, and the field's first column as a multiple of the
+    /// Gaussian count: the blocks come in this enum's order.
+    const fn shape(self) -> (usize, usize) {
+        match self {
+            Self::Offset => (3, 0),
+            Self::Colour => (3, 3),
+            Self::Scale => (3, 6),
+            Self::Rotation => (4, 9),
+            Self::Opacity => (1, 13),
+            Self::OffsetScale => (1, 14),
+        }
+    }
+
+    /// The column of component `component` of Gaussian `gaussian` in an
+    /// anchor's row of `per_anchor` Gaussians.
+    #[must_use]
+    pub const fn column(self, per_anchor: usize, gaussian: usize, component: usize) -> usize {
+        let (width, start) = self.shape();
+        start * per_anchor + gaussian * width + component
+    }
+}
 
 /// The activations' inputs: the decoder's raw output, the anchors it was asked
 /// about, and the two tensors the checkpoint stores beside the weights.
@@ -136,49 +179,56 @@ pub fn activate(
         opacity: Vec::with_capacity(total),
     };
     let opacity_offset = inverse_sigmoid(config.opacity_bias);
+    // The raw scale is biased so a zero output activates to the bias itself.
+    let scaling_offset = inverse_softplus(config.scaling_bias);
     for (anchor_index, anchor) in raw.anchors.iter().enumerate() {
         for gaussian in 0..config.num_gaussians {
-            let base = anchor_index * config.outputs_per_anchor() + gaussian * OUTPUTS_PER_GAUSSIAN;
-            let at = |offset: usize| raw.features[base + offset];
+            let row = anchor_index * config.outputs_per_anchor();
+            let per = config.num_gaussians;
+            let at = |field: Field, component: usize| {
+                raw.features[row + field.column(per, gaussian, component)]
+            };
 
             // The offset is bounded by the cell's half-width times the
             // activated offset scale, which is what keeps a Gaussian inside
             // the region its anchor was placed in.
-            let offset_scale = softplus(at(14) + raw.base_offset_scale);
+            let offset_scale = softplus(at(Field::OffsetScale, 0) + raw.base_offset_scale);
             let perturbation = raw.perturbation[gaussian];
             let reach = 0.5 * config.perturbe_size * offset_scale;
             let mut position = [0.0f32; 3];
             for axis in 0..3 {
-                let offset = (at(axis) * config.lr_xyz + perturbation[axis]).tanh() * reach;
+                let offset =
+                    (at(Field::Offset, axis) * config.lr_xyz + perturbation[axis]).tanh() * reach;
                 // The object is built in [-0.5, 0.5]^3 around the origin.
                 position[axis] = offset + anchor[axis] - 0.5;
             }
             cloud.xyz.push(position);
 
             cloud.features_dc.push([
-                at(3) * config.lr_features,
-                at(4) * config.lr_features,
-                at(5) * config.lr_features,
+                at(Field::Colour, 0) * config.lr_features,
+                at(Field::Colour, 1) * config.lr_features,
+                at(Field::Colour, 2) * config.lr_features,
             ]);
 
             let mut scale = [0.0f32; 3];
             for (axis, slot) in scale.iter_mut().enumerate() {
-                let activated = softplus(at(6 + axis) * config.lr_scaling + config.scaling_bias);
+                let activated =
+                    softplus(at(Field::Scale, axis) * config.lr_scaling + scaling_offset);
                 *slot = (activated * activated + config.kernel_size * config.kernel_size).sqrt();
             }
             cloud.scaling.push(scale);
 
             let rotation = normalize_quaternion([
-                at(9) * config.lr_rotation + 1.0,
-                at(10) * config.lr_rotation,
-                at(11) * config.lr_rotation,
-                at(12) * config.lr_rotation,
+                at(Field::Rotation, 0) * config.lr_rotation + 1.0,
+                at(Field::Rotation, 1) * config.lr_rotation,
+                at(Field::Rotation, 2) * config.lr_rotation,
+                at(Field::Rotation, 3) * config.lr_rotation,
             ]);
             cloud.rotation.push(rotation);
 
-            cloud
-                .opacity
-                .push(sigmoid(at(13) * config.lr_opacity + opacity_offset));
+            cloud.opacity.push(sigmoid(
+                at(Field::Opacity, 0) * config.lr_opacity + opacity_offset,
+            ));
         }
     }
     Ok(cloud)
@@ -198,6 +248,11 @@ fn sigmoid(x: f32) -> f32 {
         let e = x.exp();
         e / (1.0 + e)
     }
+}
+
+/// `y + ln(-expm1(-y))`: the `x` with `softplus(x) == y`.
+fn inverse_softplus(y: f32) -> f32 {
+    y + (-(-y).exp_m1()).ln()
 }
 
 /// `ln(p / (1 - p))`.
@@ -254,8 +309,8 @@ mod tests {
         for opacity in &cloud.opacity {
             assert!((opacity - 0.1).abs() < 1e-6, "opacity {opacity}");
         }
-        // Scale is softplus(0.004) floored in quadrature by the kernel size.
-        let expected = (0.004f32.exp().ln_1p().powi(2) + 0.0009f32.powi(2)).sqrt();
+        // Scale is the 0.004 bias floored in quadrature by the kernel size.
+        let expected = (0.004f32.powi(2) + 0.0009f32.powi(2)).sqrt();
         for scale in &cloud.scaling {
             for axis in scale {
                 assert!(
@@ -271,6 +326,63 @@ mod tests {
         }
     }
 
+    fn activate_one(features: &[f32]) -> crate::idol::ply::GaussianCloud {
+        let config = RepresentationConfig::idol();
+        let anchors = [[0.5f32, 0.5, 0.5]];
+        let perturbation = perturbation(&config);
+        activate(
+            &RawOutput {
+                features,
+                anchors: &anchors,
+                perturbation: &perturbation,
+                base_offset_scale: 0.0,
+            },
+            &config,
+        )
+        .expect("activates")
+    }
+
+    #[test]
+    fn the_fields_are_blocked_per_field_not_interleaved_per_gaussian() {
+        // The decoder's 480 outputs per anchor are six blocks - 32 offsets of
+        // 3, 32 colours of 3, 32 scales of 3, 32 rotations of 4, 32
+        // opacities, 32 offset scales - so Gaussian 0's opacity is column
+        // 416 and Gaussian 1's colour starts at column 99.
+        let mut features = raw_zero(1);
+        features[416] = 100.0;
+        features[99] = 0.75;
+        let cloud = activate_one(&features);
+        assert!(cloud.opacity[0] > 0.99, "opacity {}", cloud.opacity[0]);
+        assert!(
+            (cloud.opacity[1] - 0.1).abs() < 1e-6,
+            "opacity {}",
+            cloud.opacity[1]
+        );
+        assert!(
+            (cloud.features_dc[1][0] - 0.75).abs() < 1e-6,
+            "{:?}",
+            cloud.features_dc[1]
+        );
+        assert!(
+            cloud.features_dc[0][0].abs() < 1e-6,
+            "{:?}",
+            cloud.features_dc[0]
+        );
+    }
+
+    #[test]
+    fn a_zero_scale_is_the_bias_itself() {
+        // The raw scale is biased by inverse_softplus(0.004), so a zero output
+        // activates to exactly 0.004 before the kernel-size floor.
+        let cloud = activate_one(&raw_zero(1));
+        let expected = (0.004f32.powi(2) + 0.0009f32.powi(2)).sqrt();
+        assert!(
+            (cloud.scaling[0][0] - expected).abs() < 1e-7,
+            "scale {}, want {expected}",
+            cloud.scaling[0][0]
+        );
+    }
+
     #[test]
     fn the_offset_cannot_leave_its_cell() {
         let config = RepresentationConfig::idol();
@@ -279,8 +391,7 @@ mod tests {
         // activated offset scale: softplus(0) = ln 2.
         let mut features = raw_zero(1);
         for gaussian in 0..config.num_gaussians {
-            let base = gaussian * OUTPUTS_PER_GAUSSIAN;
-            features[base] = 1000.0;
+            features[Field::Offset.column(config.num_gaussians, gaussian, 0)] = 1000.0;
         }
         let anchors = [[0.5f32, 0.5, 0.5]];
         let perturbation = perturbation(&config);
@@ -310,9 +421,8 @@ mod tests {
         let config = RepresentationConfig::idol();
         let mut features = raw_zero(1);
         for gaussian in 0..config.num_gaussians {
-            let base = gaussian * OUTPUTS_PER_GAUSSIAN;
-            features[base + 9] = 3.0;
-            features[base + 10] = 4.0;
+            features[Field::Rotation.column(config.num_gaussians, gaussian, 0)] = 3.0;
+            features[Field::Rotation.column(config.num_gaussians, gaussian, 1)] = 4.0;
         }
         let anchors = [[0.5f32, 0.5, 0.5]];
         let perturbation = perturbation(&config);
@@ -337,7 +447,7 @@ mod tests {
         let config = RepresentationConfig::idol();
         let mut features = raw_zero(1);
         for gaussian in 0..config.num_gaussians {
-            features[gaussian * OUTPUTS_PER_GAUSSIAN + 13] = 100.0;
+            features[Field::Opacity.column(config.num_gaussians, gaussian, 0)] = 100.0;
         }
         let anchors = [[0.5f32, 0.5, 0.5]];
         let perturbation = perturbation(&config);
