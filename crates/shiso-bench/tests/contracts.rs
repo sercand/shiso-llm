@@ -948,9 +948,58 @@ fn splat_gen_error_variants(error: &SplatGenError) -> (u8, u32) {
             let _: &String = msg;
             (10, 0)
         }
+        SplatGenError::NoMatte => (11, 0),
     }
 }
 const _: fn(&SplatGenError) -> (u8, u32) = splat_gen_error_variants;
+
+/// The splat model's opener and what it is opened with: boot builds the
+/// description from the operator's flags, so a field drifting here is a boot
+/// that no longer finds a part.
+type SplatModelDescFields = (
+    String,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Option<std::path::PathBuf>,
+);
+fn splat_model_desc_fields(
+    desc: shiso_models::splat_registry::SplatModelDesc,
+) -> SplatModelDescFields {
+    (
+        desc.id,
+        desc.model_dir,
+        desc.encoder_dir,
+        desc.vae_dir,
+        desc.matte,
+    )
+}
+const _: fn(shiso_models::splat_registry::SplatModelDesc) -> SplatModelDescFields =
+    splat_model_desc_fields;
+type OpenSplat = fn(
+    &shiso_models::splat_registry::SplatModelDesc,
+    &std::sync::Arc<dyn Backend>,
+) -> Result<std::sync::Arc<dyn SplatGenerator>, ImageGenError>;
+const _: OpenSplat = shiso_models::splat_registry::open_splat_generator;
+
+/// The conditioning the splat family's denoiser reads, and the seam that
+/// produces it: the two streams' widths and row count are the model's, and
+/// the draws the posterior takes come from the one source the generation
+/// hands down.
+type ConditioningFields = (Vec<f32>, Vec<f32>, usize);
+fn conditioning_fields(cond: shiso_models::idol::conditioning::Conditioning) -> ConditioningFields {
+    (cond.dinov3, cond.vae, cond.rows)
+}
+const _: fn(shiso_models::idol::conditioning::Conditioning) -> ConditioningFields =
+    conditioning_fields;
+const _: Option<&dyn shiso_models::idol::conditioner::Conditioner> = None;
+const _: fn() -> shiso_models::idol::dinov3::DinoConfig =
+    shiso_models::idol::dinov3::DinoConfig::vit_h_plus;
+const _: [usize; 3] = [
+    shiso_models::idol::conditioning::COND_ROWS,
+    shiso_models::idol::conditioning::DINO_WIDTH,
+    shiso_models::idol::conditioning::VAE_WIDTH,
+];
 
 /// The IR request read apart, and the two entry points the wire calls: the
 /// request loses its wire vocabulary at the IR boundary, and the job builder
