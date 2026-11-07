@@ -358,7 +358,7 @@ environment variable. The ones you are most likely to want:
 | `--splat-encoder` | The splat model's image encoder directory (`config.json` and weights); required with `--splat-model` |
 | `--splat-vae` | The splat model's latent autoencoder directory, or a repository root holding it under `vae/`; required with `--splat-model` |
 | `--splat-max-queue` | Splat requests that may wait in the queue beyond the one generating (default 2); the next is refused with a 503 |
-| `--splat-default-steps` | Euler steps a splat request that names none gets (default: the model's own, 50) |
+| `--splat-default-steps` | Euler steps a splat request that names none gets (default: the model's own, 50). Measured on an M1 Max: a 50-step request of 262144 Gaussians takes about 19 minutes, 25 steps about 11, each step's two denoiser passes 16-27 s as the machine warms |
 | `--splat-default-num-gaussians` | Gaussians a splat request that names none gets (default: the model's own, 262144) |
 | `--embedding-max-queue` | Embedding requests that may wait in the queue beyond the one running (default 64), when `--model` is an embedding checkpoint |
 
