@@ -38,7 +38,7 @@ pub mod splat;
 // `shiso_server::state::...` naming the same items.
 pub use shiso_runtime::boot::{
     SERVER_TOOL_JSON_STYLE, boot_audio, boot_embedding, boot_image, boot_language_model,
-    log_media_decoders, log_os_decoder, open_audio_tower,
+    boot_splat, log_media_decoders, log_os_decoder, open_audio_tower,
 };
 pub use shiso_runtime::{
     audio, embed, ids, image, media, media_cache, model_factory, profile, response_store,
@@ -143,6 +143,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // speech models do: a KV pool sized to a share of free device memory must
     // see its weights already resident.
     let image = boot_image(&args)?;
+    // The splat model too: its weights must be resident before a KV pool is
+    // sized against free device memory.
+    let splat = boot_splat(&args)?;
     let (mut state, engine_thread) = match args.model.as_deref() {
         // An embedding checkpoint is not a language model: it gets its own
         // worker instead of the engine thread, and every generation route
@@ -162,6 +165,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     }
     if let Some(image) = image {
         state = state.with_image(image);
+    }
+    if let Some(splat) = splat {
+        state = state.with_splat(splat);
     }
 
     shutdown::install();

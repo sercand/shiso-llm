@@ -711,6 +711,42 @@ pub struct ServeOptions {
         arg(long, env = "SHISO_IMAGE_MAX_QUEUE", default_value_t = 16)
     )]
     pub image_max_queue: usize,
+    /// 3D splat model to serve: the checkpoint directory holding its
+    /// `config.json` and the denoiser's and decoders' weights. Serves
+    /// `POST /v1/3d/generations`. A background remover shipped beside them
+    /// (`birefnet.safetensors`) is loaded too, so pictures without
+    /// transparency are cut out; without it only cut-outs are accepted.
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_SPLAT_MODEL"))]
+    pub splat_model: Option<PathBuf>,
+    /// The name the splat generator answers to on the wire. Defaults to the
+    /// last component of `--splat-model`.
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_SPLAT_MODEL_ID"))]
+    pub splat_model_id: Option<String>,
+    /// The splat model's image encoder: the directory holding its
+    /// `config.json` and weights. Required with `--splat-model`.
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_SPLAT_ENCODER"))]
+    pub splat_encoder: Option<PathBuf>,
+    /// The splat model's latent autoencoder: the directory holding its
+    /// `config.json` and weights. Required with `--splat-model`.
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_SPLAT_VAE"))]
+    pub splat_vae: Option<PathBuf>,
+    /// Splat requests that may wait in the queue beyond the one generating;
+    /// the next is refused with a 503 a retry can fix. A generation holds the
+    /// device for minutes, so the queue is short.
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_SPLAT_MAX_QUEUE", default_value_t = 2)
+    )]
+    pub splat_max_queue: usize,
+    /// Euler steps a splat request that names none gets. Unset, the model's
+    /// own default (50) is used; it must be within the model's 1..=100.
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_SPLAT_DEFAULT_STEPS"))]
+    pub splat_default_steps: Option<u32>,
+    /// Gaussians a splat request that names none gets. Unset, the model's own
+    /// default (262144) is used; it must be a multiple of 32 within the
+    /// model's 32768..=1048576.
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_SPLAT_DEFAULT_NUM_GAUSSIANS"))]
+    pub splat_default_num_gaussians: Option<u32>,
     /// Embedding requests that may wait in the queue beyond the one running,
     /// when `--model` is an embedding checkpoint; the next is refused with a
     /// 503 a retry can fix.
@@ -846,9 +882,24 @@ pub enum ConfigError {
         /// The path as it was given.
         path: String,
     },
-    /// Neither a language model, a recognizer, nor an image model was named.
-    #[error("nothing to serve: give --model, --asr-model, or --image-model")]
+    /// Neither a language model, a recognizer, an image model nor a splat
+    /// model was named.
+    #[error("nothing to serve: give --model, --asr-model, --image-model, or --splat-model")]
     NothingToServe,
+    /// The splat model was named without a part it cannot run without.
+    #[error("--splat-model needs --{flag}: {what}")]
+    SplatPartMissing {
+        /// The missing flag, spelled as it is typed.
+        flag: &'static str,
+        /// What the part is for.
+        what: &'static str,
+    },
+    /// A splat part was named with no splat model to load it into.
+    #[error("--{flag} needs --splat-model: it is a part of the splat model")]
+    SplatPartWithoutModel {
+        /// The flag, spelled as it is typed.
+        flag: &'static str,
+    },
     /// A diarizer was named with no recognizer to attribute speech from.
     #[error("--diarization-model needs --asr-model: a diarizer labels a transcript")]
     DiarizerWithoutRecognizer,
@@ -1072,6 +1123,13 @@ impl Default for ServeOptions {
             image_vae: None,
             image_tokenizer: None,
             image_max_queue: 16,
+            splat_model: None,
+            splat_model_id: None,
+            splat_encoder: None,
+            splat_vae: None,
+            splat_max_queue: 2,
+            splat_default_steps: None,
+            splat_default_num_gaussians: None,
             embedding_max_queue: 64,
             image_default_steps: None,
             image_default_size: None,
@@ -1148,14 +1206,14 @@ impl ServeOptions {
         // model list is empty answers every request with "no such model". The
         // explicit name is the escape hatch: an operator who supplied one has
         // already answered the question this check asks.
-        match (&self.model, &self.asr_model, &self.image_model) {
-            (None, None, None) => return Err(ConfigError::NothingToServe),
-            (Some(model), _, _) if self.model_name.is_none() && model.file_stem().is_none() => {
-                return Err(ConfigError::NamelessModel {
-                    path: model.display().to_string(),
-                });
-            }
-            _ => {}
+        self.something_to_serve()?;
+        if let Some(model) = &self.model
+            && self.model_name.is_none()
+            && model.file_stem().is_none()
+        {
+            return Err(ConfigError::NamelessModel {
+                path: model.display().to_string(),
+            });
         }
         if self.diarization_model.is_some() && self.asr_model.is_none() {
             return Err(ConfigError::DiarizerWithoutRecognizer);
@@ -1465,14 +1523,83 @@ impl ServeOptions {
         })
     }
 
-    /// Refuses an image queue of zero: every request would be turned away.
+    /// Refuses a splat model without its encoders, a splat part without a
+    /// model, and a splat queue or default of zero.
+    fn splat_parts(&self) -> Result<(), ConfigError> {
+        if self.splat_model.is_some() {
+            if self.splat_encoder.is_none() {
+                return Err(ConfigError::SplatPartMissing {
+                    flag: "splat-encoder",
+                    what: "the image encoder the conditioning is read with",
+                });
+            }
+            if self.splat_vae.is_none() {
+                return Err(ConfigError::SplatPartMissing {
+                    flag: "splat-vae",
+                    what: "the latent autoencoder the conditioning is read with",
+                });
+            }
+        } else {
+            for (flag, given) in [
+                ("splat-encoder", self.splat_encoder.is_some()),
+                ("splat-vae", self.splat_vae.is_some()),
+                ("splat-model-id", self.splat_model_id.is_some()),
+            ] {
+                if given {
+                    return Err(ConfigError::SplatPartWithoutModel { flag });
+                }
+            }
+        }
+        if self.splat_max_queue == 0 {
+            return Err(ConfigError::Zero {
+                flag: "splat-max-queue",
+            });
+        }
+        // The range is the model's to judge, at boot; zero is never a count.
+        if self.splat_default_steps == Some(0) {
+            return Err(ConfigError::Zero {
+                flag: "splat-default-steps",
+            });
+        }
+        if self.splat_default_num_gaussians == Some(0) {
+            return Err(ConfigError::Zero {
+                flag: "splat-default-num-gaussians",
+            });
+        }
+        Ok(())
+    }
+
+    /// The operator's splat defaults, judged against the model at boot.
+    #[must_use]
+    pub const fn splat_overrides(&self) -> crate::splat::SplatOverrides {
+        crate::splat::SplatOverrides {
+            steps: self.splat_default_steps,
+            num_gaussians: self.splat_default_num_gaussians,
+        }
+    }
+
+    /// Refuses an image queue of zero (every request would be turned away),
+    /// and the splat parts [`Self::splat_parts`] judges.
     fn image_queue(&self) -> Result<(), ConfigError> {
         if self.image_max_queue == 0 {
             return Err(ConfigError::Zero {
                 flag: "image-max-queue",
             });
         }
-        Ok(())
+        self.splat_parts()
+    }
+
+    /// Refuses a server that names no model of any kind.
+    const fn something_to_serve(&self) -> Result<(), ConfigError> {
+        match (
+            &self.model,
+            &self.asr_model,
+            &self.image_model,
+            &self.splat_model,
+        ) {
+            (None, None, None, None) => Err(ConfigError::NothingToServe),
+            _ => Ok(()),
+        }
     }
 
     /// `--image-reserve-gb` in bytes.
@@ -1799,6 +1926,111 @@ mod tests {
         };
         options.validate().expect("the defaults are valid");
         assert!(ExplicitlySet::default().is_empty());
+    }
+
+    fn splat_options() -> ServeOptions {
+        ServeOptions {
+            splat_model: Some(PathBuf::from("/models/splat")),
+            splat_encoder: Some(PathBuf::from("/models/encoder")),
+            splat_vae: Some(PathBuf::from("/models/vae")),
+            ..ServeOptions::default()
+        }
+    }
+
+    #[test]
+    fn a_splat_model_alone_is_something_to_serve() {
+        splat_options()
+            .validate()
+            .expect("a splat server is a server");
+    }
+
+    #[test]
+    fn a_splat_model_without_its_encoders_is_refused_by_flag() {
+        let options = ServeOptions {
+            splat_encoder: None,
+            ..splat_options()
+        };
+        assert!(matches!(
+            options.validate(),
+            Err(ConfigError::SplatPartMissing {
+                flag: "splat-encoder",
+                ..
+            })
+        ));
+        let options = ServeOptions {
+            splat_vae: None,
+            ..splat_options()
+        };
+        assert!(matches!(
+            options.validate(),
+            Err(ConfigError::SplatPartMissing {
+                flag: "splat-vae",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_splat_part_without_a_splat_model_is_refused() {
+        let options = ServeOptions {
+            model: Some(PathBuf::from("/models/m.gguf")),
+            splat_encoder: Some(PathBuf::from("/models/encoder")),
+            ..ServeOptions::default()
+        };
+        assert!(matches!(
+            options.validate(),
+            Err(ConfigError::SplatPartWithoutModel {
+                flag: "splat-encoder"
+            })
+        ));
+    }
+
+    #[test]
+    fn a_zero_splat_queue_or_default_is_refused() {
+        for (options, flag) in [
+            (
+                ServeOptions {
+                    splat_max_queue: 0,
+                    ..splat_options()
+                },
+                "splat-max-queue",
+            ),
+            (
+                ServeOptions {
+                    splat_default_steps: Some(0),
+                    ..splat_options()
+                },
+                "splat-default-steps",
+            ),
+            (
+                ServeOptions {
+                    splat_default_num_gaussians: Some(0),
+                    ..splat_options()
+                },
+                "splat-default-num-gaussians",
+            ),
+        ] {
+            assert!(
+                matches!(options.validate(), Err(ConfigError::Zero { flag: f }) if f == flag),
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_splat_defaults_reach_the_overrides() {
+        let options = ServeOptions {
+            splat_default_steps: Some(20),
+            splat_default_num_gaussians: Some(65_536),
+            ..splat_options()
+        };
+        assert_eq!(
+            options.splat_overrides(),
+            crate::splat::SplatOverrides {
+                steps: Some(20),
+                num_gaussians: Some(65_536),
+            }
+        );
     }
 
     #[test]

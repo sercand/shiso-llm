@@ -1187,3 +1187,80 @@ fn a_host_profile_without_a_device_field_is_a_gpu_host() {
         serde_json::from_str(r#"{"backends":[],"ram_bytes":1,"cuda":null,"metal":null}"#).unwrap();
     assert_eq!(host.device, ServingDevice::Gpu);
 }
+
+/// A splat variant: the checkpoint directory and its two encoders, each a
+/// directory of its own repository.
+fn splat_variant() -> Variant {
+    let mut variant = image_variant();
+    let image = variant.components.remove(&Role::Image).unwrap();
+    let assets = variant.components.remove(&Role::ImageAssets).unwrap();
+    let directory = |mut component: Component, repo: &str| {
+        component.entry = None;
+        component.repo = Some(repo.to_string());
+        component
+    };
+    variant
+        .components
+        .insert(Role::Splat, directory(image, "shiso/test-splat"));
+    variant.components.insert(
+        Role::SplatEncoder,
+        directory(assets.clone(), "shiso/test-encoder"),
+    );
+    variant
+        .components
+        .insert(Role::SplatVae, directory(assets, "shiso/test-vae"));
+    // One 10-byte file in the checkpoint, three in each encoder.
+    variant.requirements.disk_bytes = 70;
+    variant
+}
+
+#[test]
+fn splat_roles_parse_and_name_their_flags() {
+    for (text, role, flag) in [
+        ("splat", Role::Splat, "--splat-model"),
+        ("splat_encoder", Role::SplatEncoder, "--splat-encoder"),
+        ("splat_vae", Role::SplatVae, "--splat-vae"),
+    ] {
+        assert_eq!(text.parse::<Role>().unwrap(), role);
+        assert_eq!(role.as_str(), text);
+        assert_eq!(role.flag_name(), flag);
+    }
+    assert_eq!(
+        "splat_generation".parse::<Task>().unwrap(),
+        Task::SplatGeneration
+    );
+}
+
+#[test]
+fn a_splat_variant_needs_both_encoders_and_nothing_else() {
+    let mut recipe = make_test_recipe();
+    recipe.variants = vec![splat_variant()];
+    validate_recipe(&recipe, ValidationMode::Strict).expect("a splat variant needs no base");
+
+    for missing in [Role::SplatEncoder, Role::SplatVae] {
+        let mut variant = splat_variant();
+        variant.components.remove(&missing);
+        recipe.variants = vec![variant];
+        let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+        assert!(err.to_string().contains(missing.as_str()), "{err}");
+    }
+
+    // An encoder with no splat model has nothing to condition.
+    let mut variant = splat_variant();
+    variant.components.remove(&Role::Splat);
+    variant.components.insert(
+        Role::Base,
+        make_test_recipe().variants[0].components[&Role::Base].clone(),
+    );
+    recipe.variants = vec![variant];
+    let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("requires 'splat'"), "{err}");
+
+    // Each part carries its own config document, so each is a directory.
+    let mut variant = splat_variant();
+    variant.components.get_mut(&Role::SplatVae).unwrap().entry =
+        Some("transformer/config.json".to_string());
+    recipe.variants = vec![variant];
+    let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("directory"), "{err}");
+}

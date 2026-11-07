@@ -130,14 +130,15 @@ pub fn validate(request: &Generate, defaults: SplatLimits) -> Result<(), AppErro
 /// The HTTP failure a [`SplatGenError`] answers with.
 ///
 /// The caller-side refusals (an undecodable picture, an alpha that matting or
-/// erosion emptied, a knob outside its range) are the request's fault and
+/// erosion emptied, an opaque picture on a server with no matte, a knob
+/// outside its range) are the request's fault and
 /// answer 400; the device-side failures answer 500 with the cause kept as a
 /// real source for the log.
 #[must_use]
 pub fn refuse(error: SplatGenError) -> AppError {
     let message = error.to_string();
     match &error {
-        SplatGenError::UndecodableImage(_) | SplatGenError::EmptyAlpha => {
+        SplatGenError::UndecodableImage(_) | SplatGenError::EmptyAlpha | SplatGenError::NoMatte => {
             AppError::bad_request(message, Some("image"), "invalid_request")
         }
         SplatGenError::InvalidSteps { .. } => {
@@ -451,6 +452,20 @@ mod tests {
             } => assert_eq!(field, "image"),
             other => panic!("expected a field-scoped bad request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_picture_needing_a_matte_on_a_server_without_one_is_a_client_error() {
+        // The request can be fixed by the caller (send a cut-out), so it is a
+        // 400 on the picture, not a 500.
+        let err = super::refuse(shiso_vision::splat::SplatGenError::NoMatte);
+        assert!(matches!(
+            err,
+            AppError::BadRequest {
+                param: Some(ref field),
+                ..
+            } if field == "image"
+        ));
     }
 
     #[test]
