@@ -25,7 +25,7 @@ use crate::harness::{Gpu, drain, f32_bytes, run};
 use crate::oracle::signal;
 
 /// Every entry point this file's cases launch.
-pub const ENTRIES: [&str; 7] = [
+pub const ENTRIES: [&str; 8] = [
     "kernel_splat_relu_f32",
     "kernel_splat_sigmoid_f32",
     "kernel_splat_gelu_erf_f32",
@@ -33,6 +33,7 @@ pub const ENTRIES: [&str; 7] = [
     "kernel_splat_merge2x2_f32",
     "kernel_splat_window_attn_f32",
     "kernel_splat_deform_im2col_f32",
+    "kernel_splat_attn_f32",
 ];
 
 const MODULE: &str = "splat";
@@ -93,7 +94,24 @@ struct DeformArgs {
     rows: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct AttnArgs {
+    queries: u32,
+    keys: u32,
+    heads: u32,
+    width: u32,
+    scale: f32,
+}
+
+/// The fused attention's fixed head width, query rows per threadgroup and
+/// threads per threadgroup (`SPLAT_ATTN_*` in the kernel files).
+const ATTN_HEAD: usize = 64;
+const ATTN_QROWS: usize = 64;
+const ATTN_THREADS: u32 = 256;
+
 const _: () = assert!(size_of::<UnaryArgs>() == 4);
+const _: () = assert!(size_of::<AttnArgs>() == 20);
 const _: () = assert!(size_of::<ResizeArgs>() == 20);
 const _: () = assert!(size_of::<MergeArgs>() == 12);
 const _: () = assert!(size_of::<WindowArgs>() == 36);
@@ -683,4 +701,198 @@ pub fn window_attention_at_the_production_window(gpu: &Gpu) {
         1e-2,
         "window attention, 12-wide, unshifted, padded",
     );
+}
+
+/// `softmax(scale * q k^T) v` per head in `f64`, max-subtracted, for the
+/// query rows in `rows` only: `q` is `(queries, heads * 64)` and `k`, `v` are
+/// `(keys, heads * 64)`, row-major. The answer is `(rows.len(), heads * 64)`.
+fn attn_oracle(
+    qkv: (&[f32], &[f32], &[f32]),
+    keys: usize,
+    heads: usize,
+    rows: std::ops::Range<usize>,
+) -> Vec<f64> {
+    let (q, k, v) = qkv;
+    let width = heads * ATTN_HEAD;
+    let scale = 1.0 / (ATTN_HEAD as f64).sqrt();
+    let mut out = vec![0.0f64; rows.len() * width];
+    let mut scores = vec![0.0f64; keys];
+    for (i, r) in rows.enumerate() {
+        for h in 0..heads {
+            let qrow = &q[r * width + h * ATTN_HEAD..][..ATTN_HEAD];
+            for (j, score) in scores.iter_mut().enumerate() {
+                let krow = &k[j * width + h * ATTN_HEAD..][..ATTN_HEAD];
+                *score = scale
+                    * qrow
+                        .iter()
+                        .zip(krow)
+                        .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                        .sum::<f64>();
+            }
+            let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mut sum = 0.0;
+            for score in &mut scores {
+                *score = (*score - max).exp();
+                sum += *score;
+            }
+            let orow = &mut out[i * width + h * ATTN_HEAD..][..ATTN_HEAD];
+            for (j, p) in scores.iter().enumerate() {
+                let vrow = &v[j * width + h * ATTN_HEAD..][..ATTN_HEAD];
+                for (o, &x) in orow.iter_mut().zip(vrow) {
+                    *o += p / sum * f64::from(x);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Launches the fused attention over device q, k, v and reads the answer.
+fn attn_launch(gpu: &Gpu, qkv: (&[f32], &[f32], &[f32]), queries: usize, heads: usize) -> Vec<f32> {
+    let width = heads * ATTN_HEAD;
+    let keys = qkv.1.len() / width;
+    let [q, k, v] = [qkv.0, qkv.1, qkv.2].map(|b| upload(gpu, b));
+    let out = upload(gpu, &vec![f32::NAN; queries * width]);
+    let args = AttnArgs {
+        queries: queries as u32,
+        keys: keys as u32,
+        heads: heads as u32,
+        width: width as u32,
+        scale: 1.0 / (ATTN_HEAD as f32).sqrt(),
+    };
+    run(
+        gpu,
+        KernelRef::new(MODULE, "kernel_splat_attn_f32"),
+        &LaunchArgs {
+            grid: Extent3::new(queries.div_ceil(ATTN_QROWS) as u32, heads as u32, 1),
+            block: Extent3::linear(ATTN_THREADS),
+            smem_bytes: 0,
+            args: &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(q.view()),
+                KernelArg::Buffer(k.view()),
+                KernelArg::Buffer(v.view()),
+            ],
+        },
+    );
+    drain(gpu);
+    gpu.read_f32(&out)
+}
+
+/// Cross attention with ragged counts: 45 queries over 77 keys, so the last
+/// key block and the only query tile are both partial.
+///
+/// # Panics
+///
+/// When the device's answer is outside the case's bound.
+pub fn attention_matches_the_softmax_oracle(gpu: &Gpu) {
+    let (queries, keys, heads) = (45, 77, 3);
+    let width = heads * ATTN_HEAD;
+    let q = signal(queries * width, 41);
+    let k = signal(keys * width, 42);
+    let v = signal(keys * width, 43);
+    let got = attn_launch(gpu, (&q, &k, &v), queries, heads);
+    let want = attn_oracle((&q, &k, &v), keys, heads, 0..queries);
+    close(&got, &want, 1e-5, 0.1, "fused attention, ragged");
+}
+
+/// Scores in the tens: the online softmax must subtract its running maximum
+/// before exponentiating, or the sums overflow.
+///
+/// # Panics
+///
+/// When the device's answer is outside the case's bound or not finite.
+pub fn attention_survives_large_scores(gpu: &Gpu) {
+    let (queries, keys, heads) = (64, 96, 2);
+    let width = heads * ATTN_HEAD;
+    let q: Vec<f32> = signal(queries * width, 51)
+        .into_iter()
+        .map(|x| x * 20.0)
+        .collect();
+    let k = signal(keys * width, 52);
+    let v = signal(keys * width, 53);
+    let got = attn_launch(gpu, (&q, &k, &v), queries, heads);
+    assert!(got.iter().all(|x| x.is_finite()), "a non-finite output");
+    let want = attn_oracle((&q, &k, &v), keys, heads, 0..queries);
+    // A score near 25 carries about 1e-5 of f32 rounding from its own dot
+    // product, which `exp` hands on to every probability: 5e-6 absolute is
+    // that rounding, where an overflowed or unshifted softmax is off by far
+    // more or not finite.
+    close(&got, &want, 5e-5, 0.1, "fused attention, large scores");
+}
+
+/// The denoiser's joint shape, 12294 rows of 16 heads: the first and last
+/// query tiles of the last head against the oracle, which catches tile and
+/// key-block boundaries at the real size.
+///
+/// # Panics
+///
+/// When the device's answer is outside the case's bound.
+pub fn attention_at_the_joint_shape(gpu: &Gpu) {
+    let (rows, heads) = (12_294, 16);
+    let width = heads * ATTN_HEAD;
+    let q = signal(rows * width, 61);
+    let k = signal(rows * width, 62);
+    let v = signal(rows * width, 63);
+    let got = attn_launch(gpu, (&q, &k, &v), rows, heads);
+    for range in [0..64, rows - 64..rows] {
+        let want = attn_oracle((&q, &k, &v), rows, heads, range.clone());
+        let got_rows = &got[range.start * width..range.end * width];
+        // Only the last head is compared; the oracle computes all of them.
+        let head = heads - 1;
+        let pick = |all: &[f32]| -> Vec<f32> {
+            all.chunks_exact(width)
+                .flat_map(|row| row[head * ATTN_HEAD..][..ATTN_HEAD].to_vec())
+                .collect()
+        };
+        let pick64 = |all: &[f64]| -> Vec<f64> {
+            all.chunks_exact(width)
+                .flat_map(|row| row[head * ATTN_HEAD..][..ATTN_HEAD].to_vec())
+                .collect()
+        };
+        close(
+            &pick(got_rows),
+            &pick64(&want),
+            1e-4,
+            0.1,
+            "fused attention, joint shape",
+        );
+    }
+}
+
+/// The denoiser's joint attention, 12294 rows of 16 heads of 64, for
+/// `kernel_bench`.
+pub(crate) fn bench_attention(gpu: &Gpu) -> crate::bench::Fixture {
+    let (rows, heads) = (12_294usize, 16usize);
+    let width = heads * ATTN_HEAD;
+    let [q, k, v] = [61, 62, 63].map(|seed| upload(gpu, &signal(rows * width, seed)));
+    let out = upload(gpu, &vec![0.0; rows * width]);
+    let args = AttnArgs {
+        queries: rows as u32,
+        keys: rows as u32,
+        heads: heads as u32,
+        width: width as u32,
+        scale: 1.0 / (ATTN_HEAD as f32).sqrt(),
+    };
+    let bytes = (4 * rows * width * 4) as u64;
+    let flops = (4 * rows * rows * ATTN_HEAD * heads) as u64;
+    crate::bench::Fixture::new(bytes, flops, move |gpu| {
+        run(
+            gpu,
+            KernelRef::new(MODULE, "kernel_splat_attn_f32"),
+            &LaunchArgs {
+                grid: Extent3::new(rows.div_ceil(ATTN_QROWS) as u32, heads as u32, 1),
+                block: Extent3::linear(ATTN_THREADS),
+                smem_bytes: 0,
+                args: &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(out.view()),
+                    KernelArg::Buffer(q.view()),
+                    KernelArg::Buffer(k.view()),
+                    KernelArg::Buffer(v.view()),
+                ],
+            },
+        );
+    })
 }

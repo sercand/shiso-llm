@@ -11,6 +11,9 @@ typedef uint64_t u64;
 
 #define SPLAT_BLOCK 64u
 #define SPLAT_MAX_WINDOW_TOKENS 256u
+#define SPLAT_ATTN_HEAD 64u
+#define SPLAT_ATTN_QROWS 64u
+#define SPLAT_ATTN_THREADS 256u
 
 struct splat_args_unary {
     u32 count;
@@ -60,6 +63,15 @@ struct splat_args_deform {
     u32 rows;
 };
 static_assert(sizeof(splat_args_deform) == 44, "splat_args_deform layout");
+
+struct splat_args_attn {
+    u32 queries;
+    u32 keys;
+    u32 heads;
+    u32 width;
+    float scale;
+};
+static_assert(sizeof(splat_args_attn) == 20, "splat_args_attn layout");
 
 extern "C" __global__ void kernel_splat_relu_f32(
         const splat_args_unary args, float* out, const float* in) {
@@ -280,4 +292,52 @@ extern "C" __global__ void kernel_splat_deform_im2col_f32(
         value = hh * hw * v1 + hh * lw * v2 + lh * hw * v3 + lh * lw * v4;
     }
     cols[(u64)r * width + col] = m * value;
+}
+
+/* Attention over 64-wide heads with an online softmax, the Metal twin's
+ * contract and launch: grid (ceil(queries / 64), heads) of 256 threads. Each
+ * of the eight warps takes eight of the tile's query rows in turn; a lane
+ * holds two of the head's 64 values, a score is a warp-wide sum, and the
+ * running maximum, denominator and value accumulators are kept per lane in
+ * f32. Correctness first: no shared-memory tiling yet. */
+extern "C" __global__ void kernel_splat_attn_f32(
+        const splat_args_attn args, float* out, const float* q, const float* k,
+        const float* v) {
+    const u32 h = blockIdx.y;
+    if (h >= args.heads) {
+        return;
+    }
+    const u32 warp = threadIdx.x / 32u;
+    const u32 lane = threadIdx.x % 32u;
+    const u32 d = lane * 2u;
+    for (u32 r = 0; r < 8u; ++r) {
+        const u32 row = blockIdx.x * SPLAT_ATTN_QROWS + warp * 8u + r;
+        if (row >= args.queries) {
+            return;
+        }
+        const float* qp = q + (u64)row * args.width + h * SPLAT_ATTN_HEAD;
+        const float q0 = qp[d] * args.scale;
+        const float q1 = qp[d + 1u] * args.scale;
+        float run_max = -INFINITY;
+        float run_sum = 0.0f;
+        float o0 = 0.0f;
+        float o1 = 0.0f;
+        for (u32 j = 0; j < args.keys; ++j) {
+            const u64 at = (u64)j * args.width + h * SPLAT_ATTN_HEAD + d;
+            float score = q0 * k[at] + q1 * k[at + 1u];
+            for (u32 off = 16u; off > 0u; off /= 2u) {
+                score += __shfl_xor_sync(0xffffffffu, score, off);
+            }
+            const float new_max = fmaxf(run_max, score);
+            const float alpha = expf(run_max - new_max);
+            const float p = expf(score - new_max);
+            run_sum = run_sum * alpha + p;
+            o0 = o0 * alpha + p * v[at];
+            o1 = o1 * alpha + p * v[at + 1u];
+            run_max = new_max;
+        }
+        float* op = out + (u64)row * args.width + h * SPLAT_ATTN_HEAD + d;
+        op[0] = o0 / run_sum;
+        op[1] = o1 / run_sum;
+    }
 }

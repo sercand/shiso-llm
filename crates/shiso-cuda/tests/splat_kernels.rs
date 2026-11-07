@@ -74,4 +74,7 @@ cases!(
     window_attention_shifts_and_masks_the_regions,
     window_attention_at_the_production_window,
     deform_im2col_samples_bilinearly_with_the_mask,
+    attention_matches_the_softmax_oracle,
+    attention_survives_large_scores,
+    attention_at_the_joint_shape,
 );

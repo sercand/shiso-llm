@@ -17,6 +17,15 @@
 #define SPLAT_BLOCK 64u
 // The largest window the attention keeps a score row for (16 x 16 tokens).
 #define SPLAT_MAX_WINDOW_TOKENS 256u
+// The fused attention's tile (`kernel_splat_attn_f32`): a fixed 64-wide head,
+// 64 query rows per threadgroup of eight simdgroups (eight rows each), keys
+// streamed 32 at a time.
+#define SPLAT_ATTN_HEAD 64u
+#define SPLAT_ATTN_SG 8u
+#define SPLAT_ATTN_QROWS (8u * SPLAT_ATTN_SG)
+#define SPLAT_ATTN_THREADS (32u * SPLAT_ATTN_SG)
+#define SPLAT_ATTN_KEYS 32u
+#define SPLAT_UNROLL _Pragma("clang loop unroll(full)")
 
 struct splat_args_unary {
     uint count;
@@ -66,6 +75,15 @@ struct splat_args_deform {
     uint rows;
 };
 static_assert(sizeof(splat_args_deform) == 44, "splat_args_deform layout");
+
+struct splat_args_attn {
+    uint queries;
+    uint keys;
+    uint heads;
+    uint width;
+    float scale;
+};
+static_assert(sizeof(splat_args_attn) == 20, "splat_args_attn layout");
 
 // `out[i] = max(in[i], 0)`.
 kernel void kernel_splat_relu_f32(
@@ -364,4 +382,180 @@ kernel void kernel_splat_deform_im2col_f32(
         value = hh * hw * v1 + hh * lw * v2 + lh * hw * v3 + lh * lw * v4;
     }
     cols[(uint64_t)r * width + col] = m * value;
+}
+
+// Attention over 64-wide heads in one pass over the keys, with an online
+// softmax on simdgroup matrices: for every head `h`,
+// `out[r][h*64 + d] = sum_j softmax_j(scale * q[r][h] . k[j][h]) v[j][h*64 + d]`,
+// q `(queries, width)`, k and v `(keys, width)`, out `(queries, width)`, all
+// row-major with `width = heads * 64` floats per row. Queries and keys may
+// differ in number (the decoders attend from anchors to latent tokens).
+//
+// A threadgroup takes 64 query rows of one head, eight per simdgroup, held
+// in registers as 8x8 fragments pre-multiplied by `scale`, and streams the
+// keys 32 at a time through threadgroup memory, the next block loading into
+// registers while the current one is multiplied. A lane holds two columns of
+// one row of each score fragment; the four lanes sharing a row (lane bits 0
+// and 3) fold the running maximum and denominator with two shuffles, and
+// the value accumulators, laid out the same way, are rescaled lane by lane.
+//
+// Everything stays f32: q, k, v, the probabilities and every product. The
+// diffusion set's fused kernel stages them as half, which moved the image
+// tower's tokens by 7.5e-3 over its 32 layers against a 5e-4 bound. K and V
+// together take 17.4 KB of threadgroup memory, so the tile is single-buffered
+// (a second copy would pass the 32 KB limit) and the prefetch rides in
+// registers instead.
+//
+// Keys past the end score -inf and are never read; query rows past the end
+// load zero and are never written.
+//
+// Measured on an M1 Max at the denoiser's joint attention (12294 rows, 16
+// heads): 194 ms per launch (3.2 TFLOP/s), against 800 ms for the same
+// attention as transposes, score GEMMs, softmax and P.V GEMMs.
+//
+// Grid `(ceil(queries / 64), heads)` of 256 threads.
+kernel void kernel_splat_attn_f32(
+        constant splat_args_attn & args [[buffer(0)]],
+        device float *out                [[buffer(1)]],
+        device const float *q            [[buffer(2)]],
+        device const float *k            [[buffer(3)]],
+        device const float *v            [[buffer(4)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint HD = SPLAT_ATTN_HEAD;
+    const uint ND = HD / 8u;
+    const uint KB = SPLAT_ATTN_KEYS;
+    const uint NB = KB / 8u;
+    const uint NT = SPLAT_ATTN_THREADS;
+    // Each staged row is padded by four floats so the transposed K loads do
+    // not land on one bank.
+    const uint LDK = HD + 4u;
+    threadgroup float kv[2u * SPLAT_ATTN_KEYS * (SPLAT_ATTN_HEAD + 4u)];
+
+    const uint h = tgpig.y;
+    if (h >= args.heads) {
+        return;
+    }
+    const uint keys = args.keys;
+    const uint width = args.width;
+
+    // The lane's place in every 8x8 fragment: columns `fn, fn + 1` of row `fr`.
+    const ushort fn = ((lane / 4u) & 2u) * 2u + (lane % 2u) * 2u;
+    const ushort fr = ((lane / 4u) & 4u) + ((lane / 2u) % 4u);
+    const uint qrow = tgpig.x * SPLAT_ATTN_QROWS + sg * 8u + fr;
+    const bool live = qrow < args.queries;
+
+    simdgroup_float8x8 qf[ND];
+    simdgroup_float8x8 of[ND];
+    device const float *qp = q + (uint64_t) (live ? qrow : 0u) * width + h * HD;
+    SPLAT_UNROLL for (uint i = 0; i < ND; ++i) {
+        const float2 qv = live ? float2(qp[8u * i + fn], qp[8u * i + fn + 1u]) * args.scale
+                               : float2(0.0f);
+        qf[i].thread_elements()[0] = qv.x;
+        qf[i].thread_elements()[1] = qv.y;
+        of[i] = simdgroup_float8x8(0.0f);
+    }
+
+    float run_max = -INFINITY;
+    float run_sum = 0.0f;
+    threadgroup float *sk = kv;
+    threadgroup float *sv = kv + KB * LDK;
+    // Four consecutive head values per load; a key past the end stages as
+    // zero and is masked below.
+    const uint HD4 = HD / 4u;
+    const uint SL = KB * HD4 / NT;
+    float4 rk[SL];
+    float4 rv[SL];
+    auto fetch = [&](uint s0) {
+        SPLAT_UNROLL for (uint c = 0; c < SL; ++c) {
+            const uint e = tid + c * NT;
+            const uint j = e / HD4;
+            const uint d = (e - j * HD4) * 4u;
+            const uint s = s0 + j;
+            rk[c] = float4(0.0f);
+            rv[c] = float4(0.0f);
+            if (s < keys) {
+                const uint64_t o = (uint64_t) s * width + h * HD + d;
+                rk[c] = float4(*((device const packed_float4 *) (k + o)));
+                rv[c] = float4(*((device const packed_float4 *) (v + o)));
+            }
+        }
+    };
+    fetch(0);
+    for (uint s0 = 0; s0 < keys; s0 += KB) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        SPLAT_UNROLL for (uint c = 0; c < SL; ++c) {
+            const uint e = tid + c * NT;
+            const uint j = e / HD4;
+            const uint d = (e - j * HD4) * 4u;
+            *((threadgroup float4 *) (sk + j * LDK + d)) = rk[c];
+            *((threadgroup float4 *) (sv + j * LDK + d)) = rv[c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s0 + KB < keys) {
+            fetch(s0 + KB);
+        }
+
+        // Scores: S (8 x KB) = Q (8 x 64) . K^T, one fragment per 8 keys.
+        simdgroup_float8x8 sf[NB];
+        SPLAT_UNROLL for (uint b = 0; b < NB; ++b) {
+            sf[b] = simdgroup_float8x8(0.0f);
+        }
+        SPLAT_UNROLL for (uint i = 0; i < ND; ++i) {
+            SPLAT_UNROLL for (uint b = 0; b < NB; ++b) {
+                simdgroup_float8x8 kt;
+                // kt(r, c) = K[8b + c][8i + r]: the transposed load.
+                simdgroup_load(kt, sk + 8u * b * LDK + 8u * i, LDK, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(sf[b], qf[i], kt, sf[b]);
+            }
+        }
+
+        float block_max = -INFINITY;
+        SPLAT_UNROLL for (uint b = 0; b < NB; ++b) {
+            SPLAT_UNROLL for (uint c = 0; c < 2u; ++c) {
+                if (s0 + 8u * b + fn + c >= keys) {
+                    sf[b].thread_elements()[c] = -INFINITY;
+                }
+                block_max = max(block_max, sf[b].thread_elements()[c]);
+            }
+        }
+        block_max = max(block_max, simd_shuffle_xor(block_max, 1));
+        block_max = max(block_max, simd_shuffle_xor(block_max, 8));
+        const float new_max = max(run_max, block_max);
+        const float alpha = precise::exp(run_max - new_max);
+        float block_sum = 0.0f;
+        SPLAT_UNROLL for (uint b = 0; b < NB; ++b) {
+            SPLAT_UNROLL for (uint c = 0; c < 2u; ++c) {
+                const float p = precise::exp(sf[b].thread_elements()[c] - new_max);
+                sf[b].thread_elements()[c] = p;
+                block_sum += p;
+            }
+        }
+        block_sum += simd_shuffle_xor(block_sum, 1);
+        block_sum += simd_shuffle_xor(block_sum, 8);
+        run_sum = run_sum * alpha + block_sum;
+        run_max = new_max;
+
+        SPLAT_UNROLL for (uint i = 0; i < ND; ++i) {
+            of[i].thread_elements()[0] *= alpha;
+            of[i].thread_elements()[1] *= alpha;
+            SPLAT_UNROLL for (uint b = 0; b < NB; ++b) {
+                simdgroup_float8x8 vf;
+                simdgroup_load(vf, sv + 8u * b * LDK + 8u * i, LDK);
+                simdgroup_multiply_accumulate(of[i], sf[b], vf, of[i]);
+            }
+        }
+    }
+
+    if (!live) {
+        return;
+    }
+    const float inv = 1.0f / run_sum;
+    device float *op = out + (uint64_t) qrow * width + h * HD;
+    SPLAT_UNROLL for (uint i = 0; i < ND; ++i) {
+        op[8u * i + fn] = of[i].thread_elements()[0] * inv;
+        op[8u * i + fn + 1u] = of[i].thread_elements()[1] * inv;
+    }
 }
