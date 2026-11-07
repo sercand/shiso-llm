@@ -175,7 +175,10 @@ pub fn activations_match_their_formulas(gpu: &Gpu) {
     close(&relu, &want, 0.0, 0.0, "relu");
 
     let sigmoid = unary(gpu, "kernel_splat_sigmoid_f32", &x);
-    let want: Vec<f64> = x.iter().map(|&v| 1.0 / (1.0 + (-f64::from(v)).exp())).collect();
+    let want: Vec<f64> = x
+        .iter()
+        .map(|&v| 1.0 / (1.0 + (-f64::from(v)).exp()))
+        .collect();
     close(&sigmoid, &want, 1e-6, 1e-30, "sigmoid");
 
     let x: Vec<f32> = (0..161).map(|i| (i as f32 - 80.0) / 20.0).collect();
@@ -214,7 +217,11 @@ pub fn resize_bilinear_aligns_corners(gpu: &Gpu) {
         launch(
             gpu,
             "kernel_splat_resize_bilinear_f32",
-            Extent3::new((out_w as u32).div_ceil(BLOCK), out_h as u32, channels as u32),
+            Extent3::new(
+                (out_w as u32).div_ceil(BLOCK),
+                out_h as u32,
+                channels as u32,
+            ),
             &[
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
                 KernelArg::Buffer(out.view()),
@@ -295,7 +302,9 @@ pub fn merge2x2_takes_the_reference_order(gpu: &Gpu) {
         for j in 0..w / 2 {
             for (dy, dx) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                 for c in 0..channels {
-                    want.push(f64::from(tokens[((2 * i + dy) * w + 2 * j + dx) * channels + c]));
+                    want.push(f64::from(
+                        tokens[((2 * i + dy) * w + 2 * j + dx) * channels + c],
+                    ));
                 }
             }
         }
@@ -357,7 +366,11 @@ fn window_oracle(
             .collect()
     };
     let zeros = vec![0.0f32; width];
-    let (gq, gk, gv) = (grid(qkv.0, &zeros), grid(qkv.1, pads.0), grid(qkv.2, pads.1));
+    let (gq, gk, gv) = (
+        grid(qkv.0, &zeros),
+        grid(qkv.1, pads.0),
+        grid(qkv.2, pads.1),
+    );
     // Step 2: roll by -shift: rolled[y][x] = grid[(y + shift) % hp][(x + shift) % wp].
     let rolled = |g: &Vec<Vec<f64>>| -> Vec<Vec<f64>> {
         (0..hp * wp)
@@ -393,14 +406,17 @@ fn window_oracle(
                             let (ky, kx) = member(j);
                             let dot: f64 = (0..hd)
                                 .map(|d| {
-                                    rq[qy * wp + qx][head * hd + d] * scale
+                                    rq[qy * wp + qx][head * hd + d]
+                                        * scale
                                         * rk[ky * wp + kx][head * hd + d]
                                 })
                                 .sum();
-                            let rel = (i / ws + ws - 1 - j / ws) * span + (i % ws + ws - 1 - j % ws);
+                            let rel =
+                                (i / ws + ws - 1 - j / ws) * span + (i % ws + ws - 1 - j % ws);
                             let mut score = dot + f64::from(table[rel * heads + head]);
                             if shift > 0
-                                && (region(qy, hp), region(qx, wp)) != (region(ky, hp), region(kx, wp))
+                                && (region(qy, hp), region(qx, wp))
+                                    != (region(ky, hp), region(kx, wp))
                             {
                                 score -= 100.0;
                             }
@@ -497,7 +513,13 @@ pub fn window_attention_pads_with_the_pad_rows(gpu: &Gpu) {
         head_dim: 8,
     };
     let (got, want) = window_case(gpu, shape, 31);
-    close(&got, &want, 1e-4, 1e-2, "window attention, padded, unshifted");
+    close(
+        &got,
+        &want,
+        1e-4,
+        1e-2,
+        "window attention, padded, unshifted",
+    );
 }
 
 /// A shifted window: the roll moves tokens into windows they share with the
@@ -527,7 +549,13 @@ pub fn window_attention_shifts_and_masks_the_regions(gpu: &Gpu) {
         head_dim: 4,
     };
     let (got, want) = window_case(gpu, shape, 59);
-    close(&got, &want, 1e-4, 1e-2, "window attention, padded and shifted");
+    close(
+        &got,
+        &want,
+        1e-4,
+        1e-2,
+        "window attention, padded and shifted",
+    );
 }
 
 /// The deformable columns: fractional offsets interpolate between four
@@ -545,7 +573,10 @@ pub fn deform_im2col_samples_bilinearly_with_the_mask(gpu: &Gpu) {
     let plane = out_h * out_w;
     let field = signal(channels * in_h * in_w, 71);
     // Offsets up to +-2.5 pixels, so some taps leave the field entirely.
-    let offset: Vec<f32> = signal(2 * taps * plane, 73).iter().map(|v| v * 2.5).collect();
+    let offset: Vec<f32> = signal(2 * taps * plane, 73)
+        .iter()
+        .map(|v| v * 2.5)
+        .collect();
     let mask: Vec<f32> = signal(taps * plane, 79).iter().map(|v| v + 1.0).collect();
     let (first, rows) = (7usize, 19usize);
     let bufs = [&field, &offset, &mask].map(|b| upload(gpu, b));
@@ -636,8 +667,20 @@ pub fn window_attention_at_the_production_window(gpu: &Gpu) {
         head_dim: 8,
     };
     let (got, want) = window_case(gpu, shape, 83);
-    close(&got, &want, 1e-4, 1e-2, "window attention, 12-wide, shifted, padded");
+    close(
+        &got,
+        &want,
+        1e-4,
+        1e-2,
+        "window attention, 12-wide, shifted, padded",
+    );
     let shape = Window { shift: 0, ..shape };
     let (got, want) = window_case(gpu, shape, 89);
-    close(&got, &want, 1e-4, 1e-2, "window attention, 12-wide, unshifted, padded");
+    close(
+        &got,
+        &want,
+        1e-4,
+        1e-2,
+        "window attention, 12-wide, unshifted, padded",
+    );
 }

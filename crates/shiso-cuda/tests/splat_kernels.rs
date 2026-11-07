@@ -46,7 +46,10 @@ fn every_splat_entry_resolves_on_the_device() {
                 .is_none()
         })
         .collect();
-    assert!(missing.is_empty(), "the splat image does not export {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "the splat image does not export {missing:?}"
+    );
 }
 
 /// One ignored wrapper per shared case.
