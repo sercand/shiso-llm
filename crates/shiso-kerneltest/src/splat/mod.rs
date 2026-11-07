@@ -808,8 +808,8 @@ pub fn attention_matches_the_softmax_oracle(gpu: &Gpu) {
     close(&got, &want, 1e-5, 0.1, "fused attention, ragged");
 }
 
-/// Scores in the tens: the online softmax must subtract its running maximum
-/// before exponentiating, or the sums overflow.
+/// Scores past 88, where `exp` overflows f32: a softmax that exponentiated
+/// before subtracting its running maximum answers inf or NaN here.
 ///
 /// # Panics
 ///
@@ -817,20 +817,42 @@ pub fn attention_matches_the_softmax_oracle(gpu: &Gpu) {
 pub fn attention_survives_large_scores(gpu: &Gpu) {
     let (queries, keys, heads) = (64, 96, 2);
     let width = heads * ATTN_HEAD;
+    // Scores spread with a deviation near 33, so every row's largest is far
+    // past 88.
     let q: Vec<f32> = signal(queries * width, 51)
         .into_iter()
-        .map(|x| x * 20.0)
+        .map(|x| x * 100.0)
         .collect();
     let k = signal(keys * width, 52);
     let v = signal(keys * width, 53);
+    let scale = 1.0 / (ATTN_HEAD as f64).sqrt();
+    let largest = (0..queries * heads)
+        .map(|rh| {
+            let (row, head) = (rh / heads, rh % heads);
+            let qrow = &q[row * width + head * ATTN_HEAD..][..ATTN_HEAD];
+            (0..keys)
+                .map(|key| {
+                    let krow = &k[key * width + head * ATTN_HEAD..][..ATTN_HEAD];
+                    scale
+                        * qrow
+                            .iter()
+                            .zip(krow)
+                            .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                            .sum::<f64>()
+                })
+                .fold(f64::NEG_INFINITY, f64::max)
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        largest > 100.0,
+        "the case's largest score is only {largest}"
+    );
     let got = attn_launch(gpu, (&q, &k, &v), queries, heads);
     assert!(got.iter().all(|x| x.is_finite()), "a non-finite output");
     let want = attn_oracle((&q, &k, &v), keys, heads, 0..queries);
-    // A score near 25 carries about 1e-5 of f32 rounding from its own dot
-    // product, which `exp` hands on to every probability: 5e-6 absolute is
-    // that rounding, where an overflowed or unshifted softmax is off by far
-    // more or not finite.
-    close(&got, &want, 5e-5, 0.1, "fused attention, large scores");
+    // A score near 100 carries about 5e-5 of f32 rounding from its own dot
+    // product, which `exp` hands on to the probabilities: 1e-4 absolute.
+    close(&got, &want, 1e-3, 0.1, "fused attention, large scores");
 }
 
 /// The denoiser's joint shape, 12294 rows of 16 heads: the first and last

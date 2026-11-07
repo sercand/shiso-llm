@@ -4,6 +4,7 @@
  * for entry; see that file for what each computes and why.
  */
 
+#include <math_constants.h>
 #include <stdint.h>
 
 typedef uint32_t u32;
@@ -326,7 +327,7 @@ extern "C" __global__ void kernel_splat_attn_f32(
         const float* qp = q + (u64)row * args.width + h * SPLAT_ATTN_HEAD;
         const float q0 = qp[d] * args.scale;
         const float q1 = qp[d + 1u] * args.scale;
-        float run_max = -INFINITY;
+        float run_max = -CUDART_INF_F;
         float run_sum = 0.0f;
         float o0 = 0.0f;
         float o1 = 0.0f;
