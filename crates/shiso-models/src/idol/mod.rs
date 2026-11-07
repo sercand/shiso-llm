@@ -5,6 +5,7 @@
 //! 1024-square RGB image the encoders read. The device stages arrive with
 //! their own plans, which is why this module has no backend in it yet.
 
+pub mod birefnet;
 pub mod conditioner;
 pub mod conditioning;
 pub mod config;
@@ -21,6 +22,7 @@ pub mod octree;
 pub mod ply;
 pub mod preprocess;
 pub mod sampler;
+pub(crate) mod splat_ops;
 
 #[cfg(test)]
 mod device_tests;

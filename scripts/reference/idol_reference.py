@@ -25,8 +25,8 @@ It never overwrites a stage's files: delete them to recapture.
     idol_reference.py --image <picture> [stage ...]
     idol_reference.py --sdk <space checkout> crosscheck
 
-Stages: preprocess, encoders, denoiser, decoders, e2e, crosscheck
-(default: encoders denoiser decoders e2e).
+Stages: preprocess, encoders, denoiser, decoders, e2e, matte, crosscheck
+(default: encoders denoiser decoders e2e matte).
 Checkpoints are read from the Hugging Face cache (`--weights`, `--dinov3`,
 `--vae` override the snapshot directories).
 """
@@ -303,9 +303,36 @@ def stage_crosscheck(args):
     print(json.dumps(report, indent=2))
 
 
+def stage_matte(args):
+    """The background remover on a picture with a background, at its own size (it resizes to 1024 and back)."""
+    import idol_models as m
+    from safetensors.torch import load_file
+
+    if args.image is None:
+        sys.exit("the matte stage needs --image")
+    net = m.BiRefNet()
+    net.load_state_dict(load_file(str(args.weights / "birefnet.safetensors")), strict=True)
+    net = net.eval().float()
+    rgb = np.array(Image.open(args.image).convert("RGB"))
+    Image.fromarray(rgb).save(OUT / "matte_input.png")
+    taps = {}
+    alpha = net.alpha(rgb, taps)
+    path = OUT / "matte_alpha.u8"
+    if path.exists():
+        sys.exit(f"{path} exists; delete it to recapture")
+    path.write_bytes(alpha.tobytes())
+    f32_file("matte_net_input.f32", taps["input"][0])
+    f32_file("matte_x4.f32", taps["x4"][0])
+    f32_file("matte_squeezed.f32", taps["squeezed"][0])
+    f32_file("matte_p4.f32", taps["p4"][0])
+    f32_file("matte_mask.f32", taps["mask"][0, 0])
+    write_json("matte.json", {"height": int(rgb.shape[0]), "width": int(rgb.shape[1])})
+
+
 STAGES = {"preprocess": stage_preprocess, "encoders": stage_encoders, "denoiser": stage_denoiser,
-          "decoders": stage_decoders, "e2e": stage_e2e, "crosscheck": stage_crosscheck}
-DEFAULT_STAGES = ["encoders", "denoiser", "decoders", "e2e"]
+          "decoders": stage_decoders, "e2e": stage_e2e, "matte": stage_matte,
+          "crosscheck": stage_crosscheck}
+DEFAULT_STAGES = ["encoders", "denoiser", "decoders", "e2e", "matte"]
 
 
 def main():

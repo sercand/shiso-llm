@@ -268,11 +268,11 @@ fn planar(image: &image::RgbImage) -> Vec<f32> {
 }
 
 /// Opens the background remover.
-fn open_matte(path: &Path, _ops: &Arc<Ops>) -> Result<Box<dyn Matting>, ImageGenError> {
-    Err(ImageGenError::Checkpoint(format!(
-        "{}: this build has no background remover yet",
-        path.display()
-    )))
+fn open_matte(path: &Path, ops: &Arc<Ops>) -> Result<Box<dyn Matting>, ImageGenError> {
+    Ok(Box::new(super::birefnet::BiRefNet::load(
+        path,
+        Arc::clone(ops),
+    )?))
 }
 
 #[cfg(test)]

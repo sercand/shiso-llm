@@ -401,6 +401,13 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "ternary/ternary_mm.metal",
         include_str!("../../../kernels/metal/ternary/ternary_mm.metal"),
     ),
+    // --- 3D splat kernel set (the background remover's window attention,
+    // deformable sampling, resampling and activations); appended, nothing
+    // above this line changed. Self-contained: no header of its own.
+    (
+        "splat/splat.metal",
+        include_str!("../../../kernels/metal/splat/splat.metal"),
+    ),
 ];
 
 /// Concatenates every source into the one translation unit the device compiles.

@@ -633,3 +633,41 @@ fn the_decode_from_the_reference_latent_replays_the_reference_cloud() {
     };
     close_mean(&body(&ply), &body(&ply_ref), 5e-3, 1e-5, "e2e ply body");
 }
+
+#[test]
+#[ignore = "needs the splat checkpoint (SHISO_TEST_MODEL_IDOL), the idol fixtures and a Metal device"]
+fn the_background_remover_matches_the_reference_matte() {
+    use crate::idol::birefnet::BiRefNet;
+    use crate::idol::preprocess::Matting;
+
+    let case = "background remover";
+    let dir = need!(case, checkpoint("SHISO_TEST_MODEL_IDOL"));
+    let png = need!(case, fixture("matte_input.png"));
+    let alpha_ref = std::fs::read(need!(case, fixture("matte_alpha.u8"))).expect("the reference matte");
+    let backend = need!(case, device());
+    let ops = Arc::new(Ops::new(&backend).expect("the diffusion kernel set"));
+    let net = BiRefNet::load(&dir.join("birefnet.safetensors"), ops).expect("the remover loads");
+    let rgb = image::open(&png).expect("the fixture picture").to_rgb8();
+    let alpha = net.alpha(&rgb).expect("the remover runs");
+    assert_eq!(alpha.len(), alpha_ref.len(), "the matte is the picture's size");
+    // The matte is bytes: compare the counts that move, not a float bound.
+    let mut off_by_more_than_one = 0usize;
+    let mut worst = 0u8;
+    for (got, want) in alpha.iter().zip(&alpha_ref) {
+        let diff = got.abs_diff(*want);
+        worst = worst.max(diff);
+        if diff > 1 {
+            off_by_more_than_one += 1;
+        }
+    }
+    let share = off_by_more_than_one as f64 / alpha.len() as f64;
+    #[expect(
+        clippy::print_stderr,
+        reason = "the measured agreement is the case's report"
+    )]
+    {
+        eprintln!("matte: worst {worst} levels, {share:.3e} of pixels off by more than one");
+    }
+    assert!(share < 1e-3, "{share} of the matte is off by more than one level");
+    assert!(worst <= 16, "a pixel is {worst} levels off");
+}

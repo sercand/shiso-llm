@@ -449,3 +449,321 @@ def ply_bytes(xyz, colour, scaling, rotation, opacity):
     header = "ply\nformat binary_little_endian 1.0\nelement vertex %d\n" % n
     header += "".join("property float %s\n" % name for name in names) + "end_header\n"
     return header.encode("ascii") + rows.numpy().astype("<f4").tobytes()
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The background remover: a Swin-L backbone run at two scales, an ASPP-deformable squeeze block and a four-level
+# decoder that re-reads the picture at every level. Names are the checkpoint's; loaded strictly.
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _window_partition(x, ws):
+    b, h, w, c = x.shape
+    x = x.view(b, h // ws, ws, w // ws, ws, c)
+    return x.permute(0, 1, 3, 2, 4, 5).reshape(-1, ws, ws, c)
+
+
+def _window_reverse(windows, ws, h, w):
+    b = int(windows.shape[0] / (h * w / ws / ws))
+    x = windows.view(b, h // ws, w // ws, ws, ws, -1)
+    return x.permute(0, 1, 3, 2, 4, 5).reshape(b, h, w, -1)
+
+
+class _SwinMlp(nn.Module):
+    def __init__(self, dim, hidden):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, hidden)
+        self.fc2 = nn.Linear(hidden, dim)
+
+    def forward(self, x):
+        return self.fc2(F.gelu(self.fc1(x)))
+
+
+class _WindowAttention(nn.Module):
+    def __init__(self, dim, ws, heads):
+        super().__init__()
+        self.ws, self.heads = ws, heads
+        self.scale = (dim // heads) ** -0.5
+        self.relative_position_bias_table = nn.Parameter(torch.zeros((2 * ws - 1) ** 2, heads))
+        coords = torch.stack(torch.meshgrid([torch.arange(ws), torch.arange(ws)], indexing="ij")).flatten(1)
+        rel = (coords[:, :, None] - coords[:, None, :]).permute(1, 2, 0).contiguous()
+        rel[:, :, 0] += ws - 1
+        rel[:, :, 1] += ws - 1
+        rel[:, :, 0] *= 2 * ws - 1
+        self.register_buffer("relative_position_index", rel.sum(-1))
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x, mask=None):
+        b, n, c = x.shape
+        q, k, v = self.qkv(x).reshape(b, n, 3, self.heads, c // self.heads).permute(2, 0, 3, 1, 4)
+        attn = (q * self.scale) @ k.transpose(-2, -1)
+        bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(n, n, -1)
+        attn = attn + bias.permute(2, 0, 1).unsqueeze(0)
+        if mask is not None:
+            nw = mask.shape[0]
+            attn = (attn.view(b // nw, nw, self.heads, n, n) + mask.unsqueeze(1).unsqueeze(0)).view(-1, self.heads, n, n)
+        return self.proj((attn.softmax(dim=-1) @ v).transpose(1, 2).reshape(b, n, c))
+
+
+class _SwinBlock(nn.Module):
+    def __init__(self, dim, heads, ws, shift):
+        super().__init__()
+        self.ws, self.shift = ws, shift
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = _WindowAttention(dim, ws, heads)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = _SwinMlp(dim, dim * 4)
+
+    def forward(self, x, h, w, mask):
+        b, _, c = x.shape
+        shortcut = x
+        x = self.norm1(x).view(b, h, w, c)
+        pad_r, pad_b = (self.ws - w % self.ws) % self.ws, (self.ws - h % self.ws) % self.ws
+        x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))
+        hp, wp = x.shape[1], x.shape[2]
+        if self.shift > 0:
+            x = torch.roll(x, shifts=(-self.shift, -self.shift), dims=(1, 2))
+        windows = self.attn(_window_partition(x, self.ws).view(-1, self.ws * self.ws, c),
+                            mask=mask if self.shift > 0 else None)
+        x = _window_reverse(windows.view(-1, self.ws, self.ws, c), self.ws, hp, wp)
+        if self.shift > 0:
+            x = torch.roll(x, shifts=(self.shift, self.shift), dims=(1, 2))
+        x = shortcut + x[:, :h, :w, :].reshape(b, h * w, c)
+        return x + self.mlp(self.norm2(x))
+
+
+class _PatchMerging(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.norm = nn.LayerNorm(4 * dim)
+
+    def forward(self, x, h, w):
+        b, _, c = x.shape
+        x = x.view(b, h, w, c)
+        x = torch.cat([x[:, 0::2, 0::2], x[:, 1::2, 0::2], x[:, 0::2, 1::2], x[:, 1::2, 1::2]], -1)
+        return self.reduction(self.norm(x.view(b, -1, 4 * c)))
+
+
+class _SwinLayer(nn.Module):
+    def __init__(self, dim, depth, heads, ws, downsample):
+        super().__init__()
+        self.ws, self.shift = ws, ws // 2
+        self.blocks = nn.ModuleList([_SwinBlock(dim, heads, ws, 0 if i % 2 == 0 else ws // 2) for i in range(depth)])
+        self.downsample = _PatchMerging(dim) if downsample else None
+
+    def forward(self, x, h, w):
+        hp, wp = math.ceil(h / self.ws) * self.ws, math.ceil(w / self.ws) * self.ws
+        img = torch.zeros((1, hp, wp, 1))
+        cnt = 0
+        for hs in (slice(0, -self.ws), slice(-self.ws, -self.shift), slice(-self.shift, None)):
+            for wsl in (slice(0, -self.ws), slice(-self.ws, -self.shift), slice(-self.shift, None)):
+                img[:, hs, wsl, :] = cnt
+                cnt += 1
+        mw = _window_partition(img, self.ws).view(-1, self.ws ** 2)
+        mask = mw.unsqueeze(1) - mw.unsqueeze(2)
+        mask = mask.masked_fill(mask != 0, -100.0).masked_fill(mask == 0, 0.0)
+        for blk in self.blocks:
+            x = blk(x, h, w, mask)
+        if self.downsample is not None:
+            return x, h, w, self.downsample(x, h, w), (h + 1) // 2, (w + 1) // 2
+        return x, h, w, x, h, w
+
+
+class _PatchEmbed(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Conv2d(3, 192, kernel_size=4, stride=4)
+        self.norm = nn.LayerNorm(192)
+
+    def forward(self, x):
+        x = self.proj(x)
+        h, w = x.shape[2], x.shape[3]
+        return self.norm(x.flatten(2).transpose(1, 2)), h, w
+
+
+class _SwinLarge(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.patch_embed = _PatchEmbed()
+        dims, depths, heads = [192, 384, 768, 1536], [2, 2, 18, 2], [6, 12, 24, 48]
+        self.dims = dims
+        self.layers = nn.ModuleList([_SwinLayer(dims[i], depths[i], heads[i], 12, i < 3) for i in range(4)])
+        for i in range(4):
+            self.add_module(f"norm{i}", nn.LayerNorm(dims[i]))
+
+    def forward(self, x):
+        x, h, w = self.patch_embed(x)
+        outs = []
+        for i in range(4):
+            x_out, hh, ww, x, h, w = self.layers[i](x, h, w)
+            x_out = getattr(self, f"norm{i}")(x_out)
+            outs.append(x_out.view(-1, hh, ww, self.dims[i]).permute(0, 3, 1, 2).contiguous())
+        return tuple(outs)
+
+
+class _DeformableConv2d(nn.Module):
+    def __init__(self, cin, cout, k, padding):
+        super().__init__()
+        self.padding = padding
+        self.offset_conv = nn.Conv2d(cin, 2 * k * k, kernel_size=k, padding=padding)
+        self.modulator_conv = nn.Conv2d(cin, k * k, kernel_size=k, padding=padding)
+        self.regular_conv = nn.Conv2d(cin, cout, kernel_size=k, padding=padding, bias=False)
+
+    def forward(self, x):
+        from torchvision.ops import deform_conv2d
+        return deform_conv2d(x, self.offset_conv(x), self.regular_conv.weight, self.regular_conv.bias,
+                             padding=self.padding, mask=2.0 * torch.sigmoid(self.modulator_conv(x)))
+
+
+class _ASPPModule(nn.Module):
+    def __init__(self, cin, planes, k, padding):
+        super().__init__()
+        self.atrous_conv = _DeformableConv2d(cin, planes, k, padding)
+        self.bn = nn.BatchNorm2d(planes)
+
+    def forward(self, x):
+        return F.relu(self.bn(self.atrous_conv(x)))
+
+
+class _ASPPDeformable(nn.Module):
+    def __init__(self, cin):
+        super().__init__()
+        self.aspp1 = _ASPPModule(cin, 256, 1, 0)
+        self.aspp_deforms = nn.ModuleList([_ASPPModule(cin, 256, k, k // 2) for k in (1, 3, 7)])
+        self.global_avg_pool = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)), nn.Conv2d(cin, 256, 1, bias=False),
+                                             nn.BatchNorm2d(256), nn.ReLU())
+        self.conv1 = nn.Conv2d(256 * 5, cin, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(cin)
+
+    def forward(self, x):
+        x1 = self.aspp1(x)
+        rest = [m(x) for m in self.aspp_deforms]
+        x5 = F.interpolate(self.global_avg_pool(x), size=x1.shape[2:], mode="bilinear", align_corners=True)
+        return F.relu(self.bn1(self.conv1(torch.cat((x1, *rest, x5), dim=1))))
+
+
+class _BasicDecBlk(nn.Module):
+    def __init__(self, cin, cout):
+        super().__init__()
+        self.conv_in = nn.Conv2d(cin, 64, 3, 1, padding=1)
+        self.bn_in = nn.BatchNorm2d(64)
+        self.dec_att = _ASPPDeformable(64)
+        self.conv_out = nn.Conv2d(64, cout, 3, 1, padding=1)
+        self.bn_out = nn.BatchNorm2d(cout)
+
+    def forward(self, x):
+        return self.bn_out(self.conv_out(self.dec_att(F.relu(self.bn_in(self.conv_in(x))))))
+
+
+class _Lateral(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.conv = nn.Conv2d(c, c, 1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class _SimpleConvs(nn.Module):
+    def __init__(self, cin, cout):
+        super().__init__()
+        self.conv1 = nn.Conv2d(cin, 64, 3, 1, 1)
+        self.conv_out = nn.Conv2d(64, cout, 3, 1, 1)
+
+    def forward(self, x):
+        return self.conv_out(self.conv1(x))
+
+
+def image_to_patches(image, ref):
+    """(b, c, hg*h, wg*w) -> (b, c*hg*wg, h, w): the picture cut into ref-sized patches stacked on channels."""
+    b, c, hf, wf = image.shape
+    hg, wg = hf // ref.shape[-2], wf // ref.shape[-1]
+    return image.view(b, c, hg, hf // hg, wg, wf // wg).permute(0, 1, 2, 4, 3, 5).reshape(b, c * hg * wg,
+                                                                                        hf // hg, wf // wg)
+
+
+def _up(x, ref):
+    return F.interpolate(x, size=ref.shape[2:], mode="bilinear", align_corners=True)
+
+
+class _Decoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        c = (3072, 1536, 768, 384)
+        self.ipt_blk5 = _SimpleConvs(2 ** 10 * 3, c[0] // 8)
+        self.ipt_blk4 = _SimpleConvs(2 ** 8 * 3, c[0] // 8)
+        self.ipt_blk3 = _SimpleConvs(2 ** 6 * 3, c[1] // 8)
+        self.ipt_blk2 = _SimpleConvs(2 ** 4 * 3, c[2] // 8)
+        self.ipt_blk1 = _SimpleConvs(3, c[3] // 8)
+        self.decoder_block4 = _BasicDecBlk(c[0] + c[0] // 8, c[1])
+        self.decoder_block3 = _BasicDecBlk(c[1] + c[0] // 8, c[2])
+        self.decoder_block2 = _BasicDecBlk(c[2] + c[1] // 8, c[3])
+        self.decoder_block1 = _BasicDecBlk(c[3] + c[2] // 8, c[3] // 2)
+        self.conv_out1 = nn.Sequential(nn.Conv2d(c[3] // 2 + c[3] // 8, 1, 1))
+        self.lateral_block4 = _Lateral(c[1])
+        self.lateral_block3 = _Lateral(c[2])
+        self.lateral_block2 = _Lateral(c[3])
+        for i, cin in ((4, c[1]), (3, c[2]), (2, c[3])):
+            setattr(self, f"gdt_convs_{i}", nn.Sequential(nn.Conv2d(cin, 16, 3, 1, 1), nn.BatchNorm2d(16), nn.ReLU()))
+            setattr(self, f"gdt_convs_attn_{i}", nn.Sequential(nn.Conv2d(16, 1, 1)))
+
+    def forward(self, x, x1, x2, x3, x4, taps=None):
+        x4 = torch.cat((x4, self.ipt_blk5(image_to_patches(x, x4))), 1)
+        p4 = self.decoder_block4(x4)
+        p4 = p4 * self.gdt_convs_attn_4(self.gdt_convs_4(p4)).sigmoid()
+        p3 = _up(p4, x3) + self.lateral_block4(x3)
+        p3 = torch.cat((p3, self.ipt_blk4(image_to_patches(x, p3))), 1)
+        p3 = self.decoder_block3(p3)
+        p3 = p3 * self.gdt_convs_attn_3(self.gdt_convs_3(p3)).sigmoid()
+        p2 = _up(p3, x2) + self.lateral_block3(x2)
+        p2 = torch.cat((p2, self.ipt_blk3(image_to_patches(x, p2))), 1)
+        p2 = self.decoder_block2(p2)
+        p2 = p2 * self.gdt_convs_attn_2(self.gdt_convs_2(p2)).sigmoid()
+        p1 = _up(p2, x1) + self.lateral_block2(x1)
+        p1 = torch.cat((p1, self.ipt_blk2(image_to_patches(x, p1))), 1)
+        p1 = _up(self.decoder_block1(p1), x)
+        if taps is not None:
+            taps["p4"], taps["p1"] = p4, p1
+        p1 = torch.cat((p1, self.ipt_blk1(image_to_patches(x, p1))), 1)
+        return self.conv_out1(p1)
+
+
+class BiRefNet(nn.Module):
+    INPUT_SIZE = (1024, 1024)
+    MEAN = (0.485, 0.456, 0.406)
+    STD = (0.229, 0.224, 0.225)
+
+    def __init__(self):
+        super().__init__()
+        self.bb = _SwinLarge()
+        self.squeeze_module = nn.Sequential(_BasicDecBlk(3072 + 384 + 768 + 1536, 3072))
+        self.decoder = _Decoder()
+
+    def forward(self, x, taps=None):
+        x1, x2, x3, x4 = self.bb(x)
+        h, w = x.shape[2:]
+        y1, y2, y3, y4 = self.bb(F.interpolate(x, size=(h // 2, w // 2), mode="bilinear", align_corners=True))
+        x1 = torch.cat([x1, _up(y1, x1)], 1)
+        x2 = torch.cat([x2, _up(y2, x2)], 1)
+        x3 = torch.cat([x3, _up(y3, x3)], 1)
+        x4 = torch.cat([x4, _up(y4, x4)], 1)
+        x4 = torch.cat([_up(x1, x4), _up(x2, x4), _up(x3, x4), x4], 1)
+        if taps is not None:
+            taps["x1"], taps["x4"] = x1, x4
+        x4 = self.squeeze_module(x4)
+        if taps is not None:
+            taps["squeezed"] = x4
+        return torch.sigmoid(self.decoder(x, x1, x2, x3, x4, taps))
+
+    def alpha(self, rgb_u8, taps=None):
+        """(H, W, 3) uint8 -> (H, W) uint8 matte: resized to 1024 and back, bilinear with aligned corners."""
+        h, w = rgb_u8.shape[:2]
+        t = torch.from_numpy(rgb_u8.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+        t = F.interpolate(t, size=self.INPUT_SIZE, mode="bilinear", align_corners=True)
+        t = (t - torch.tensor(self.MEAN).view(1, 3, 1, 1)) / torch.tensor(self.STD).view(1, 3, 1, 1)
+        out = self(t, taps)
+        if taps is not None:
+            taps["input"], taps["mask"] = t, out
+        out = F.interpolate(out, size=(h, w), mode="bilinear", align_corners=True)[0, 0]
+        return (out.clamp(0, 1) * 255).to(torch.uint8).numpy()
