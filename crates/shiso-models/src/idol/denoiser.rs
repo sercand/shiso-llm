@@ -32,6 +32,7 @@ use super::nn::{
     Affine, AttnShape, HeadNorm, Pairing, Qkv, add_gated_in_place, attention, bytes, host_lin,
     layer_norm, linear, point_embed_v1, read_linear, rotate_in_place, turned,
 };
+use super::splat_ops::{RotaryCall, rotary_tables};
 use crate::diffusion::lin::Lin;
 use crate::diffusion::ops::{ModulateCall, Ops, SliceExt};
 use crate::diffusion::weights::StStore;
@@ -173,10 +174,12 @@ struct Repo {
     gate: Lin,
     content: Lin,
     project: Lin,
-    /// The 32 pair frequencies: ten for x, ten for y, twelve for z.
-    freqs: Vec<f32>,
-    /// Which of the three predicted offsets each pair turns by.
-    axis: Vec<usize>,
+    /// How many pairs a head turns (32: ten for x, ten for y, twelve for z).
+    pairs: usize,
+    /// Each pair's frequency times pi, rounded once to f32, on the device.
+    rates: DeviceBuffer,
+    /// Which of the three predicted offsets each pair turns by, as `u32`.
+    axis: DeviceBuffer,
 }
 
 /// How a block's norms are scaled.
@@ -238,20 +241,21 @@ pub(crate) struct Velocity {
 }
 
 fn load_repo(store: &StStore, ops: &Ops, base: &str) -> Result<Repo, ImageGenError> {
-    let mut freqs = Vec::new();
+    let mut rates = Vec::new();
     let mut axis = Vec::new();
-    for a in 0..3 {
+    for a in 0u32..3 {
         let f = store.f32_vec(&format!("{base}freqs_{a}"))?;
         axis.extend(std::iter::repeat_n(a, f.len()));
-        freqs.extend(f);
+        rates.extend(f.into_iter().map(|f| f * PI));
     }
     Ok(Repo {
+        pairs: rates.len(),
+        rates: ops.upload_f32("denoiser repo rates", &rates)?,
+        axis: ops.upload_u32("denoiser repo axis", &axis)?,
         norm: Affine::load(store, ops, &format!("{base}norm"))?,
         gate: Lin::load(store, ops, &format!("{base}gate_map"))?,
         content: Lin::load(store, ops, &format!("{base}content_map"))?,
         project: Lin::load(store, ops, &format!("{base}final_map"))?,
-        freqs,
-        axis,
     })
 }
 
@@ -733,10 +737,10 @@ impl IdolDenoiser {
         let width = self.args.model_channels;
         let heads = self.args.num_heads;
         let pairs = self.head_dim / 2;
-        if repo.freqs.len() != pairs {
+        if repo.pairs != pairs {
             return Err(ImageGenError::Checkpoint(format!(
                 "the rotary tables carry {} frequencies for {pairs} pairs",
-                repo.freqs.len()
+                repo.pairs
             )));
         }
         let hn = layer_norm(
@@ -759,50 +763,24 @@ impl IdolDenoiser {
             rows * repo.gate.out_dim,
         )?;
         let offsets = linear(ops, "denoiser repo", &repo.project, gate.view(), rows)?;
-        let delta = ops.download("denoiser repo", offsets.view(), rows * heads * 3)?;
-        let mut cos_m1 = vec![0.0f32; rows * width];
-        let mut sin = vec![0.0f32; rows * width];
-        let head_dim = self.head_dim;
-        // Each row's tables depend on its own offsets only, so the rows are
-        // split across the host's cores: a joint block's tables are 6.3M
-        // angles, a few percent of a step's time when built on one thread.
-        let fill = |first: usize, cos_rows: &mut [f32], sin_rows: &mut [f32]| {
-            for (i, (cos_row, sin_row)) in cos_rows
-                .chunks_exact_mut(width)
-                .zip(sin_rows.chunks_exact_mut(width))
-                .enumerate()
-            {
-                let r = first + i;
-                for head in 0..heads {
-                    let offsets = &delta[(r * heads + head) * 3..(r * heads + head) * 3 + 3];
-                    for j in 0..pairs {
-                        let angle = offsets[repo.axis[j]] * repo.freqs[j] * PI;
-                        let (sine, cosine) = angle.sin_cos();
-                        let at = head * head_dim + 2 * j;
-                        cos_row[at] = cosine - 1.0;
-                        cos_row[at + 1] = cosine - 1.0;
-                        sin_row[at] = sine;
-                        sin_row[at + 1] = sine;
-                    }
-                }
-            }
-        };
-        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-        let per = rows.div_ceil(threads).max(1);
-        std::thread::scope(|scope| {
-            for (k, (cos_rows, sin_rows)) in cos_m1
-                .chunks_mut(per * width)
-                .zip(sin.chunks_mut(per * width))
-                .enumerate()
-            {
-                let fill = &fill;
-                scope.spawn(move || fill(k * per, cos_rows, sin_rows));
-            }
-        });
-        Ok((
-            ops.upload_scratch("denoiser rope", &cos_m1)?,
-            ops.upload_scratch("denoiser rope", &sin)?,
-        ))
+        drop(gate);
+        let cos_m1 = ops.alloc_f32("denoiser rope", rows * width)?;
+        let sin = ops.alloc_f32("denoiser rope", rows * width)?;
+        rotary_tables(
+            ops,
+            &RotaryCall {
+                step: "denoiser rope",
+                cos_m1: cos_m1.view(),
+                sin: sin.view(),
+                offsets: offsets.view(),
+                rates: repo.rates.view(),
+                axis: repo.axis.view(),
+                rows,
+                heads,
+                head_dim: self.head_dim,
+            },
+        )?;
+        Ok((cos_m1, sin))
     }
 }
 

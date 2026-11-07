@@ -73,6 +73,14 @@ struct splat_args_attn {
 };
 static_assert(sizeof(splat_args_attn) == 20, "splat_args_attn layout");
 
+struct splat_args_rotary {
+    u32 row0;
+    u32 rows;
+    u32 heads;
+    u32 head_dim;
+};
+static_assert(sizeof(splat_args_rotary) == 16, "splat_args_rotary layout");
+
 extern "C" __global__ void kernel_splat_relu_f32(
         const splat_args_unary args, float* out, const float* in) {
     const u32 i = blockIdx.x * SPLAT_BLOCK + threadIdx.x;
@@ -340,4 +348,28 @@ extern "C" __global__ void kernel_splat_attn_f32(
         op[0] = o0 / run_sum;
         op[1] = o1 / run_sum;
     }
+}
+
+/* The denoiser's rotary tables, the Metal twin's contract and launch. The
+ * module is built without fast math, so sinf and cosf are the full-range
+ * versions the large angles need. */
+extern "C" __global__ void kernel_splat_rotary_tables_f32(
+        const splat_args_rotary args, float* cos_m1, float* sin_out,
+        const float* offsets, const float* rates, const u32* axis) {
+    const u32 pairs = args.head_dim / 2u;
+    const u32 p = blockIdx.x * SPLAT_BLOCK + threadIdx.x;
+    const u32 row = args.row0 + blockIdx.y;
+    if (p >= args.heads * pairs || row >= args.rows) {
+        return;
+    }
+    const u32 head = p / pairs;
+    const u32 j = p - head * pairs;
+    const float angle = __fmul_rn(offsets[((u64)row * args.heads + head) * 3u + axis[j]], rates[j]);
+    const float c = cosf(angle) - 1.0f;
+    const float s = sinf(angle);
+    const u64 at = (u64)row * (args.heads * args.head_dim) + head * args.head_dim + 2u * j;
+    cos_m1[at] = c;
+    cos_m1[at + 1u] = c;
+    sin_out[at] = s;
+    sin_out[at + 1u] = s;
 }

@@ -25,7 +25,7 @@ use crate::harness::{Gpu, drain, f32_bytes, run};
 use crate::oracle::signal;
 
 /// Every entry point this file's cases launch.
-pub const ENTRIES: [&str; 8] = [
+pub const ENTRIES: [&str; 9] = [
     "kernel_splat_relu_f32",
     "kernel_splat_sigmoid_f32",
     "kernel_splat_gelu_erf_f32",
@@ -34,6 +34,7 @@ pub const ENTRIES: [&str; 8] = [
     "kernel_splat_window_attn_f32",
     "kernel_splat_deform_im2col_f32",
     "kernel_splat_attn_f32",
+    "kernel_splat_rotary_tables_f32",
 ];
 
 const MODULE: &str = "splat";
@@ -112,6 +113,16 @@ const ATTN_THREADS: u32 = 256;
 
 const _: () = assert!(size_of::<UnaryArgs>() == 4);
 const _: () = assert!(size_of::<AttnArgs>() == 20);
+const _: () = assert!(size_of::<RotaryArgs>() == 16);
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct RotaryArgs {
+    row0: u32,
+    rows: u32,
+    heads: u32,
+    head_dim: u32,
+}
 const _: () = assert!(size_of::<ResizeArgs>() == 20);
 const _: () = assert!(size_of::<MergeArgs>() == 12);
 const _: () = assert!(size_of::<WindowArgs>() == 36);
@@ -895,4 +906,80 @@ pub(crate) fn bench_attention(gpu: &Gpu) -> crate::bench::Fixture {
             },
         );
     })
+}
+
+/// The rotary tables across two launches (70000 rows, past one launch's
+/// 65535 on the grid's second axis), at offsets up to 64 so the angles reach
+/// the hundreds, where a fast sine is off by far more than the bound.
+///
+/// The oracle forms each angle in `f32` exactly as the kernel's contract
+/// does (`offset * rate`, the rate being the frequency times pi rounded once)
+/// and takes its sine and cosine in `f64`: the bound is then the kernel's
+/// own trigonometry.
+///
+/// # Panics
+///
+/// When the device's answer is outside the case's bound.
+pub fn rotary_tables_match_the_angle_formula(gpu: &Gpu) {
+    let (rows, heads, head_dim) = (70_000usize, 2usize, 8usize);
+    let pairs = head_dim / 2;
+    let width = heads * head_dim;
+    let offsets: Vec<f32> = signal(rows * heads * 3, 71)
+        .into_iter()
+        .map(|x| x * 64.0)
+        .collect();
+    let rates = [0.1f32, 0.7, 2.3, 4.0].map(|f| f * std::f32::consts::PI);
+    let axis = [0u32, 1, 2, 0];
+    let d_offsets = upload(gpu, &offsets);
+    let d_rates = upload(gpu, &rates);
+    let d_axis = gpu.upload(bytemuck::cast_slice(&axis));
+    let cos_m1 = upload(gpu, &vec![f32::NAN; rows * width]);
+    let sin = upload(gpu, &vec![f32::NAN; rows * width]);
+    let per_launch = 65_535usize;
+    for row0 in (0..rows).step_by(per_launch) {
+        let count = per_launch.min(rows - row0);
+        let args = RotaryArgs {
+            row0: row0 as u32,
+            rows: rows as u32,
+            heads: heads as u32,
+            head_dim: head_dim as u32,
+        };
+        launch(
+            gpu,
+            "kernel_splat_rotary_tables_f32",
+            Extent3::new(((heads * pairs) as u32).div_ceil(BLOCK), count as u32, 1),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(cos_m1.view()),
+                KernelArg::Buffer(sin.view()),
+                KernelArg::Buffer(d_offsets.view()),
+                KernelArg::Buffer(d_rates.view()),
+                KernelArg::Buffer(d_axis.view()),
+            ],
+        );
+    }
+    drain(gpu);
+    let mut want_cos = vec![0.0f64; rows * width];
+    let mut want_sin = vec![0.0f64; rows * width];
+    for r in 0..rows {
+        for h in 0..heads {
+            for j in 0..pairs {
+                let offset = offsets[(r * heads + h) * 3 + axis[j] as usize];
+                let angle = f64::from(offset * rates[j]);
+                let at = r * width + h * head_dim + 2 * j;
+                for c in [at, at + 1] {
+                    want_cos[c] = angle.cos() - 1.0;
+                    want_sin[c] = angle.sin();
+                }
+            }
+        }
+    }
+    close(
+        &gpu.read_f32(&cos_m1),
+        &want_cos,
+        2e-6,
+        1.0,
+        "rotary cos - 1",
+    );
+    close(&gpu.read_f32(&sin), &want_sin, 2e-6, 1.0, "rotary sin");
 }

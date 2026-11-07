@@ -85,6 +85,14 @@ struct splat_args_attn {
 };
 static_assert(sizeof(splat_args_attn) == 20, "splat_args_attn layout");
 
+struct splat_args_rotary {
+    uint row0;
+    uint rows;
+    uint heads;
+    uint head_dim;
+};
+static_assert(sizeof(splat_args_rotary) == 16, "splat_args_rotary layout");
+
 // `out[i] = max(in[i], 0)`.
 kernel void kernel_splat_relu_f32(
         constant splat_args_unary & args [[buffer(0)]],
@@ -558,4 +566,47 @@ kernel void kernel_splat_attn_f32(
         op[8u * i + fn] = of[i].thread_elements()[0] * inv;
         op[8u * i + fn + 1u] = of[i].thread_elements()[1] * inv;
     }
+}
+
+// The denoiser's rotary tables from its predicted positions: for row `r`,
+// head `h` and pair `j < head_dim / 2`, with
+// `angle = offsets[(r * heads + h) * 3 + axis[j]] * rates[j]`, both columns
+// `2j` and `2j + 1` of the head get
+// `cos_m1 = cos(angle) - 1` and `sin = sin(angle)`. Tables are
+// `(rows, heads * head_dim)` row-major.
+//
+// The angles reach the hundreds, where the fast sine is off by far more than
+// the host's f32 `sin_cos` the tables replace, hence `precise::`. `rates` are
+// the pair frequencies already multiplied by pi on the host: the library is
+// built with fast math, which may reassociate a three-way product, and one
+// multiply leaves the compiler no order to choose.
+//
+// Grid `(ceil(heads * head_dim / 2 / 64), rows in this launch)` of 64
+// threads, one per pair; this launch's first row is `row0`, so the driver
+// can split a long table across launches.
+kernel void kernel_splat_rotary_tables_f32(
+        constant splat_args_rotary & args [[buffer(0)]],
+        device float *cos_m1                 [[buffer(1)]],
+        device float *sin_out                [[buffer(2)]],
+        device const float *offsets          [[buffer(3)]],
+        device const float *rates            [[buffer(4)]],
+        device const uint *axis              [[buffer(5)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint pairs = args.head_dim / 2u;
+    const uint p = tgpig.x * SPLAT_BLOCK + tpitg.x;
+    const uint row = args.row0 + tgpig.y;
+    if (p >= args.heads * pairs || row >= args.rows) {
+        return;
+    }
+    const uint head = p / pairs;
+    const uint j = p - head * pairs;
+    const float angle = offsets[((uint64_t) row * args.heads + head) * 3u + axis[j]] * rates[j];
+    const float c = precise::cos(angle) - 1.0f;
+    const float s = precise::sin(angle);
+    const uint64_t at = (uint64_t) row * (args.heads * args.head_dim) + head * args.head_dim + 2u * j;
+    cos_m1[at] = c;
+    cos_m1[at + 1u] = c;
+    sin_out[at] = s;
+    sin_out[at + 1u] = s;
 }

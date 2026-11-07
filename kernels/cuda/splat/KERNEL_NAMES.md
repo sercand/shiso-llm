@@ -12,7 +12,7 @@ registers.
 from the source, not pasted from compiled PTX.** The first CUDA build should
 replace this with the output of `grep -o '\.visible \.entry [^(]*' splat.ptx`.
 
-## Module `splat` - 8 entries
+## Module `splat` - 9 entries
 
 ```
 kernel_splat_attn_f32
@@ -21,6 +21,7 @@ kernel_splat_gelu_erf_f32
 kernel_splat_merge2x2_f32
 kernel_splat_relu_f32
 kernel_splat_resize_bilinear_f32
+kernel_splat_rotary_tables_f32
 kernel_splat_sigmoid_f32
 kernel_splat_window_attn_f32
 ```

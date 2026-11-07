@@ -29,6 +29,7 @@ pub(crate) const REQUIRED_KERNELS: &[&str] = &[
     "kernel_splat_window_attn_f32",
     "kernel_splat_deform_im2col_f32",
     "kernel_splat_attn_f32",
+    "kernel_splat_rotary_tables_f32",
 ];
 
 /// Threads per threadgroup, every entry.
@@ -119,6 +120,34 @@ struct DeformArgs {
 }
 
 const _: () = assert!(size_of::<AttnArgs>() == 20);
+const _: () = assert!(size_of::<RotaryArgs>() == 16);
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct RotaryArgs {
+    row0: u32,
+    rows: u32,
+    heads: u32,
+    head_dim: u32,
+}
+
+/// One set of rotary tables.
+pub(crate) struct RotaryCall<'a> {
+    pub step: &'static str,
+    /// `cos(angle) - 1`, `(rows, heads * head_dim)`.
+    pub cos_m1: DeviceView<'a>,
+    /// `sin(angle)`, the same shape.
+    pub sin: DeviceView<'a>,
+    /// The predicted positions, `(rows, heads, 3)`.
+    pub offsets: DeviceView<'a>,
+    /// Each pair's frequency times pi, rounded once to f32 (`head_dim / 2`).
+    pub rates: DeviceView<'a>,
+    /// Which of the three positions each pair turns by, as `u32`.
+    pub axis: DeviceView<'a>,
+    pub rows: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+}
 const _: () = assert!(size_of::<UnaryArgs>() == 4);
 const _: () = assert!(size_of::<ResizeArgs>() == 20);
 const _: () = assert!(size_of::<MergeArgs>() == 12);
@@ -280,6 +309,56 @@ pub(crate) fn fused_attention<'o>(
         )
         .map_err(|e| ImageGenError::Backend(format!("{step}: {e}")))?;
     Ok(out)
+}
+
+/// The rotary tables `cos(angle) - 1` and `sin(angle)` for every pair of
+/// every head, `angle = offsets[row][head][axis[j]] * rates[j]`, in launches
+/// of at most [`MAX_GRID_ROWS`] rows. A free function over [`Ops`] for the
+/// reason [`fused_attention`] is.
+///
+/// # Errors
+///
+/// [`ImageGenError::Backend`] for an odd head, a count past the argument
+/// block, or a device failure.
+pub(crate) fn rotary_tables(ops: &Ops, call: &RotaryCall<'_>) -> Result<(), ImageGenError> {
+    if !call.head_dim.is_multiple_of(2) {
+        return Err(ImageGenError::Backend(format!(
+            "{}: a {}-wide head has no whole pairs to turn",
+            call.step, call.head_dim
+        )));
+    }
+    let pairs = call.heads * call.head_dim / 2;
+    for (row0, rows) in row_chunks(0, call.rows) {
+        let args = RotaryArgs {
+            row0: arg_u32(call.step, row0)?,
+            rows: arg_u32(call.step, call.rows)?,
+            heads: arg_u32(call.step, call.heads)?,
+            head_dim: arg_u32(call.step, call.head_dim)?,
+        };
+        ops.backend()
+            .run(
+                KernelRef::new(MODULE, "kernel_splat_rotary_tables_f32"),
+                &LaunchArgs {
+                    grid: Extent3::new(
+                        arg_u32(call.step, pairs)?.div_ceil(BLOCK),
+                        arg_u32(call.step, rows)?,
+                        1,
+                    ),
+                    block: Extent3::linear(BLOCK),
+                    smem_bytes: 0,
+                    args: &[
+                        KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                        KernelArg::Buffer(call.cos_m1),
+                        KernelArg::Buffer(call.sin),
+                        KernelArg::Buffer(call.offsets),
+                        KernelArg::Buffer(call.rates),
+                        KernelArg::Buffer(call.axis),
+                    ],
+                },
+            )
+            .map_err(|e| ImageGenError::Backend(format!("{}: {e}", call.step)))?;
+    }
+    Ok(())
 }
 
 impl SplatOps {

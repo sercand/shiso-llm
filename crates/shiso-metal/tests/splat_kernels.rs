@@ -64,4 +64,5 @@ splat_cases!(
     attention_matches_the_softmax_oracle,
     attention_survives_large_scores,
     attention_at_the_joint_shape,
+    rotary_tables_match_the_angle_formula,
 );
