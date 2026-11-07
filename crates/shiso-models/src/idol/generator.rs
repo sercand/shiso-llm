@@ -169,6 +169,57 @@ fn stage(stage: &'static str) -> impl Fn(String) -> PipelineError {
     move |reason| PipelineError::Stage { stage, reason }
 }
 
+/// The guided velocity at `sample` into `velocity`: the conditional pass
+/// under `conds.0`, and when guidance is on the unconditional one under
+/// `conds.1`.
+fn guided(
+    pipeline: &Pipeline<'_>,
+    sample: &FlowState,
+    timestep: f32,
+    conds: (&Conditioning, &Conditioning),
+    velocity: &mut FlowState,
+) -> Result<(), PipelineError> {
+    let (cond, negative) = conds;
+    let conditional = pipeline
+        .denoiser
+        .velocity(sample, timestep, cond)
+        .map_err(stage("the denoiser"))?;
+    let unconditional = if pipeline.cfg_strength > 0.0 {
+        pipeline
+            .denoiser
+            .velocity(sample, timestep, negative)
+            .map_err(stage("the denoiser"))?
+    } else {
+        FlowState {
+            latent: vec![0.0; sample.latent.len()],
+            camera: vec![0.0; sample.camera.len()],
+        }
+    };
+    if conditional.latent.len() != sample.latent.len()
+        || conditional.camera.len() != sample.camera.len()
+        || unconditional.latent.len() != sample.latent.len()
+        || unconditional.camera.len() != sample.camera.len()
+    {
+        return Err(PipelineError::Stage {
+            stage: "the denoiser",
+            reason: "a velocity of another shape than the sample".to_owned(),
+        });
+    }
+    guided_velocity(
+        &conditional.latent,
+        &unconditional.latent,
+        pipeline.cfg_strength,
+        &mut velocity.latent,
+    );
+    guided_velocity(
+        &conditional.camera,
+        &unconditional.camera,
+        pipeline.cfg_strength,
+        &mut velocity.camera,
+    );
+    Ok(())
+}
+
 /// Runs the pipeline and answers the cloud.
 ///
 /// The draws happen in the reference's order: the latent's noise, then the
@@ -204,47 +255,24 @@ pub fn run(
     let negative = Conditioning::zero(cond.rows);
     let mut velocity = sample.clone();
     for (index, pair) in grid.windows(2).enumerate() {
+        let started = std::time::Instant::now();
         let (t, t_prev) = (pair[0], pair[1]);
         let timestep = t * TIMESTEP_SCALE;
-        let conditional = pipeline
-            .denoiser
-            .velocity(&sample, timestep, cond)
-            .map_err(stage("the denoiser"))?;
-        let unconditional = if pipeline.cfg_strength > 0.0 {
-            pipeline
-                .denoiser
-                .velocity(&sample, timestep, &negative)
-                .map_err(stage("the denoiser"))?
-        } else {
-            FlowState {
-                latent: vec![0.0; sample.latent.len()],
-                camera: vec![0.0; sample.camera.len()],
-            }
-        };
-        if conditional.latent.len() != sample.latent.len()
-            || conditional.camera.len() != sample.camera.len()
-            || unconditional.latent.len() != sample.latent.len()
-            || unconditional.camera.len() != sample.camera.len()
-        {
-            return Err(PipelineError::Stage {
-                stage: "the denoiser",
-                reason: "a velocity of another shape than the sample".to_owned(),
-            });
-        }
-        guided_velocity(
-            &conditional.latent,
-            &unconditional.latent,
-            pipeline.cfg_strength,
-            &mut velocity.latent,
-        );
-        guided_velocity(
-            &conditional.camera,
-            &unconditional.camera,
-            pipeline.cfg_strength,
-            &mut velocity.camera,
-        );
+        guided(
+            pipeline,
+            &sample,
+            timestep,
+            (cond, &negative),
+            &mut velocity,
+        )?;
         euler_step(&mut sample.latent, &velocity.latent, t, t_prev);
         euler_step(&mut sample.camera, &velocity.camera, t, t_prev);
+        tracing::debug!(
+            target: "shiso::idol",
+            step = index,
+            step_ms = started.elapsed().as_millis(),
+            "flow step"
+        );
         if let Some(progress) = progress {
             // The step index is bounded by the request's 1..=100 step ceiling.
             let step = u32::try_from(index).unwrap_or(u32::MAX);

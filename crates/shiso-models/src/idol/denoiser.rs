@@ -20,6 +20,7 @@
 use std::f32::consts::PI;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use shiso_core::DeviceBuffer;
 use shiso_vision::generator::ImageGenError;
@@ -82,6 +83,52 @@ impl HostLinear {
             })
             .collect()
     }
+}
+
+/// Where a pass's time went, kept only while the `shiso::idol` debug log is
+/// on.
+///
+/// Launches are queued, so a stage's wall time means nothing unless the
+/// queue is drained on both sides of it. The drains cost a pass several
+/// stalls, which is why they happen only when somebody reads the numbers.
+#[derive(Debug, Default)]
+struct PassTimes {
+    enabled: bool,
+    attention: Duration,
+    rotary: Duration,
+}
+
+impl PassTimes {
+    fn new() -> Self {
+        Self {
+            enabled: tracing::enabled!(target: "shiso::idol", tracing::Level::DEBUG),
+            ..Self::default()
+        }
+    }
+
+    /// Runs `stage`, adding its drained wall time to `slot` when enabled.
+    fn time<T>(
+        &mut self,
+        ops: &Ops,
+        slot: fn(&mut Self) -> &mut Duration,
+        stage: impl FnOnce() -> Result<T, ImageGenError>,
+    ) -> Result<T, ImageGenError> {
+        if !self.enabled {
+            return stage();
+        }
+        drain(ops)?;
+        let start = Instant::now();
+        let out = stage()?;
+        drain(ops)?;
+        *slot(self) += start.elapsed();
+        Ok(out)
+    }
+}
+
+fn drain(ops: &Ops) -> Result<(), ImageGenError> {
+    ops.backend()
+        .sync()
+        .map_err(|e| ImageGenError::Backend(format!("denoiser timing drain: {e}")))
 }
 
 /// `x * sigmoid(x)`.
@@ -335,6 +382,8 @@ impl IdolDenoiser {
         cond: &Conditioning,
     ) -> Result<Velocity, ImageGenError> {
         let ops = &*self.ops;
+        let started = Instant::now();
+        let mut times = PassTimes::new();
         let a = &self.args;
         let width = a.model_channels;
         let (n_x, n_c) = (a.q_token_length, cond.rows);
@@ -376,7 +425,7 @@ impl IdolDenoiser {
         )?;
         drop((z, h_x));
         for (repo, block) in self.noise_repo.iter().zip(&self.noise_refiner) {
-            self.block(block, repo, stream(0, n_x)?, n_x, Some(&t_mod))?;
+            self.block(block, repo, stream(0, n_x)?, n_x, Some(&t_mod), &mut times)?;
         }
 
         // The conditioning stream.
@@ -393,7 +442,7 @@ impl IdolDenoiser {
         )?;
         drop((f1, f2, c1, c2));
         for (repo, block) in self.context_repo.iter().zip(&self.context_refiner) {
-            self.block(block, repo, stream(n_x, n_c)?, n_c, None)?;
+            self.block(block, repo, stream(n_x, n_c)?, n_c, None, &mut times)?;
         }
 
         // The camera token.
@@ -409,7 +458,7 @@ impl IdolDenoiser {
             .map_err(|e| ImageGenError::Backend(format!("denoiser camera row: {e}")))?;
 
         for (repo, block) in self.repo.iter().zip(&self.blocks) {
-            self.block(block, repo, h.view(), rows, Some(&t_mod))?;
+            self.block(block, repo, h.view(), rows, Some(&t_mod), &mut times)?;
         }
 
         // Read-out: a parameter-free norm, the final time modulation, the heads.
@@ -450,6 +499,13 @@ impl IdolDenoiser {
                 "the denoiser produced a non-finite velocity".to_owned(),
             ));
         }
+        tracing::debug!(
+            target: "shiso::idol",
+            pass_ms = started.elapsed().as_millis(),
+            attention_ms = times.attention.as_millis(),
+            rotary_ms = times.rotary.as_millis(),
+            "denoiser pass"
+        );
         Ok(Velocity {
             latent: latent_v,
             camera: cam_v,
@@ -470,11 +526,12 @@ impl IdolDenoiser {
         x: shiso_core::DeviceView<'_>,
         rows: usize,
         t_mod: Option<&[f32]>,
+        times: &mut PassTimes,
     ) -> Result<(), ImageGenError> {
         let ops = &*self.ops;
         let width = self.args.model_channels;
         let count = rows * width;
-        let (cos_m1, sin) = self.rotary(repo, x, rows)?;
+        let (cos_m1, sin) = times.time(ops, |t| &mut t.rotary, || self.rotary(repo, x, rows))?;
 
         let modulation = match (&block.norms, t_mod) {
             (Norms::Modulated(table), Some(t_mod)) => {
@@ -543,19 +600,25 @@ impl IdolDenoiser {
         let k = project(&block.k, &block.k_turn, &block.k_norm)?;
         let v = linear(ops, "denoiser v", &block.v, h.view(), rows)?;
         drop(h);
-        let attended = attention(
+        let attended = times.time(
             ops,
-            "denoiser attention",
-            Qkv {
-                q: q.view(),
-                k: k.view(),
-                v: v.view(),
-            },
-            AttnShape {
-                queries: rows,
-                keys: rows,
-                heads: self.args.num_heads,
-                head_dim: self.head_dim,
+            |t| &mut t.attention,
+            || {
+                attention(
+                    ops,
+                    "denoiser attention",
+                    Qkv {
+                        q: q.view(),
+                        k: k.view(),
+                        v: v.view(),
+                    },
+                    AttnShape {
+                        queries: rows,
+                        keys: rows,
+                        heads: self.args.num_heads,
+                        head_dim: self.head_dim,
+                    },
+                )
             },
         )?;
         drop((q, k, v, cos_m1, sin));
