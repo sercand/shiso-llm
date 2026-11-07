@@ -27,6 +27,7 @@ use shiso_vision::generator::ImageGenError;
 
 use super::conditioning::Conditioning;
 use super::config::{DenoiserArgs, IdolConfig};
+use super::generator::Prepared;
 use super::nn::{
     Affine, AttnShape, HeadNorm, Pairing, Qkv, add_gated_in_place, attention, bytes, host_lin,
     layer_norm, linear, point_embed_v1, read_linear, rotate_in_place, turned,
@@ -363,8 +364,56 @@ impl IdolDenoiser {
         })
     }
 
+    /// The conditioning stream for `cond`: both projections summed and run
+    /// through the context refiner, read back to the host.
+    ///
+    /// The refiner sees neither the latent nor the timestep, so one request
+    /// computes this once per conditioning and hands it to every
+    /// [`IdolDenoiser::forward`].
+    ///
+    /// # Errors
+    ///
+    /// [`ImageGenError::Backend`] for streams of the wrong width or a device
+    /// failure.
+    pub(crate) fn context(&self, cond: &Conditioning) -> Result<Prepared, ImageGenError> {
+        let ops = &*self.ops;
+        let a = &self.args;
+        let (width, n_c) = (a.model_channels, cond.rows);
+        if cond.dinov3.len() != n_c * a.cond_channels || cond.vae.len() != n_c * a.cond2_channels {
+            return Err(ImageGenError::Backend(format!(
+                "the denoiser reads {n_c} conditioning rows of {} and {} values, got {} and {}",
+                a.cond_channels,
+                a.cond2_channels,
+                cond.dinov3.len(),
+                cond.vae.len()
+            )));
+        }
+        let mut times = PassTimes::new();
+        let stream = ops.alloc_f32("denoiser cond", n_c * width)?;
+        let f1 = ops.upload_scratch("denoiser cond", &cond.dinov3)?;
+        let f2 = ops.upload_scratch("denoiser cond", &cond.vae)?;
+        let c1 = linear(ops, "denoiser cond", &self.cond1, f1.view(), n_c)?;
+        let c2 = linear(ops, "denoiser cond", &self.cond2, f2.view(), n_c)?;
+        ops.add(
+            "denoiser cond",
+            stream.view(),
+            c1.view(),
+            c2.view(),
+            n_c * width,
+        )?;
+        drop((f1, f2, c1, c2));
+        for (repo, block) in self.context_repo.iter().zip(&self.context_refiner) {
+            self.block(block, repo, stream.view(), n_c, None, &mut times)?;
+        }
+        Ok(Prepared {
+            rows: n_c,
+            stream: ops.download("denoiser cond readback", stream.view(), n_c * width)?,
+        })
+    }
+
     /// The velocity at `(latent, camera)` for the model timestep `timestep`
-    /// (the sampler's `t` times 1000) under `cond`.
+    /// (the sampler's `t` times 1000) under the conditioning stream
+    /// `prepared` (from [`IdolDenoiser::context`]).
     ///
     /// # Errors
     ///
@@ -379,15 +428,21 @@ impl IdolDenoiser {
         latent: &[f32],
         camera: &[f32],
         timestep: f32,
-        cond: &Conditioning,
+        prepared: &Prepared,
     ) -> Result<Velocity, ImageGenError> {
         let ops = &*self.ops;
         let started = Instant::now();
         let mut times = PassTimes::new();
         let a = &self.args;
         let width = a.model_channels;
-        let (n_x, n_c) = (a.q_token_length, cond.rows);
+        let (n_x, n_c) = (a.q_token_length, prepared.rows);
         let rows = n_x + n_c + 1;
+        if prepared.stream.len() != n_c * width {
+            return Err(ImageGenError::Backend(format!(
+                "the denoiser reads {n_c} conditioning rows of {width}, got {} values",
+                prepared.stream.len()
+            )));
+        }
         if latent.len() != n_x * a.in_channels || camera.len() != a.cam_channels {
             return Err(ImageGenError::Backend(format!(
                 "the denoiser reads a {}x{} latent and a {}-value camera, got {} and {}",
@@ -428,22 +483,17 @@ impl IdolDenoiser {
             self.block(block, repo, stream(0, n_x)?, n_x, Some(&t_mod), &mut times)?;
         }
 
-        // The conditioning stream.
-        let f1 = ops.upload_scratch("denoiser cond", &cond.dinov3)?;
-        let f2 = ops.upload_scratch("denoiser cond", &cond.vae)?;
-        let c1 = linear(ops, "denoiser cond", &self.cond1, f1.view(), n_c)?;
-        let c2 = linear(ops, "denoiser cond", &self.cond2, f2.view(), n_c)?;
-        ops.add(
-            "denoiser cond",
-            stream(n_x, n_c)?,
-            c1.view(),
-            c2.view(),
-            n_c * width,
-        )?;
-        drop((f1, f2, c1, c2));
-        for (repo, block) in self.context_repo.iter().zip(&self.context_refiner) {
-            self.block(block, repo, stream(n_x, n_c)?, n_c, None, &mut times)?;
-        }
+        // The conditioning stream, refined once per request: copied in, as
+        // the joint blocks below write over these rows.
+        let cond_bytes: Vec<u8> = prepared
+            .stream
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        ops.backend()
+            .copy_h2d(stream(n_x, n_c)?, &cond_bytes)
+            .map_err(|e| ImageGenError::Backend(format!("denoiser cond rows: {e}")))?;
+        drop(cond_bytes);
 
         // The camera token.
         let cam_hidden: Vec<f32> = self.cam[0]

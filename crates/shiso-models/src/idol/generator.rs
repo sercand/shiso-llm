@@ -68,10 +68,31 @@ pub struct FlowState {
     pub camera: Vec<f32>,
 }
 
+/// A conditioning after the denoiser's own refinement of it: what every pass
+/// of one request reads in its place.
+///
+/// The refinement sees neither the latent nor the timestep, so it is the same
+/// on every step; computing it once per request, rather than once per pass,
+/// saves its blocks on every pass but the first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Prepared {
+    /// Conditioning rows.
+    pub rows: usize,
+    /// The refined rows, `(rows, model_channels)` row-major, on the host.
+    pub stream: Vec<f32>,
+}
+
 /// The denoiser: one velocity evaluation.
 pub trait Denoiser: Send + Sync + fmt::Debug {
+    /// The refined form of `cond` that [`Denoiser::velocity`] reads.
+    ///
+    /// # Errors
+    ///
+    /// A device or checkpoint failure.
+    fn prepare(&self, cond: &Conditioning) -> Result<Prepared, String>;
+
     /// The velocity at `sample` for the model timestep `timestep` (the
-    /// sampler's `t` times [`TIMESTEP_SCALE`]) under `cond`.
+    /// sampler's `t` times [`TIMESTEP_SCALE`]) under `prepared`.
     ///
     /// # Errors
     ///
@@ -80,7 +101,7 @@ pub trait Denoiser: Send + Sync + fmt::Debug {
         &self,
         sample: &FlowState,
         timestep: f32,
-        cond: &Conditioning,
+        prepared: &Prepared,
     ) -> Result<FlowState, String>;
 }
 
@@ -170,13 +191,13 @@ fn stage(stage: &'static str) -> impl Fn(String) -> PipelineError {
 }
 
 /// The guided velocity at `sample` into `velocity`: the conditional pass
-/// under `conds.0`, and when guidance is on the unconditional one under
-/// `conds.1`.
+/// under `conds.0`, and, when there is a `conds.1` (guidance is on), the
+/// unconditional one under it.
 fn guided(
     pipeline: &Pipeline<'_>,
     sample: &FlowState,
     timestep: f32,
-    conds: (&Conditioning, &Conditioning),
+    conds: (&Prepared, Option<&Prepared>),
     velocity: &mut FlowState,
 ) -> Result<(), PipelineError> {
     let (cond, negative) = conds;
@@ -184,7 +205,7 @@ fn guided(
         .denoiser
         .velocity(sample, timestep, cond)
         .map_err(stage("the denoiser"))?;
-    let unconditional = if pipeline.cfg_strength > 0.0 {
+    let unconditional = if let Some(negative) = negative {
         pipeline
             .denoiser
             .velocity(sample, timestep, negative)
@@ -252,7 +273,20 @@ pub fn run(
     };
 
     let grid = time_grid(pipeline.steps, pipeline.rescale_t);
-    let negative = Conditioning::zero(cond.rows);
+    let positive = pipeline
+        .denoiser
+        .prepare(cond)
+        .map_err(stage("the denoiser"))?;
+    let negative = if pipeline.cfg_strength > 0.0 {
+        Some(
+            pipeline
+                .denoiser
+                .prepare(&Conditioning::zero(cond.rows))
+                .map_err(stage("the denoiser"))?,
+        )
+    } else {
+        None
+    };
     let mut velocity = sample.clone();
     for (index, pair) in grid.windows(2).enumerate() {
         let started = std::time::Instant::now();
@@ -262,7 +296,7 @@ pub fn run(
             pipeline,
             &sample,
             timestep,
-            (cond, &negative),
+            (&positive, negative.as_ref()),
             &mut velocity,
         )?;
         euler_step(&mut sample.latent, &velocity.latent, t, t_prev);
@@ -329,14 +363,24 @@ mod tests {
         timesteps: std::sync::Mutex<Vec<f32>>,
         samples: std::sync::Mutex<Vec<FlowState>>,
         calls: std::sync::atomic::AtomicUsize,
+        prepares: std::sync::atomic::AtomicUsize,
     }
 
     impl Denoiser for Constant {
+        fn prepare(&self, cond: &Conditioning) -> Result<Prepared, String> {
+            self.prepares
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Prepared {
+                rows: cond.rows,
+                stream: Vec::new(),
+            })
+        }
+
         fn velocity(
             &self,
             sample: &FlowState,
             timestep: f32,
-            _cond: &Conditioning,
+            _prepared: &Prepared,
         ) -> Result<FlowState, String> {
             self.timesteps.lock().expect("lock").push(timestep);
             self.samples.lock().expect("lock").push(sample.clone());
@@ -567,6 +611,35 @@ mod tests {
             denoiser.calls.load(std::sync::atomic::Ordering::SeqCst),
             6,
             "three steps, a conditional and an unconditional pass each"
+        );
+    }
+
+    #[test]
+    fn the_conditioning_is_prepared_once_per_stream() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let denoiser = Constant::default();
+        let mut guided = pipeline(&denoiser, &LowCorner, &Echo);
+        guided.cfg_strength = 3.0;
+        run(&guided, &conditioning(4), &mut draws(1), None).expect("runs");
+        assert_eq!(
+            denoiser.prepares.load(SeqCst),
+            2,
+            "the picture and the zero conditioning"
+        );
+        assert_eq!(denoiser.calls.load(SeqCst), 6);
+
+        let denoiser = Constant::default();
+        run(
+            &pipeline(&denoiser, &LowCorner, &Echo),
+            &conditioning(4),
+            &mut draws(1),
+            None,
+        )
+        .expect("runs");
+        assert_eq!(
+            denoiser.prepares.load(SeqCst),
+            1,
+            "no guidance, no zero conditioning"
         );
     }
 

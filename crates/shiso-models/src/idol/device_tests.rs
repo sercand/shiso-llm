@@ -273,8 +273,9 @@ fn the_denoiser_matches_the_reference_velocity() {
     let backend = need!(case, device());
     let ops = Arc::new(Ops::new(&backend).expect("the diffusion kernel set"));
     let denoiser = IdolDenoiser::load(&dir, ops).expect("the denoiser loads");
+    let prepared = denoiser.context(&cond).expect("the conditioning refines");
     let v = denoiser
-        .forward(&latent, &camera, 700.0, &cond)
+        .forward(&latent, &camera, 700.0, &prepared)
         .expect("the denoiser runs");
     // Measured: worst 3.2e-4, mean 9.3e-6.
     close_mean(
@@ -286,6 +287,9 @@ fn the_denoiser_matches_the_reference_velocity() {
     );
     close(&v.camera, &out_camera, 1e-4, "denoiser camera velocity");
     let negative = crate::idol::conditioning::Conditioning::zero(cond.rows);
+    let negative = denoiser
+        .context(&negative)
+        .expect("the zero conditioning refines");
     let v = denoiser
         .forward(&latent, &camera, 700.0, &negative)
         .expect("the negative pass runs");
@@ -556,11 +560,21 @@ fn the_flow_integrates_to_the_reference_latent() {
 struct Still;
 
 impl crate::idol::generator::Denoiser for Still {
+    fn prepare(
+        &self,
+        cond: &crate::idol::conditioning::Conditioning,
+    ) -> Result<crate::idol::generator::Prepared, String> {
+        Ok(crate::idol::generator::Prepared {
+            rows: cond.rows,
+            stream: Vec::new(),
+        })
+    }
+
     fn velocity(
         &self,
         sample: &crate::idol::generator::FlowState,
         _timestep: f32,
-        _cond: &crate::idol::conditioning::Conditioning,
+        _prepared: &crate::idol::generator::Prepared,
     ) -> Result<crate::idol::generator::FlowState, String> {
         Ok(crate::idol::generator::FlowState {
             latent: vec![0.0; sample.latent.len()],
@@ -731,4 +745,31 @@ fn the_fused_attention_matches_the_gemm_path() {
             .expect("read");
         close(&fused, &gemm, 1e-5, "fused attention");
     }
+}
+
+/// One refined conditioning serves every pass: the joint blocks write over
+/// the stream rows on the device, so a stream that was aliased rather than
+/// copied in would hand the second pass the first pass's output.
+#[test]
+#[ignore = "needs the splat checkpoint (SHISO_TEST_MODEL_IDOL), the idol fixtures and a Metal device"]
+fn a_prepared_stream_is_reusable() {
+    use crate::idol::denoiser::IdolDenoiser;
+
+    let case = "prepared stream";
+    let dir = need!(case, checkpoint("SHISO_TEST_MODEL_IDOL"));
+    let cond = need!(case, fixture_conditioning());
+    let latent = read_f32(&need!(case, fixture("den_in_latent.f32")));
+    let camera = read_f32(&need!(case, fixture("den_in_camera.f32")));
+    let backend = need!(case, device());
+    let ops = Arc::new(Ops::new(&backend).expect("the diffusion kernel set"));
+    let denoiser = IdolDenoiser::load(&dir, ops).expect("the denoiser loads");
+    let prepared = denoiser.context(&cond).expect("the conditioning refines");
+    let first = denoiser
+        .forward(&latent, &camera, 700.0, &prepared)
+        .expect("the first pass runs");
+    let second = denoiser
+        .forward(&latent, &camera, 700.0, &prepared)
+        .expect("the second pass runs");
+    assert_eq!(first.latent, second.latent, "latent velocity");
+    assert_eq!(first.camera, second.camera, "camera velocity");
 }

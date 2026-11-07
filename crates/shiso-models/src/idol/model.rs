@@ -27,7 +27,7 @@ use super::draws::{Draws, SeededDraws};
 use super::gaussian::{RawOutput, RepresentationConfig, activate};
 use super::generator::{
     Denoiser, FlowState, GaussianDecoder, OctreeDecoder, Pipeline, PipelineConfig, PipelineError,
-    run,
+    Prepared, run,
 };
 use super::octree::CHILDREN;
 use super::ply::{GaussianCloud, write_ply};
@@ -44,14 +44,18 @@ pub const SEQUENCE_TOKENS: u32 = 12_294;
 const MEDIA_TYPE: &str = "model/ply";
 
 impl Denoiser for IdolDenoiser {
+    fn prepare(&self, cond: &Conditioning) -> Result<Prepared, String> {
+        self.context(cond).map_err(|e| e.to_string())
+    }
+
     fn velocity(
         &self,
         sample: &FlowState,
         timestep: f32,
-        cond: &Conditioning,
+        prepared: &Prepared,
     ) -> Result<FlowState, String> {
         let v = self
-            .forward(&sample.latent, &sample.camera, timestep, cond)
+            .forward(&sample.latent, &sample.camera, timestep, prepared)
             .map_err(|e| e.to_string())?;
         Ok(FlowState {
             latent: v.latent,
