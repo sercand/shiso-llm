@@ -13,7 +13,8 @@ use bytemuck::{Pod, Zeroable};
 use shiso_core::{DeviceView, Extent3, KernelArg, KernelRef, LaunchArgs};
 use shiso_vision::generator::ImageGenError;
 
-use crate::diffusion::ops::{Ops, SliceExt};
+use super::nn::{AttnShape, Qkv, bytes};
+use crate::diffusion::ops::{Ops, Scratch, SliceExt};
 
 /// The module every entry here lives under.
 pub(crate) const MODULE: &str = "splat";
@@ -27,6 +28,7 @@ pub(crate) const REQUIRED_KERNELS: &[&str] = &[
     "kernel_splat_merge2x2_f32",
     "kernel_splat_window_attn_f32",
     "kernel_splat_deform_im2col_f32",
+    "kernel_splat_attn_f32",
 ];
 
 /// Threads per threadgroup, every entry.
@@ -44,6 +46,22 @@ fn row_chunks(first: usize, count: usize) -> Vec<(usize, usize)> {
         .step_by(MAX_GRID_ROWS)
         .map(|done| (first + done, MAX_GRID_ROWS.min(count - done)))
         .collect()
+}
+
+/// The fused attention's fixed head width, query rows per threadgroup and
+/// threads per threadgroup (`SPLAT_ATTN_*` in the kernel files).
+pub(crate) const ATTN_HEAD: usize = 64;
+const ATTN_QROWS: usize = 64;
+const ATTN_THREADS: u32 = 256;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct AttnArgs {
+    queries: u32,
+    keys: u32,
+    heads: u32,
+    width: u32,
+    scale: f32,
 }
 
 #[repr(C)]
@@ -100,6 +118,7 @@ struct DeformArgs {
     rows: u32,
 }
 
+const _: () = assert!(size_of::<AttnArgs>() == 20);
 const _: () = assert!(size_of::<UnaryArgs>() == 4);
 const _: () = assert!(size_of::<ResizeArgs>() == 20);
 const _: () = assert!(size_of::<MergeArgs>() == 12);
@@ -178,6 +197,89 @@ fn arg_u32(step: &'static str, value: usize) -> Result<u32, ImageGenError> {
     u32::try_from(value).map_err(|_| {
         ImageGenError::Backend(format!("{step}: {value} does not fit a launch argument"))
     })
+}
+
+/// `softmax(q k^T / 8) v` per 64-wide head in one launch of
+/// `kernel_splat_attn_f32`: `q` is `(queries, heads * 64)`, `k` and `v` are
+/// `(keys, heads * 64)`, row-major, and so is the answer.
+///
+/// A free function over [`Ops`] rather than a [`SplatOps`] method so the
+/// family's transformers, which hold only the diffusion driver, reach it
+/// through [`super::nn::attention`]; the generator probes the module once
+/// when it opens, so a missing entry is refused there, not mid-request.
+///
+/// # Errors
+///
+/// [`ImageGenError::Backend`] for a head of another width, an empty side, a
+/// count past the argument block or the grid, or a device failure.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a head width (64) is exact in f32"
+)]
+pub(crate) fn fused_attention<'o>(
+    ops: &'o Ops,
+    step: &'static str,
+    qkv: Qkv<'_>,
+    shape: AttnShape,
+) -> Result<Scratch<'o>, ImageGenError> {
+    let AttnShape {
+        queries,
+        keys,
+        heads,
+        head_dim,
+    } = shape;
+    if head_dim != ATTN_HEAD || queries == 0 || keys == 0 || heads == 0 {
+        return Err(ImageGenError::Backend(format!(
+            "{step}: the fused attention takes {ATTN_HEAD}-wide heads and at least one query, \
+             key and head (got {queries} queries, {keys} keys, {heads} heads of {head_dim})"
+        )));
+    }
+    let tiles = queries.div_ceil(ATTN_QROWS);
+    if tiles > MAX_GRID_ROWS || heads > MAX_GRID_ROWS {
+        return Err(ImageGenError::Backend(format!(
+            "{step}: {queries} queries over {heads} heads is past one launch's grid"
+        )));
+    }
+    let width = heads * head_dim;
+    let out = ops.alloc_f32(step, queries * width)?;
+    let args = AttnArgs {
+        queries: arg_u32(step, queries)?,
+        keys: arg_u32(step, keys)?,
+        heads: arg_u32(step, heads)?,
+        width: arg_u32(step, width)?,
+        scale: 1.0 / (head_dim as f32).sqrt(),
+    };
+    // Every view must hold its rows: the kernel reads by index, not by view.
+    for (name, view, rows) in [
+        ("q", qkv.q, queries),
+        ("k", qkv.k, keys),
+        ("v", qkv.v, keys),
+    ] {
+        if view.len() < bytes(rows * width) {
+            return Err(ImageGenError::Backend(format!(
+                "{step}: {name} holds {} bytes, short of {rows} rows of {width}",
+                view.len()
+            )));
+        }
+    }
+    ops.backend()
+        .run(
+            KernelRef::new(MODULE, "kernel_splat_attn_f32"),
+            &LaunchArgs {
+                grid: Extent3::new(arg_u32(step, tiles)?, args.heads, 1),
+                block: Extent3::linear(ATTN_THREADS),
+                smem_bytes: 0,
+                args: &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(out.view()),
+                    KernelArg::Buffer(qkv.q),
+                    KernelArg::Buffer(qkv.k),
+                    KernelArg::Buffer(qkv.v),
+                ],
+            },
+        )
+        .map_err(|e| ImageGenError::Backend(format!("{step}: {e}")))?;
+    Ok(out)
 }
 
 impl SplatOps {

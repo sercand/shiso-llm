@@ -155,6 +155,9 @@ impl IdolGenerator {
             )));
         }
         let ops = Arc::new(Ops::new(backend)?);
+        // The transformers attend through the splat module's fused kernel;
+        // probing it here refuses a backend without it before any request.
+        super::splat_ops::SplatOps::new(Arc::clone(&ops))?;
         let matte = match &desc.matte {
             Some(path) => Some(open_matte(path, &ops)?),
             None => None,

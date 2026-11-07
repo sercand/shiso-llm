@@ -465,9 +465,30 @@ pub(crate) struct AttnShape {
     pub head_dim: usize,
 }
 
-/// Attention, in f32 throughout: packed `q (queries, heads * head_dim)`
-/// against packed
-/// `k`, `v (keys, heads * head_dim)`, scale `1 / sqrt(head_dim)`.
+/// `softmax(q k^T / sqrt(head_dim)) v` per head: the fused kernel
+/// ([`super::splat_ops::fused_attention`]) for the family's 64-wide heads, and
+/// [`attention_gemm`] for any other width.
+///
+/// # Errors
+///
+/// A device failure.
+pub(crate) fn attention<'o>(
+    ops: &'o Ops,
+    step: &'static str,
+    qkv: Qkv<'_>,
+    shape: AttnShape,
+) -> Result<Scratch<'o>, ImageGenError> {
+    if shape.head_dim == super::splat_ops::ATTN_HEAD {
+        super::splat_ops::fused_attention(ops, step, qkv, shape)
+    } else {
+        attention_gemm(ops, step, qkv, shape)
+    }
+}
+
+/// Attention as GEMMs, in f32 throughout: packed `q (queries, heads *
+/// head_dim)` against packed `k`, `v (keys, heads * head_dim)`, scale
+/// `1 / sqrt(head_dim)`. The path for heads the fused kernel does not take,
+/// and that kernel's device oracle.
 ///
 /// Per head, the head's columns are gathered by a transpose of the whole
 /// buffer - `(rows, width)` to `(width, rows)` makes every head's block of
@@ -483,7 +504,7 @@ pub(crate) struct AttnShape {
     clippy::cast_precision_loss,
     reason = "a head width (64) is exact in f32"
 )]
-pub(crate) fn attention<'o>(
+pub(crate) fn attention_gemm<'o>(
     ops: &'o Ops,
     step: &'static str,
     qkv: Qkv<'_>,

@@ -679,3 +679,56 @@ fn the_background_remover_matches_the_reference_matte() {
     );
     assert!(worst <= 16, "a pixel is {worst} levels off");
 }
+
+/// The fused kernel against the GEMM path it replaces, on ragged, joint and
+/// decoder-like shapes. Both are f32 end to end, so they agree to rounding.
+#[test]
+#[ignore = "needs a Metal device"]
+fn the_fused_attention_matches_the_gemm_path() {
+    use crate::idol::nn::{AttnShape, Qkv, attention_gemm};
+    use crate::idol::splat_ops::fused_attention;
+    let case = "fused attention";
+    let backend = need!(case, device());
+    let ops = Ops::new(&backend).expect("the diffusion kernel set");
+    let signal = |len: usize, seed: u32| -> Vec<f32> {
+        let mut state = seed | 0x9E37_79B9;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    };
+    for (queries, keys, heads) in [(45, 77, 3), (4101, 4101, 16), (300, 8192, 16)] {
+        let width = heads * 64;
+        let q = ops
+            .upload_scratch("test q", &signal(queries * width, 1))
+            .expect("upload");
+        let k = ops
+            .upload_scratch("test k", &signal(keys * width, 2))
+            .expect("upload");
+        let v = ops
+            .upload_scratch("test v", &signal(keys * width, 3))
+            .expect("upload");
+        let qkv = || Qkv {
+            q: q.view(),
+            k: k.view(),
+            v: v.view(),
+        };
+        let shape = AttnShape {
+            queries,
+            keys,
+            heads,
+            head_dim: 64,
+        };
+        let fused = fused_attention(&ops, "test fused", qkv(), shape).expect("fused");
+        let fused = ops
+            .download("test", fused.view(), queries * width)
+            .expect("read");
+        let gemm = attention_gemm(&ops, "test gemm", qkv(), shape).expect("gemm");
+        let gemm = ops
+            .download("test", gemm.view(), queries * width)
+            .expect("read");
+        close(&fused, &gemm, 1e-5, "fused attention");
+    }
+}
