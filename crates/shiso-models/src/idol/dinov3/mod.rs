@@ -6,6 +6,7 @@
 //! two are assembled together in [`crate::idol::conditioning`].
 
 mod config;
+pub(crate) mod encoder;
 mod rope;
 
 pub use config::{DinoConfig, IMAGENET_MEAN, IMAGENET_STD, normalize_pixels};

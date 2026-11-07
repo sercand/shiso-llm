@@ -101,7 +101,9 @@ pub(super) fn close(got: &[f32], want: &[f32], tol: f32, what: &str) {
         (want.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / want.len() as f64).sqrt() as f32;
     let mut worst = 0f32;
     let mut at = 0usize;
+    let mut total = 0f64;
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        total += f64::from((g - w).abs());
         let ratio = (g - w).abs() / w.abs().max(rms);
         if ratio.is_nan() || ratio > worst {
             worst = if ratio.is_nan() { f32::INFINITY } else { ratio };
@@ -113,7 +115,10 @@ pub(super) fn close(got: &[f32], want: &[f32], tol: f32, what: &str) {
         reason = "the measured agreement is the case's report"
     )]
     {
-        eprintln!("{what}: worst error {worst:.3e} of max(|w|, rms {rms:.3e}) at {at}");
+        let mean = total / got.len() as f64 / f64::from(rms);
+        eprintln!(
+            "{what}: worst error {worst:.3e} of max(|w|, rms {rms:.3e}) at {at}, mean {mean:.3e} of rms"
+        );
     }
     assert!(
         worst <= tol,
@@ -169,4 +174,63 @@ fn the_vae_encoder_matches_the_reference_posterior() {
     let rows = tokens.len() / (channels * 4);
     let tokens = with_prefix(&tokens, rows, channels * 4, VAE_PREFIX_ROWS);
     close(&tokens, &read_f32(&tokens_ref), 1e-5, "vae tokens");
+}
+
+#[test]
+#[ignore = "needs DINOv3 (SHISO_TEST_MODEL_DINOV3), the idol fixtures and a Metal device"]
+fn the_image_tower_matches_the_reference_tokens() {
+    let case = "dinov3 tower";
+    let dir = need!(case, checkpoint("SHISO_TEST_MODEL_DINOV3"));
+    let png = need!(case, fixture("preprocessed.png"));
+    let tokens_ref = need!(case, fixture("dino_tokens.f32"));
+    let backend = need!(case, device());
+    let ops = Ops::new(&backend).expect("the diffusion kernel set");
+    let tower = crate::idol::dinov3::encoder::DinoV3::load(&dir, &ops).expect("the tower loads");
+    let (rgb, width, height) = picture(&png);
+    let tokens = tower
+        .tokens(&ops, &rgb, width, height)
+        .expect("the tower runs");
+    close(&tokens, &read_f32(&tokens_ref), 5e-4, "dinov3 tokens");
+}
+
+#[test]
+#[ignore = "needs DINOv3 and the FLUX.2 VAE (SHISO_TEST_MODEL_DINOV3, SHISO_TEST_MODEL_FLUX2_VAE), the idol fixtures and a Metal device"]
+fn the_conditioner_matches_both_reference_streams() {
+    use crate::idol::conditioner::{Conditioner, IdolConditioner};
+    use crate::idol::draws::Replay;
+
+    let case = "conditioner";
+    let tower = need!(case, checkpoint("SHISO_TEST_MODEL_DINOV3"));
+    let vae = need!(case, checkpoint("SHISO_TEST_MODEL_FLUX2_VAE"));
+    let png = need!(case, fixture("preprocessed.png"));
+    let noise = need!(case, fixture("vae_noise.f32"));
+    let dino_ref = need!(case, fixture("dino_tokens.f32"));
+    let vae_ref = need!(case, fixture("vae_tokens.f32"));
+    let backend = need!(case, device());
+    let ops = Arc::new(Ops::new(&backend).expect("the diffusion kernel set"));
+    let conditioner = IdolConditioner::load(ops, &tower, &vae).expect("both encoders load");
+    let (rgb, width, height) = picture(&png);
+    assert_eq!(width, height, "the fixture picture is square");
+    let mut draws = Replay::new(read_f32(&noise), Vec::new());
+    let cond = conditioner
+        .condition(&rgb, width, &mut draws)
+        .expect("the conditioner runs");
+    assert_eq!(
+        draws.remaining(),
+        (0, 0),
+        "the posterior takes every noise value"
+    );
+    assert_eq!(cond.rows, crate::idol::conditioning::COND_ROWS);
+    close(
+        &cond.dinov3,
+        &read_f32(&dino_ref),
+        5e-4,
+        "conditioning tower stream",
+    );
+    close(
+        &cond.vae,
+        &read_f32(&vae_ref),
+        5e-4,
+        "conditioning vae stream",
+    );
 }

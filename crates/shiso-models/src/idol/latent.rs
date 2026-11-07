@@ -166,7 +166,11 @@ mod tests {
         // Two channels, one 2x2 block: the first four columns are channel 0's
         // sub-pixels, the next four channel 1's.
         let latents = [0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0];
-        let norm = LatentNorm::new(&[0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0], &[1.0; 8], 0.0);
+        let norm = LatentNorm::new(
+            &[0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0],
+            &[1.0; 8],
+            0.0,
+        );
         let out = tokenize(&latents, 2, 2, 2, &norm);
         assert_eq!(out, vec![0.0; 8]);
     }
