@@ -618,3 +618,26 @@ pub fn deform_im2col_samples_bilinearly_with_the_mask(gpu: &Gpu) {
     // corners is small, and its error is the corners' rounding, not its own.
     close(&got, &want, 1e-5, 1.0, "deform im2col");
 }
+
+/// The remover's own window: 12 wide (144 tokens, more than one
+/// threadgroup's 64 threads, so each thread takes several queries), shifted
+/// by 6, on a grid that is not a multiple of it, with a 23x23 bias table.
+///
+/// # Panics
+///
+/// When the device's answer is outside the case's bound.
+pub fn window_attention_at_the_production_window(gpu: &Gpu) {
+    let shape = Window {
+        h: 14,
+        w: 17,
+        side: 12,
+        shift: 6,
+        heads: 2,
+        head_dim: 8,
+    };
+    let (got, want) = window_case(gpu, shape, 83);
+    close(&got, &want, 1e-4, 1e-2, "window attention, 12-wide, shifted, padded");
+    let shape = Window { shift: 0, ..shape };
+    let (got, want) = window_case(gpu, shape, 89);
+    close(&got, &want, 1e-4, 1e-2, "window attention, 12-wide, unshifted, padded");
+}

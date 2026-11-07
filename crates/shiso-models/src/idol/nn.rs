@@ -157,7 +157,7 @@ pub(crate) fn point_embed_v2(points: &[f32], channels: usize) -> Vec<f32> {
     let freq_dim = channels / 3 / 2;
     let last = freq_dim.saturating_sub(1).max(1) as f64;
     // The exponents `linspace(0, 10, 170)`, each rounded once from f64 (see
-    // `exact_pow2` for why the port does not imitate torch's own rounding).
+    // `exact_pow2` for why the port does not imitate the reference's own rounding).
     let freqs: Vec<f32> = (0..freq_dim)
         .map(|i| exact_pow2(MAX_RES * i as f64 / last))
         .collect();
@@ -167,10 +167,10 @@ pub(crate) fn point_embed_v2(points: &[f32], channels: usize) -> Vec<f32> {
 /// `2^e`, rounded once to f32.
 ///
 /// The reference's `2 ** e` in f32 is one ulp low on 4 of the denoiser's 170
-/// frequencies and 6 of the decoders' (torch's vectorised pow is not
+/// frequencies and 6 of the decoders' (the reference's vectorised pow is not
 /// correctly rounded). At the denoiser's top frequency, 2^16 over angles up to
 /// 4e5 rad, one ulp moves a sinusoid by 0.03, which the velocity carries as
-/// ~3.7e-4 of its scale (measured against the reference with torch's values).
+/// ~3.7e-4 of its scale (measured against the reference with its own values).
 /// The port rounds correctly instead of imitating one library's pow.
 #[expect(
     clippy::cast_possible_truncation,

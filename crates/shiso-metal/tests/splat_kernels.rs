@@ -59,5 +59,6 @@ splat_cases!(
     merge2x2_takes_the_reference_order,
     window_attention_pads_with_the_pad_rows,
     window_attention_shifts_and_masks_the_regions,
+    window_attention_at_the_production_window,
     deform_im2col_samples_bilinearly_with_the_mask,
 );

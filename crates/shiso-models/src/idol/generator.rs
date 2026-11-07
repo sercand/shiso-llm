@@ -425,7 +425,7 @@ mod tests {
         reason = "the latent's 131072 values are exact in f64"
     )]
     fn the_latent_starts_from_standard_normal_noise() {
-        // The reference draws `torch.randn`: zero mean, unit variance, both
+        // The reference draws standard normals: zero mean, unit variance, both
         // signs. A uniform draw in [0, 1) has none of the three.
         let denoiser = Constant::default();
         run(

@@ -643,13 +643,18 @@ fn the_background_remover_matches_the_reference_matte() {
     let case = "background remover";
     let dir = need!(case, checkpoint("SHISO_TEST_MODEL_IDOL"));
     let png = need!(case, fixture("matte_input.png"));
-    let alpha_ref = std::fs::read(need!(case, fixture("matte_alpha.u8"))).expect("the reference matte");
+    let alpha_ref =
+        std::fs::read(need!(case, fixture("matte_alpha.u8"))).expect("the reference matte");
     let backend = need!(case, device());
     let ops = Arc::new(Ops::new(&backend).expect("the diffusion kernel set"));
     let net = BiRefNet::load(&dir.join("birefnet.safetensors"), ops).expect("the remover loads");
     let rgb = image::open(&png).expect("the fixture picture").to_rgb8();
     let alpha = net.alpha(&rgb).expect("the remover runs");
-    assert_eq!(alpha.len(), alpha_ref.len(), "the matte is the picture's size");
+    assert_eq!(
+        alpha.len(),
+        alpha_ref.len(),
+        "the matte is the picture's size"
+    );
     // The matte is bytes: compare the counts that move, not a float bound.
     let mut off_by_more_than_one = 0usize;
     let mut worst = 0u8;
@@ -668,6 +673,9 @@ fn the_background_remover_matches_the_reference_matte() {
     {
         eprintln!("matte: worst {worst} levels, {share:.3e} of pixels off by more than one");
     }
-    assert!(share < 1e-3, "{share} of the matte is off by more than one level");
+    assert!(
+        share < 1e-3,
+        "{share} of the matte is off by more than one level"
+    );
     assert!(worst <= 16, "a pixel is {worst} levels off");
 }

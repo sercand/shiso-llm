@@ -649,20 +649,43 @@ impl IdolDenoiser {
         let delta = ops.download("denoiser repo", offsets.view(), rows * heads * 3)?;
         let mut cos_m1 = vec![0.0f32; rows * width];
         let mut sin = vec![0.0f32; rows * width];
-        for r in 0..rows {
-            for head in 0..heads {
-                let d = &delta[(r * heads + head) * 3..(r * heads + head) * 3 + 3];
-                for j in 0..pairs {
-                    let angle = d[repo.axis[j]] * repo.freqs[j] * PI;
-                    let (s, c) = angle.sin_cos();
-                    let at = r * width + head * self.head_dim + 2 * j;
-                    cos_m1[at] = c - 1.0;
-                    cos_m1[at + 1] = c - 1.0;
-                    sin[at] = s;
-                    sin[at + 1] = s;
+        let head_dim = self.head_dim;
+        // Each row's tables depend on its own offsets only, so the rows are
+        // split across the host's cores: a joint block's tables are 6.3M
+        // angles, a few percent of a step's time when built on one thread.
+        let fill = |first: usize, cos_rows: &mut [f32], sin_rows: &mut [f32]| {
+            for (i, (cos_row, sin_row)) in cos_rows
+                .chunks_exact_mut(width)
+                .zip(sin_rows.chunks_exact_mut(width))
+                .enumerate()
+            {
+                let r = first + i;
+                for head in 0..heads {
+                    let offsets = &delta[(r * heads + head) * 3..(r * heads + head) * 3 + 3];
+                    for j in 0..pairs {
+                        let angle = offsets[repo.axis[j]] * repo.freqs[j] * PI;
+                        let (sine, cosine) = angle.sin_cos();
+                        let at = head * head_dim + 2 * j;
+                        cos_row[at] = cosine - 1.0;
+                        cos_row[at + 1] = cosine - 1.0;
+                        sin_row[at] = sine;
+                        sin_row[at + 1] = sine;
+                    }
                 }
             }
-        }
+        };
+        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let per = rows.div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            for (k, (cos_rows, sin_rows)) in cos_m1
+                .chunks_mut(per * width)
+                .zip(sin.chunks_mut(per * width))
+                .enumerate()
+            {
+                let fill = &fill;
+                scope.spawn(move || fill(k * per, cos_rows, sin_rows));
+            }
+        });
         Ok((
             ops.upload_scratch("denoiser rope", &cos_m1)?,
             ops.upload_scratch("denoiser rope", &sin)?,

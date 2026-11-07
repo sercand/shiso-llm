@@ -13,7 +13,7 @@ use bytemuck::{Pod, Zeroable};
 use shiso_core::{DeviceView, Extent3, KernelArg, KernelRef, LaunchArgs};
 use shiso_vision::generator::ImageGenError;
 
-use crate::diffusion::ops::Ops;
+use crate::diffusion::ops::{Ops, SliceExt};
 
 /// The module every entry here lives under.
 pub(crate) const MODULE: &str = "splat";
@@ -33,6 +33,18 @@ pub(crate) const REQUIRED_KERNELS: &[&str] = &[
 const BLOCK: u32 = 64;
 /// The largest window the attention kernel keeps a score row for.
 const MAX_WINDOW_TOKENS: usize = 256;
+/// The most threadgroups one launch puts on its second or third grid axis:
+/// CUDA's limit there (Metal's is far larger, so a launch that fits CUDA
+/// fits both).
+const MAX_GRID_ROWS: usize = 65_535;
+
+/// `count` rows from row `first`, cut into launches of at most [`MAX_GRID_ROWS`].
+fn row_chunks(first: usize, count: usize) -> Vec<(usize, usize)> {
+    (0..count)
+        .step_by(MAX_GRID_ROWS)
+        .map(|done| (first + done, MAX_GRID_ROWS.min(count - done)))
+        .collect()
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -285,6 +297,13 @@ impl SplatOps {
                 call.step
             )));
         }
+        // Output rows and channels ride the grid's second and third axes.
+        if call.out_h > MAX_GRID_ROWS || call.channels > MAX_GRID_ROWS {
+            return Err(ImageGenError::Backend(format!(
+                "{}: a {}-row, {}-channel field is past one launch's {MAX_GRID_ROWS} rows",
+                call.step, call.out_h, call.channels
+            )));
+        }
         let args = ResizeArgs {
             channels: arg_u32(call.step, call.channels)?,
             in_h: arg_u32(call.step, call.in_h)?,
@@ -383,37 +402,42 @@ impl SplatOps {
         )
     }
 
-    /// One block of deformable columns.
+    /// One block of deformable columns, in launches of at most
+    /// [`MAX_GRID_ROWS`] rows (the rows ride the grid's second axis).
     pub(crate) fn deform_im2col(&self, call: &DeformCall<'_>) -> Result<(), ImageGenError> {
-        let args = DeformArgs {
-            channels: arg_u32(call.step, call.channels)?,
-            in_h: arg_u32(call.step, call.in_h)?,
-            in_w: arg_u32(call.step, call.in_w)?,
-            out_h: arg_u32(call.step, call.out_h)?,
-            out_w: arg_u32(call.step, call.out_w)?,
-            k_h: arg_u32(call.step, call.k)?,
-            k_w: arg_u32(call.step, call.k)?,
-            stride: arg_u32(call.step, call.stride)?,
-            pad: arg_u32(call.step, call.pad)?,
-            row0: arg_u32(call.step, call.row0)?,
-            rows: arg_u32(call.step, call.rows)?,
-        };
-        self.launch(
-            call.step,
-            "kernel_splat_deform_im2col_f32",
-            Extent3::new(
-                arg_u32(call.step, call.channels * call.k * call.k)?.div_ceil(BLOCK),
-                args.rows,
-                1,
-            ),
-            &[
-                KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                KernelArg::Buffer(call.cols),
-                KernelArg::Buffer(call.input),
-                KernelArg::Buffer(call.offset),
-                KernelArg::Buffer(call.mask),
-            ],
-        )
+        let width = call.channels * call.k * call.k;
+        for (row0, rows) in row_chunks(call.row0, call.rows) {
+            let args = DeformArgs {
+                channels: arg_u32(call.step, call.channels)?,
+                in_h: arg_u32(call.step, call.in_h)?,
+                in_w: arg_u32(call.step, call.in_w)?,
+                out_h: arg_u32(call.step, call.out_h)?,
+                out_w: arg_u32(call.step, call.out_w)?,
+                k_h: arg_u32(call.step, call.k)?,
+                k_w: arg_u32(call.step, call.k)?,
+                stride: arg_u32(call.step, call.stride)?,
+                pad: arg_u32(call.step, call.pad)?,
+                row0: arg_u32(call.step, row0)?,
+                rows: arg_u32(call.step, rows)?,
+            };
+            // This launch's rows start `row0 - call.row0` rows into the
+            // columns buffer.
+            let skip = (row0 - call.row0) * width * 4;
+            let cols = call.cols.cut(skip as u64, (rows * width * 4) as u64)?;
+            self.launch(
+                call.step,
+                "kernel_splat_deform_im2col_f32",
+                Extent3::new(arg_u32(call.step, width)?.div_ceil(BLOCK), args.rows, 1),
+                &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(cols),
+                    KernelArg::Buffer(call.input),
+                    KernelArg::Buffer(call.offset),
+                    KernelArg::Buffer(call.mask),
+                ],
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -430,6 +454,22 @@ mod tests {
     /// Every entry the driver launches is defined by both backends' sources
     /// and listed in the CUDA name table: a backend missing one refuses the
     /// whole model at load, so the gap is found here instead.
+    #[test]
+    fn a_launch_never_puts_more_rows_on_one_grid_axis_than_a_device_takes() {
+        // A 256x256 field at a 64-wide deformable branch is 65536 rows in one
+        // block; one CUDA grid axis takes at most 65535.
+        let chunks = super::row_chunks(7, 65_536);
+        assert!(chunks.iter().all(|&(_, rows)| rows <= super::MAX_GRID_ROWS));
+        assert_eq!(chunks.first(), Some(&(7, super::MAX_GRID_ROWS)));
+        assert_eq!(chunks.iter().map(|&(_, rows)| rows).sum::<usize>(), 65_536);
+        let mut next = 7;
+        for (row0, rows) in chunks {
+            assert_eq!(row0, next, "the chunks tile the rows in order");
+            next += rows;
+        }
+        assert_eq!(super::row_chunks(0, 10), vec![(0, 10)]);
+    }
+
     #[test]
     fn both_backends_define_every_required_entry() {
         let metal = std::fs::read_to_string(kernels().join("metal/splat/splat.metal"))
