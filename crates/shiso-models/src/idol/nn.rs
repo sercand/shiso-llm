@@ -40,8 +40,8 @@ use shiso_vision::generator::ImageGenError;
 
 use crate::diffusion::lin::Lin;
 use crate::diffusion::ops::{
-    AddGatedCall, GemmCall, LayerNormCall, LinWeight, ModulateCall, Ops, Scratch, SliceExt,
-    WeightKind,
+    AddGatedCall, GemmCall, LayerNormCall, LinWeight, ModulateCall, NormCall, Ops, Scratch,
+    SliceExt, WeightKind,
 };
 use crate::diffusion::weights::StStore;
 
@@ -128,6 +128,83 @@ pub(crate) fn linear<'o>(
         k: lin.in_dim,
     })?;
     Ok(out)
+}
+
+/// The denoiser's sinusoidal embedding of 3D positions: per axis, 170
+/// frequencies `2^0 .. 2^15` then a ramp of `2^(16 i / 154)`, as
+/// `[sin(2 pi x f)..., cos(2 pi x f)...]`, the three axes side by side and
+/// zero-padded to `channels`.
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "frequency indices below 200 are exact in f32"
+)]
+pub(crate) fn point_embed_v1(points: &[f32], channels: usize) -> Vec<f32> {
+    const MAX_RES: usize = 16;
+    let freq_dim = channels / 3 / 2;
+    let extra = freq_dim.saturating_sub(MAX_RES);
+    let freqs: Vec<f32> = (0..MAX_RES)
+        .map(|i| i as f32)
+        .chain((0..extra).map(|i| i as f32 / extra as f32 * MAX_RES as f32))
+        .take(freq_dim)
+        .map(|e| exact_pow2(f64::from(e)))
+        .collect();
+    embed_points(points, channels, &freqs, 2.0 * std::f32::consts::PI)
+}
+
+/// The decoders' sinusoidal embedding of 3D points: per axis, 170
+/// frequencies `2^linspace(0, 10)`, as `[sin(pi x f)..., cos(pi x f)...]`,
+/// the three axes side by side and zero-padded to `channels`.
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "frequency indices below 200 are exact in f32"
+)]
+pub(crate) fn point_embed_v2(points: &[f32], channels: usize) -> Vec<f32> {
+    const MAX_RES: f64 = 10.0;
+    let freq_dim = channels / 3 / 2;
+    let last = freq_dim.saturating_sub(1).max(1) as f64;
+    // The exponents `linspace(0, 10, 170)`, each rounded once from f64 (see
+    // `exact_pow2` for why the port does not imitate torch's own rounding).
+    let freqs: Vec<f32> = (0..freq_dim)
+        .map(|i| exact_pow2(MAX_RES * i as f64 / last))
+        .collect();
+    embed_points(points, channels, &freqs, std::f32::consts::PI)
+}
+
+/// `2^e`, rounded once to f32.
+///
+/// The reference's `2 ** e` in f32 is one ulp low on 4 of the denoiser's 170
+/// frequencies and 6 of the decoders' (torch's vectorised pow is not
+/// correctly rounded). At the denoiser's top frequency, 2^16 over angles up to
+/// 4e5 rad, one ulp moves a sinusoid by 0.03, which the velocity carries as
+/// ~3.7e-4 of its scale (measured against the reference with torch's values).
+/// The port rounds correctly instead of imitating one library's pow.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the power is computed in f64 and rounded once to the f32 the tables hold"
+)]
+fn exact_pow2(e: f64) -> f32 {
+    2.0f64.powf(e) as f32
+}
+
+/// `[sin(scale x f)..., cos(scale x f)...]` per axis, axes side by side, padded.
+fn embed_points(points: &[f32], channels: usize, freqs: &[f32], scale: f32) -> Vec<f32> {
+    let n = points.len() / 3;
+    let per_axis = 2 * freqs.len();
+    let mut out = vec![0.0f32; n * channels];
+    for p in 0..n {
+        for axis in 0..3 {
+            let x = points[p * 3 + axis];
+            let base = p * channels + axis * per_axis;
+            for (i, f) in freqs.iter().enumerate() {
+                let angle = x * f * scale;
+                out[base + i] = angle.sin();
+                out[base + freqs.len() + i] = angle.cos();
+            }
+        }
+    }
+    out
 }
 
 /// A layer norm's affine, stored as the modulation's `(w - 1, b)`.
@@ -301,6 +378,75 @@ pub(crate) fn rotate_in_place(
 ) -> Result<(), ImageGenError> {
     add_gated_in_place(ops, step, q, cos_m1, q, count, count)?;
     add_gated_in_place(ops, step, q, sin, turned, count, count)
+}
+
+/// A per-head RMS norm's gamma, `(heads, head_dim)`, stored as `gamma - 1`.
+#[derive(Debug)]
+pub(crate) struct HeadNorm {
+    gamma_m1: DeviceBuffer,
+    ones: DeviceBuffer,
+    heads: usize,
+    head_dim: usize,
+}
+
+/// The norm's floor on `mean(x^2)`: the reference divides by
+/// `max(|x|, 1e-12)`, so only an all-zero head can tell the two apart.
+const HEAD_NORM_EPS: f32 = 1e-24;
+
+impl HeadNorm {
+    /// Reads `{name}.gamma`, `(heads, head_dim)`.
+    ///
+    /// # Errors
+    ///
+    /// [`ImageGenError::Checkpoint`] for a missing or misshapen tensor.
+    pub(crate) fn load(
+        store: &StStore,
+        ops: &Ops,
+        name: &str,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<Self, ImageGenError> {
+        let gamma = store.f32_vec(&format!("{name}.gamma"))?;
+        if gamma.len() != heads * head_dim {
+            return Err(ImageGenError::Checkpoint(format!(
+                "{name}.gamma is {} values, expected {heads}x{head_dim}",
+                gamma.len()
+            )));
+        }
+        let gamma_m1: Vec<f32> = gamma.iter().map(|g| g - 1.0).collect();
+        Ok(Self {
+            gamma_m1: ops.upload_f32("head norm", &gamma_m1)?,
+            ones: ops.upload_f32("head norm", &vec![1.0; head_dim])?,
+            heads,
+            head_dim,
+        })
+    }
+
+    /// Normalises every head of `tokens` packed `(tokens, heads * head_dim)`
+    /// rows in place.
+    ///
+    /// # Errors
+    ///
+    /// A device failure.
+    pub(crate) fn apply(
+        &self,
+        ops: &Ops,
+        step: &'static str,
+        x: shiso_core::DeviceView<'_>,
+        tokens: usize,
+    ) -> Result<(), ImageGenError> {
+        ops.rmsnorm(&NormCall {
+            step,
+            out: x,
+            input: x,
+            weight: self.ones.view(),
+            rows: tokens * self.heads,
+            dim: self.head_dim,
+            eps: HEAD_NORM_EPS,
+        })?;
+        let width = self.heads * self.head_dim;
+        add_gated_in_place(ops, step, x, self.gamma_m1.view(), x, tokens * width, width)
+    }
 }
 
 /// Three packed projections of the same rows.

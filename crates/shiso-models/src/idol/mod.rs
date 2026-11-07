@@ -7,6 +7,9 @@
 
 pub mod conditioner;
 pub mod conditioning;
+pub mod config;
+pub(crate) mod decoders;
+pub(crate) mod denoiser;
 pub mod dinov3;
 pub mod draws;
 pub mod gaussian;

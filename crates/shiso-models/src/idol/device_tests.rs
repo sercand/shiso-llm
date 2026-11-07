@@ -94,8 +94,15 @@ pub(super) fn picture(path: &Path) -> (Vec<f32>, usize, usize) {
 }
 
 /// Asserts `|got - want| <= tol * max(|want|, rms(want))` element by element,
-/// and reports the worst ratio.
+/// and reports the worst ratio and the mean error.
 pub(super) fn close(got: &[f32], want: &[f32], tol: f32, what: &str) {
+    close_mean(got, want, tol, f64::from(tol), what);
+}
+
+/// As [`close`], and also bounds the mean error at `mean_tol` of the rms: for
+/// a stage whose worst element is one outlier among millions, the mean is the
+/// sharper statement.
+pub(super) fn close_mean(got: &[f32], want: &[f32], tol: f32, mean_tol: f64, what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: length");
     let rms =
         (want.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / want.len() as f64).sqrt() as f32;
@@ -125,6 +132,11 @@ pub(super) fn close(got: &[f32], want: &[f32], tol: f32, what: &str) {
         "{what}[{at}]: device {} vs reference {} (worst {worst:.3e} > {tol:.1e})",
         got[at],
         want[at]
+    );
+    let mean = total / got.len() as f64 / f64::from(rms);
+    assert!(
+        mean <= mean_tol,
+        "{what}: mean error {mean:.3e} > {mean_tol:.1e}"
     );
 }
 
@@ -233,4 +245,175 @@ fn the_conditioner_matches_both_reference_streams() {
         5e-4,
         "conditioning vae stream",
     );
+}
+
+/// The fixture conditioning (the reference encoders' streams).
+fn fixture_conditioning() -> Result<crate::idol::conditioning::Conditioning, String> {
+    let dino = read_f32(&fixture("dino_tokens.f32")?);
+    let vae = read_f32(&fixture("vae_tokens.f32")?);
+    crate::idol::conditioning::assemble(dino, vae).map_err(|e| e.to_string())
+}
+
+#[test]
+#[ignore = "needs the splat checkpoint (SHISO_TEST_MODEL_IDOL), the idol fixtures and a Metal device"]
+fn the_denoiser_matches_the_reference_velocity() {
+    use crate::idol::denoiser::IdolDenoiser;
+
+    let case = "denoiser";
+    let dir = need!(case, checkpoint("SHISO_TEST_MODEL_IDOL"));
+    let cond = need!(case, fixture_conditioning());
+    let latent = read_f32(&need!(case, fixture("den_in_latent.f32")));
+    let camera = read_f32(&need!(case, fixture("den_in_camera.f32")));
+    let out_latent = read_f32(&need!(case, fixture("den_out_latent.f32")));
+    let out_camera = read_f32(&need!(case, fixture("den_out_camera.f32")));
+    let neg_latent = read_f32(&need!(case, fixture("den_neg_latent.f32")));
+    let neg_camera = read_f32(&need!(case, fixture("den_neg_camera.f32")));
+    let backend = need!(case, device());
+    let ops = Arc::new(Ops::new(&backend).expect("the diffusion kernel set"));
+    let denoiser = IdolDenoiser::load(&dir, ops).expect("the denoiser loads");
+    let v = denoiser
+        .forward(&latent, &camera, 700.0, &cond)
+        .expect("the denoiser runs");
+    // Measured: worst 3.2e-4, mean 9.3e-6.
+    close_mean(
+        &v.latent,
+        &out_latent,
+        1e-3,
+        5e-5,
+        "denoiser latent velocity",
+    );
+    close(&v.camera, &out_camera, 1e-4, "denoiser camera velocity");
+    let negative = crate::idol::conditioning::Conditioning::zero(cond.rows);
+    let v = denoiser
+        .forward(&latent, &camera, 700.0, &negative)
+        .expect("the negative pass runs");
+    // Zero conditioning gives 4101 near-identical context rows, and the 24
+    // joint blocks amplify f32 rounding more there: the streams agree to
+    // 2.2e-6 after the first joint block and the velocity to a mean of 2e-4
+    // (worst 4.1e-3).
+    close_mean(
+        &v.latent,
+        &neg_latent,
+        1e-2,
+        5e-4,
+        "denoiser negative latent velocity",
+    );
+    close(
+        &v.camera,
+        &neg_camera,
+        1e-3,
+        "denoiser negative camera velocity",
+    );
+}
+
+#[test]
+#[ignore = "needs the splat checkpoint (SHISO_TEST_MODEL_IDOL), the idol fixtures and a Metal device"]
+fn the_octree_decoder_matches_the_reference_logits() {
+    use crate::idol::decoders::OctreeNet;
+
+    let case = "octree decoder";
+    let dir = need!(case, checkpoint("SHISO_TEST_MODEL_IDOL"));
+    let latent = read_f32(&need!(case, fixture("dec_latent.f32")));
+    let coords = read_f32(&need!(case, fixture("oct_coords.f32")));
+    let logits_ref = read_f32(&need!(case, fixture("oct_logits.f32")));
+    let backend = need!(case, device());
+    let ops = Arc::new(Ops::new(&backend).expect("the diffusion kernel set"));
+    let net = OctreeNet::load(&dir, ops).expect("the octree decoder loads");
+    // Level 3's parents sit on the 4x4x4 grid; their children at resolution 8.
+    let centres: Vec<f32> = coords.iter().map(|c| (c + 0.5) / 4.0).collect();
+    let logits = net
+        .logits(&centres, 8.0, &latent)
+        .expect("the decoder runs");
+    close(&logits, &logits_ref, 1e-3, "octree logits");
+}
+
+#[test]
+#[ignore = "needs the splat checkpoint (SHISO_TEST_MODEL_IDOL), the idol fixtures and a Metal device"]
+fn the_gaussian_decoder_matches_the_reference_cloud() {
+    use crate::idol::decoders::GaussianNet;
+    use crate::idol::gaussian::{RawOutput, RepresentationConfig, activate};
+
+    let case = "gaussian decoder";
+    let dir = need!(case, checkpoint("SHISO_TEST_MODEL_IDOL"));
+    let latent = read_f32(&need!(case, fixture("dec_latent.f32")));
+    let anchors = read_f32(&need!(case, fixture("gs_anchors.f32")));
+    let features_ref = read_f32(&need!(case, fixture("gs_features.f32")));
+    let backend = need!(case, device());
+    let ops = Arc::new(Ops::new(&backend).expect("the diffusion kernel set"));
+    let net = GaussianNet::load(&dir, ops).expect("the Gaussian decoder loads");
+    let features = net.features(&anchors, &latent).expect("the decoder runs");
+    // Measured: mean 1.8e-6, one element of 245760 at 2e-3.
+    close_mean(&features, &features_ref, 5e-3, 1e-5, "gaussian features");
+
+    // The activations, on the reference's own features.
+    let points: Vec<[f32; 3]> = anchors
+        .chunks_exact(3)
+        .map(|c| [c[0], c[1], c[2]])
+        .collect();
+    let cloud = activate(
+        &RawOutput {
+            features: &features_ref,
+            anchors: &points,
+            perturbation: &net.perturbation,
+            base_offset_scale: net.base_offset_scale,
+        },
+        &RepresentationConfig::idol(),
+    )
+    .expect("the reference features activate");
+    let flat = |rows: &[[f32; 3]]| rows.iter().flatten().copied().collect::<Vec<f32>>();
+    close(
+        &flat(&cloud.xyz),
+        &read_f32(&need!(case, fixture("gs_xyz.f32"))),
+        1e-5,
+        "gaussian xyz",
+    );
+    close(
+        &flat(&cloud.features_dc),
+        &read_f32(&need!(case, fixture("gs_features_dc.f32"))),
+        1e-5,
+        "gaussian colour",
+    );
+    close(
+        &flat(&cloud.scaling),
+        &read_f32(&need!(case, fixture("gs_scaling.f32"))),
+        1e-5,
+        "gaussian scaling",
+    );
+    let rotation: Vec<f32> = cloud.rotation.iter().flatten().copied().collect();
+    close(
+        &rotation,
+        &read_f32(&need!(case, fixture("gs_rotation.f32"))),
+        1e-5,
+        "gaussian rotation",
+    );
+    close(
+        &cloud.opacity,
+        &read_f32(&need!(case, fixture("gs_opacity.f32"))),
+        1e-5,
+        "gaussian opacity",
+    );
+    let ply = crate::idol::ply::write_ply(&cloud).expect("the cloud writes");
+    let ply_ref = std::fs::read(need!(case, fixture("gs.ply"))).expect("the reference ply");
+    assert_eq!(
+        ply.len(),
+        ply_ref.len(),
+        "the two files are the same length"
+    );
+    let header_end = ply_ref
+        .windows(11)
+        .position(|w| w == b"end_header\n")
+        .expect("a header")
+        + 11;
+    assert_eq!(
+        ply[..header_end],
+        ply_ref[..header_end],
+        "the headers are identical"
+    );
+    let body = |bytes: &[u8]| -> Vec<f32> {
+        bytes[header_end..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+    close(&body(&ply), &body(&ply_ref), 1e-4, "gaussian ply body");
 }

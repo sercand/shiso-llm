@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """Capture independent references for the 3D splat family, stage by stage.
 
-Runs the model's own SDK (its `idol/` package, imported unmodified from a
-checkout of the published Space) and the two collateral encoders through
-`transformers` and `diffusers`, all in float32 on the CPU, and writes every
-stage's inputs and outputs under test-vectors/references/idol/. The Rust
-stages are replayed against these by the `idol` device tests.
+Runs the two collateral encoders through `transformers` and `diffusers`, and
+the model's three networks through `idol_models.py` (a PyTorch transcription
+of the published SDK, loaded strictly against the checkpoint), all in float32
+on the CPU, and writes every stage's inputs and outputs under
+test-vectors/references/idol/. The Rust stages are replayed against these by
+`crates/shiso-models/src/idol/device_tests.rs`.
+
+The `crosscheck` stage grades the transcription against the SDK's own modules
+(`--sdk <checkout>`, the Space's `idol/` package imported unmodified); the
+`preprocess` stage runs the SDK's matte and crop (also `--sdk`).
 
 Float32 is deliberate: the shipped pipeline runs the image tower in bf16 and
 the transformer trunks in fp16, and a port carrying f32 activations is graded
 against f32 so a difference is the port's, not the reference's rounding.
 
-Every random draw the pipeline makes is recorded (the VAE posterior noise, the
+Every random draw a generation makes is recorded (the VAE posterior noise, the
 latent and camera noise, the octree's per-cell offsets and the leaf jitter),
 so the end-to-end case can replay them instead of reproducing torch's RNG.
 
 It never overwrites a stage's files: delete them to recapture.
 
-    idol_reference.py --sdk <space checkout> --image <picture> [stage ...]
+    idol_reference.py --image <picture> [stage ...]
+    idol_reference.py --sdk <space checkout> crosscheck
 
-Stages: preprocess, encoders, denoiser, decoders, e2e (default: all).
+Stages: preprocess, encoders, denoiser, decoders, e2e, crosscheck
+(default: encoders denoiser decoders e2e).
 Checkpoints are read from the Hugging Face cache (`--weights`, `--dinov3`,
 `--vae` override the snapshot directories).
 """
@@ -69,7 +76,7 @@ def pixels_of(png):
     return torch.from_numpy(arr).permute(2, 0, 1).float().div(255.0)[None]
 
 
-def stage_preprocess(args, sdk):
+def stage_preprocess(args):
     from idol.models import BiRefNet
     from idol.preprocess import preprocess_image
     from safetensors.torch import load_file
@@ -96,7 +103,7 @@ def stage_preprocess(args, sdk):
         captured["alpha"].save(OUT / "matte_alpha.png")
 
 
-def stage_encoders(args, sdk):
+def stage_encoders(args):
     from diffusers.models import AutoencoderKLFlux2
     from transformers import AutoModel
 
@@ -137,172 +144,168 @@ def stage_encoders(args, sdk):
     f32_file("dino_tokens.f32", F.layer_norm(hidden, hidden.shape[-1:])[0])
 
 
-def load_idol(args, sdk):
-    from idol.models import GaussianFixedlenDecoder, LatentSeqMMFlowModel, OctreeProbabilityFixedlenDecoder
+def load_idol(args):
+    """The three networks, from the transcription in idol_models.py, loaded strictly."""
     from safetensors.torch import load_file
+    import idol_models as m
 
     config = json.loads((args.weights / "config.json").read_text())
 
     def load(model, name):
         model.load_state_dict(load_file(str(args.weights / f"{name}.safetensors")), strict=True)
-        model = model.eval().requires_grad_(False).float()
-        model.dtype = torch.float32
-        return model
+        return model.eval().requires_grad_(False).float()
 
     return (config,
-            load(LatentSeqMMFlowModel(**config["denoiser"]["args"]), "denoiser"),
-            load(OctreeProbabilityFixedlenDecoder(**config["decoder"]["args"]), "decoder"),
-            load(GaussianFixedlenDecoder(**config["decoder_gs"]["args"]), "decoder_gs"))
+            load(m.Denoiser(**config["denoiser"]["args"]), "denoiser"),
+            load(m.OctreeDecoder(**config["decoder"]["args"]), "decoder"),
+            load(m.GaussianDecoder(**config["decoder_gs"]["args"]), "decoder_gs"))
 
 
 def cond_fixture():
-    from tensordict import TensorDict
-
-    return TensorDict({"feature1": read_f32("dino_tokens.f32", (1, 4101, 1280)),
-                       "feature2": read_f32("vae_tokens.f32", (1, 4101, 128))}, batch_size=1)
+    return (read_f32("dino_tokens.f32", (1, 4101, 1280)), read_f32("vae_tokens.f32", (1, 4101, 128)))
 
 
-def stage_denoiser(args, sdk):
-    from tensordict import TensorDict
-
-    _, denoiser, _, _ = load_idol(args, sdk)
-    cond = cond_fixture()
+def stage_denoiser(args):
+    _, denoiser, _, _ = load_idol(args)
+    feature1, feature2 = cond_fixture()
     generator = torch.Generator().manual_seed(1)
     latent = torch.randn(1, 8192, 16, generator=generator)
     camera = torch.randn(1, 1, 5, generator=generator)
     timestep = 700.0
     taps = {}
-    denoiser.noise_refiner[-1].register_forward_hook(lambda m, i, o: taps.__setitem__("noise", o))
-    denoiser.context_refiner[-1].register_forward_hook(lambda m, i, o: taps.__setitem__("context", o))
-    denoiser.blocks[0].register_forward_hook(lambda m, i, o: taps.__setitem__("block0", o))
-    x = TensorDict({"latent": latent, "camera": camera}, batch_size=1)
-    with torch.no_grad():
-        out = denoiser(x, torch.tensor([timestep]), cond)
-        negative = denoiser(x, torch.tensor([timestep]), cond.apply(torch.zeros_like))
+    out_latent, out_camera = denoiser(latent, camera, torch.tensor([timestep]), feature1, feature2, taps)
+    neg_latent, neg_camera = denoiser(latent, camera, torch.tensor([timestep]), torch.zeros_like(feature1),
+                                      torch.zeros_like(feature2))
     f32_file("den_in_latent.f32", latent[0])
     f32_file("den_in_camera.f32", camera[0, 0])
-    f32_file("den_out_latent.f32", out["latent"][0])
-    f32_file("den_out_camera.f32", out["camera"][0, 0])
-    f32_file("den_neg_latent.f32", negative["latent"][0])
-    f32_file("den_neg_camera.f32", negative["camera"][0, 0])
+    f32_file("den_out_latent.f32", out_latent[0])
+    f32_file("den_out_camera.f32", out_camera[0, 0])
+    f32_file("den_neg_latent.f32", neg_latent[0])
+    f32_file("den_neg_camera.f32", neg_camera[0, 0])
     f32_file("den_tap_noise.f32", taps["noise"][0])
     f32_file("den_tap_context.f32", taps["context"][0])
     f32_file("den_tap_block0.f32", taps["block0"][0])
     write_json("denoiser.json", {"timestep": timestep})
 
 
-def stage_decoders(args, sdk):
-    _, _, octree, gs = load_idol(args, sdk)
+def stage_decoders(args):
+    import idol_models as m
+
+    _, _, octree, gs = load_idol(args)
     generator = torch.Generator().manual_seed(2)
     latent = torch.randn(1, 8192, 16, generator=generator)
     f32_file("dec_latent.f32", latent[0])
-    # Level 3's parents: every cell of the 4x4x4 grid, in the descent's order.
-    coords = torch.tensor([[i, j, k] for i in range(4) for j in range(4) for k in range(4)],
-                          dtype=torch.float32)
-    parents = ((coords + 0.5) / 4)[None]
-    with torch.no_grad():
-        logits = octree(parents, torch.tensor([8]), latent)
+    # Level 3's parents: every cell of the 4x4x4 grid, x slowest.
+    coords = torch.tensor([[i, j, k] for i in range(4) for j in range(4) for k in range(4)], dtype=torch.float32)
+    logits = octree(((coords + 0.5) / 4)[None], torch.tensor([8]), latent)
     f32_file("oct_coords.f32", coords)
     f32_file("oct_logits.f32", logits[0])
-    anchors = torch.rand(1, 512, 3, generator=generator)
-    with torch.no_grad():
-        features = gs(anchors, latent)
-        gaussian = gs.to_representation(anchors, features)[0]
-    f32_file("gs_anchors.f32", anchors[0])
-    f32_file("gs_features.f32", features[0])
-    f32_file("gs_xyz.f32", gaussian.xyz)
-    f32_file("gs_features_dc.f32", gaussian.features_dc.reshape(-1, 3))
-    f32_file("gs_scaling.f32", gaussian.scaling)
-    f32_file("gs_rotation.f32", gaussian.rotation)
-    f32_file("gs_opacity.f32", gaussian.opacity.reshape(-1))
-    gaussian.save_ply(str(OUT / "gs.ply"))
+    anchors = torch.rand(512, 3, generator=generator)
+    features = gs(anchors[None], latent)[0]
+    xyz, colour, scaling, rotation, opacity = gs.activate(anchors, features)
+    f32_file("gs_anchors.f32", anchors)
+    f32_file("gs_features.f32", features)
+    f32_file("gs_xyz.f32", xyz)
+    f32_file("gs_features_dc.f32", colour)
+    f32_file("gs_scaling.f32", scaling)
+    f32_file("gs_rotation.f32", rotation)
+    f32_file("gs_opacity.f32", opacity)
+    path = OUT / "gs.ply"
+    if path.exists():
+        sys.exit(f"{path} exists; delete it to recapture")
+    path.write_bytes(m.ply_bytes(xyz, colour, scaling, rotation, opacity))
 
 
-def stage_e2e(args, sdk):
-    import idol.models.decoder as decoder_module
-    from tensordict import TensorDict
-    from idol.sampler import sample_flow
+def stage_e2e(args):
+    """A whole generation from the fixture conditioning, with every draw recorded."""
+    import idol_models as m
 
-    config, denoiser, octree, gs = load_idol(args, sdk)
-    cond = cond_fixture()
+    config, denoiser, octree, gs = load_idol(args)
+    feature1, feature2 = cond_fixture()
     generator = torch.Generator().manual_seed(3)
-    noise = TensorDict({"latent": torch.randn(1, 8192, 16, generator=generator),
-                        "camera": torch.randn(1, 1, 5, generator=generator)}, batch_size=1)
-    f32_file("e2e_noise_latent.f32", noise["latent"][0])
-    f32_file("e2e_noise_camera.f32", noise["camera"][0, 0])
-    with torch.no_grad():
-        sample = sample_flow(denoiser, noise, cond=cond, neg_cond=cond.apply(torch.zeros_like),
-                             steps=args.steps, rescale_t=3.0, cfg_strength=3.0, verbose=False)
-    f32_file("e2e_latent.f32", sample["latent"][0])
-    f32_file("e2e_camera.f32", sample["camera"][0, 0])
+    latent = torch.randn(1, 8192, 16, generator=generator)
+    camera = torch.randn(1, 1, 5, generator=generator)
+    f32_file("e2e_noise_latent.f32", latent[0])
+    f32_file("e2e_noise_camera.f32", camera[0, 0])
+    zeros1, zeros2 = torch.zeros_like(feature1), torch.zeros_like(feature2)
+    steps, cfg, shift = args.steps, 3.0, 3.0
+    grid = np.linspace(1, 0, steps + 1)
+    grid = shift * grid / (1 + (shift - 1) * grid)
+    for i in range(steps):
+        t, t_prev = grid[i], grid[i + 1]
+        tt = torch.tensor([1000 * t], dtype=torch.float32)
+        v_latent, v_camera = denoiser(latent, camera, tt, feature1, feature2)
+        if cfg > 0:
+            n_latent, n_camera = denoiser(latent, camera, tt, zeros1, zeros2)
+            v_latent = (1 + cfg) * v_latent - cfg * n_latent
+            v_camera = (1 + cfg) * v_camera - cfg * n_camera
+        latent = latent - v_latent * (t - t_prev)
+        camera = camera - v_camera * (t - t_prev)
+    f32_file("e2e_latent.f32", latent[0])
+    f32_file("e2e_camera.f32", camera[0, 0])
 
-    # The octree's draws, one offset per cell in the descent's cell order: the
-    # reference groups rows by count before drawing, so the order it draws in
-    # is not the cell order, and the replay needs the cell order.
-    offsets = []
-    original_rand = torch.rand
+    def rand(n):
+        return torch.rand(n, generator=generator)
 
-    def systematic_sample(probs, counts):
-        batch_shape = counts.shape
-        rows_total = counts.numel()
-        bins = probs.size(-1)
-        probs = probs.view(rows_total, bins).to(torch.float32).clamp_min_(0)
-        row_sums = probs.sum(1, keepdim=True)
-        zero_mask = row_sums.eq(0)
-        probs = probs / row_sums.clamp_min_(1)
-        if zero_mask.any():
-            probs = probs.clone()
-            probs[zero_mask.expand_as(probs)] = 1.0 / bins
-        counts = counts.view(rows_total).to(torch.long)
-        out = torch.zeros(rows_total, bins, dtype=torch.long)
-        cdf = probs.cumsum(dim=1).clamp(max=1.0 - 1e-12)
-        raw = torch.zeros(rows_total)
-        unique_n, inv = counts.unique(sorted=False, return_inverse=True)
-        for index, n in enumerate(unique_n.tolist()):
-            if n == 0:
-                continue
-            rows = (inv == index).nonzero(as_tuple=False).squeeze(1)
-            r = rows.numel()
-            draw = original_rand(r, 1, generator=generator)
-            raw[rows] = draw[:, 0]
-            u0 = draw / float(n)
-            grid = torch.arange(n, dtype=torch.float32)[None, :] / float(n)
-            us = (u0 + grid).clamp(max=1.0 - 1e-12)
-            idx = torch.searchsorted(cdf.index_select(0, rows), us).clamp_max(bins - 1)
-            buf = torch.zeros(r, bins, dtype=torch.float32)
-            buf.scatter_add_(1, idx, torch.ones_like(idx, dtype=buf.dtype))
-            out.index_copy_(0, rows, buf.to(torch.long))
-        offsets.append(raw)
-        return out.view(*batch_shape, bins)
+    anchors, level_draws, jitter = m.place_anchors(octree, latent, args.num_gaussians // 32,
+                                                   config["max_voxel_level"], rand)
+    for level, draws in enumerate(level_draws, start=1):
+        f32_file(f"e2e_octree_offsets_{level}.f32", draws)
+    f32_file("e2e_jitter.f32", jitter)
+    f32_file("e2e_anchors.f32", anchors)
+    features = gs(anchors[None], latent)[0]
+    cloud = gs.activate(anchors, features)
+    path = OUT / "e2e.ply"
+    if path.exists():
+        sys.exit(f"{path} exists; delete it to recapture")
+    path.write_bytes(m.ply_bytes(*cloud))
+    write_json("e2e.json", {"steps": steps, "num_gaussians": args.num_gaussians, "cfg_strength": cfg,
+                            "rescale_t": shift, "levels": len(level_draws), "seed_note": "torch generator 3"})
 
-    decoder_module.systematic_sample = systematic_sample
-    jitter = []
-    original_rand_like = torch.rand_like
 
-    def rand_like(tensor, dtype=None):
-        value = torch.rand(tensor.shape, generator=generator, dtype=dtype or tensor.dtype)
-        jitter.append(value)
-        return value
+def stage_crosscheck(args):
+    """The transcription against the SDK's own modules, same weights, random inputs (needs --sdk)."""
+    if args.sdk is None:
+        sys.exit("the crosscheck stage needs --sdk")
+    from tensordict import TensorDict
+    from idol.models import GaussianFixedlenDecoder, LatentSeqMMFlowModel, OctreeProbabilityFixedlenDecoder
+    from safetensors.torch import load_file
 
-    torch.rand_like = rand_like
-    try:
-        with torch.no_grad():
-            anchors = decoder_module.OctreeProbabilityFixedlenDecoder.sample(
-                octree, sample["latent"], num_points=args.num_gaussians // 32, level=config["max_voxel_level"])
-            gaussian = gs.to_representation(anchors, gs(anchors, sample["latent"]))[0]
-    finally:
-        torch.rand_like = original_rand_like
-    for level, raw in enumerate(offsets, start=1):
-        f32_file(f"e2e_octree_offsets_{level}.f32", raw)
-    f32_file("e2e_jitter.f32", jitter[0][0])
-    f32_file("e2e_anchors.f32", anchors[0])
-    gaussian.save_ply(str(OUT / "e2e.ply"))
-    write_json("e2e.json", {"steps": args.steps, "num_gaussians": args.num_gaussians, "cfg_strength": 3.0,
-                            "rescale_t": 3.0, "levels": len(offsets)})
+    config, denoiser, octree, gs = load_idol(args)
+
+    def sdk(model, name):
+        model.load_state_dict(load_file(str(args.weights / f"{name}.safetensors")), strict=True)
+        model = model.eval().float()
+        model.dtype = torch.float32
+        return model
+
+    s_den = sdk(LatentSeqMMFlowModel(**config["denoiser"]["args"]), "denoiser")
+    s_oct = sdk(OctreeProbabilityFixedlenDecoder(**config["decoder"]["args"]), "decoder")
+    s_gs = sdk(GaussianFixedlenDecoder(**config["decoder_gs"]["args"]), "decoder_gs")
+    g = torch.Generator().manual_seed(4)
+    latent, camera = torch.randn(1, 8192, 16, generator=g), torch.randn(1, 1, 5, generator=g)
+    f1, f2 = torch.randn(1, 4101, 1280, generator=g), torch.randn(1, 4101, 128, generator=g)
+    mine = denoiser(latent, camera, torch.tensor([400.0]), f1, f2)
+    theirs = s_den(TensorDict({"latent": latent, "camera": camera}, batch_size=1), torch.tensor([400.0]),
+                   TensorDict({"feature1": f1, "feature2": f2}, batch_size=1))
+    report = {"denoiser_latent": (mine[0] - theirs["latent"]).abs().max().item(),
+              "denoiser_camera": (mine[1] - theirs["camera"]).abs().max().item()}
+    x = torch.rand(1, 64, 3, generator=g)
+    report["octree"] = (octree(x, torch.tensor([16]), latent) - s_oct(x, torch.tensor([16]), latent)).abs().max().item()
+    pts = torch.rand(1, 256, 3, generator=g)
+    f_mine, f_theirs = gs(pts, latent), s_gs(pts, latent)
+    report["gaussian_features"] = (f_mine - f_theirs).abs().max().item()
+    ref = s_gs.to_representation(pts, f_theirs)[0]
+    act = gs.activate(pts[0], f_mine[0])
+    for name, a, b in zip(["xyz", "colour", "scaling", "rotation", "opacity"], act,
+                          [ref.xyz, ref.features_dc.reshape(-1, 3), ref.scaling, ref.rotation, ref.opacity.reshape(-1)]):
+        report[f"gaussian_{name}"] = (a - b).abs().max().item()
+    print(json.dumps(report, indent=2))
 
 
 STAGES = {"preprocess": stage_preprocess, "encoders": stage_encoders, "denoiser": stage_denoiser,
-          "decoders": stage_decoders, "e2e": stage_e2e}
+          "decoders": stage_decoders, "e2e": stage_e2e, "crosscheck": stage_crosscheck}
+DEFAULT_STAGES = ["encoders", "denoiser", "decoders", "e2e"]
 
 
 def main():
@@ -314,11 +317,12 @@ def main():
     ap.add_argument("--vae", type=Path, default=None)
     ap.add_argument("--steps", type=int, default=4)
     ap.add_argument("--num-gaussians", type=int, default=32768)
-    ap.add_argument("stages", nargs="*", default=list(STAGES))
+    ap.add_argument("stages", nargs="*", default=DEFAULT_STAGES)
     args = ap.parse_args()
     args.weights = args.weights or snapshot("speridlabs/idol")
     args.dinov3 = args.dinov3 or snapshot("facebook/dinov3-vith16plus-pretrain-lvd1689m")
     args.vae = args.vae or snapshot("black-forest-labs/FLUX.2-dev")
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     if args.sdk is not None:
         sys.path.insert(0, str(args.sdk))
     OUT.mkdir(parents=True, exist_ok=True)
@@ -326,7 +330,7 @@ def main():
     for stage in args.stages:
         if stage == "preprocess" and args.image is None:
             sys.exit("the preprocess stage needs --image")
-        STAGES[stage](args, args.sdk)
+        STAGES[stage](args)
         print(f"{stage}: written under {OUT}")
 
 
