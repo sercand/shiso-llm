@@ -39,6 +39,7 @@ pub mod qwen35moe;
 pub mod qwen3_asr;
 pub mod qwen4exp;
 pub(crate) mod qwen_image21;
+pub mod splat_registry;
 #[cfg(test)]
 mod test_gguf;
 

@@ -7,14 +7,6 @@
 //! The tower runs first and draws nothing; the posterior's noise is the first
 //! draw of the generation, which is the reference's order.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the splat generator's opener is the conditioner's first caller"
-    )
-)]
-
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;

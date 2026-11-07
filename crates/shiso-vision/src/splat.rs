@@ -149,6 +149,13 @@ pub enum SplatGenError {
     /// The matte (or the erosion after it) left no opaque pixel to crop to.
     #[error("the image has no opaque pixels left after matting")]
     EmptyAlpha,
+    /// The picture has no transparency to crop to and this server has no
+    /// background remover loaded: the caller can send a cut-out instead.
+    #[error(
+        "the image has no transparent pixels and this server has no background remover \
+         loaded; send an RGBA PNG with the background removed"
+    )]
+    NoMatte,
     /// The step count is zero or over the family's ceiling.
     #[error("steps must be between 1 and {MAX_STEPS}, got {steps}")]
     InvalidSteps {

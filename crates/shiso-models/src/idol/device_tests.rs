@@ -11,7 +11,9 @@
 #![expect(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    reason = "the comparison's rms is an f64 sum narrowed to the f32 the device computes in"
+    clippy::cast_sign_loss,
+    reason = "the comparison's rms is an f64 sum narrowed to the f32 the device computes in, \
+              and the e2e manifest's small counts are JSON numbers"
 )]
 
 use std::path::{Path, PathBuf};
@@ -416,4 +418,218 @@ fn the_gaussian_decoder_matches_the_reference_cloud() {
             .collect()
     };
     close(&body(&ply), &body(&ply_ref), 1e-4, "gaussian ply body");
+}
+
+/// The end-to-end case's recorded draws and settings.
+struct E2e {
+    noise: Vec<f32>,
+    uniforms: Vec<f32>,
+    steps: u32,
+    rescale_t: f32,
+    cfg_strength: f32,
+    num_gaussians: u32,
+}
+
+fn e2e_fixture() -> Result<E2e, String> {
+    let manifest = std::fs::read_to_string(fixture("e2e.json")?).map_err(|e| e.to_string())?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).map_err(|e| e.to_string())?;
+    let field = |name: &str| {
+        manifest[name]
+            .as_f64()
+            .ok_or(format!("e2e.json has no {name}"))
+    };
+    let mut noise = read_f32(&fixture("e2e_noise_latent.f32")?);
+    noise.extend(read_f32(&fixture("e2e_noise_camera.f32")?));
+    let mut uniforms = Vec::new();
+    for level in 1..=field("levels")? as usize {
+        uniforms.extend(read_f32(&fixture(&format!(
+            "e2e_octree_offsets_{level}.f32"
+        ))?));
+    }
+    uniforms.extend(read_f32(&fixture("e2e_jitter.f32")?));
+    Ok(E2e {
+        noise,
+        uniforms,
+        steps: field("steps")? as u32,
+        rescale_t: field("rescale_t")? as f32,
+        cfg_strength: field("cfg_strength")? as f32,
+        num_gaussians: field("num_gaussians")? as u32,
+    })
+}
+
+/// A Gaussian decoder for the flow case, which checks the latent and never
+/// looks at the cloud.
+#[derive(Debug)]
+struct NoCloud;
+
+impl crate::idol::generator::GaussianDecoder for NoCloud {
+    fn decode(
+        &self,
+        anchors: &[[f32; 3]],
+        _latent: &[f32],
+    ) -> Result<crate::idol::ply::GaussianCloud, String> {
+        let n = anchors.len() * 32;
+        Ok(crate::idol::ply::GaussianCloud {
+            xyz: vec![[0.0; 3]; n],
+            features_dc: vec![[0.0; 3]; n],
+            scaling: vec![[0.01; 3]; n],
+            rotation: vec![[1.0, 0.0, 0.0, 0.0]; n],
+            opacity: vec![0.5; n],
+        })
+    }
+}
+
+/// An octree for the flow case: one child per cell, so the descent takes one
+/// draw per level and the uniforms it is handed are never short.
+#[derive(Debug)]
+struct OneChild;
+
+impl crate::idol::generator::OctreeDecoder for OneChild {
+    fn child_probs(
+        &self,
+        coords: &[[u32; 3]],
+        _level: u32,
+        _latent: &[f32],
+    ) -> Result<Vec<[f32; 8]>, String> {
+        let mut probs = [0.0f32; 8];
+        probs[0] = 1.0;
+        Ok(vec![probs; coords.len()])
+    }
+}
+
+#[test]
+#[ignore = "needs the splat checkpoint (SHISO_TEST_MODEL_IDOL), the idol fixtures and a Metal device"]
+fn the_flow_integrates_to_the_reference_latent() {
+    use crate::idol::denoiser::IdolDenoiser;
+    use crate::idol::draws::Replay;
+    use crate::idol::generator::{Pipeline, PipelineConfig, run};
+
+    let case = "end to end flow";
+    let dir = need!(case, checkpoint("SHISO_TEST_MODEL_IDOL"));
+    let cond = need!(case, fixture_conditioning());
+    let e2e = need!(case, e2e_fixture());
+    let latent_ref = read_f32(&need!(case, fixture("e2e_latent.f32")));
+    let camera_ref = read_f32(&need!(case, fixture("e2e_camera.f32")));
+    let backend = need!(case, device());
+    let ops = Arc::new(Ops::new(&backend).expect("the diffusion kernel set"));
+    let denoiser = IdolDenoiser::load(&dir, ops).expect("the denoiser loads");
+    let anchors = e2e.num_gaussians as usize / 32;
+    let mut replay = Replay::new(e2e.noise, vec![0.5; 8 + 3 * anchors]);
+    let generation = run(
+        &Pipeline {
+            denoiser: &denoiser,
+            octree: &OneChild,
+            gaussian: &NoCloud,
+            config: PipelineConfig::idol(),
+            steps: e2e.steps,
+            rescale_t: e2e.rescale_t,
+            cfg_strength: e2e.cfg_strength,
+            num_gaussians: e2e.num_gaussians,
+        },
+        &cond,
+        &mut replay,
+        None,
+    )
+    .expect("the flow runs");
+    assert_eq!(
+        replay.remaining().0,
+        0,
+        "the latent and camera noise are both drawn"
+    );
+    // Four guided steps carry the negative pass's error (mean 2e-4 of the
+    // velocity) times the guidance weight: measured mean 1.4e-4, worst element
+    // 2.9e-2 of the scale.
+    close_mean(
+        &generation.sample.latent,
+        &latent_ref,
+        5e-2,
+        5e-4,
+        "e2e latent",
+    );
+    close(&generation.sample.camera, &camera_ref, 1e-2, "e2e camera");
+}
+
+/// A denoiser that answers zero velocity, so the flow leaves the sample it
+/// was handed where it is: the decode case's way to start from the
+/// reference's own final latent.
+#[derive(Debug)]
+struct Still;
+
+impl crate::idol::generator::Denoiser for Still {
+    fn velocity(
+        &self,
+        sample: &crate::idol::generator::FlowState,
+        _timestep: f32,
+        _cond: &crate::idol::conditioning::Conditioning,
+    ) -> Result<crate::idol::generator::FlowState, String> {
+        Ok(crate::idol::generator::FlowState {
+            latent: vec![0.0; sample.latent.len()],
+            camera: vec![0.0; sample.camera.len()],
+        })
+    }
+}
+
+#[test]
+#[ignore = "needs the splat checkpoint (SHISO_TEST_MODEL_IDOL), the idol fixtures and a Metal device"]
+fn the_decode_from_the_reference_latent_replays_the_reference_cloud() {
+    use crate::idol::decoders::{GaussianNet, OctreeNet};
+    use crate::idol::draws::Replay;
+    use crate::idol::generator::{Pipeline, PipelineConfig, run};
+
+    let case = "end to end decode";
+    let dir = need!(case, checkpoint("SHISO_TEST_MODEL_IDOL"));
+    let e2e = need!(case, e2e_fixture());
+    let mut start = read_f32(&need!(case, fixture("e2e_latent.f32")));
+    start.extend(read_f32(&need!(case, fixture("e2e_camera.f32"))));
+    let anchors_ref = read_f32(&need!(case, fixture("e2e_anchors.f32")));
+    let ply_ref = std::fs::read(need!(case, fixture("e2e.ply"))).expect("the reference ply");
+    let backend = need!(case, device());
+    let ops = Arc::new(Ops::new(&backend).expect("the diffusion kernel set"));
+    let octree = OctreeNet::load(&dir, Arc::clone(&ops)).expect("the octree decoder loads");
+    let gaussian = GaussianNet::load(&dir, ops).expect("the Gaussian decoder loads");
+    let mut replay = Replay::new(start, e2e.uniforms);
+    let generation = run(
+        &Pipeline {
+            denoiser: &Still,
+            octree: &octree,
+            gaussian: &gaussian,
+            config: PipelineConfig::idol(),
+            steps: 1,
+            rescale_t: e2e.rescale_t,
+            cfg_strength: 0.0,
+            num_gaussians: e2e.num_gaussians,
+        },
+        &crate::idol::conditioning::Conditioning::zero(1),
+        &mut replay,
+        None,
+    )
+    .expect("the decode runs");
+    assert_eq!(
+        replay.remaining(),
+        (0, 0),
+        "every recorded draw is used, in order"
+    );
+    // Every octree split agreed, so the replayed offsets and jitters land the
+    // anchors on the reference's points.
+    let anchors: Vec<f32> = generation.anchors.iter().flatten().copied().collect();
+    close(&anchors, &anchors_ref, 1e-6, "e2e anchors");
+    let ply = crate::idol::ply::write_ply(&generation.cloud).expect("the cloud writes");
+    assert_eq!(ply.len(), ply_ref.len(), "the same vertex count");
+    let header_end = ply_ref
+        .windows(11)
+        .position(|w| w == b"end_header\n")
+        .expect("a header")
+        + 11;
+    assert_eq!(
+        ply[..header_end],
+        ply_ref[..header_end],
+        "identical headers"
+    );
+    let body = |bytes: &[u8]| -> Vec<f32> {
+        bytes[header_end..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+    close_mean(&body(&ply), &body(&ply_ref), 5e-3, 1e-5, "e2e ply body");
 }

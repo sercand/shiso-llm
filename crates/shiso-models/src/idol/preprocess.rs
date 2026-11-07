@@ -43,6 +43,9 @@ pub enum PreprocessError {
     #[error("no object found in the image (the alpha channel is empty)")]
     EmptyAlpha,
     /// The image has no real alpha and no background remover is loaded.
+    #[error("the image has no alpha and no background remover is loaded")]
+    NoMatte,
+    /// The background remover failed, or answered the wrong number of values.
     #[error("{0}")]
     Matting(String),
     /// Scaling the short side to the model's input size would produce a
@@ -68,7 +71,7 @@ pub enum PreprocessError {
 /// A seam rather than a concrete model so the stage can be tested without a
 /// device, and so the remover can be swapped or left out on a host that only
 /// ever sees cut-outs.
-pub trait Matting {
+pub trait Matting: Send + Sync + std::fmt::Debug {
     /// The alpha channel for `rgb`, one byte per pixel in row-major order.
     ///
     /// # Errors
@@ -104,8 +107,9 @@ pub fn decode_rgba(bytes: &[u8]) -> Result<RgbaImage, PreprocessError> {
 /// # Errors
 ///
 /// [`PreprocessError::Decode`] for bytes that are not a picture,
-/// [`PreprocessError::Matting`] when the picture has no real alpha and no
-/// remover is loaded (or the remover failed), and
+/// [`PreprocessError::NoMatte`] when the picture has no real alpha and no
+/// remover is loaded, [`PreprocessError::Matting`] when the remover failed,
+/// and
 /// [`PreprocessError::EmptyAlpha`] when nothing opaque is left to crop to.
 #[expect(
     clippy::cast_possible_truncation,
@@ -147,11 +151,7 @@ pub fn preprocess(
     // chunk into RGBA, which Pillow keeps as mode `P` and therefore mattes. The
     // PNG header's colour type is what tells the two apart.
     if !(is_rgba_png(image) && has_transparent_pixel(&working)) {
-        let matting = matting.ok_or_else(|| {
-            PreprocessError::Matting(
-                "the image has no alpha and no background remover is loaded".to_owned(),
-            )
-        })?;
+        let matting = matting.ok_or(PreprocessError::NoMatte)?;
         let rgb = to_rgb(&working);
         let alpha = matting.alpha(&rgb).map_err(PreprocessError::Matting)?;
         let expected = (working.width() * working.height()) as usize;
@@ -799,12 +799,13 @@ mod tests {
     /// A matte that marks a square, built from the dimensions it is handed:
     /// the matte runs after the first resize, so the image is 1024 on its
     /// short side and may be wider than that.
+    #[derive(Debug)]
     struct SquareMatte {
         lo: u32,
         hi: u32,
         /// The dimensions the matte was handed, so a test can prove the stage
         /// resized *before* matting rather than after.
-        seen: std::cell::Cell<Option<(u32, u32)>>,
+        seen: std::sync::Mutex<Option<(u32, u32)>>,
     }
 
     impl SquareMatte {
@@ -812,7 +813,7 @@ mod tests {
             Self {
                 lo,
                 hi,
-                seen: std::cell::Cell::new(None),
+                seen: std::sync::Mutex::new(None),
             }
         }
     }
@@ -820,7 +821,7 @@ mod tests {
     impl Matting for SquareMatte {
         fn alpha(&self, rgb: &RgbImage) -> Result<Vec<u8>, String> {
             let (width, height) = rgb.dimensions();
-            self.seen.set(Some((width, height)));
+            *self.seen.lock().expect("the matte's own lock") = Some((width, height));
             let mut alpha = vec![0u8; (width * height) as usize];
             for y in self.lo..self.hi.min(height) {
                 for x in self.lo..self.hi.min(width) {
@@ -842,7 +843,7 @@ mod tests {
     fn an_opaque_photo_without_a_matte_is_refused() {
         let png = opaque_png(1024, 1024);
         let err = preprocess(&png, 1.7, None).expect_err("no matte available");
-        assert!(matches!(err, PreprocessError::Matting(_)));
+        assert!(matches!(err, PreprocessError::NoMatte), "{err}");
     }
 
     #[test]
@@ -877,6 +878,7 @@ mod tests {
 
     #[test]
     fn a_matte_of_the_wrong_length_is_refused() {
+        #[derive(Debug)]
         struct Short;
         impl Matting for Short {
             fn alpha(&self, _rgb: &RgbImage) -> Result<Vec<u8>, String> {

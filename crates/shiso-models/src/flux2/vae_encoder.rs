@@ -22,14 +22,6 @@
 //! The encoder runs f32, like the decoder, widening the `BF16` checkpoint
 //! losslessly.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the splat conditioner is the encoder's first caller and lands next"
-    )
-)]
-
 use std::path::Path;
 
 use shiso_vision::generator::ImageGenError;

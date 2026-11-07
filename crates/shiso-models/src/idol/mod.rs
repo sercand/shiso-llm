@@ -15,6 +15,7 @@ pub mod draws;
 pub mod gaussian;
 pub mod generator;
 pub mod latent;
+pub mod model;
 pub(crate) mod nn;
 pub mod octree;
 pub mod ply;

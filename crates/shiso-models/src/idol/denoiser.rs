@@ -17,14 +17,6 @@
 //! The reference runs the blocks in fp16; this runs f32 throughout (see the
 //! module doc of [`super::nn`]).
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the splat generator's opener is the denoiser's first caller"
-    )
-)]
-
 use std::f32::consts::PI;
 use std::path::Path;
 use std::sync::Arc;

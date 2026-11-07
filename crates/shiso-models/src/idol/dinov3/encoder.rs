@@ -11,14 +11,6 @@
 //! tables of [`super::rope_tables`]; the five prefix rows get the identity
 //! (cosine one, sine zero), which is how the reference leaves them unrotated.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the splat generator's opener is the tower's first caller"
-    )
-)]
-
 use std::path::Path;
 
 use shiso_core::DeviceBuffer;

@@ -27,14 +27,6 @@
 //!   blocks cost 7.5e-3 of the reference's scale where this path measures
 //!   4.7e-5 (and runs faster at these widths).
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the splat generator's opener is the layers' first caller"
-    )
-)]
-
 use shiso_core::DeviceBuffer;
 use shiso_vision::generator::ImageGenError;
 

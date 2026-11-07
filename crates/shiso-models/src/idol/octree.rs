@@ -8,14 +8,15 @@
 //! probability `0.5` and ten points receive exactly five, every time, which a
 //! multinomial draw would not.
 
-use shiso_core::ids::Seed;
+use super::draws::Draws;
 
 /// Children per cell.
 pub const CHILDREN: usize = 8;
 
 /// The child probabilities of every cell at one level, as the decoder answers
-/// them. A named type because the closure is passed across a module boundary.
-pub type ProbsAt<'a> = dyn FnMut(&[[u32; 3]], u32) -> Vec<[f32; CHILDREN]> + 'a;
+/// them, or the decoder's failure. A named type because the closure is passed
+/// across a module boundary.
+pub type ProbsAt<'a> = dyn FnMut(&[[u32; 3]], u32) -> Result<Vec<[f32; CHILDREN]>, String> + 'a;
 
 /// One cell of the octree: its integer coordinates at its own level, and how
 /// many of the points still inside it.
@@ -54,7 +55,7 @@ const CHILD_OFFSETS: [[u32; 3]; CHILDREN] = [
 pub fn systematic_sample(
     probs: &[f32; CHILDREN],
     count: u32,
-    rng: &mut Seed,
+    draws: &mut dyn Draws,
     counts: &mut [u32; 8],
 ) {
     counts.fill(0);
@@ -84,7 +85,7 @@ pub fn systematic_sample(
     }
 
     let count_f = count as f32;
-    let offset = rng.next_f32() / count_f;
+    let offset = draws.uniform() / count_f;
     for k in 0..count {
         let point = (offset + k as f32 / count_f).min(1.0 - 1e-12);
         // The first bin whose cumulative probability covers the point.
@@ -108,11 +109,10 @@ pub fn systematic_sample(
 /// is the reference's last step and the reason the output is continuous rather
 /// than a lattice.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics when `probs_at` answers a different number of distributions than
-/// there are cells, which is a graph bug rather than a request's.
-#[must_use]
+/// The decoder's failure, or a decoder that answers a different number of
+/// distributions than there are cells.
 #[expect(
     clippy::cast_precision_loss,
     reason = "the anchor count and the leaf coordinates are bounded by the request's Gaussian \
@@ -121,25 +121,27 @@ pub fn systematic_sample(
 pub fn place_anchors(
     num_anchors: u32,
     level: u32,
-    rng: &mut Seed,
+    draws: &mut dyn Draws,
     probs_at: &mut ProbsAt<'_>,
-) -> Vec<[f32; 3]> {
+) -> Result<Vec<[f32; 3]>, String> {
     let mut cells = vec![Cell {
         coords: [0, 0, 0],
         count: num_anchors,
     }];
     for depth in 1..=level {
         let coords: Vec<[u32; 3]> = cells.iter().map(|cell| cell.coords).collect();
-        let probabilities = probs_at(&coords, depth);
-        assert_eq!(
-            probabilities.len(),
-            cells.len(),
-            "the decoder must answer one distribution per cell at level {depth}"
-        );
+        let probabilities = probs_at(&coords, depth)?;
+        if probabilities.len() != cells.len() {
+            return Err(format!(
+                "the octree decoder answered {} distributions for {} cells at level {depth}",
+                probabilities.len(),
+                cells.len()
+            ));
+        }
         let mut next = Vec::with_capacity(cells.len() * CHILDREN);
         for (cell, probs) in cells.iter().zip(&probabilities) {
             let mut counts = [0u32; CHILDREN];
-            systematic_sample(probs, cell.count, rng, &mut counts);
+            systematic_sample(probs, cell.count, draws, &mut counts);
             for (child, count) in counts.into_iter().enumerate() {
                 if count == 0 {
                     continue;
@@ -163,21 +165,23 @@ pub fn place_anchors(
     for cell in &cells {
         for _ in 0..cell.count {
             anchors.push([
-                (cell.coords[0] as f32 + rng.next_f32()) / side,
-                (cell.coords[1] as f32 + rng.next_f32()) / side,
-                (cell.coords[2] as f32 + rng.next_f32()) / side,
+                (cell.coords[0] as f32 + draws.uniform()) / side,
+                (cell.coords[1] as f32 + draws.uniform()) / side,
+                (cell.coords[2] as f32 + draws.uniform()) / side,
             ]);
         }
     }
-    anchors
+    Ok(anchors)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::idol::draws::SeededDraws;
+    use shiso_core::ids::Seed;
 
-    fn rng() -> Seed {
-        Seed::new(7)
+    fn rng() -> SeededDraws {
+        SeededDraws::new(Seed::new(7))
     }
 
     #[test]
@@ -199,7 +203,12 @@ mod tests {
             let mut probs = [0.0f32; 8];
             probs[0] = 0.5;
             probs[1] = 0.5;
-            systematic_sample(&probs, 10, &mut Seed::new(seed), &mut counts);
+            systematic_sample(
+                &probs,
+                10,
+                &mut SeededDraws::new(Seed::new(seed)),
+                &mut counts,
+            );
             assert_eq!((counts[0], counts[1]), (5, 5), "seed {seed}");
         }
     }
@@ -250,9 +259,9 @@ mod tests {
         let mut probs_at = |coords: &[[u32; 3]], _level: u32| {
             let mut probs = [0.0f32; 8];
             probs[7] = 1.0;
-            vec![probs; coords.len()]
+            Ok(vec![probs; coords.len()])
         };
-        let anchors = place_anchors(16, 4, &mut rng(), &mut probs_at);
+        let anchors = place_anchors(16, 4, &mut rng(), &mut probs_at).expect("places");
         assert_eq!(anchors.len(), 16);
         let side = 16.0;
         for anchor in &anchors {
@@ -269,8 +278,8 @@ mod tests {
     fn the_descent_keeps_the_anchor_count_exact() {
         // A uniform split at every level: the counts must still sum to the
         // request, with no point lost to rounding.
-        let mut probs_at = |coords: &[[u32; 3]], _level: u32| vec![[0.125f32; 8]; coords.len()];
-        let anchors = place_anchors(37, 3, &mut rng(), &mut probs_at);
+        let mut probs_at = |coords: &[[u32; 3]], _level: u32| Ok(vec![[0.125f32; 8]; coords.len()]);
+        let anchors = place_anchors(37, 3, &mut rng(), &mut probs_at).expect("places");
         assert_eq!(anchors.len(), 37);
         for anchor in &anchors {
             for axis in anchor {
@@ -295,9 +304,9 @@ mod tests {
             } else {
                 probs[0] = 1.0;
             }
-            vec![probs; coords.len()]
+            Ok(vec![probs; coords.len()])
         };
-        let anchors = place_anchors(20, 2, &mut rng(), &mut probs_at);
+        let anchors = place_anchors(20, 2, &mut rng(), &mut probs_at).expect("places");
         assert_eq!(anchors.len(), 20);
         for anchor in &anchors {
             let x = anchor[0];

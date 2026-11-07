@@ -8,14 +8,6 @@
 //! [`super::gaussian::Field`]); its sixteen blocks add self attention among
 //! the anchors.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the splat generator's opener is the decoders' first caller"
-    )
-)]
-
 use std::path::Path;
 use std::sync::Arc;
 
