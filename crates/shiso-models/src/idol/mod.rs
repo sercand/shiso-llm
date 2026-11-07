@@ -14,3 +14,6 @@ pub mod octree;
 pub mod ply;
 pub mod preprocess;
 pub mod sampler;
+
+#[cfg(test)]
+mod device_tests;

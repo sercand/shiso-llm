@@ -22,6 +22,7 @@ pub(crate) mod scheduler;
 pub(crate) mod text_encoder;
 pub(crate) mod transformer;
 pub(crate) mod vae;
+pub(crate) mod vae_encoder;
 
 use crate::catalog::FamilyFacts;
 
