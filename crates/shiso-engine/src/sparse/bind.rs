@@ -493,6 +493,17 @@ pub enum Operand {
     /// reading a streamed target layer's map against them would send every
     /// column to the slot some other layer's expert sits at.
     ResidentExpertMap,
+    /// Bytes between consecutive slots of one routed bank of a target
+    /// layer, as an unsigned 32-bit scalar: `natural` - one expert's own
+    /// bytes - while the banks are resident, and the stream's slot width for
+    /// `role` while they are streamed, which a mixed-precision export sizes at
+    /// its widest layer.
+    ExpertStride {
+        /// The routed bank.
+        role: Role,
+        /// One expert's bytes in this layer's own format.
+        natural: u32,
+    },
     /// A pointer parameter the launcher passes as null.
     Null,
     /// An unsigned 32-bit scalar.
@@ -1055,6 +1066,15 @@ impl<'a> Binder<'a> {
                     })?
                     .map(layer)?,
             ),
+            Operand::ExpertStride { role, natural } => KernelArg::U32(match self.stream {
+                Some(stream) => u32::try_from(stream.slot_stride(role, WeightPart::Whole)?)
+                    .map_err(|_| CoreError::ShapeMismatch {
+                        field: "streamed expert slot bytes",
+                        expected: u64::from(u32::MAX),
+                        got: u64::MAX,
+                    })?,
+                None => natural,
+            }),
             Operand::ExpertMap(_) | Operand::ResidentExpertMap => KernelArg::Buffer(
                 self.weights
                     .expert_map

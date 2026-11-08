@@ -21,6 +21,7 @@ use shiso_core::DType;
 use shiso_core::error::{CoreError, CoreResult};
 
 use crate::sparse::bind::{Args, Operand};
+use crate::sparse::ggml;
 use crate::sparse::kernels::{self, Entry, MOD_EMBED};
 use crate::sparse::plan::Plan;
 use crate::sparse::shape::SparseShape;
@@ -136,6 +137,25 @@ pub fn rows(shape: &SparseShape, dtype: DType, bound: Bound, n_tok: u32) -> Core
                 ]),
             );
         }
+        // `out, tokens, w, n_tokens, n_embd` - the `q8_0` list, over a table
+        // kept in its GGUF blocks and decoded a row at a time.
+        stored if ggml::is_block(stored) => {
+            let entry = ggml::entry(stored, ggml::Stage::Embed).ok_or(CoreError::Unsupported {
+                what: "a block-quantized vocabulary table with no gather instantiated",
+                backend: "engine",
+            })?;
+            plan.launch(
+                entry,
+                ggml::embed_launch(n_tok),
+                Args::of(&[
+                    bound.dst,
+                    bound.ids,
+                    bound.table,
+                    Operand::U32(n_tok),
+                    Operand::U32(shape.hidden),
+                ]),
+            );
+        }
         _ => {
             return Err(CoreError::Unsupported {
                 what: "a vocabulary table stored in a format no row gather in this kernel set \
@@ -195,6 +215,8 @@ mod tests {
 
     #[test]
     fn a_format_no_entry_reads_is_refused_rather_than_approximated() {
+        let plan = rows(&shape(), DType::Q6_K, bound(), 8).expect("a GGUF block table");
+        assert_eq!(plan.names(), vec!["q4e_g_embed_q6_k_kernel"]);
         let err = rows(&shape(), DType::Q4_K, bound(), 8)
             .expect_err("no gather entry reads a k-quant table");
         assert!(matches!(err, CoreError::Unsupported { .. }), "{err:?}");

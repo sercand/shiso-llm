@@ -49,3 +49,10 @@ fn the_vocabulary_gather_decodes_rows_exactly() {
     let Some(gpu) = open() else { return };
     cases::the_vocabulary_gather_decodes_rows_exactly(&gpu);
 }
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn the_ngram_row_decode_places_iq4_nl_rows_exactly() {
+    let Some(gpu) = open() else { return };
+    cases::the_ngram_row_decode_places_iq4_nl_rows_exactly(&gpu);
+}

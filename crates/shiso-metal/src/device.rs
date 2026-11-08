@@ -581,9 +581,13 @@ impl Backend for MetalBackend {
         let length = usize::try_from(bytes).map_err(|_| {
             MetalError::backend("alloc_raw", format!("{bytes} bytes is unaddressable here"))
         })?;
+        // A zero-byte request still gets a real buffer, as the CUDA backend
+        // gives it a real address: a scratch slot a configuration leaves
+        // empty (the block taps without a block drafter) is still bound to its
+        // launch argument, and the device refuses a zero-length buffer.
         let buffer = self
             .device
-            .newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
+            .newBufferWithLength_options(length.max(1), MTLResourceOptions::StorageModeShared)
             .ok_or_else(|| {
                 MetalError::backend(
                     "alloc_raw",

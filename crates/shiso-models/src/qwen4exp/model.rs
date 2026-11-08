@@ -83,7 +83,7 @@ use shiso_engine::sparse::weights::{
     DraftHead, ExpertBank, Indexer, NgramBlock, Recurrent, SparseAttn, SparseBlock, SparseLayer,
     SparseWeights, StreamMix, Weight,
 };
-use shiso_modelfile::{GgufError, GgufFile, TensorView};
+use shiso_modelfile::{GgufError, GgufFile, TensorDesc, TensorView};
 use shiso_ple::{PleRowType, PleStream};
 
 use crate::qwen4exp::binding::{
@@ -91,6 +91,7 @@ use crate::qwen4exp::binding::{
     NGRAM_TABLE, NgramRoles, RecurrentRoles, bind_draft, bind_qwen4exp,
 };
 use crate::qwen4exp::config::Qwen4ExpConfig;
+use crate::qwen4exp::gguf_experts::{self, GgufExperts};
 use crate::qwen4exp::{exl3, mlx};
 
 /// The formats a bound projection may be stored as.
@@ -107,6 +108,11 @@ const SUPPORTED: &[DType] = &[
     DType::Q5_1,
     DType::Q4_K,
     DType::Q6_K,
+    DType::IQ2_S,
+    DType::IQ3_XXS,
+    DType::IQ4_XS,
+    DType::IQ4_NL,
+    DType::Q2_0,
     DType::Exl3K4,
     DType::Exl3K5,
     DType::Exl3K6,
@@ -226,18 +232,50 @@ impl Qwen4ExpModel {
         config: &Qwen4ExpConfig,
         opts: SparseOptions,
     ) -> CoreResult<Self> {
+        Self::load_gguf(
+            backend,
+            path,
+            Sidecars { draft, counts },
+            config,
+            opts,
+            GgufPlacement::default(),
+        )
+    }
+
+    /// [`Qwen4ExpModel::load_with`], with the routed banks placed as
+    /// `placement` says: imported in place, or read from disk into a pool of
+    /// expert slots as the routers pick them. An automatic choice streams them
+    /// when every weight does not fit in the device's working set with
+    /// `placement.reserve` bytes to spare.
+    ///
+    /// # Errors
+    ///
+    /// As [`Qwen4ExpModel::load_with`], plus [`CoreError::Unsupported`] when
+    /// not even one layer's experts fit beside the other weights.
+    pub fn load_gguf(
+        backend: &Arc<dyn Backend>,
+        path: &Path,
+        sidecars: Sidecars<'_>,
+        config: &Qwen4ExpConfig,
+        opts: SparseOptions,
+        placement: GgufPlacement,
+    ) -> CoreResult<Self> {
         let file = GgufFile::open_shared(path).map_err(open_failure)?;
         let binding = bind_qwen4exp(&file, config)?;
         let ngram = {
             let _tag = ledger::scope(MemTag::WeightsEmbedding);
-            open_ngram(backend, &file, path, &binding, config, opts)?
+            open_ngram(backend, &file, &binding, config, opts)?
         };
         let expert_gate = binding
             .layers
             .first()
             .map_or(binding.token_embd.dtype, |layer| layer.experts.gate.dtype);
-        let mut weights = import(backend, &file, &binding, opts.pack_halves)?;
-        if let Some(sidecar) = draft {
+        let shape = config.shape();
+        let (layers, experts) = (shape.n_layers(), shape.moe.experts);
+        let source = Arc::new(GgufExperts::open(&file, layers, experts)?);
+        let slots = gguf_slots(backend.as_ref(), &file, &source, experts, placement)?;
+        let mut weights = import(backend, &file, &binding, opts.pack_halves, slots.is_some())?;
+        if let Some(sidecar) = sidecars.draft {
             let _tag = ledger::scope(MemTag::DraftWeights);
             // Its own mapping, dropped with the target's: the head's tensors
             // take handles on it exactly as the target's do on the checkpoint.
@@ -253,7 +291,7 @@ impl Qwen4ExpModel {
             )?);
             drop(bound);
             drop(head);
-            if let Some(list) = counts {
+            if let Some(list) = sidecars.counts {
                 narrow_draft_head(backend, &mut weights, list, config.shape().vocab)?;
             }
         }
@@ -263,7 +301,23 @@ impl Qwen4ExpModel {
         drop(binding);
         drop(file);
 
-        let stack = SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
+        let free = device_free(backend.as_ref());
+        let mut stack =
+            SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
+        if let Some(slots) = slots {
+            let slots = beside_stack(backend.as_ref(), free, slots, source.slot_bytes());
+            let used = shape.moe.used;
+            let stream = gguf_experts::open_stream(
+                backend,
+                source,
+                layers,
+                experts,
+                used,
+                slots,
+                opts.prefill_rows,
+            )?;
+            stack.attach_expert_stream(stream)?;
+        }
         Ok(Self {
             info: ModelInfo {
                 context_capacity: stack.context_capacity(),
@@ -654,6 +708,89 @@ impl Qwen4ExpModel {
 /// many slots as fit once the rest of the weights and the reserve are
 /// accounted for. The n-gram table is never counted: it is streamed either
 /// way.
+/// The files a GGUF load reads beside the checkpoint.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Sidecars<'a> {
+    /// A draft head's own GGUF file.
+    pub draft: Option<&'a Path>,
+    /// The `id count` list a narrowed draft vocabulary is chosen from.
+    pub counts: Option<&'a Path>,
+}
+
+/// Where a GGUF load puts the routed expert banks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GgufPlacement {
+    /// `None` decides from the device; `Streamed { slots: 0 }` streams into a
+    /// pool sized to the device.
+    pub residency: Option<mlx::ExpertResidency>,
+    /// Bytes of the working set an automatic choice leaves for the cache and
+    /// the activations.
+    pub reserve: u64,
+}
+
+impl Default for GgufPlacement {
+    fn default() -> Self {
+        Self {
+            residency: None,
+            reserve: 6 << 30,
+        }
+    }
+}
+
+/// How many expert slots a GGUF load streams into, or `None` to import the
+/// banks in place.
+///
+/// The n-gram table is never counted: it is streamed either way.
+fn gguf_slots(
+    backend: &dyn Backend,
+    file: &GgufFile,
+    source: &GgufExperts,
+    experts: u32,
+    placement: GgufPlacement,
+) -> CoreResult<Option<u32>> {
+    let all = experts.saturating_mul(u32::try_from(source.layers()).unwrap_or(u32::MAX));
+    let sized = match placement.residency {
+        Some(mlx::ExpertResidency::Resident) => return Ok(None),
+        Some(mlx::ExpertResidency::Streamed { slots }) if slots > 0 => {
+            return Ok(Some(slots.min(all)));
+        }
+        Some(mlx::ExpertResidency::Streamed { .. }) => true,
+        None => false,
+    };
+    let total = backend.memory_info().map_or(u64::MAX, |info| info.total);
+    let banks = source.bank_bytes(experts);
+    let stored: u64 = file
+        .tensors()
+        .iter()
+        .filter(|desc| desc.name.as_ref() != NGRAM_TABLE)
+        .map(|desc| desc.bytes)
+        .sum();
+    let rest = stored.saturating_sub(banks);
+    let fixed = rest.saturating_add(placement.reserve);
+    if !sized && fixed.saturating_add(banks) <= total {
+        return Ok(None);
+    }
+    let room = total.saturating_sub(fixed);
+    let slots = u32::try_from(room / source.slot_bytes().max(1)).unwrap_or(u32::MAX);
+    if slots < experts {
+        return Err(CoreError::Unsupported {
+            what: "a device whose working set cannot hold one layer's routed experts beside \
+                   the rest of the weights",
+            backend: "qwen4exp",
+        });
+    }
+    tracing::info!(
+        total_gib = total >> 30,
+        other_weights_gib = rest >> 30,
+        reserve_gib = placement.reserve >> 30,
+        banks_gib = banks >> 30,
+        slot_kib = source.slot_bytes() >> 10,
+        slots,
+        "streaming the routed banks from disk"
+    );
+    Ok(Some(slots.min(all)))
+}
+
 /// What the device reports free, or `None` where it reports nothing.
 fn device_free(backend: &dyn Backend) -> Option<u64> {
     backend.memory_info().map(|info| info.free)
@@ -745,7 +882,6 @@ fn choose_residency(
 fn open_ngram(
     backend: &Arc<dyn Backend>,
     file: &GgufFile,
-    path: &Path,
     binding: &ModelBinding<'_>,
     config: &Qwen4ExpConfig,
     opts: SparseOptions,
@@ -806,7 +942,9 @@ fn open_ngram(
         });
     }
     let offset = u64::try_from(range_of(file, table)?.start).unwrap_or(u64::MAX);
-    let shard = std::fs::File::open(path).map_err(CoreError::Io)?;
+    // A split checkpoint keeps the table in one of its later shards; the
+    // offset is relative to that file.
+    let shard = std::fs::File::open(file.path_of(desc_of(file, table)?)).map_err(CoreError::Io)?;
     let stream = PleStream::open(
         shard,
         offset,
@@ -816,7 +954,13 @@ fn open_ngram(
         &opts.ngram_reader,
     )?;
     let resident_bias = bias
-        .map(|view| import_host(backend, file.mapping(), range_of(file, view)?))
+        .map(|view| {
+            import_host(
+                backend,
+                file.mapping_of(desc_of(file, view)?),
+                range_of(file, view)?,
+            )
+        })
         .transpose()?;
     NgramTable::new(table.dtype, Arc::new(stream), resident_bias)
 }
@@ -864,7 +1008,7 @@ fn import_draft(
             attn_mix: import_mix(backend, file, &binding.layer.attn_mix, pack)?,
             ffn_mix: import_mix(backend, file, &binding.layer.ffn_mix, pack)?,
             block: SparseBlock::Attn(import_attn(backend, file, roles)?),
-            experts: import_experts(backend, file, &binding.layer.experts, pack)?,
+            experts: import_experts(backend, file, &binding.layer.experts, pack, false)?,
             ngram: None,
             ordinal: rank,
         },
@@ -879,6 +1023,7 @@ fn import(
     file: &GgufFile,
     binding: &ModelBinding<'_>,
     pack: bool,
+    streamed: bool,
 ) -> CoreResult<SparseWeights> {
     let mut gdn_rank = 0;
     let mut attn_rank = 0;
@@ -907,7 +1052,7 @@ fn import(
         drop(mix);
         let experts = {
             let _tag = ledger::scope(MemTag::WeightsExperts);
-            import_experts(backend, file, &layer.experts, pack)?
+            import_experts(backend, file, &layer.experts, pack, streamed)?
         };
         let ngram = {
             let _tag = ledger::scope(MemTag::WeightsEmbedding);
@@ -945,7 +1090,9 @@ fn import(
         layers,
         draft: None,
         block_vocabulary: None,
-        expert_map: None,
+        // The identity a resident bank's stages read their slots through; a
+        // streamed bank reads the stream's own map instead.
+        expert_map: Some(identity_map(backend, binding)?),
     })
 }
 
@@ -968,18 +1115,53 @@ fn import_mix(
     })
 }
 
+/// The identity expert-to-slot map: expert `e` sits in slot `e` of a
+/// resident bank.
+fn identity_map(
+    backend: &Arc<dyn Backend>,
+    binding: &ModelBinding<'_>,
+) -> CoreResult<DeviceBuffer> {
+    let experts = binding
+        .layers
+        .first()
+        .and_then(|layer| layer.experts.gate.shape.dims().get(2).copied())
+        .unwrap_or(1);
+    let bytes: Vec<u8> = (0..u32::try_from(experts).unwrap_or(u32::MAX))
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let buffer = shiso_core::buffer::alloc(backend, bytes.len() as u64)?;
+    backend.copy_h2d(buffer.view(), &bytes)?;
+    Ok(buffer)
+}
+
 /// Moves one routed feed-forward to the device.
 fn import_experts(
     backend: &Arc<dyn Backend>,
     file: &GgufFile,
     roles: &ExpertRoles<'_>,
     pack: bool,
+    streamed: bool,
 ) -> CoreResult<ExpertBank> {
+    // A streamed bank is described, not imported: the stream reads its
+    // experts out of the file as the router picks them.
+    let bank = |view: &TensorView<'_>| -> CoreResult<Weight> {
+        if !streamed {
+            return weight(backend, file, view);
+        }
+        let dims = view.shape.dims();
+        Ok(Weight::streamed(
+            view.dtype,
+            extent(dims.first().copied().unwrap_or(0))?,
+            extent(dims.get(1).copied().unwrap_or(1))?,
+            extent(dims.get(2).copied().unwrap_or(1))?,
+            shiso_core::buffer::alloc(backend, 16)?,
+        ))
+    };
     Ok(ExpertBank {
         router: projection(backend, file, &roles.router, pack)?,
-        gate: weight(backend, file, &roles.gate)?,
-        up: weight(backend, file, &roles.up)?,
-        down: weight(backend, file, &roles.down)?,
+        gate: bank(&roles.gate)?,
+        up: bank(&roles.up)?,
+        down: bank(&roles.down)?,
         shared_router: projection(backend, file, &roles.shared_router, pack)?,
         shared_gate: weight(backend, file, &roles.shared_gate)?,
         shared_up: weight(backend, file, &roles.shared_up)?,
@@ -1081,10 +1263,10 @@ fn weight(
         in_dim,
         out_dim,
         slots,
-        file.mapping(),
+        file.mapping_of(desc_of(file, view)?),
         range.clone(),
     )?;
-    release(backend, file, range);
+    release(backend, file, view, range)?;
     Ok(weight)
 }
 
@@ -1104,7 +1286,7 @@ fn projection(
         let in_dim = extent(dims.first().copied().unwrap_or(0))?;
         let out_dim = extent(dims.get(1).copied().unwrap_or(1))?;
         let range = range_of(file, view)?;
-        let mapping = file.mapping();
+        let mapping = file.mapping_of(desc_of(file, view)?);
         let stored =
             AsRef::<[u8]>::as_ref(&*mapping)
                 .get(range.clone())
@@ -1114,7 +1296,7 @@ fn projection(
                     buffer_bytes: 0,
                 })?;
         if let Some(packed) = Weight::packed_half(backend, in_dim, out_dim, stored)? {
-            release(backend, file, range);
+            release(backend, file, view, range)?;
             return Ok(packed);
         }
     }
@@ -1127,10 +1309,16 @@ fn projection(
 /// The checkpoint is 105 GB and its weights 62; kept cached beside the device's
 /// copies, the file's pages are what the next allocation has to reclaim, which
 /// measured on a GB10 as 17 s of a 48 s load spent inside the allocator.
-fn release(backend: &Arc<dyn Backend>, file: &GgufFile, range: std::ops::Range<usize>) {
+fn release(
+    backend: &Arc<dyn Backend>,
+    file: &GgufFile,
+    view: &TensorView<'_>,
+    range: std::ops::Range<usize>,
+) -> CoreResult<()> {
     if backend.imports_copy() {
-        file.release_cached(range);
+        file.release_cached_of(desc_of(file, view)?, range);
     }
+    Ok(())
 }
 
 /// Imports one weight vector, which every format stores as plain `f32`.
@@ -1146,18 +1334,26 @@ fn vector(
         });
     }
     let range = range_of(file, view)?;
-    let buffer = import_host(backend, file.mapping(), range.clone())?;
-    release(backend, file, range);
+    let buffer = import_host(
+        backend,
+        file.mapping_of(desc_of(file, view)?),
+        range.clone(),
+    )?;
+    release(backend, file, view, range)?;
     Ok(buffer)
 }
 
 /// The file range one bound tensor occupies.
 fn range_of(file: &GgufFile, view: &TensorView<'_>) -> CoreResult<std::ops::Range<usize>> {
-    let desc = file.find(view.name).ok_or(CoreError::InvalidValue {
+    Ok(file.range_of(desc_of(file, view)?))
+}
+
+/// The directory entry of one bound tensor, which names its shard.
+fn desc_of<'f>(file: &'f GgufFile, view: &TensorView<'_>) -> CoreResult<&'f TensorDesc> {
+    file.find(view.name).ok_or(CoreError::InvalidValue {
         key: "tensor name",
         value: format!("{} was bound but is not in the directory", view.name),
-    })?;
-    Ok(file.range_of(desc))
+    })
 }
 
 /// Narrows one file dimension to the width a launch counts in.

@@ -643,15 +643,7 @@ pub fn load_model(
                     ),
                 }));
             }
-            let model = Qwen4ExpModel::load_with(
-                backend,
-                path,
-                args.draft_model.as_deref(),
-                draft_vocab_of(args),
-                &family,
-                sparse_options(args, opts, backend)?,
-            )
-            .map_err(FactoryError::Load)?;
+            let model = load_qwen4exp_gguf(backend, path, &family, args, opts)?;
             // This family shares the Qwen template's markers AND its tower:
             // the checkpoint carries one under the same `vision_tower` prefix,
             // at the same 27 blocks of width 1152, so it opens through the
@@ -1341,6 +1333,52 @@ pub fn takes_ngram(config: &HfConfig, path: &Path) -> bool {
         && shiso_models::qwen4exp::exl3::is_exl3_dir(path)
 }
 
+/// The sparse family's single-container load: the checkpoint (or the first
+/// shard of a split), a draft head beside it, and the routed banks placed as
+/// the expert flags say.
+fn load_qwen4exp_gguf(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    family: &Qwen4ExpConfig,
+    args: &ServeOptions,
+    opts: EngineOptions,
+) -> Result<Qwen4ExpModel, FactoryError> {
+    Qwen4ExpModel::load_gguf(
+        backend,
+        path,
+        shiso_models::qwen4exp::Sidecars {
+            draft: args.draft_model.as_deref(),
+            counts: draft_vocab_of(args),
+        },
+        family,
+        sparse_options(args, opts, backend)?,
+        gguf_placement(args),
+    )
+    .map_err(FactoryError::Load)
+}
+
+/// Where a sparse GGUF load puts its routed banks, from the expert flags.
+///
+/// `stream` without a slot count sizes the pool to the device, as the
+/// automatic choice does when the banks do not fit.
+fn gguf_placement(args: &ServeOptions) -> shiso_models::qwen4exp::GgufPlacement {
+    use shiso_models::qwen4exp::mlx::ExpertResidency;
+    let residency = match args.expert_residency {
+        crate::options::ExpertResidencyChoice::Resident => Some(ExpertResidency::Resident),
+        _ if args.expert_slots > 0 => Some(ExpertResidency::Streamed {
+            slots: args.expert_slots,
+        }),
+        crate::options::ExpertResidencyChoice::Stream => {
+            Some(ExpertResidency::Streamed { slots: 0 })
+        }
+        crate::options::ExpertResidencyChoice::Auto => None,
+    };
+    shiso_models::qwen4exp::GgufPlacement {
+        residency,
+        reserve: args.expert_reserve_gb.saturating_mul(1 << 30),
+    }
+}
+
 /// The sparse family's directory: the trellis export when its shard index
 /// names one, the MLX or reference export otherwise.
 fn load_qwen4exp_dir(
@@ -1502,7 +1540,6 @@ fn load_qwen4exp_mlx(
     opts: EngineOptions,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
-    use shiso_models::qwen4exp::mlx::ExpertResidency;
     if args.spec_k > 0 {
         return Err(FactoryError::Load(CoreError::Unsupported {
             what: "speculation on the MLX container, which carries no draft head",
@@ -1511,7 +1548,9 @@ fn load_qwen4exp_mlx(
     }
     let residency = match args.expert_residency {
         crate::options::ExpertResidencyChoice::Auto if args.expert_slots == 0 => None,
-        crate::options::ExpertResidencyChoice::Resident => Some(ExpertResidency::Resident),
+        crate::options::ExpertResidencyChoice::Resident => {
+            Some(shiso_models::qwen4exp::mlx::ExpertResidency::Resident)
+        }
         crate::options::ExpertResidencyChoice::Auto
         | crate::options::ExpertResidencyChoice::Stream => {
             let slots = if args.expert_slots == 0 {
@@ -1519,7 +1558,7 @@ fn load_qwen4exp_mlx(
             } else {
                 args.expert_slots
             };
-            Some(ExpertResidency::Streamed { slots })
+            Some(shiso_models::qwen4exp::mlx::ExpertResidency::Streamed { slots })
         }
     };
     let reserve = args.expert_reserve_gb.saturating_mul(1 << 30);

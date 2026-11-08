@@ -64,6 +64,9 @@ pub enum DType {
     BF16 = 30,
     /// Microscaling 4-bit with one shared exponent per 32 elements.
     MXFP4 = 39,
+    /// 2-bit linear quant: one `f16` scale per 64 elements and 2-bit codes
+    /// standing for -1, 0, 1 and 2 steps of it, four to a byte low bits first.
+    Q2_0 = 42,
     /// Trellis 4-bit codec, one 16x16 tile per block.
     Exl3K4 = 68,
     /// Trellis 5-bit codec, one 16x16 tile per block.
@@ -198,6 +201,7 @@ impl DType {
             21 => Some(Self::IQ3_S),
             22 => Some(Self::IQ2_S),
             23 => Some(Self::IQ4_XS),
+            42 => Some(Self::Q2_0),
             26 => Some(Self::I32),
             29 => Some(Self::IQ1_M),
             30 => Some(Self::BF16),
@@ -243,6 +247,7 @@ impl DType {
             Self::IQ3_XXS => "iq3_xxs",
             Self::IQ1_S => "iq1_s",
             Self::IQ4_NL => "iq4_nl",
+            Self::Q2_0 => "q2_0",
             Self::IQ3_S => "iq3_s",
             Self::IQ2_S => "iq2_s",
             Self::IQ4_XS => "iq4_xs",
@@ -292,7 +297,7 @@ impl DType {
             | Self::MXFP4
             | Self::MlxAffine4Gs32
             | Self::Mxfp8E4M3G32 => 32,
-            Self::MlxAffine4Gs64 | Self::MlxAffine8Gs64 => 64,
+            Self::MlxAffine4Gs64 | Self::MlxAffine8Gs64 | Self::Q2_0 => 64,
             Self::Exl3Ngram6 => 160,
             Self::Pq2_0 | Self::Ptq1_0 | Self::MlxAffine2Gs128 => 128,
             Self::Q2_K
@@ -328,7 +333,7 @@ impl DType {
             Self::Fp8E4M3 | Self::Fp8E4M3Block128 => 1,
             Self::F16 | Self::BF16 => 2,
             Self::F32 | Self::I32 => 4,
-            Self::Q4_0 | Self::IQ4_NL => 18,
+            Self::Q4_0 | Self::IQ4_NL | Self::Q2_0 => 18,
             Self::Q5_0 => 22,
             Self::Q5_1 => 24,
             Self::Q8_0 | Self::Pq2_0 => 34,

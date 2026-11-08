@@ -22,6 +22,7 @@
 using namespace metal;
 
 // GGML type ids of the formats decoded here.
+constant constexpr uint Q4E_G_F32 = 0;
 constant constexpr uint Q4E_G_Q8_0 = 8;
 constant constexpr uint Q4E_G_Q6_K = 14;
 constant constexpr uint Q4E_G_IQ3_XXS = 18;
@@ -39,6 +40,7 @@ constant constexpr uint Q4E_G_Q2_0 = 42;
 template <uint T>
 static inline ulong q4e_g_row_bytes(uint n) {
     switch (T) {
+        case Q4E_G_F32: return ulong(n) * 4ul;
         case Q4E_G_Q8_0: return ulong(n / 32u) * 34ul;
         case Q4E_G_IQ4_NL: return ulong(n / 32u) * 18ul;
         case Q4E_G_Q2_0: return ulong(n / 64u) * 18ul;
@@ -61,7 +63,14 @@ static inline float q4e_g_half(device const uchar *p) {
 template <uint T>
 static inline void q4e_g_deq32(device const uchar *row, uint s, thread float4 *qv) {
     float2 ab;
-    if (T == Q4E_G_Q8_0) {
+    if (T == Q4E_G_F32) {
+        // Single precision is here for the stream mixes' injections, whose
+        // other tier takes one row a launch.
+        device const float4 *v = (device const float4 *)(row + ulong(s) * 128ul);
+        for (short k = 0; k < 8; ++k) {
+            qv[k] = v[k];
+        }
+    } else if (T == Q4E_G_Q8_0) {
         device const uchar *b = row + ulong(s) * 34ul;
         const float d = q4e_g_half(b);
         device const char *q = (device const char *)(b + 2);
@@ -178,13 +187,15 @@ kernel void q4e_g_matvec_kernel(
 }
 
 /// One routed matrix over an active expert's sorted columns, the shared body
-/// of the gate/up and down stages. `slot` is the expert's place in the bank.
+/// of the gate/up and down stages. `slot` is the expert's place in the bank
+/// and `stride` the bytes between slots: one expert's own bytes in a resident
+/// bank, the pool's slot width (which may be wider) in a streamed one.
 template <uint T>
 static inline void q4e_g_expert_rows(device float *out, device const uchar *w,
                                      device const float *x, device const int *sorted, int c0,
-                                     int c1, ulong slot, uint o, uint in_dim, uint out_dim,
-                                     uint x_div, uint lane) {
-    device const uchar *row = w + (slot * out_dim + o) * q4e_g_row_bytes<T>(in_dim);
+                                     int c1, ulong slot, ulong stride, uint o, uint in_dim,
+                                     uint out_dim, uint x_div, uint lane) {
+    device const uchar *row = w + slot * stride + ulong(o) * q4e_g_row_bytes<T>(in_dim);
     for (int c = c0; c < c1; c += int(Q4E_G_COLS)) {
         const uint n_cols = min(Q4E_G_COLS, uint(c1 - c));
         ulong xoff[Q4E_G_COLS];
@@ -208,7 +219,7 @@ static inline void q4e_g_expert_rows(device float *out, device const uchar *w,
 /// contract without the affine parameter arrays.
 ///
 /// `out_gate, out_up, gate_w, up_w, x, sorted, bounds, active, map, in_dim,
-/// out_dim, n_expert, n_used`. Grid `(ceil(out_dim / Q4E_G_ROWS), groups)`,
+/// out_dim, n_expert, n_used, gate_stride, up_stride`. Grid `(ceil(out_dim / Q4E_G_ROWS), groups)`,
 /// block `32 * Q4E_G_ROWS`. A column `col` reads token `col / n_used`.
 template <uint T>
 kernel void q4e_g_experts_gate_up_kernel(
@@ -225,6 +236,8 @@ kernel void q4e_g_experts_gate_up_kernel(
         constant uint &out_dim [[buffer(10)]],
         constant uint &n_expert [[buffer(11)]],
         constant uint &n_used [[buffer(12)]],
+        constant uint &gate_stride [[buffer(13)]],
+        constant uint &up_stride [[buffer(14)]],
         uint3 group [[threadgroup_position_in_grid]],
         uint lane [[thread_index_in_simdgroup]],
         uint simd [[simdgroup_index_in_threadgroup]]) {
@@ -239,12 +252,14 @@ kernel void q4e_g_experts_gate_up_kernel(
         return;
     }
     const ulong slot = map[expert];
-    q4e_g_expert_rows<T>(out_gate, gate_w, x, sorted, c0, c1, slot, o, in_dim, out_dim, n_used, lane);
-    q4e_g_expert_rows<T>(out_up, up_w, x, sorted, c0, c1, slot, o, in_dim, out_dim, n_used, lane);
+    q4e_g_expert_rows<T>(out_gate, gate_w, x, sorted, c0, c1, slot, gate_stride, o, in_dim,
+                         out_dim, n_used, lane);
+    q4e_g_expert_rows<T>(out_up, up_w, x, sorted, c0, c1, slot, up_stride, o, in_dim, out_dim,
+                         n_used, lane);
 }
 
 /// The routed down projection: `out, down_w, mid, sorted, bounds, active,
-/// map, in_dim, out_dim, n_expert, n_used`. A column reads its own row of
+/// map, in_dim, out_dim, n_expert, n_used, stride`. A column reads its own row of
 /// `mid`. Grid and block as the gate/up stage.
 template <uint T>
 kernel void q4e_g_experts_down_kernel(
@@ -259,6 +274,7 @@ kernel void q4e_g_experts_down_kernel(
         constant uint &out_dim [[buffer(8)]],
         constant uint &n_expert [[buffer(9)]],
         constant uint &n_used [[buffer(10)]],
+        constant uint &stride [[buffer(11)]],
         uint3 group [[threadgroup_position_in_grid]],
         uint lane [[thread_index_in_simdgroup]],
         uint simd [[simdgroup_index_in_threadgroup]]) {
@@ -272,7 +288,8 @@ kernel void q4e_g_experts_down_kernel(
     if (c1 <= c0 || o >= out_dim) {
         return;
     }
-    q4e_g_expert_rows<T>(out, down_w, mid, sorted, c0, c1, map[expert], o, in_dim, out_dim, 1u, lane);
+    q4e_g_expert_rows<T>(out, down_w, mid, sorted, c0, c1, map[expert], stride, o, in_dim,
+                         out_dim, 1u, lane);
 }
 
 /// Vocabulary rows: `out[t * n_embd + i] = W[tokens[t]][i]`, the row decoded
@@ -310,16 +327,19 @@ kernel void q4e_g_embed_kernel(
                                     device const uchar *, device const float *,                 \
                                     device const int *, device const int *, device const int *, \
                                     device const uint *, constant uint &, constant uint &,      \
-                                    constant uint &, constant uint &, uint3, uint, uint);       \
+                                    constant uint &, constant uint &, constant uint &,          \
+                                    constant uint &, uint3, uint, uint);                        \
     template [[host_name("q4e_g_experts_down_" NAME "_kernel")]] kernel void                    \
     q4e_g_experts_down_kernel<T>(device float *, device const uchar *, device const float *,    \
                                  device const int *, device const int *, device const int *,    \
                                  device const uint *, constant uint &, constant uint &,         \
-                                 constant uint &, constant uint &, uint3, uint, uint);          \
+                                 constant uint &, constant uint &, constant uint &, uint3,      \
+                                 uint, uint);                                                   \
     template [[host_name("q4e_g_embed_" NAME "_kernel")]] kernel void q4e_g_embed_kernel<T>(    \
         device float *, device const int *, device const uchar *, constant uint &,              \
         constant uint &, uint3, uint);
 
+Q4E_G_INSTANTIATE(Q4E_G_F32, "f32")
 Q4E_G_INSTANTIATE(Q4E_G_Q8_0, "q8_0")
 Q4E_G_INSTANTIATE(Q4E_G_Q6_K, "q6_k")
 Q4E_G_INSTANTIATE(Q4E_G_IQ3_XXS, "iq3_xxs")

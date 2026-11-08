@@ -8,7 +8,7 @@
 use shiso_core::DType;
 
 /// Every variant, so the round-trip test cannot silently skip one.
-const ALL: [DType; 31] = [
+const ALL: [DType; 32] = [
     DType::F32,
     DType::F16,
     DType::Q4_0,
@@ -29,6 +29,7 @@ const ALL: [DType; 31] = [
     DType::IQ3_S,
     DType::IQ2_S,
     DType::IQ4_XS,
+    DType::Q2_0,
     DType::I32,
     DType::IQ1_M,
     DType::BF16,
@@ -61,7 +62,7 @@ fn on_disk_ids_are_unique() {
 
 #[test]
 fn discriminants_are_the_documented_ids() {
-    let expected: [(DType, u32); 31] = [
+    let expected: [(DType, u32); 32] = [
         (DType::F32, 0),
         (DType::F16, 1),
         (DType::Q4_0, 2),
@@ -82,6 +83,7 @@ fn discriminants_are_the_documented_ids() {
         (DType::IQ3_S, 21),
         (DType::IQ2_S, 22),
         (DType::IQ4_XS, 23),
+        (DType::Q2_0, 42),
         (DType::I32, 26),
         (DType::IQ1_M, 29),
         (DType::BF16, 30),

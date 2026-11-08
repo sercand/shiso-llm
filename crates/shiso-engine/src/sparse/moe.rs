@@ -43,6 +43,7 @@ use shiso_core::error::{CoreError, CoreResult};
 
 use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef, WeightSet};
 use crate::sparse::exl3::{self, Fanout};
+use crate::sparse::ggml;
 use crate::sparse::kernels::{
     self, Entry, MOD_EXL3, MOD_MODELOPT, MOD_MOE, MOD_NVFP4_A4, TemplateArgs,
 };
@@ -1859,6 +1860,146 @@ pub fn affine_experts(
     Ok(plan)
 }
 
+/// [`block`] over banks kept in their GGUF blocks: the same route, fetch,
+/// combine and shared expert as the affine stage, around the block entries.
+fn ggml_block(
+    shape: &SparseShape,
+    desc: &ExpertDesc,
+    layer: LayerRef,
+    n_tok: u32,
+    device: Device,
+) -> CoreResult<Plan> {
+    let mut plan = if route_sorts(shape, n_tok) {
+        let mut plan = router_logits(desc, layer, n_tok, device)?;
+        plan.append(route_sort(shape, n_tok, device));
+        plan
+    } else {
+        let mut plan = route(shape, desc, layer, n_tok, device)?;
+        plan.append(sort(shape, n_tok));
+        plan
+    };
+    if layer.set == WeightSet::Target {
+        plan.push(Step::Fetch {
+            layer: layer.index,
+            ids: u32::try_from(shape.moe.slot_rows(n_tok)).unwrap_or(u32::MAX),
+        });
+    }
+    plan.append(ggml_experts(shape, desc, layer, n_tok)?);
+    plan.append(combine(shape, n_tok));
+    with_shared(shape, desc, layer, n_tok, device, plan)
+}
+
+/// The expert stages over banks kept in their GGUF blocks: gate and up in one
+/// launch over the sorted columns, the activation, and the down projection,
+/// every stage reaching an expert's matrices through the layer's
+/// expert-to-slot map.
+///
+/// Gate and up share one format; down may be another, as a mixed-precision
+/// export stores it. The grid's second axis is one threadgroup per active
+/// expert, as the affine stage's.
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] when gate and up disagree on format, a bank is
+/// not a block format, or a width does not match the expert shape.
+pub fn ggml_experts(
+    shape: &SparseShape,
+    desc: &ExpertDesc,
+    layer: LayerRef,
+    n_tok: u32,
+) -> CoreResult<Plan> {
+    let hidden = shape.hidden;
+    let inter = shape.moe.intermediate;
+    let shapes_match = desc.gate.in_dim == hidden
+        && desc.gate.out_dim == inter
+        && desc.up.in_dim == hidden
+        && desc.up.out_dim == inter
+        && desc.down.in_dim == inter
+        && desc.down.out_dim == hidden;
+    let gate_up = ggml::entry(desc.gate.dtype, ggml::Stage::GateUp);
+    let down = ggml::entry(desc.down.dtype, ggml::Stage::Down);
+    let (Some(gate_up), Some(down)) = (gate_up, down) else {
+        return Err(CoreError::Unsupported {
+            what: "a routed bank in a block format with no expert entry instantiated",
+            backend: "engine",
+        });
+    };
+    if desc.up.dtype != desc.gate.dtype || !shapes_match {
+        return Err(CoreError::Unsupported {
+            what: "a routed expert stage whose gate and up disagree on format, or whose widths \
+                   are not the expert shape's",
+            backend: "engine",
+        });
+    }
+    let columns = u32::try_from(shape.moe.slot_rows(n_tok)).unwrap_or(u32::MAX);
+    let groups = columns.min(shape.moe.experts);
+    let at =
+        |role: Role| Operand::Weight(WeightRef::layer(layer, role).spanning(WeightPart::Whole));
+    // A target layer's banks may be streamed into slots sized for the widest
+    // layer; a draft head's are always resident at their own size.
+    let stride = |role: Role, w: &crate::sparse::weights::WeightDesc| -> CoreResult<Operand> {
+        let natural = crate::sparse::weights::Weight::payload_bytes(w.dtype, w.in_dim, w.out_dim)
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or(CoreError::ShapeMismatch {
+                field: "routed expert bytes",
+                expected: u64::from(u32::MAX),
+                got: u64::MAX,
+            })?;
+        Ok(match layer.set {
+            WeightSet::Target => Operand::ExpertStride { role, natural },
+            WeightSet::Draft => Operand::U32(natural),
+        })
+    };
+    let map = match layer.set {
+        WeightSet::Target => Operand::ExpertMap(layer.index),
+        WeightSet::Draft => Operand::ResidentExpertMap,
+    };
+    let tail = |in_dim: u32, out_dim: u32| {
+        [
+            Operand::Scratch(Buf::MoeSorted),
+            Operand::Scratch(Buf::MoeBounds),
+            Operand::Scratch(Buf::MoeActive),
+            map,
+            Operand::U32(in_dim),
+            Operand::U32(out_dim),
+            Operand::U32(shape.moe.experts),
+            Operand::U32(shape.moe.used),
+        ]
+    };
+    let mut plan = Plan::new();
+    // `out_gate, out_up, gate_w, up_w, x, sorted, bounds, active, map, in_dim,
+    //  out_dim, n_expert, n_used, gate_stride, up_stride`
+    let mut ops = vec![
+        Operand::Scratch(Buf::MoeGate),
+        Operand::Scratch(Buf::MoeUp),
+        at(Role::ExpertGate),
+        at(Role::ExpertUp),
+        Operand::Scratch(Buf::Mixed),
+    ];
+    ops.extend(tail(hidden, inter));
+    ops.push(stride(Role::ExpertGate, &desc.gate)?);
+    ops.push(stride(Role::ExpertUp, &desc.up)?);
+    plan.launch(gate_up, ggml::launch(inter, groups), Args::of(&ops));
+    plan.append(activate(
+        shape,
+        Operand::Scratch(Buf::MoeGate),
+        Operand::Scratch(Buf::MoeUp),
+        Operand::Scratch(Buf::MoeMid),
+        n_tok,
+    ));
+    // `out, down_w, mid, sorted, bounds, active, map, in_dim, out_dim,
+    //  n_expert, n_used, stride`
+    let mut ops = vec![
+        Operand::Scratch(Buf::MoeDown),
+        at(Role::ExpertDown),
+        Operand::Scratch(Buf::MoeMid),
+    ];
+    ops.extend(tail(inter, hidden));
+    ops.push(stride(Role::ExpertDown, &desc.down)?);
+    plan.launch(down, ggml::launch(hidden, groups), Args::of(&ops));
+    Ok(plan)
+}
+
 /// The activation between the up projection and the down one.
 ///
 /// `out, gate, up, n`. The three buffers are the caller's because this kernel
@@ -2199,6 +2340,21 @@ fn with_shared(
 /// staged gate-and-up belongs to a kernel set this build does not carry, and
 /// whatever the stages report.
 pub fn block(
+    shape: &SparseShape,
+    desc: &ExpertDesc,
+    layer: LayerRef,
+    n_tok: u32,
+    device: Device,
+) -> CoreResult<Plan> {
+    if ggml::is_block(desc.gate.dtype) {
+        ggml_block(shape, desc, layer, n_tok, device)
+    } else {
+        staged_block(shape, desc, layer, n_tok, device)
+    }
+}
+
+/// [`block`] over an affine, block-scaled or trellis bank.
+fn staged_block(
     shape: &SparseShape,
     desc: &ExpertDesc,
     layer: LayerRef,

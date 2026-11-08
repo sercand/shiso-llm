@@ -43,6 +43,8 @@ const COLS: usize = 8;
 /// A stored format the entries are instantiated for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
+    /// Single precision, read 32 floats at a time.
+    F32,
     /// 32 signed bytes and a half scale.
     Q8_0,
     /// 6-bit `K`-quant, 256 weights.
@@ -60,7 +62,8 @@ pub enum Format {
 }
 
 /// Every format, in instantiation order.
-pub const FORMATS: [Format; 7] = [
+pub const FORMATS: [Format; 8] = [
+    Format::F32,
     Format::Q8_0,
     Format::Q6K,
     Format::Iq3Xxs,
@@ -80,6 +83,7 @@ impl Format {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::F32 => "f32",
             Self::Q8_0 => "q8_0",
             Self::Q6K => "q6_k",
             Self::Iq3Xxs => "iq3_xxs",
@@ -94,6 +98,7 @@ impl Format {
     #[must_use]
     pub const fn block(self) -> (usize, usize) {
         match self {
+            Self::F32 => (32, 128),
             Self::Q8_0 => (32, 34),
             Self::Q6K => (256, 210),
             Self::Iq3Xxs => (256, 98),
@@ -114,6 +119,9 @@ impl Format {
 
     /// One random block with a small finite scale.
     fn random_block(self, rng: &mut u32) -> Vec<u8> {
+        if self == Self::F32 {
+            return f32_bytes(&signal(32, next(rng)));
+        }
         let (_, bytes) = self.block();
         let mut b: Vec<u8> = (0..bytes).map(|_| next(rng) as u8).collect();
         let scale = 0.002 + (next(rng) % 1000) as f32 * 1e-5;
@@ -165,6 +173,12 @@ impl Format {
                 }
                 out
             }
+            Self::F32 => b
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| f32::from_le_bytes(*w))
+                .collect(),
             Self::Iq3Xxs | Self::Iq2S | Self::Iq4Xs => {
                 let dtype = match self {
                     Self::Iq3Xxs => DType::IQ3_XXS,
@@ -201,6 +215,7 @@ fn entry(format: Format, stage: Stage) -> &'static str {
         };
     }
     match format {
+        Format::F32 => names!("f32"),
         Format::Q8_0 => names!("q8_0"),
         Format::Q6K => names!("q6_k"),
         Format::Iq3Xxs => names!("iq3_xxs"),
@@ -244,6 +259,20 @@ impl Bank {
             in_dim,
             out_dim,
         }
+    }
+
+    /// The bank laid out with `pad` bytes after every slot, as a streamed
+    /// pool sized for a wider layer holds it; returns the bytes and the
+    /// stride between slots.
+    fn padded(&self, slots: usize, pad: usize) -> (Vec<u8>, u32) {
+        let natural = self.bytes.len() / slots;
+        let stride = natural + pad;
+        let mut out = vec![0xA5u8; slots * stride];
+        for slot in 0..slots {
+            out[slot * stride..slot * stride + natural]
+                .copy_from_slice(&self.bytes[slot * natural..(slot + 1) * natural]);
+        }
+        (out, stride as u32)
     }
 
     fn project(&self, slot: usize, x: &[f32]) -> Vec<f32> {
@@ -320,7 +349,9 @@ pub fn the_dense_projection_matches_the_host_in_every_format(gpu: &Gpu) {
 }
 
 /// The routed stages: gate and up over a token's columns, then down over each
-/// column's own row, every expert reached through the slot map.
+/// column's own row, every expert reached through the slot map - in slots
+/// padded wider than one expert, as a streamed pool sized for another layer's
+/// format lays them out.
 pub fn the_routed_stages_match_the_host_in_every_format(gpu: &Gpu) {
     let (hidden, inter, experts, used, tokens) = (512usize, 256usize, 6usize, 2usize, 5usize);
     for (i, format) in FORMATS.into_iter().enumerate() {
@@ -351,10 +382,13 @@ pub fn the_routed_stages_match_the_host_in_every_format(gpu: &Gpu) {
         let cols = ids.len();
         let i32_le = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
         let u32_le = |v: &[u32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let (gate_bytes, gate_stride) = gate.padded(experts, 96);
+        let (up_bytes, up_stride) = up.padded(experts, 96);
+        let (down_bytes, down_stride) = down.padded(experts, 160);
         let (gw, uw, dw) = (
-            gpu.upload(&gate.bytes),
-            gpu.upload(&up.bytes),
-            gpu.upload(&down.bytes),
+            gpu.upload(&gate_bytes),
+            gpu.upload(&up_bytes),
+            gpu.upload(&down_bytes),
         );
         let xs = gpu.upload(&f32_bytes(&x));
         let sorted_b = gpu.upload(&i32_le(&sorted));
@@ -384,6 +418,8 @@ pub fn the_routed_stages_match_the_host_in_every_format(gpu: &Gpu) {
                     KernelArg::U32(inter as u32),
                     KernelArg::U32(experts as u32),
                     KernelArg::U32(used as u32),
+                    KernelArg::U32(gate_stride),
+                    KernelArg::U32(up_stride),
                 ],
             ),
         );
@@ -432,6 +468,7 @@ pub fn the_routed_stages_match_the_host_in_every_format(gpu: &Gpu) {
                     KernelArg::U32(hidden as u32),
                     KernelArg::U32(experts as u32),
                     KernelArg::U32(used as u32),
+                    KernelArg::U32(down_stride),
                 ],
             ),
         );
@@ -488,4 +525,38 @@ pub fn the_vocabulary_gather_decodes_rows_exactly(gpu: &Gpu) {
             .collect();
         assert!(got == want, "{}: gathered rows differ", format.name());
     }
+}
+
+/// The n-gram table's `IQ4_NL` row decode places each gathered row at its
+/// token and head slot, exactly.
+pub fn the_ngram_row_decode_places_iq4_nl_rows_exactly(gpu: &Gpu) {
+    let (head_dim, n_heads, n_tok) = (160usize, 3usize, 2usize);
+    let n_rows = n_heads * n_tok;
+    let bank = Bank::new(Format::Iq4Nl, 1, n_rows, head_dim, 1234);
+    let row_bytes = head_dim / 32 * 18;
+    let rows = gpu.upload(&bank.bytes);
+    let out = gpu.upload(&vec![0u8; n_rows * head_dim * 4]);
+    run(
+        gpu,
+        KernelRef::new("q4e_ple", "q4e_ple_dequant_kernel"),
+        &LaunchArgs::new(
+            Extent3::new(n_rows as u32, 1, 1),
+            Extent3::linear(32),
+            &[
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(rows.view()),
+                KernelArg::U32(head_dim as u32),
+                KernelArg::U32(n_heads as u32),
+                KernelArg::U32(row_bytes as u32),
+                KernelArg::U32(n_rows as u32),
+            ],
+        ),
+    );
+    drain(gpu);
+    // Row r is token r / n_heads, head r % n_heads: the gather order is
+    // already the output order.
+    assert!(
+        gpu.read_f32(&out) == bank.values,
+        "decoded n-gram rows differ"
+    );
 }
