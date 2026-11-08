@@ -20,6 +20,7 @@ pub mod ffn;
 pub mod fp8;
 pub mod gdn;
 pub mod gdn_fused;
+pub mod ggml;
 pub mod hc;
 pub mod hc_mix;
 pub mod idx;

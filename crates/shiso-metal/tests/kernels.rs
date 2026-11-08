@@ -56,6 +56,8 @@ mod q4e_affine;
 mod q4e_fp8;
 #[path = "q4e_gdn.rs"]
 mod q4e_gdn;
+#[path = "q4e_ggml.rs"]
+mod q4e_ggml;
 #[path = "q4e_hc.rs"]
 mod q4e_hc;
 #[path = "q4e_idx.rs"]

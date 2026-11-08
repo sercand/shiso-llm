@@ -337,6 +337,12 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "q4e/exact.metal",
         include_str!("../../../kernels/metal/q4e/exact.metal"),
     ),
+    // GGUF block-quantized projections, routed experts and vocabulary rows;
+    // after the generic set, whose IQ decoders and grid tables it calls.
+    (
+        "q4e/ggml.metal",
+        include_str!("../../../kernels/metal/q4e/ggml.metal"),
+    ),
     // --- audio encoder kernel set; appended, nothing above this line changed.
     (
         "audio_common.h",

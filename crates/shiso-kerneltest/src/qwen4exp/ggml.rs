@@ -1,0 +1,491 @@
+//! The sparse family's GGML block entries: dense projections, the routed
+//! expert stages and the vocabulary gather over weights kept in their GGUF
+//! blocks, graded against a host decode of the same bytes.
+//!
+//! The 256-weight i-quants are decoded on the host by the loader's own block
+//! decoders; the three formats it has none for (`q8_0`, `iq4_nl`, `q2_0`) and
+//! `q6_K` are restated here from the block layout, so a kernel and the host
+//! disagree whenever either misreads a bit.
+//!
+//! Block bytes are random apart from each scale field, which is set to a small
+//! finite half so every block decodes to finite weights. The budgets are
+//! relative to the magnitude of the sums: the device folds a row lane-major,
+//! the host in index order.
+#![expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "fixture dimensions are small literals, codes are a few bits wide, and the ids \
+              and column indices the kernels read as i32 are below a thousand"
+)]
+#![expect(
+    clippy::missing_panics_doc,
+    clippy::too_many_lines,
+    reason = "every case asserts by panicking, and the routed case runs both expert stages as \
+              one sequence"
+)]
+
+use crate::harness::{Gpu, drain, f32_bytes, run};
+use crate::oracle::signal;
+use half::f16;
+use shiso_core::{DType, Extent3, KernelArg, KernelRef, LaunchArgs};
+use shiso_modelfile::iq_quant::decode_block;
+
+/// The module every entry here is filed under.
+const MODULE: &str = "q4e_ggml";
+
+/// Output rows one threadgroup covers (`Q4E_G_ROWS`).
+const ROWS: usize = 4;
+/// Activation rows one pass carries (`Q4E_G_COLS`).
+const COLS: usize = 8;
+
+/// A stored format the entries are instantiated for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// 32 signed bytes and a half scale.
+    Q8_0,
+    /// 6-bit `K`-quant, 256 weights.
+    Q6K,
+    /// 3-bit grid i-quant, 256 weights.
+    Iq3Xxs,
+    /// 4-bit non-linear codebook, 32 weights.
+    Iq4Nl,
+    /// 2-bit grid i-quant, 256 weights.
+    Iq2S,
+    /// 4-bit non-linear codebook with 6-bit sub-scales, 256 weights.
+    Iq4Xs,
+    /// 2-bit codes standing for -1..2 steps, 64 weights.
+    Q2_0,
+}
+
+/// Every format, in instantiation order.
+pub const FORMATS: [Format; 7] = [
+    Format::Q8_0,
+    Format::Q6K,
+    Format::Iq3Xxs,
+    Format::Iq4Nl,
+    Format::Iq2S,
+    Format::Iq4Xs,
+    Format::Q2_0,
+];
+
+const IQ4NL: [f32; 16] = [
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0,
+    89.0, 113.0,
+];
+
+impl Format {
+    /// The name the entries carry.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Q8_0 => "q8_0",
+            Self::Q6K => "q6_k",
+            Self::Iq3Xxs => "iq3_xxs",
+            Self::Iq4Nl => "iq4_nl",
+            Self::Iq2S => "iq2_s",
+            Self::Iq4Xs => "iq4_xs",
+            Self::Q2_0 => "q2_0",
+        }
+    }
+
+    /// `(weights, bytes)` of one block.
+    #[must_use]
+    pub const fn block(self) -> (usize, usize) {
+        match self {
+            Self::Q8_0 => (32, 34),
+            Self::Q6K => (256, 210),
+            Self::Iq3Xxs => (256, 98),
+            Self::Iq4Nl => (32, 18),
+            Self::Iq2S => (256, 82),
+            Self::Iq4Xs => (256, 136),
+            Self::Q2_0 => (64, 18),
+        }
+    }
+
+    /// Byte offset of the block's half scale.
+    const fn scale_at(self) -> usize {
+        match self {
+            Self::Q6K => 208,
+            _ => 0,
+        }
+    }
+
+    /// One random block with a small finite scale.
+    fn random_block(self, rng: &mut u32) -> Vec<u8> {
+        let (_, bytes) = self.block();
+        let mut b: Vec<u8> = (0..bytes).map(|_| next(rng) as u8).collect();
+        let scale = 0.002 + (next(rng) % 1000) as f32 * 1e-5;
+        let at = self.scale_at();
+        b[at..at + 2].copy_from_slice(&f16::from_f32(scale).to_le_bytes());
+        if self == Self::Q6K {
+            // Sub-block scales are signed bytes; keep them small.
+            for s in &mut b[192..208] {
+                *s = ((next(rng) % 33) as i32 - 16) as i8 as u8;
+            }
+        }
+        b
+    }
+
+    /// Decodes one block on the host.
+    fn decode(self, b: &[u8]) -> Vec<f32> {
+        let d = f16::from_le_bytes([b[self.scale_at()], b[self.scale_at() + 1]]).to_f32();
+        match self {
+            Self::Q8_0 => b[2..34].iter().map(|&q| d * f32::from(q as i8)).collect(),
+            Self::Iq4Nl => {
+                let mut out = vec![0f32; 32];
+                for j in 0..16 {
+                    out[j] = d * IQ4NL[usize::from(b[2 + j] & 0xF)];
+                    out[j + 16] = d * IQ4NL[usize::from(b[2 + j] >> 4)];
+                }
+                out
+            }
+            Self::Q2_0 => (0..64)
+                .map(|e| {
+                    let q = (b[2 + e / 4] >> ((e % 4) * 2)) & 3;
+                    d * (f32::from(q) - 1.0)
+                })
+                .collect(),
+            Self::Q6K => {
+                let mut out = vec![0f32; 256];
+                for n in 0..2 {
+                    for l in 0..32 {
+                        let ql = &b[n * 64..];
+                        let qh = b[128 + n * 32 + l];
+                        let sc = |i: usize| f32::from(b[192 + n * 8 + i] as i8);
+                        let is = l / 16;
+                        let q =
+                            |low: u8, hi: u8| f32::from(((low & 0xF) | ((hi & 3) << 4)) as i8 - 32);
+                        out[n * 128 + l] = d * sc(is) * q(ql[l], qh);
+                        out[n * 128 + l + 32] = d * sc(is + 2) * q(ql[l + 32], qh >> 2);
+                        out[n * 128 + l + 64] = d * sc(is + 4) * q(ql[l] >> 4, qh >> 4);
+                        out[n * 128 + l + 96] = d * sc(is + 6) * q(ql[l + 32] >> 4, qh >> 6);
+                    }
+                }
+                out
+            }
+            Self::Iq3Xxs | Self::Iq2S | Self::Iq4Xs => {
+                let dtype = match self {
+                    Self::Iq3Xxs => DType::IQ3_XXS,
+                    Self::Iq2S => DType::IQ2_S,
+                    _ => DType::IQ4_XS,
+                };
+                let mut out = vec![0f32; 256];
+                decode_block(dtype, b, &mut out).expect("a whole i-quant block");
+                out
+            }
+        }
+    }
+}
+
+/// Which entry of a format's four.
+#[derive(Debug, Clone, Copy)]
+enum Stage {
+    Matvec,
+    GateUp,
+    Down,
+    Embed,
+}
+
+/// The entry name of `stage` for `format`.
+fn entry(format: Format, stage: Stage) -> &'static str {
+    macro_rules! names {
+        ($n:literal) => {
+            match stage {
+                Stage::Matvec => concat!("q4e_g_matvec_", $n, "_kernel"),
+                Stage::GateUp => concat!("q4e_g_experts_gate_up_", $n, "_kernel"),
+                Stage::Down => concat!("q4e_g_experts_down_", $n, "_kernel"),
+                Stage::Embed => concat!("q4e_g_embed_", $n, "_kernel"),
+            }
+        };
+    }
+    match format {
+        Format::Q8_0 => names!("q8_0"),
+        Format::Q6K => names!("q6_k"),
+        Format::Iq3Xxs => names!("iq3_xxs"),
+        Format::Iq4Nl => names!("iq4_nl"),
+        Format::Iq2S => names!("iq2_s"),
+        Format::Iq4Xs => names!("iq4_xs"),
+        Format::Q2_0 => names!("q2_0"),
+    }
+}
+
+fn next(rng: &mut u32) -> u32 {
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 17;
+    *rng ^= *rng << 5;
+    *rng
+}
+
+/// A bank of `slots` matrices of `out_dim` rows, stored and decoded.
+struct Bank {
+    bytes: Vec<u8>,
+    values: Vec<f32>,
+    in_dim: usize,
+    out_dim: usize,
+}
+
+impl Bank {
+    fn new(format: Format, slots: usize, out_dim: usize, in_dim: usize, seed: u32) -> Self {
+        let (per, _) = format.block();
+        assert_eq!(in_dim % per, 0, "{}: width {in_dim}", format.name());
+        let mut rng = seed | 1;
+        let mut bytes = Vec::new();
+        let mut values = Vec::new();
+        for _ in 0..slots * out_dim * in_dim / per {
+            let b = format.random_block(&mut rng);
+            values.extend(format.decode(&b));
+            bytes.extend(b);
+        }
+        Self {
+            bytes,
+            values,
+            in_dim,
+            out_dim,
+        }
+    }
+
+    fn project(&self, slot: usize, x: &[f32]) -> Vec<f32> {
+        (0..self.out_dim)
+            .map(|o| {
+                let row = &self.values[(slot * self.out_dim + o) * self.in_dim..][..self.in_dim];
+                row.iter()
+                    .zip(x)
+                    .map(|(w, v)| f64::from(*w) * f64::from(*v))
+                    .sum::<f64>() as f32
+            })
+            .collect()
+    }
+}
+
+fn assert_close(what: &str, got: &[f32], want: &[f32], rel: f32) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    let mean = want.iter().map(|v| v.abs()).sum::<f32>() / want.len().max(1) as f32;
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        let tol = rel * w.abs().max(mean).max(1e-6);
+        assert!(
+            (g - w).abs() <= tol,
+            "{what}: element {i} is {g}, the host says {w} (tolerance {tol})"
+        );
+    }
+}
+
+fn matvec(gpu: &Gpu, format: Format, bank: &Bank, x: &[f32], rows: usize) -> Vec<f32> {
+    let w = gpu.upload(&bank.bytes);
+    let xs = gpu.upload(&f32_bytes(&x[..rows * bank.in_dim]));
+    let out = gpu.upload(&vec![0u8; rows * bank.out_dim * 4]);
+    let args = [
+        KernelArg::Buffer(out.view()),
+        KernelArg::Buffer(w.view()),
+        KernelArg::Buffer(xs.view()),
+        KernelArg::U32(bank.in_dim as u32),
+        KernelArg::U32(bank.out_dim as u32),
+        KernelArg::U32(rows as u32),
+    ];
+    let grid = Extent3::new(
+        bank.out_dim.div_ceil(ROWS) as u32,
+        rows.div_ceil(COLS) as u32,
+        1,
+    );
+    run(
+        gpu,
+        KernelRef::new(MODULE, entry(format, Stage::Matvec)),
+        &LaunchArgs::new(grid, Extent3::linear((32 * ROWS) as u32), &args),
+    );
+    drain(gpu);
+    gpu.read_f32(&out)
+}
+
+/// Every format's dense projection matches the host at one row and at a row
+/// count with a partial last pass, and a row's result does not move when
+/// fewer rows share its pass.
+pub fn the_dense_projection_matches_the_host_in_every_format(gpu: &Gpu) {
+    for (i, format) in FORMATS.into_iter().enumerate() {
+        let (out_dim, in_dim, rows) = (37usize, 512usize, 11usize);
+        let bank = Bank::new(format, 1, out_dim, in_dim, 101 + i as u32);
+        let x = signal(rows * in_dim, 7 + i as u32);
+        let got = matvec(gpu, format, &bank, &x, rows);
+        let want: Vec<f32> = (0..rows)
+            .flat_map(|r| bank.project(0, &x[r * in_dim..(r + 1) * in_dim]))
+            .collect();
+        assert_close(format.name(), &got, &want, 2e-4);
+        let one = matvec(gpu, format, &bank, &x, 1);
+        assert!(
+            one == got[..out_dim],
+            "{}: row 0 moved alone",
+            format.name()
+        );
+    }
+}
+
+/// The routed stages: gate and up over a token's columns, then down over each
+/// column's own row, every expert reached through the slot map.
+pub fn the_routed_stages_match_the_host_in_every_format(gpu: &Gpu) {
+    let (hidden, inter, experts, used, tokens) = (512usize, 256usize, 6usize, 2usize, 5usize);
+    for (i, format) in FORMATS.into_iter().enumerate() {
+        let seed = 300 + 10 * i as u32;
+        let gate = Bank::new(format, experts, inter, hidden, seed);
+        let up = Bank::new(format, experts, inter, hidden, seed + 1);
+        let down = Bank::new(format, experts, hidden, inter, seed + 2);
+        let x = signal(tokens * hidden, seed + 3);
+        // Token t picks experts (t + k) % experts; slot map reverses the bank.
+        let ids: Vec<usize> = (0..tokens * used)
+            .map(|c| (c / used + c % used) % experts)
+            .collect();
+        let map: Vec<u32> = (0..experts).map(|e| (experts - 1 - e) as u32).collect();
+        let mut sorted = Vec::new();
+        let mut bounds = vec![0i32; experts + 1];
+        for (e, bound) in bounds.iter_mut().take(experts).enumerate() {
+            *bound = sorted.len() as i32;
+            sorted.extend((0..ids.len()).filter(|&c| ids[c] == e).map(|c| c as i32));
+        }
+        bounds[experts] = sorted.len() as i32;
+        let mut active: Vec<i32> = (0..experts as i32)
+            .filter(|&e| bounds[e as usize + 1] > bounds[e as usize])
+            .collect();
+        let n_active = active.len() as i32;
+        active.resize(experts, 0);
+        active.push(n_active);
+
+        let cols = ids.len();
+        let i32_le = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let u32_le = |v: &[u32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let (gw, uw, dw) = (
+            gpu.upload(&gate.bytes),
+            gpu.upload(&up.bytes),
+            gpu.upload(&down.bytes),
+        );
+        let xs = gpu.upload(&f32_bytes(&x));
+        let sorted_b = gpu.upload(&i32_le(&sorted));
+        let bounds_b = gpu.upload(&i32_le(&bounds));
+        let active_b = gpu.upload(&i32_le(&active));
+        let map_b = gpu.upload(&u32_le(&map));
+        let out_gate = gpu.upload(&vec![0u8; cols * inter * 4]);
+        let out_up = gpu.upload(&vec![0u8; cols * inter * 4]);
+        let block = Extent3::linear((32 * ROWS) as u32);
+        run(
+            gpu,
+            KernelRef::new(MODULE, entry(format, Stage::GateUp)),
+            &LaunchArgs::new(
+                Extent3::new(inter.div_ceil(ROWS) as u32, experts as u32, 1),
+                block,
+                &[
+                    KernelArg::Buffer(out_gate.view()),
+                    KernelArg::Buffer(out_up.view()),
+                    KernelArg::Buffer(gw.view()),
+                    KernelArg::Buffer(uw.view()),
+                    KernelArg::Buffer(xs.view()),
+                    KernelArg::Buffer(sorted_b.view()),
+                    KernelArg::Buffer(bounds_b.view()),
+                    KernelArg::Buffer(active_b.view()),
+                    KernelArg::Buffer(map_b.view()),
+                    KernelArg::U32(hidden as u32),
+                    KernelArg::U32(inter as u32),
+                    KernelArg::U32(experts as u32),
+                    KernelArg::U32(used as u32),
+                ],
+            ),
+        );
+        drain(gpu);
+        let got_gate = gpu.read_f32(&out_gate);
+        let got_up = gpu.read_f32(&out_up);
+        let mut want_gate = Vec::new();
+        let mut want_up = Vec::new();
+        for (c, &e) in ids.iter().enumerate() {
+            let xr = &x[(c / used) * hidden..][..hidden];
+            let slot = map[e] as usize;
+            want_gate.extend(gate.project(slot, xr));
+            want_up.extend(up.project(slot, xr));
+        }
+        assert_close(
+            &format!("{} gate", format.name()),
+            &got_gate,
+            &want_gate,
+            2e-4,
+        );
+        assert_close(&format!("{} up", format.name()), &got_up, &want_up, 2e-4);
+
+        // Down over the host's own activations, so it is graded on its own.
+        let mid: Vec<f32> = want_gate
+            .iter()
+            .zip(&want_up)
+            .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
+            .collect();
+        let mid_b = gpu.upload(&f32_bytes(&mid));
+        let out_down = gpu.upload(&vec![0u8; cols * hidden * 4]);
+        run(
+            gpu,
+            KernelRef::new(MODULE, entry(format, Stage::Down)),
+            &LaunchArgs::new(
+                Extent3::new(hidden.div_ceil(ROWS) as u32, experts as u32, 1),
+                block,
+                &[
+                    KernelArg::Buffer(out_down.view()),
+                    KernelArg::Buffer(dw.view()),
+                    KernelArg::Buffer(mid_b.view()),
+                    KernelArg::Buffer(sorted_b.view()),
+                    KernelArg::Buffer(bounds_b.view()),
+                    KernelArg::Buffer(active_b.view()),
+                    KernelArg::Buffer(map_b.view()),
+                    KernelArg::U32(inter as u32),
+                    KernelArg::U32(hidden as u32),
+                    KernelArg::U32(experts as u32),
+                    KernelArg::U32(used as u32),
+                ],
+            ),
+        );
+        drain(gpu);
+        let got_down = gpu.read_f32(&out_down);
+        let want_down: Vec<f32> = ids
+            .iter()
+            .enumerate()
+            .flat_map(|(c, &e)| down.project(map[e] as usize, &mid[c * inter..][..inter]))
+            .collect();
+        assert_close(
+            &format!("{} down", format.name()),
+            &got_down,
+            &want_down,
+            2e-4,
+        );
+    }
+}
+
+/// The vocabulary gather decodes a token's row exactly.
+pub fn the_vocabulary_gather_decodes_rows_exactly(gpu: &Gpu) {
+    for (i, format) in [Format::Q6K, Format::Q8_0].into_iter().enumerate() {
+        let (vocab, embd) = (40usize, 512usize);
+        let bank = Bank::new(format, 1, vocab, embd, 900 + i as u32);
+        let tokens: Vec<i32> = vec![3, 39, 0, 17];
+        let w = gpu.upload(&bank.bytes);
+        let ids = gpu.upload(
+            &tokens
+                .iter()
+                .flat_map(|t| t.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
+        let out = gpu.upload(&vec![0u8; tokens.len() * embd * 4]);
+        run(
+            gpu,
+            KernelRef::new(MODULE, entry(format, Stage::Embed)),
+            &LaunchArgs::new(
+                Extent3::new(tokens.len() as u32, 1, 1),
+                Extent3::linear(32),
+                &[
+                    KernelArg::Buffer(out.view()),
+                    KernelArg::Buffer(ids.view()),
+                    KernelArg::Buffer(w.view()),
+                    KernelArg::U32(tokens.len() as u32),
+                    KernelArg::U32(embd as u32),
+                ],
+            ),
+        );
+        drain(gpu);
+        let got = gpu.read_f32(&out);
+        let want: Vec<f32> = tokens
+            .iter()
+            .flat_map(|&t| bank.values[t as usize * embd..][..embd].to_vec())
+            .collect();
+        assert!(got == want, "{}: gathered rows differ", format.name());
+    }
+}
