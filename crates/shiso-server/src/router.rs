@@ -124,9 +124,22 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(crate::openai::transcription::transcriptions)
                 .layer(DefaultBodyLimit::max(upload_limit)),
         )
-        .merge(image_routes(image_upload_limit))
-        // `/embeddings` is the OpenRouter spelling, `/v1/embeddings` the
-        // OpenAI one; one handler answers both.
+        .route("/images", post(crate::openai::images::generate_images))
+        .route("/v1/images", post(crate::openai::images::generate_images))
+        .route(
+            "/v1/images/generations",
+            post(crate::openai::images::generate_images),
+        )
+        .route(
+            "/images/edits",
+            post(crate::openai::image_edits::edit_images)
+                .layer(DefaultBodyLimit::max(image_upload_limit)),
+        )
+        .route(
+            "/v1/images/edits",
+            post(crate::openai::image_edits::edit_images)
+                .layer(DefaultBodyLimit::max(image_upload_limit)),
+        )
         .route(
             "/embeddings",
             post(crate::openai::embeddings::create_embeddings),
@@ -135,7 +148,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/v1/embeddings",
             post(crate::openai::embeddings::create_embeddings),
         )
-        .merge(splat_routes())
+        .route(
+            "/v1/3d/generations",
+            post(crate::splat::generate::generate_splats)
+                .layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .method_not_allowed_fallback(misc_handlers::method_not_allowed)
         .fallback(misc_handlers::not_found)
         .layer(DefaultBodyLimit::max(max_body_bytes()));
@@ -151,46 +168,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // backtrace ends up in a response.
         .layer(CatchPanicLayer::new())
         .with_state(state)
-}
-
-/// The image generation and edit routes.
-///
-/// The three spellings of the generation route are one handler: `/images` is
-/// the `OpenRouter` shape, `/v1/images/generations` the `OpenAI` one, and
-/// `/v1/images` the shorthand both clients reach for. Edits carry reference
-/// pictures, so they take the image upload limit; the route's layer is the
-/// inner one and wins.
-fn image_routes(upload_limit: usize) -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/images", post(crate::openai::images::generate_images))
-        .route("/v1/images", post(crate::openai::images::generate_images))
-        .route(
-            "/v1/images/generations",
-            post(crate::openai::images::generate_images),
-        )
-        .route(
-            "/images/edits",
-            post(crate::openai::image_edits::edit_images)
-                .layer(DefaultBodyLimit::max(upload_limit)),
-        )
-        .route(
-            "/v1/images/edits",
-            post(crate::openai::image_edits::edit_images)
-                .layer(DefaultBodyLimit::max(upload_limit)),
-        )
-}
-
-/// The 3D generation route: one picture in, one Gaussian-splat `.ply` out.
-///
-/// Its body carries a base64 picture, so it gets its own ceiling rather than
-/// the JSON one. Kept out of [`build_router`] so that function stays a list of
-/// routes rather than a list of routes and their reasons.
-fn splat_routes() -> Router<Arc<AppState>> {
-    Router::new().route(
-        "/v1/3d/generations",
-        post(crate::splat::generate::generate_splats)
-            .layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
-    )
 }
 
 /// The configured body ceiling.
