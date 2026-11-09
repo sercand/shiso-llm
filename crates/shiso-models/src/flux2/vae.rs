@@ -35,7 +35,7 @@ use crate::diffusion::ops::{
 use crate::diffusion::weights::StStore;
 
 /// Group-norm epsilon the decoder uses (the reference's group-norm epsilon).
-const GN_EPS: f32 = 1e-6;
+pub(super) const GN_EPS: f32 = 1e-6;
 /// Scores the mid-block attention forms at once, in f32 elements (1 GiB):
 /// a 1024x1024 image's 16384 query rows fit in one block, and a 2048x2048
 /// one takes four.
@@ -43,23 +43,23 @@ const ATTN_SCORE_BUDGET: usize = 1 << 28;
 /// Batch-norm epsilon for the latent denormalization, used when the
 /// checkpoint's `vae/config.json` carries no `batch_norm_eps` (the reference
 /// trains with this value).
-const DEFAULT_BN_EPS: f32 = 1e-4;
+pub(super) const DEFAULT_BN_EPS: f32 = 1e-4;
 
 /// One convolution with its shape read from the weight tensor.
 #[derive(Debug)]
-struct Conv {
-    w: DeviceBuffer,
-    bias: Option<DeviceBuffer>,
-    out_c: usize,
-    in_c: usize,
-    k_h: usize,
-    k_w: usize,
+pub(super) struct Conv {
+    pub(super) w: DeviceBuffer,
+    pub(super) bias: Option<DeviceBuffer>,
+    pub(super) out_c: usize,
+    pub(super) in_c: usize,
+    pub(super) k_h: usize,
+    pub(super) k_w: usize,
 }
 
 /// A residual normalization block: two (norm, silu, conv) stages and an
 /// optional 1x1 shortcut.
 #[derive(Debug)]
-struct Resnet {
+pub(super) struct Resnet {
     norm1_w: DeviceBuffer,
     norm1_b: DeviceBuffer,
     conv1: Conv,
@@ -71,7 +71,7 @@ struct Resnet {
 
 /// The mid block's single-head spatial attention.
 #[derive(Debug)]
-struct SpatialAttention {
+pub(super) struct SpatialAttention {
     norm_w: DeviceBuffer,
     norm_b: DeviceBuffer,
     q: Conv,
@@ -90,10 +90,10 @@ struct UpBlock {
 /// convolutions it runs are same-padding, so only a shortcut or an upsampler
 /// changes it.
 #[derive(Debug, Clone, Copy)]
-struct Field {
-    channels: usize,
-    h: usize,
-    w: usize,
+pub(super) struct Field {
+    pub(super) channels: usize,
+    pub(super) h: usize,
+    pub(super) w: usize,
 }
 
 /// The loaded decoder.
@@ -113,9 +113,9 @@ pub(crate) struct Vae {
 }
 
 #[derive(Debug, Deserialize)]
-struct VaeConfig {
-    norm_num_groups: Option<usize>,
-    batch_norm_eps: Option<f32>,
+pub(super) struct VaeConfig {
+    pub(super) norm_num_groups: Option<usize>,
+    pub(super) batch_norm_eps: Option<f32>,
 }
 
 /// Reads one convolution weight and its bias, widened to the f32 the decoder
@@ -124,7 +124,7 @@ struct VaeConfig {
     clippy::cast_possible_truncation,
     reason = "safetensors dims are element counts of conv kernels; they fit usize on any supported target"
 )]
-fn load_conv(store: &StStore, ops: &Ops, name: &str) -> Result<Conv, ImageGenError> {
+pub(super) fn load_conv(store: &StStore, ops: &Ops, name: &str) -> Result<Conv, ImageGenError> {
     let weight_name = format!("{name}.weight");
     let entry = store.require(&weight_name)?;
     let shape = &entry.shape;
@@ -156,7 +156,7 @@ fn load_conv(store: &StStore, ops: &Ops, name: &str) -> Result<Conv, ImageGenErr
 
 /// Reads a group-norm affine pair (both widened to the f32 the decoder runs
 /// in), uploaded as vectors of `channels`.
-fn load_norm(
+pub(super) fn load_norm(
     store: &StStore,
     ops: &Ops,
     name: &str,
@@ -167,7 +167,7 @@ fn load_norm(
     ))
 }
 
-fn load_resnet(store: &StStore, ops: &Ops, base: &str) -> Result<Resnet, ImageGenError> {
+pub(super) fn load_resnet(store: &StStore, ops: &Ops, base: &str) -> Result<Resnet, ImageGenError> {
     let (norm1_w, norm1_b) = load_norm(store, ops, &format!("{base}norm1"))?;
     let (norm2_w, norm2_b) = load_norm(store, ops, &format!("{base}norm2"))?;
     Ok(Resnet {
@@ -182,6 +182,44 @@ fn load_resnet(store: &StStore, ops: &Ops, base: &str) -> Result<Resnet, ImageGe
         } else {
             None
         },
+    })
+}
+
+/// Reads a mid block's single-head spatial attention under `attn_base`.
+pub(super) fn load_attention(
+    store: &StStore,
+    ops: &Ops,
+    attn_base: &str,
+) -> Result<SpatialAttention, ImageGenError> {
+    let norm_base = if store.contains(&format!("{attn_base}norm.weight")) {
+        "norm"
+    } else {
+        "group_norm"
+    };
+    let (norm_w, norm_b) = {
+        let n = format!("{attn_base}{norm_base}");
+        (
+            store.f32_widen(ops, "vae norm affine", &format!("{n}.weight"))?,
+            store.f32_widen(ops, "vae norm affine", &format!("{n}.bias"))?,
+        )
+    };
+    // The reference names the attention output projection `to_out.0`
+    // (a Sequential); an export that flattened it may carry the upstream
+    // `out` instead. Try the reference spelling first and fall back to
+    // the upstream one; if neither is present the missing-tensor error
+    // names `out`, the last spelling tried.
+    let out_base = if store.contains(&format!("{attn_base}to_out.0.weight")) {
+        "to_out.0"
+    } else {
+        "out"
+    };
+    Ok(SpatialAttention {
+        norm_w,
+        norm_b,
+        q: load_conv(store, ops, &format!("{attn_base}to_q"))?,
+        k: load_conv(store, ops, &format!("{attn_base}to_k"))?,
+        v: load_conv(store, ops, &format!("{attn_base}to_v"))?,
+        out: load_conv(store, ops, &format!("{attn_base}{out_base}"))?,
     })
 }
 
@@ -228,37 +266,7 @@ impl Vae {
             load_resnet(&store, ops, "decoder.mid_block.resnets.0.")?,
             load_resnet(&store, ops, "decoder.mid_block.resnets.1.")?,
         ];
-        let attn_base = "decoder.mid_block.attentions.0.";
-        let norm_base = if store.contains(&format!("{attn_base}norm.weight")) {
-            "norm"
-        } else {
-            "group_norm"
-        };
-        let (norm_w, norm_b) = {
-            let n = format!("{attn_base}{norm_base}");
-            (
-                store.f32_widen(ops, "vae norm affine", &format!("{n}.weight"))?,
-                store.f32_widen(ops, "vae norm affine", &format!("{n}.bias"))?,
-            )
-        };
-        // The reference names the attention output projection `to_out.0`
-        // (a Sequential); an export that flattened it may carry the upstream
-        // `out` instead. Try the reference spelling first and fall back to
-        // the upstream one; if neither is present the missing-tensor error
-        // names `out`, the last spelling tried.
-        let out_base = if store.contains(&format!("{attn_base}to_out.0.weight")) {
-            "to_out.0"
-        } else {
-            "out"
-        };
-        let mid_attn = SpatialAttention {
-            norm_w,
-            norm_b,
-            q: load_conv(&store, ops, &format!("{attn_base}to_q"))?,
-            k: load_conv(&store, ops, &format!("{attn_base}to_k"))?,
-            v: load_conv(&store, ops, &format!("{attn_base}to_v"))?,
-            out: load_conv(&store, ops, &format!("{attn_base}{out_base}"))?,
-        };
+        let mid_attn = load_attention(&store, ops, "decoder.mid_block.attentions.0.")?;
 
         let depth = store
             .count_blocks("decoder.up_blocks.")
@@ -325,7 +333,7 @@ impl Vae {
         };
 
         // post_quant_conv and conv_in.
-        let y = Self::conv(
+        let y = conv(
             ops,
             &self.post_quant,
             x.view(),
@@ -336,7 +344,7 @@ impl Vae {
         field.channels = self.post_quant.out_c;
         drop(x);
         x = y;
-        let y = Self::conv(
+        let y = conv(
             ops,
             &self.conv_in,
             x.view(),
@@ -349,13 +357,27 @@ impl Vae {
         x = y;
 
         // Mid block.
-        x = self.resnet(ops, &self.mid_resnets[0], &x, &mut field, "vae mid0")?;
-        x = self.attention(ops, &self.mid_attn, &x, &field)?;
-        x = self.resnet(ops, &self.mid_resnets[1], &x, &mut field, "vae mid1")?;
+        x = resnet(
+            ops,
+            self.groups,
+            &self.mid_resnets[0],
+            &x,
+            &mut field,
+            "vae mid0",
+        )?;
+        x = attention(ops, self.groups, &self.mid_attn, &x, &field)?;
+        x = resnet(
+            ops,
+            self.groups,
+            &self.mid_resnets[1],
+            &x,
+            &mut field,
+            "vae mid1",
+        )?;
 
         // Up blocks; the last one has no upsampler.
         for (i, block) in self.up_blocks.iter().enumerate() {
-            for (j, resnet) in block.resnets.iter().enumerate() {
+            for (j, block_resnet) in block.resnets.iter().enumerate() {
                 let step: &'static str = match (i, j) {
                     (0, 0) => "vae up 0.0",
                     (0, 1) => "vae up 0.1",
@@ -371,7 +393,7 @@ impl Vae {
                     (3, 2) => "vae up 3.2",
                     _ => "vae up n",
                 };
-                x = self.resnet(ops, resnet, &x, &mut field, step)?;
+                x = resnet(ops, self.groups, block_resnet, &x, &mut field, step)?;
             }
             if let Some(up) = &block.upsample {
                 // The reference's upsampling: nearest 2x interpolation
@@ -394,7 +416,7 @@ impl Vae {
                 drop(x);
                 field.h *= 2;
                 field.w *= 2;
-                let y = Self::conv(
+                let y = conv(
                     ops,
                     up,
                     upsampled.view(),
@@ -429,7 +451,7 @@ impl Vae {
             normed.view(),
             field.channels * spatial,
         )?;
-        let rgb = Self::conv(
+        let rgb = conv(
             ops,
             &self.conv_out,
             normed.view(),
@@ -516,200 +538,211 @@ impl Vae {
         }
         Ok(z)
     }
+}
 
-    /// One convolution with its bias, returning the output buffer. The
-    /// spatial size is the field's; same-padding convolutions preserve it.
-    fn conv<'o>(
-        ops: &'o Ops,
-        conv: &Conv,
-        input: shiso_core::DeviceView<'_>,
-        in_c: usize,
-        field: &Field,
-        step: &'static str,
-    ) -> Result<Scratch<'o>, ImageGenError> {
-        let pad = conv.k_h / 2;
-        let out_h = (field.h + 2 * pad - conv.k_h) + 1;
-        let out_w = (field.w + 2 * pad - conv.k_w) + 1;
-        let out = ops.alloc_f32(step, conv.out_c * out_h * out_w)?;
-        ops.conv2d(&Conv2dCall {
-            step,
-            out: out.view(),
-            input,
-            weight: conv.w.view(),
-            bias: conv.bias.as_ref().map(DeviceBuffer::view),
-            batch: 1,
-            in_c,
-            in_h: field.h,
-            in_w: field.w,
-            out_c: conv.out_c,
-            out_h,
-            out_w,
-            k_h: conv.k_h,
-            k_w: conv.k_w,
-            stride: 1,
-            pad,
-        })?;
-        Ok(out)
-    }
+/// One convolution with its bias, returning the output buffer. The spatial
+/// size is the field's; same-padding convolutions preserve it.
+pub(super) fn conv<'o>(
+    ops: &'o Ops,
+    conv: &Conv,
+    input: shiso_core::DeviceView<'_>,
+    in_c: usize,
+    field: &Field,
+    step: &'static str,
+) -> Result<Scratch<'o>, ImageGenError> {
+    let pad = conv.k_h / 2;
+    let out_h = (field.h + 2 * pad - conv.k_h) + 1;
+    let out_w = (field.w + 2 * pad - conv.k_w) + 1;
+    let out = ops.alloc_f32(step, conv.out_c * out_h * out_w)?;
+    ops.conv2d(&Conv2dCall {
+        step,
+        out: out.view(),
+        input,
+        weight: conv.w.view(),
+        bias: conv.bias.as_ref().map(DeviceBuffer::view),
+        batch: 1,
+        in_c,
+        in_h: field.h,
+        in_w: field.w,
+        out_c: conv.out_c,
+        out_h,
+        out_w,
+        k_h: conv.k_h,
+        k_w: conv.k_w,
+        stride: 1,
+        pad,
+    })?;
+    Ok(out)
+}
 
-    /// One residual normalization block; updates the field's channels when a
-    /// shortcut changes them.
-    fn resnet<'o>(
-        &self,
-        ops: &'o Ops,
-        resnet: &Resnet,
-        x: &DeviceBuffer,
-        field: &mut Field,
-        step: &'static str,
-    ) -> Result<Scratch<'o>, ImageGenError> {
-        let spatial = field.h * field.w;
-        let xn = ops.alloc_f32(step, field.channels * spatial)?;
-        ops.group_norm(&GroupNormCall {
-            step,
-            out: xn.view(),
-            input: x.view(),
-            weight: resnet.norm1_w.view(),
-            bias: resnet.norm1_b.view(),
-            batch: 1,
-            groups: self.groups,
-            channels_per_group: field.channels / self.groups,
-            spatial,
-            eps: GN_EPS,
-        })?;
-        ops.silu(step, xn.view(), xn.view(), field.channels * spatial)?;
-        let mut y = Self::conv(ops, &resnet.conv1, xn.view(), field.channels, field, step)?;
-        ops.group_norm(&GroupNormCall {
-            step,
-            out: xn.view(),
-            input: y.view(),
-            weight: resnet.norm2_w.view(),
-            bias: resnet.norm2_b.view(),
-            batch: 1,
-            groups: self.groups,
-            channels_per_group: resnet.conv1.out_c / self.groups,
-            spatial,
-            eps: GN_EPS,
-        })?;
-        ops.silu(step, xn.view(), xn.view(), resnet.conv1.out_c * spatial)?;
-        y = Self::conv(
-            ops,
-            &resnet.conv2,
-            xn.view(),
-            resnet.conv1.out_c,
-            field,
-            step,
-        )?;
-        let summed = if let Some(shortcut) = &resnet.shortcut {
-            let s = Self::conv(ops, shortcut, x.view(), field.channels, field, step)?;
-            let out = ops.alloc_f32(step, shortcut.out_c * spatial)?;
-            ops.add(
-                step,
-                out.view(),
-                s.view(),
-                y.view(),
-                shortcut.out_c * spatial,
-            )?;
-            field.channels = shortcut.out_c;
-            out
-        } else {
-            let out = ops.alloc_f32(step, field.channels * spatial)?;
-            ops.add(
-                step,
-                out.view(),
-                x.view(),
-                y.view(),
-                field.channels * spatial,
-            )?;
-            out
-        };
-        Ok(summed)
-    }
-
-    /// Single-head spatial self-attention with a residual add: the group
-    /// norm feeds the q/k/v projections directly, with no activation between.
-    fn attention<'o>(
-        &self,
-        ops: &'o Ops,
-        attn: &SpatialAttention,
-        x: &DeviceBuffer,
-        field: &Field,
-    ) -> Result<Scratch<'o>, ImageGenError> {
-        let channels = field.channels;
-        let spatial = field.h * field.w;
-        let xn = ops.alloc_f32("vae attn norm", channels * spatial)?;
-        ops.group_norm(&GroupNormCall {
-            step: "vae attn norm",
-            out: xn.view(),
-            input: x.view(),
-            weight: attn.norm_w.view(),
-            bias: attn.norm_b.view(),
-            batch: 1,
-            groups: self.groups,
-            channels_per_group: channels / self.groups,
-            spatial,
-            eps: GN_EPS,
-        })?;
-        // No activation between the norm and the projections: the reference's
-        // attention block reads the normed field straight into q/k/v, unlike
-        // the resnet blocks, which do activate after each norm. A SiLU here
-        // would bend every mid-block attention statistic away from the
-        // trained field.
-        let q = Self::conv(ops, &attn.q, xn.view(), channels, field, "vae attn q")?;
-        let k = Self::conv(ops, &attn.k, xn.view(), channels, field, "vae attn k")?;
-        let v = Self::conv(ops, &attn.v, xn.view(), channels, field, "vae attn v")?;
-        // softmax(q k^T / sqrt(c)) v as two tiled GEMMs around a row
-        // softmax, a block of query rows at a time: the scores of a
-        // 1024x1024 image are 16384 x 16384, and the per-row attention
-        // kernel, which never forms them, spent 3.4 s there on an M1 Max.
-        // The GEMM reads its right operand as (n, k) rows, so q and k go to
-        // (spatial, channels) and v is read as it stands, (channels, spatial).
-        let qt = ops.alloc_f32("vae attn qt", spatial * channels)?;
-        let kt = ops.alloc_f32("vae attn kt", spatial * channels)?;
-        ops.transpose("vae attn t", qt.view(), q.view(), channels, spatial)?;
-        ops.transpose("vae attn t", kt.view(), k.view(), channels, spatial)?;
-        let at = ops.alloc_f32("vae attn ctx", spatial * channels)?;
-        let block = (ATTN_SCORE_BUDGET / spatial).clamp(1, spatial);
-        let scores = ops.alloc_f32("vae attn scores", block * spatial)?;
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a channel count (512) is exact in f32"
-        )]
-        let scale = 1.0 / (channels as f32).sqrt();
-        let row_bytes = |n: usize| (n * channels * 4) as u64;
-        for r0 in (0..spatial).step_by(block) {
-            let rows = block.min(spatial - r0);
-            let slab = scores.view().cut(0, (rows * spatial * 4) as u64)?;
-            ops.gemm(&GemmCall {
-                step: "vae attn scores",
-                out: slab,
-                input: qt.view().cut(row_bytes(r0), row_bytes(rows))?,
-                weight: LinWeight::f32(kt.view()),
-                m: rows,
-                n: spatial,
-                k: channels,
-            })?;
-            ops.softmax_rows("vae attn softmax", slab, rows, spatial, scale)?;
-            ops.gemm(&GemmCall {
-                step: "vae attn values",
-                out: at.view().cut(row_bytes(r0), row_bytes(rows))?,
-                input: slab,
-                weight: LinWeight::f32(v.view()),
-                m: rows,
-                n: channels,
-                k: spatial,
-            })?;
-        }
-        let ctx = ops.alloc_f32("vae attn ctx ch", channels * spatial)?;
-        ops.transpose("vae attn t", ctx.view(), at.view(), spatial, channels)?;
-        let proj = Self::conv(ops, &attn.out, ctx.view(), channels, field, "vae attn proj")?;
-        let out = ops.alloc_f32("vae attn residual", channels * spatial)?;
+/// One residual normalization block over `groups` groups; updates the
+/// field's channels when a shortcut changes them.
+pub(super) fn resnet<'o>(
+    ops: &'o Ops,
+    groups: usize,
+    resnet: &Resnet,
+    x: &DeviceBuffer,
+    field: &mut Field,
+    step: &'static str,
+) -> Result<Scratch<'o>, ImageGenError> {
+    let spatial = field.h * field.w;
+    let xn = ops.alloc_f32(step, field.channels * spatial)?;
+    ops.group_norm(&GroupNormCall {
+        step,
+        out: xn.view(),
+        input: x.view(),
+        weight: resnet.norm1_w.view(),
+        bias: resnet.norm1_b.view(),
+        batch: 1,
+        groups,
+        channels_per_group: field.channels / groups,
+        spatial,
+        eps: GN_EPS,
+    })?;
+    ops.silu(step, xn.view(), xn.view(), field.channels * spatial)?;
+    let mut y = conv(ops, &resnet.conv1, xn.view(), field.channels, field, step)?;
+    // The second norm's field is `conv1.out_c` wide. The decoder's blocks
+    // only keep or narrow the channels, so the first norm's buffer holds it;
+    // the encoder's widen them (128 to 256), and writing the wider field into
+    // the narrower buffer would run past its end.
+    let widened;
+    let hn = if resnet.conv1.out_c > field.channels {
+        widened = ops.alloc_f32(step, resnet.conv1.out_c * spatial)?;
+        &widened
+    } else {
+        &xn
+    };
+    ops.group_norm(&GroupNormCall {
+        step,
+        out: hn.view(),
+        input: y.view(),
+        weight: resnet.norm2_w.view(),
+        bias: resnet.norm2_b.view(),
+        batch: 1,
+        groups,
+        channels_per_group: resnet.conv1.out_c / groups,
+        spatial,
+        eps: GN_EPS,
+    })?;
+    ops.silu(step, hn.view(), hn.view(), resnet.conv1.out_c * spatial)?;
+    y = conv(
+        ops,
+        &resnet.conv2,
+        hn.view(),
+        resnet.conv1.out_c,
+        field,
+        step,
+    )?;
+    let summed = if let Some(shortcut) = &resnet.shortcut {
+        let s = conv(ops, shortcut, x.view(), field.channels, field, step)?;
+        let out = ops.alloc_f32(step, shortcut.out_c * spatial)?;
         ops.add(
-            "vae attn residual",
+            step,
+            out.view(),
+            s.view(),
+            y.view(),
+            shortcut.out_c * spatial,
+        )?;
+        field.channels = shortcut.out_c;
+        out
+    } else {
+        let out = ops.alloc_f32(step, field.channels * spatial)?;
+        ops.add(
+            step,
             out.view(),
             x.view(),
-            proj.view(),
-            channels * spatial,
+            y.view(),
+            field.channels * spatial,
         )?;
-        Ok(out)
+        out
+    };
+    Ok(summed)
+}
+
+/// Single-head spatial self-attention with a residual add: the group norm
+/// feeds the q/k/v projections directly, with no activation between.
+pub(super) fn attention<'o>(
+    ops: &'o Ops,
+    groups: usize,
+    attn: &SpatialAttention,
+    x: &DeviceBuffer,
+    field: &Field,
+) -> Result<Scratch<'o>, ImageGenError> {
+    let channels = field.channels;
+    let spatial = field.h * field.w;
+    let xn = ops.alloc_f32("vae attn norm", channels * spatial)?;
+    ops.group_norm(&GroupNormCall {
+        step: "vae attn norm",
+        out: xn.view(),
+        input: x.view(),
+        weight: attn.norm_w.view(),
+        bias: attn.norm_b.view(),
+        batch: 1,
+        groups,
+        channels_per_group: channels / groups,
+        spatial,
+        eps: GN_EPS,
+    })?;
+    // No activation between the norm and the projections: the reference's
+    // attention block reads the normed field straight into q/k/v, unlike
+    // the resnet blocks, which do activate after each norm. A SiLU here
+    // would bend every mid-block attention statistic away from the
+    // trained field.
+    let q = conv(ops, &attn.q, xn.view(), channels, field, "vae attn q")?;
+    let k = conv(ops, &attn.k, xn.view(), channels, field, "vae attn k")?;
+    let v = conv(ops, &attn.v, xn.view(), channels, field, "vae attn v")?;
+    // softmax(q k^T / sqrt(c)) v as two tiled GEMMs around a row
+    // softmax, a block of query rows at a time: the scores of a
+    // 1024x1024 image are 16384 x 16384, and the per-row attention
+    // kernel, which never forms them, spent 3.4 s there on an M1 Max.
+    // The GEMM reads its right operand as (n, k) rows, so q and k go to
+    // (spatial, channels) and v is read as it stands, (channels, spatial).
+    let qt = ops.alloc_f32("vae attn qt", spatial * channels)?;
+    let kt = ops.alloc_f32("vae attn kt", spatial * channels)?;
+    ops.transpose("vae attn t", qt.view(), q.view(), channels, spatial)?;
+    ops.transpose("vae attn t", kt.view(), k.view(), channels, spatial)?;
+    let at = ops.alloc_f32("vae attn ctx", spatial * channels)?;
+    let block = (ATTN_SCORE_BUDGET / spatial).clamp(1, spatial);
+    let scores = ops.alloc_f32("vae attn scores", block * spatial)?;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a channel count (512) is exact in f32"
+    )]
+    let scale = 1.0 / (channels as f32).sqrt();
+    let row_bytes = |n: usize| (n * channels * 4) as u64;
+    for r0 in (0..spatial).step_by(block) {
+        let rows = block.min(spatial - r0);
+        let slab = scores.view().cut(0, (rows * spatial * 4) as u64)?;
+        ops.gemm(&GemmCall {
+            step: "vae attn scores",
+            out: slab,
+            input: qt.view().cut(row_bytes(r0), row_bytes(rows))?,
+            weight: LinWeight::f32(kt.view()),
+            m: rows,
+            n: spatial,
+            k: channels,
+        })?;
+        ops.softmax_rows("vae attn softmax", slab, rows, spatial, scale)?;
+        ops.gemm(&GemmCall {
+            step: "vae attn values",
+            out: at.view().cut(row_bytes(r0), row_bytes(rows))?,
+            input: slab,
+            weight: LinWeight::f32(v.view()),
+            m: rows,
+            n: channels,
+            k: spatial,
+        })?;
     }
+    let ctx = ops.alloc_f32("vae attn ctx ch", channels * spatial)?;
+    ops.transpose("vae attn t", ctx.view(), at.view(), spatial, channels)?;
+    let proj = conv(ops, &attn.out, ctx.view(), channels, field, "vae attn proj")?;
+    let out = ops.alloc_f32("vae attn residual", channels * spatial)?;
+    ops.add(
+        "vae attn residual",
+        out.view(),
+        x.view(),
+        proj.view(),
+        channels * spatial,
+    )?;
+    Ok(out)
 }

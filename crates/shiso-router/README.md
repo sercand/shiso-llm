@@ -11,6 +11,7 @@ An HTTP router that proxies LLM API requests to third-party backend services. Cl
 | `POST /v1/embeddings` | OpenAI Embeddings |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/images/generations` | OpenAI Image Generation (also `/v1/images`, `/images`) |
+| `POST /v1/3d/generations` | 3D Gaussian-splat generation (also `/3d/generations`) |
 
 The router picks a backend based on the `model` field in the request body, swaps the client's router token for the backend's real API key, optionally renames the model, and streams the response through untouched.
 

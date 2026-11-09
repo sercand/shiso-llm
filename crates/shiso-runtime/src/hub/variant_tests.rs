@@ -252,6 +252,51 @@ fn image_variant_resolves_to_model_and_assets() {
     assert_eq!(args.model, None);
 }
 
+/// A splat variant hands its three directories to `--splat-model`,
+/// `--splat-encoder` and `--splat-vae`, and answers to the recipe's name.
+#[test]
+fn splat_variant_resolves_to_its_three_directories() {
+    let sha = "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a";
+    let rev = "3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c";
+    let component = |repo: &str, file: &str| {
+        format!(
+            r#"{{"provider": "huggingface", "repo": "{repo}", "revision": "{rev}",
+                "files": [{{"name": "{file}", "size": 10, "sha256": "{sha}"}}]}}"#
+        )
+    };
+    let recipe: Recipe = serde_json::from_str(&format!(
+        r#"{{
+          "schema_version": 1, "name": "splat-test", "family": "idol",
+          "min_shiso_version": "0.1.0", "description": "x",
+          "tasks": ["splat_generation"], "features": {{}},
+          "modalities": {{"inputs": ["image"], "outputs": ["image"]}},
+          "variants": [{{
+            "key": "f32", "backends": ["metal"], "quant": "f32",
+            "requirements": {{"min_ram_bytes": 1, "disk_bytes": 30}},
+            "components": {{
+              "splat": {},
+              "splat_encoder": {},
+              "splat_vae": {}
+            }}
+          }}]
+        }}"#,
+        component("o/splat", "config.json"),
+        component("o/encoder", "config.json"),
+        component("o/vae", "vae/config.json"),
+    ))
+    .expect("recipe parses");
+    validate_recipe(&recipe, ValidationMode::Strict).expect("recipe validates");
+    let mut args = ServeOptions::default();
+    let vdir = Path::new("/hub/models/splat-test/f32");
+    fill_options_from_variant(&mut args, vdir, &recipe.variants[0], &recipe.name)
+        .expect("populates");
+    assert_eq!(args.splat_model, Some(vdir.join("splat")));
+    assert_eq!(args.splat_encoder, Some(vdir.join("splat_encoder")));
+    assert_eq!(args.splat_vae, Some(vdir.join("splat_vae")));
+    assert_eq!(args.splat_model_id.as_deref(), Some("splat-test"));
+    assert_eq!(args.model, None);
+}
+
 /// A fine-tune shipped as one GGUF: the base model's sidecar is the config, and
 /// the publisher's sampling settings are a registry-hosted file of their own.
 const GGUF_WITH_SAMPLING: &str = r#"{

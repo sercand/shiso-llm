@@ -202,6 +202,7 @@ fn the_real_manifest_tree_parses() {
             "qwen35moe",
             "repack",
             "sample",
+            "splat",
             "ternary",
             "vision",
             "vision_attn",

@@ -412,6 +412,12 @@ pub enum Role {
     /// prompt is split with, when no assets directory carries it. Names a
     /// file.
     ImageTokenizer,
+    /// 3D splat model checkpoint directory (`--splat-model`).
+    Splat,
+    /// The splat model's image encoder directory (`--splat-encoder`).
+    SplatEncoder,
+    /// The splat model's latent autoencoder directory (`--splat-vae`).
+    SplatVae,
     /// Per-layer n-gram embedding table (`--ngram`).
     ///
     /// For a checkpoint that keeps the table in a file of its own rather than
@@ -450,6 +456,9 @@ impl Role {
             Self::ImageTextEncoder => "--image-text-encoder",
             Self::ImageVae => "--image-vae",
             Self::ImageTokenizer => "--image-tokenizer",
+            Self::Splat => "--splat-model",
+            Self::SplatEncoder => "--splat-encoder",
+            Self::SplatVae => "--splat-vae",
             Self::Ngram => "--ngram",
             Self::GenerationConfig => "--generation-config",
             Self::Config => "--config",
@@ -472,6 +481,9 @@ impl Role {
             Self::ImageTextEncoder => "image_text_encoder",
             Self::ImageVae => "image_vae",
             Self::ImageTokenizer => "image_tokenizer",
+            Self::Splat => "splat",
+            Self::SplatEncoder => "splat_encoder",
+            Self::SplatVae => "splat_vae",
             Self::Ngram => "ngram",
             Self::GenerationConfig => "generation_config",
             Self::Config => "config",
@@ -501,6 +513,9 @@ impl FromStr for Role {
             "image_text_encoder" => Ok(Self::ImageTextEncoder),
             "image_vae" => Ok(Self::ImageVae),
             "image_tokenizer" => Ok(Self::ImageTokenizer),
+            "splat" => Ok(Self::Splat),
+            "splat_encoder" => Ok(Self::SplatEncoder),
+            "splat_vae" => Ok(Self::SplatVae),
             "ngram" => Ok(Self::Ngram),
             "generation_config" => Ok(Self::GenerationConfig),
             "config" => Ok(Self::Config),
@@ -523,6 +538,8 @@ pub enum Task {
     Diarization,
     /// Image generation.
     ImageGeneration,
+    /// 3D Gaussian-splat generation from one picture.
+    SplatGeneration,
     /// Text or multimodal embeddings.
     Embedding,
     /// Schema decisions answered by a decision head.
@@ -538,6 +555,7 @@ impl Task {
             Self::Transcription => "transcription",
             Self::Diarization => "diarization",
             Self::ImageGeneration => "image_generation",
+            Self::SplatGeneration => "splat_generation",
             Self::Embedding => "embedding",
             Self::Decision => "decision",
         }
@@ -558,6 +576,7 @@ impl FromStr for Task {
             "transcription" => Ok(Self::Transcription),
             "diarization" => Ok(Self::Diarization),
             "image_generation" => Ok(Self::ImageGeneration),
+            "splat_generation" => Ok(Self::SplatGeneration),
             "embedding" => Ok(Self::Embedding),
             "decision" => Ok(Self::Decision),
             _ => Err(HubError::Validation {

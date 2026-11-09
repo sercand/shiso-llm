@@ -715,6 +715,10 @@ pub const CASES: &[Case] = &[
         name: "vit_q_blas_fc2_196",
         build: crate::vision::quant::bench_blas_fc2_196,
     },
+    Case {
+        name: "splat_attn_f32_12294x16h64",
+        build: crate::splat::bench_attention,
+    },
 ];
 
 /// What [`time`] measured.

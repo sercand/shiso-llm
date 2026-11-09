@@ -76,6 +76,8 @@ mod q4e_qsa;
 mod q4e_route;
 #[path = "sample_kernels.rs"]
 mod sample_kernels;
+#[path = "splat_kernels.rs"]
+mod splat_kernels;
 #[path = "ternary.rs"]
 mod ternary;
 #[path = "vision_kernels.rs"]

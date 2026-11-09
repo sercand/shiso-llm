@@ -39,6 +39,11 @@ pub(crate) enum Dialect {
     /// so it is recovered from a bounded tail window rather than a whole
     /// parse.
     Images,
+    /// 3D generation (`/v1/3d/generations`). Bodies are mostly base64
+    /// `.ply` data, and the usage object rides at the end of the response
+    /// (or of the streamed `splat_generation.completed` frame), so it is
+    /// recovered from a bounded tail window rather than a whole parse.
+    Splat,
     Anthropic,
 }
 
@@ -56,6 +61,8 @@ impl Dialect {
             Dialect::Scoring
         } else if path.ends_with("/v1/images/generations") {
             Dialect::Images
+        } else if path.ends_with("/v1/3d/generations") {
+            Dialect::Splat
         } else {
             Dialect::OpenAiChat
         }
@@ -133,8 +140,9 @@ enum Mode {
         partial: Vec<u8>,
         skipping_oversized: bool,
         /// The last `MAX_EDGE_WINDOW` bytes of the line being skipped, kept
-        /// only for `Dialect::Images`: a streamed image frame is far over
-        /// `MAX_SSE_LINE`, and the completed frame's `usage` is at its end.
+        /// only for `Dialect::Images` and `Dialect::Splat`: a streamed image
+        /// or splat frame is far over `MAX_SSE_LINE`, and the completed
+        /// frame's `usage` is at its end.
         oversized_tail: Vec<u8>,
     },
     Json {
@@ -187,7 +195,10 @@ impl UsageAccumulator {
                 },
                 false,
             )
-        } else if matches!(dialect, Dialect::OpenAiEmbeddings | Dialect::Images) {
+        } else if matches!(
+            dialect,
+            Dialect::OpenAiEmbeddings | Dialect::Images | Dialect::Splat
+        ) {
             (
                 Mode::Edges {
                     head: Vec::new(),
@@ -253,7 +264,7 @@ impl UsageAccumulator {
                 skipping_oversized,
                 oversized_tail,
             } => {
-                let keep_tail = self.dialect == Dialect::Images;
+                let keep_tail = matches!(self.dialect, Dialect::Images | Dialect::Splat);
                 let mut rest = chunk;
                 while let Some(pos) = rest.iter().position(|&b| b == b'\n') {
                     let (head, tail) = rest.split_at(pos);
@@ -368,7 +379,7 @@ impl UsageAccumulator {
 }
 
 /// The longest SSE line parsed whole for `dialect`; a longer one is skipped
-/// (`Dialect::Images` recovers usage from its tail).
+/// (`Dialect::Images` and `Dialect::Splat` recover usage from its tail).
 fn sse_line_cap(dialect: Dialect) -> usize {
     match dialect {
         Dialect::OpenAiResponses => MAX_RESPONSES_SSE_LINE,
@@ -386,9 +397,9 @@ fn push_window(window: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Recovers usage from the tail of an SSE line too long to parse whole.
-/// Empty for every dialect but `Images`, which is the only one that fills
-/// the tail; base64 carries no quotes, so `last_usage_object` cannot be
-/// fooled by the image payload in front of the `usage` key.
+/// Empty for every dialect but `Images` and `Splat`, which are the only ones
+/// that fill the tail; base64 carries no quotes, so `last_usage_object`
+/// cannot be fooled by the payload in front of the `usage` key.
 fn finish_oversized_line(ext: &mut Extracted, tail: &mut Vec<u8>) {
     if let Some(usage) = last_usage_object(tail) {
         apply_openai_usage(ext, &usage);
@@ -594,7 +605,7 @@ fn apply_event(dialect: Dialect, ext: &mut Extracted, v: &Value) {
         Dialect::Scoring => apply_openai_usage(ext, &v["usage"]),
         // Streamed usage is cumulative over the request's images, so the
         // last completed frame's value is the total.
-        Dialect::Images => apply_openai_usage(ext, &v["usage"]),
+        Dialect::Images | Dialect::Splat => apply_openai_usage(ext, &v["usage"]),
         Dialect::Anthropic => match v["type"].as_str() {
             Some("message_start") => {
                 apply_anthropic_usage(ext, &v["message"]["usage"]);
@@ -905,6 +916,31 @@ mod tests {
         let usage = acc.finish(true);
         assert_eq!(usage.prompt_tokens, Some(14));
         assert_eq!(usage.total_tokens, Some(14));
+    }
+
+    #[test]
+    fn splat_sse_recovers_usage_from_oversized_completed_frames() {
+        let b64 = "C".repeat(MAX_SSE_LINE * 3);
+        let frame = |n: u32| {
+            format!(
+                "event: splat_generation.completed\ndata: {{\"type\":\"splat_generation.completed\",\"created\":1,\"b64_ply\":\"{b64}\",\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":{n},\"total_tokens\":{n}}}}}\n\n"
+            )
+        };
+        let first = frame(614_700);
+        let second = frame(1_229_400);
+        // Split mid-payload so the oversized line spans several chunks.
+        let (a, b) = first.as_bytes().split_at(1000);
+        let mut acc = UsageAccumulator::new(Dialect::Splat, true, false);
+        acc.push(b": accepted\n\n");
+        assert!(!acc.saw_token());
+        acc.push(a);
+        acc.push(b);
+        assert!(acc.saw_token(), "an oversized frame is a payload");
+        acc.push(second.as_bytes());
+        acc.push(b"data: [DONE]\n\n");
+        let usage = acc.finish(true);
+        assert_eq!(usage.completion_tokens, Some(1_229_400));
+        assert_eq!(usage.total_tokens, Some(1_229_400));
     }
 
     #[test]

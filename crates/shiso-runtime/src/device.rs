@@ -140,6 +140,8 @@ pub(crate) enum Purpose {
     Audio,
     /// The image generation model: a diffusion step is never replayed.
     Image,
+    /// The 3D splat model: a flow step is never replayed.
+    Splat,
 }
 
 impl Purpose {
@@ -149,6 +151,7 @@ impl Purpose {
             Self::Language => "the language model",
             Self::Audio => "the speech models",
             Self::Image => "the image generation model",
+            Self::Splat => "the splat model",
         }
     }
 }
@@ -282,6 +285,7 @@ fn open_context(purpose: Purpose) -> String {
             Purpose::Language => "opening the CUDA device".to_owned(),
             Purpose::Audio => "opening the CUDA device for the speech models".to_owned(),
             Purpose::Image => "opening the CUDA device for the image generation model".to_owned(),
+            Purpose::Splat => "opening the CUDA device for the splat model".to_owned(),
         }
     } else {
         "opening the Metal device".to_owned()
@@ -903,7 +907,12 @@ mod tests {
             device: DeviceChoice::Cpu,
             ..ServeOptions::default()
         };
-        for purpose in [Purpose::Language, Purpose::Audio, Purpose::Image] {
+        for purpose in [
+            Purpose::Language,
+            Purpose::Audio,
+            Purpose::Image,
+            Purpose::Splat,
+        ] {
             let opened = open_device(&args, purpose).expect("the CPU opens");
             assert_eq!(opened.kind, DeviceKind::Cpu);
         }

@@ -1039,6 +1039,9 @@ fn check_component_flag_conflicts(options: &ServeOptions, ref_str: &str) -> Resu
         || options.image_text_encoder.is_some()
         || options.image_vae.is_some()
         || options.image_tokenizer.is_some()
+        || options.splat_model.is_some()
+        || options.splat_encoder.is_some()
+        || options.splat_vae.is_some()
     {
         return Err(PullError::ComponentFlagConflict(ref_str.to_owned()));
     }
@@ -1142,6 +1145,9 @@ fn fill_options_from_variant(
             Role::ImageTextEncoder => options.image_text_encoder = Some(target),
             Role::ImageVae => options.image_vae = Some(target),
             Role::ImageTokenizer => options.image_tokenizer = Some(target),
+            Role::Splat => options.splat_model = Some(target),
+            Role::SplatEncoder => options.splat_encoder = Some(target),
+            Role::SplatVae => options.splat_vae = Some(target),
             // The publisher's sampling defaults, which an operator's own
             // `--generation-config` overrides rather than conflicts with: the
             // file changes no weight and no shape, only what an unset request
@@ -1155,6 +1161,9 @@ fn fill_options_from_variant(
     }
     if options.image_model.is_some() && options.image_model_id.is_none() {
         options.image_model_id = Some(recipe_name.to_string());
+    }
+    if options.splat_model.is_some() && options.splat_model_id.is_none() {
+        options.splat_model_id = Some(recipe_name.to_string());
     }
     if options.model_name.is_none() {
         options.model_name = Some(recipe_name.to_string());

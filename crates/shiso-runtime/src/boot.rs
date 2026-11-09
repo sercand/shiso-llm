@@ -11,7 +11,7 @@ use crate::device::{DeviceKind, OpenedDevice, Purpose, on_device, open_device, w
 use crate::options::ServeOptions;
 use crate::state::AppState;
 use crate::{
-    api, audio, embed, image, media, media_cache, model_factory, profile, scheduler, state,
+    api, audio, embed, image, media, media_cache, model_factory, profile, scheduler, splat, state,
     tokenizer, vision,
 };
 
@@ -186,6 +186,79 @@ pub fn boot_image(args: &ServeOptions) -> Result<Option<image::ImageService>, Bo
         .with_overrides(args.image_overrides()?)
         .context("--image-default-size / --image-default-steps")?
         .with_max_upload_bytes(args.image_max_upload_bytes());
+    Ok(Some(service))
+}
+
+/// Opens the 3D splat model and starts its worker, when `--splat-model` was
+/// given.
+///
+/// On a backend instance of its own, for the reason the image model has one.
+/// The background remover is loaded when the checkpoint ships one; without
+/// it the route still serves pictures that carry their own transparency and
+/// refuses the rest by name.
+///
+/// # Errors
+///
+/// A part that will not load, an operator default the model would refuse, or
+/// a device that will not open.
+// `Ok(None)` is a server without splat generation: no `--splat-model` was given.
+pub fn boot_splat(args: &ServeOptions) -> Result<Option<splat::SplatService>, BootError> {
+    let Some(model_dir) = args.splat_model.as_deref() else {
+        return Ok(None);
+    };
+    let part = |path: Option<&std::path::Path>, flag: &str| {
+        path.map(std::path::Path::to_path_buf)
+            .ok_or_else(|| refuse!("--splat-model needs --{flag}"))
+    };
+    let matte = model_dir.join(shiso_models::splat_registry::MATTE_FILE);
+    let id = match &args.splat_model_id {
+        Some(id) => id.clone(),
+        None => model_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or_else(|| {
+                refuse!(
+                    "--splat-model {} has no file name to use as a model id; give --splat-model-id",
+                    model_dir.display()
+                )
+            })?,
+    };
+    let desc = shiso_models::splat_registry::SplatModelDesc {
+        id: id.clone(),
+        model_dir: model_dir.to_path_buf(),
+        encoder_dir: part(args.splat_encoder.as_deref(), "splat-encoder")?,
+        vae_dir: part(args.splat_vae.as_deref(), "splat-vae")?,
+        matte: matte.is_file().then_some(matte),
+    };
+    let OpenedDevice { backend, kind } = open_device(args, Purpose::Splat)?;
+    let started = std::time::Instant::now();
+    let generator = on_device(
+        kind,
+        shiso_models::splat_registry::open_splat_generator(&desc, &backend)
+            .with_context(|| format!("loading splat model at {}", model_dir.display())),
+    )?;
+    backend.finish_imports();
+    tracing::info!(
+        path = %model_dir.display(),
+        id = %id,
+        matte = desc.matte.is_some(),
+        seconds = started.elapsed().as_secs_f64(),
+        "the splat model is resident"
+    );
+    let service = splat::SplatService::start(splat::SplatServiceDesc {
+        generator,
+        model_id: id,
+        max_queue: args.splat_max_queue,
+        profile: args
+            .profile_dir
+            .as_deref()
+            .map(|dir| profile::ProfileSink::new(dir, Arc::clone(&backend)))
+            .transpose()?,
+    })
+    .context("starting splat service worker")?;
+    let service = service
+        .with_overrides(args.splat_overrides())
+        .context("--splat-default-steps / --splat-default-num-gaussians")?;
     Ok(Some(service))
 }
 

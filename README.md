@@ -353,6 +353,13 @@ environment variable. The ones you are most likely to want:
 | `--image-reserve-gb` | GiB of the device working set the image pipeline leaves to the rest of the host when it plans what stays loaded (default 1.5) |
 | `--image-draft-steps` | Leading denoising steps of every image job run at half the requested resolution, then handed over to the full size (Qwen-Image-2.1 only; default 0). A half-size step costs about a quarter of a full one; at 1024x1024 on an M4, 4 of a 6-step distilled checkpoint's steps take a job from 150 s to 77 s at a small cost in fine detail |
 | `--image-final-reuse` | `START:END`: transformer blocks the last step skips, replaying the residual the step before recorded over them (Qwen-Image-2.1 only; the last two steps must run at full size). Faster, visibly softer |
+| `--splat-model` | 3D splat checkpoint directory (its `config.json` and the denoiser's and decoders' weights); serves `POST /v1/3d/generations`. The background remover shipped beside them (`birefnet.safetensors`) is loaded when present |
+| `--splat-model-id` | The name the splat generator answers to on the wire (default: the directory's name) |
+| `--splat-encoder` | The splat model's image encoder directory (`config.json` and weights); required with `--splat-model` |
+| `--splat-vae` | The splat model's latent autoencoder directory, or a repository root holding it under `vae/`; required with `--splat-model` |
+| `--splat-max-queue` | Splat requests that may wait in the queue beyond the one generating (default 2); the next is refused with a 503 |
+| `--splat-default-steps` | Euler steps a splat request that names none gets (default: the model's own, 50). Measured on an M1 Max: a 50-step request of 262144 Gaussians takes about 19 minutes, 25 steps about 11, each step's two denoiser passes 16-27 s as the machine warms |
+| `--splat-default-num-gaussians` | Gaussians a splat request that names none gets (default: the model's own, 262144) |
 | `--embedding-max-queue` | Embedding requests that may wait in the queue beyond the one running (default 64), when `--model` is an embedding checkpoint |
 
 Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=debug`).
@@ -368,6 +375,7 @@ Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=d
 | `POST /v1/audio/transcriptions` | OpenAI Audio Transcriptions (also at `/audio/transcriptions`) |
 | `POST /v1/images/generations` | OpenAI Images (also at `/v1/images` and `/images`; serves FLUX.2-klein, the distilled FLUX.3 Klein and Qwen-Image-2.1 (Turbo, base, and fine-tunes in the same format; the schedule is the assets' `model_index.json` `sample_sigmas`, shifted by `scheduler/scheduler_config.json`); `b64_json` only) |
 | `POST /v1/images/edits` | OpenAI Image edits (also at `/images/edits`; FLUX.3 Klein only; multipart `image`/`image[]` (up to 10) or JSON `images` with `data:` URLs, plus `prompt`, `size`, `seed`, `steps`, `output_format`, `output_compression`; `n` must be 1, no `mask`; `b64_json` only; body limit `--image-max-upload-mb`) |
+| `POST /v1/3d/generations` | 3D Gaussian-splat generation: one image in, one binary `.ply` out, `b64_ply` only; `mode`, `seed`, `steps`, `cfg_strength`, `rescale_t`, `num_gaussians`, `crop_margin`, `stream`; requires a splat model (`--splat-model` with `--splat-encoder` and `--splat-vae`); a picture without transparency is cut out by the checkpoint's background remover |
 | `POST /v1/embeddings` | OpenAI and OpenRouter Embeddings (also at `/embeddings`; text, token-id and multimodal `content` inputs, `dimensions`, `encoding_format` `float` or `base64`, `input_type`) |
 | `GET /v1/models` | OpenAI Models |
 | `GET /health`, `GET /metrics`, `GET /cache` | health, metrics, cache report |

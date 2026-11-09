@@ -1,0 +1,23 @@
+# The 3D splat family's kernel pack, module `splat`.
+#
+# One translation unit (`splat.cu`): the background remover's shifted-window
+# attention, modulated deformable sampling, aligned-corner bilinear
+# resampling, Swin's 2x2 patch merge and three activations. The entries and
+# their argument blocks are the Metal twin's
+# (`kernels/metal/splat/splat.metal`), graded by the same cases
+# (`crates/shiso-kerneltest/src/splat/`). Nothing here is copied from
+# anywhere: the kernels are written against the Metal twin and the driver's
+# argument blocks, so no unit carries a provenance header.
+
+[build]
+sources = ["splat.cu"]
+
+# `--use_fast_math` is DROPPED, as for the diffusion pack: the sigmoid's and
+# GELU's `expf` and the attention's softmax are graded at 1e-5 against `f64`
+# oracles, and nvcc's fast forms are not that close.
+base_flags = ["-O3", "-g", "-lineinfo"]
+
+arch = ["compute_80"]
+
+[modules]
+splat = "splat"

@@ -4424,3 +4424,56 @@ async fn ordinary_and_default_tier_requests_record_no_tier() {
         );
     }
 }
+
+/// Both spellings of the 3D generation endpoint reach the backend as the
+/// `/v1` path, with the model renamed, and the usage at the end of a body
+/// that is almost all base64 still lands in the log row.
+#[tokio::test]
+async fn splats_are_routed_renamed_and_logged() {
+    let b64 = "C".repeat(256 * 1024);
+    let upstream_body = format!(
+        r#"{{"created":1,"data":[{{"b64_ply":"{b64}"}}],"usage":{{"prompt_tokens":0,"completion_tokens":614700,"total_tokens":614700}}}}"#
+    );
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/3d/generations"))
+        .and(header("authorization", "Bearer k"))
+        .and(body_json_string(r#"{"model":"idol","image":"aGk="}"#))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(upstream_body.clone().into_bytes(), "application/json"),
+        )
+        .mount(&mock)
+        .await;
+
+    let config = backend_toml("b1", &mock.uri(), "k")
+        + "[[models]]\nname = \"splat-model\"\n\
+           [[models.targets]]\nbackend = \"b1\"\nmodel = \"idol\"\n";
+    let router = TestRouter::start(&config).await;
+    let (token, _) = router.create_token().await;
+
+    let spellings = ["/v1/3d/generations", "/3d/generations"];
+    for p in spellings {
+        let resp = router
+            .client
+            .post(router.url(p))
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .body(r#"{"model":"splat-model","image":"aGk="}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{p}");
+        assert_eq!(resp.bytes().await.unwrap().len(), upstream_body.len());
+    }
+
+    let rows = router.wait_for_logs(spellings.len()).await;
+    for row in &rows {
+        assert_eq!(row["model"], "splat-model");
+        assert_eq!(row["upstream_model"], "idol");
+        assert_eq!(row["path"], "/v1/3d/generations");
+        assert_eq!(row["status"], 200);
+        assert_eq!(row["completion_tokens"], 614_700);
+        assert_eq!(row["total_tokens"], 614_700);
+    }
+}

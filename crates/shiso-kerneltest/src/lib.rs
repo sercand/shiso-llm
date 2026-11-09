@@ -1,4 +1,4 @@
-//! The dense, diffusion, generic, qwen35, qwen35moe, qwen4exp and vision kernel sets' device cases,
+//! The dense, diffusion, generic, qwen35, qwen35moe, qwen4exp, splat and vision kernel sets' device cases,
 //! written against no backend in particular.
 //!
 //! Every case here is a fixture, a launch through [`shiso_core::Backend`] and a
@@ -34,6 +34,7 @@ pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen4exp;
 pub mod sample;
+pub mod splat;
 pub mod ternary;
 pub mod vision;
 

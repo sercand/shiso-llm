@@ -54,6 +54,7 @@ pub mod image;
 mod message;
 mod request;
 mod response;
+pub mod splat;
 mod stream;
 mod tools;
 

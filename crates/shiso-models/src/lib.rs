@@ -24,6 +24,7 @@ pub mod embedding_gemma2;
 pub mod flux2;
 pub mod flux3;
 pub mod gemma4;
+pub mod idol;
 pub mod image_registry;
 #[cfg(test)]
 mod image_registry_tests;
@@ -38,6 +39,7 @@ pub mod qwen35moe;
 pub mod qwen3_asr;
 pub mod qwen4exp;
 pub(crate) mod qwen_image21;
+pub mod splat_registry;
 #[cfg(test)]
 mod test_gguf;
 

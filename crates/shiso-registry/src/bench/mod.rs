@@ -148,15 +148,15 @@ pub(crate) enum BenchKind {
 }
 
 impl BenchKind {
-    /// The bench for a task, if there is one. Diarization and embeddings
-    /// have none yet.
+    /// The bench for a task, if there is one. Diarization, embeddings and
+    /// splats have none yet.
     pub(crate) const fn for_task(task: Task) -> Option<Self> {
         match task {
             Task::Chat => Some(Self::Chat),
             Task::Decision => Some(Self::Decision),
             Task::ImageGeneration => Some(Self::Image),
             Task::Transcription => Some(Self::Transcription),
-            Task::Diarization | Task::Embedding => None,
+            Task::Diarization | Task::Embedding | Task::SplatGeneration => None,
         }
     }
 

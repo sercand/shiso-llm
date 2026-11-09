@@ -335,6 +335,20 @@ fn validate_role_shapes(
         }
     }
 
+    // The splat parts are directories: each carries its own `config.json`.
+    for role in [Role::Splat, Role::SplatEncoder, Role::SplatVae] {
+        if let Some(place) = roles.get(&role)
+            && place.file.is_some()
+        {
+            return Err(HubError::Validation {
+                reason: format!(
+                    "variant '{}' role '{role}' must be a directory: no 'entry' or 'binds'",
+                    variant.key.as_str()
+                ),
+            });
+        }
+    }
+
     // `--image-assets-dir` names a directory; a file there finds nothing.
     if let Some(place) = roles.get(&Role::ImageAssets)
         && place.file.is_some()
@@ -360,16 +374,38 @@ fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
     let has_asr_mmproj = roles.contains_key(&Role::AsrMmproj);
     let has_diarization = roles.contains_key(&Role::Diarization);
     let has_image = roles.contains_key(&Role::Image);
+    let has_splat = roles.contains_key(&Role::Splat);
 
     validate_role_shapes(variant, &roles)?;
 
-    if !has_base && !has_asr && !has_image {
+    if !has_base && !has_asr && !has_image && !has_splat {
         return Err(HubError::Validation {
             reason: format!(
-                "variant '{}' must contain a 'base' component unless it has 'asr' or 'image'",
+                "variant '{}' must contain a 'base' component unless it has 'asr', 'image' or 'splat'",
                 variant.key.as_str()
             ),
         });
+    }
+
+    // The splat model cannot condition on a picture without both encoders,
+    // and the encoders are parts of no other model.
+    for role in [Role::SplatEncoder, Role::SplatVae] {
+        if has_splat && !roles.contains_key(&role) {
+            return Err(HubError::Validation {
+                reason: format!(
+                    "variant '{}' supplies 'splat' without '{role}'",
+                    variant.key.as_str()
+                ),
+            });
+        }
+        if !has_splat && roles.contains_key(&role) {
+            return Err(HubError::Validation {
+                reason: format!(
+                    "variant '{}' supplies '{role}' which requires 'splat'",
+                    variant.key.as_str()
+                ),
+            });
+        }
     }
 
     if has_draft {
