@@ -176,6 +176,9 @@ pub enum Projection {
         entry: Entry,
         /// Its launch, rows on the second axis.
         launch: Launch,
+        /// Lanes a row, the trailing argument of the CUDA step entries;
+        /// absent for the entries without it.
+        lanes: Option<u32>,
     },
     /// A single-precision weight, with its contraction split.
     Float {
@@ -757,9 +760,15 @@ pub fn plan(
     match dtype {
         // The split single-precision tier takes one row; a wider pass - the
         // stream mixes' injections over a prompt - takes the block entries'.
-        DType::F32 if rows == 1 => Ok(float(in_dim, out_dim)),
-        DType::F32 => ggml(dtype, in_dim, out_dim, rows),
-        stored if ggml::is_block(stored) => ggml(stored, in_dim, out_dim, rows),
+        // Where the CUDA step entries exist a one-row step takes them too, so
+        // a verify row's router logits are a single-row step's, bit for bit.
+        DType::F32
+            if rows == 1 && ggml_step(DType::F32, ggml::Stage::StepMatvec, device).is_none() =>
+        {
+            Ok(float(in_dim, out_dim))
+        }
+        DType::F32 => ggml(dtype, in_dim, out_dim, rows, device),
+        stored if ggml::is_block(stored) => ggml(stored, in_dim, out_dim, rows, device),
         DType::F16 => half(in_dim, out_dim, rows, device),
         DType::F16Pack12 => packed_half(in_dim, out_dim, rows, device),
         DType::BF16 => brain(in_dim, out_dim, rows, device),
@@ -779,14 +788,37 @@ pub fn plan(
 }
 
 /// The GGUF block tier: weights decoded a 32-weight sub-block at a time in
-/// registers, any row count in one launch.
-fn ggml(dtype: DType, in_dim: u32, out_dim: u32, rows: u32) -> CoreResult<Projection> {
+/// registers, any row count in one launch - or, for a prompt pass on a
+/// device with the tensor-core prompt kernels, the block format's prompt
+/// entry, at every prompt width.
+fn ggml(
+    dtype: DType,
+    in_dim: u32,
+    out_dim: u32,
+    rows: u32,
+    device: Device,
+) -> CoreResult<Projection> {
     let per = dtype.block_elems().get();
     if !in_dim.is_multiple_of(per.max(ggml::SUB_BLOCK)) {
         return Err(CoreError::ShapeMismatch {
             field: "block-quantized contraction width",
             expected: u64::from(per.max(ggml::SUB_BLOCK)),
             got: u64::from(in_dim),
+        });
+    }
+    if let Some(entry) = ggml_prompt(dtype, ggml::Stage::Gemm, device) {
+        return Ok(Projection::Ggml {
+            entry,
+            launch: ggml::gemm_rows_launch(out_dim, rows),
+            lanes: None,
+        });
+    }
+    if let Some(entry) = ggml_step(dtype, ggml::step_stage(rows).0, device) {
+        let lanes = ggml::step_lanes(in_dim);
+        return Ok(Projection::Ggml {
+            entry,
+            launch: ggml::step_launch(out_dim, rows, lanes),
+            lanes: Some(lanes),
         });
     }
     let entry = ggml::entry(dtype, ggml::Stage::Matvec).ok_or(CoreError::Unsupported {
@@ -796,7 +828,37 @@ fn ggml(dtype: DType, in_dim: u32, out_dim: u32, rows: u32) -> CoreResult<Projec
     Ok(Projection::Ggml {
         entry,
         launch: ggml::rows_launch(out_dim, rows),
+        lanes: None,
     })
+}
+
+/// The CUDA step entry `stage` of a GGUF block format, when this pass takes
+/// one: a step or verify pass on a device whose kernel set has the CUDA
+/// block entries ([`PromptMatmul::Tensor`] is that probe, as for
+/// [`ggml_prompt`]). Every step pass takes it whatever its row count, so a
+/// verify row is summed as a single-row step sums it.
+#[must_use]
+pub fn ggml_step(dtype: DType, stage: ggml::Stage, device: Device) -> Option<Entry> {
+    if !device.row_invariant() && matches!(device.prompt_matmul, PromptMatmul::Tensor) {
+        ggml::entry(dtype, stage)
+    } else {
+        None
+    }
+}
+
+/// The tensor-core prompt entry `stage` of a GGUF block format, when this
+/// pass takes one: a prompt pass (whose rows are held to every prompt width,
+/// not to a step's sums) on a device whose kernel set has the tensor-core
+/// prompt modules. [`PromptMatmul::Tensor`] is that probe: the kernel tree
+/// that builds the brain-float module builds `q4e_ggml`'s prompt entries
+/// beside it.
+#[must_use]
+pub fn ggml_prompt(dtype: DType, stage: ggml::Stage, device: Device) -> Option<Entry> {
+    if device.row_invariant() && matches!(device.prompt_matmul, PromptMatmul::Tensor) {
+        ggml::entry(dtype, stage)
+    } else {
+        None
+    }
 }
 
 /// The single-precision tier.
@@ -1344,6 +1406,32 @@ pub fn project(
     rows: u32,
     device: Device,
 ) -> CoreResult<()> {
+    // A single-precision weight over a prompt chunk - a GGUF router or a
+    // stream mix's injection - multiplies on the BLAS tier in strict single
+    // precision: the warp-a-row block entry re-reads its activations once a
+    // row of the weight (a 512-expert router over a 2k-token chunk took 7 ms
+    // a layer there), and the pinned reduction keeps the rows held to every
+    // prompt width. Strict, because a router's choice is what a rounding of
+    // its logits would move. Every prompt width takes it, a one-row chunk
+    // too, so where a prompt was cut moves no bit.
+    if weight.dtype == DType::F32 && device.row_invariant() && device.blas {
+        out.push(Step::Blas {
+            op_a: GemmOp::Transposed,
+            op_b: GemmOp::AsStored,
+            m: weight.out_dim,
+            n: rows,
+            k: weight.in_dim,
+            lda: weight.in_dim,
+            ldb: weight.in_dim,
+            ldc: weight.out_dim,
+            a: Operand::Weight(bound.weight),
+            b: bound.src,
+            c: bound.dst,
+            dtype: GemmDType::F32Strict,
+            reduction: device.reduction(),
+        });
+        return Ok(());
+    }
     let passes = match weight.dtype {
         DType::F16 | DType::F16Pack12 => {
             half_in_passes(weight.in_dim, weight.out_dim, rows, device)
@@ -1640,19 +1728,23 @@ fn project_one(
     let w = Operand::Weight(bound.weight);
     match plan(weight.dtype, weight.in_dim, weight.out_dim, rows, device)? {
         // `out, w, x, in_dim, out_dim, rows`.
-        Projection::Ggml { entry, launch } => {
-            out.launch(
-                entry,
-                launch,
-                Args::of(&[
-                    bound.dst,
-                    w,
-                    bound.src,
-                    Operand::U32(weight.in_dim),
-                    Operand::U32(weight.out_dim),
-                    Operand::U32(rows),
-                ]),
-            );
+        Projection::Ggml {
+            entry,
+            launch,
+            lanes,
+        } => {
+            let mut ops = vec![
+                bound.dst,
+                w,
+                bound.src,
+                Operand::U32(weight.in_dim),
+                Operand::U32(weight.out_dim),
+                Operand::U32(rows),
+            ];
+            if let Some(lanes) = lanes {
+                ops.push(Operand::U32(lanes));
+            }
+            out.launch(entry, launch, Args::of(&ops));
         }
         // `out, w, x, in_dim, chunk` - and where the contraction was split the
         // projection writes the shared partial slab instead of the destination,

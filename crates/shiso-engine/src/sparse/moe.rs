@@ -1860,6 +1860,58 @@ pub fn affine_experts(
     Ok(plan)
 }
 
+/// The entries a GGUF routed stage pair takes on this pass, their launches,
+/// and the lanes a row the CUDA step entries take last.
+struct GgmlTier {
+    gate_up: Option<Entry>,
+    down: Option<Entry>,
+    launches: [kernels::Launch; 2],
+    lanes: Option<(u32, u32)>,
+}
+
+/// Picks [`GgmlTier`]: both stages take one tier or neither does, so a
+/// column's two stages are one tier's arithmetic.
+fn ggml_tier(desc: &ExpertDesc, hidden: u32, inter: u32, groups: u32, device: Device) -> GgmlTier {
+    let prompt = (
+        matmul::ggml_prompt(desc.gate.dtype, ggml::Stage::GemmGateUp, device),
+        matmul::ggml_prompt(desc.down.dtype, ggml::Stage::GemmDown, device),
+    );
+    let step = (
+        matmul::ggml_step(desc.gate.dtype, ggml::Stage::StepGateUp, device),
+        matmul::ggml_step(desc.down.dtype, ggml::Stage::StepDown, device),
+    );
+    let lanes = (
+        ggml::step_expert_lanes(hidden),
+        ggml::step_expert_lanes(inter),
+    );
+    match (prompt, step) {
+        ((Some(g), Some(d)), _) => GgmlTier {
+            gate_up: Some(g),
+            down: Some(d),
+            launches: [
+                ggml::gemm_gate_up_launch(inter, groups),
+                ggml::gemm_down_launch(hidden, groups),
+            ],
+            lanes: None,
+        },
+        (_, (Some(g), Some(d))) => GgmlTier {
+            gate_up: Some(g),
+            down: Some(d),
+            launches: [
+                ggml::step_gate_up_launch(inter, groups, lanes.0),
+                ggml::step_down_launch(hidden, groups, lanes.1),
+            ],
+            lanes: Some(lanes),
+        },
+        _ => GgmlTier {
+            gate_up: ggml::entry(desc.gate.dtype, ggml::Stage::GateUp),
+            down: ggml::entry(desc.down.dtype, ggml::Stage::Down),
+            launches: [ggml::launch(inter, groups), ggml::launch(hidden, groups)],
+            lanes: None,
+        },
+    }
+}
+
 /// [`block`] over banks kept in their GGUF blocks: the same route, fetch,
 /// combine and shared expert as the affine stage, around the block entries.
 fn ggml_block(
@@ -1884,7 +1936,7 @@ fn ggml_block(
             ids: u32::try_from(shape.moe.slot_rows(n_tok)).unwrap_or(u32::MAX),
         });
     }
-    plan.append(ggml_experts(shape, desc, layer, n_tok)?);
+    plan.append(ggml_experts(shape, desc, layer, n_tok, device)?);
     plan.append(combine(shape, n_tok));
     with_shared(shape, desc, layer, n_tok, device, plan)
 }
@@ -1896,7 +1948,10 @@ fn ggml_block(
 ///
 /// Gate and up share one format; down may be another, as a mixed-precision
 /// export stores it. The grid's second axis is one threadgroup per active
-/// expert, as the affine stage's.
+/// expert, as the affine stage's. On a device with the CUDA block entries a
+/// prompt pass takes their tensor-core stages ([`matmul::ggml_prompt`]) and a
+/// step or verify pass their lanes-a-row stages ([`matmul::ggml_step`]), with
+/// the same arguments (the step stages take their lanes last).
 ///
 /// # Errors
 ///
@@ -1907,6 +1962,7 @@ pub fn ggml_experts(
     desc: &ExpertDesc,
     layer: LayerRef,
     n_tok: u32,
+    device: Device,
 ) -> CoreResult<Plan> {
     let hidden = shape.hidden;
     let inter = shape.moe.intermediate;
@@ -1916,8 +1972,14 @@ pub fn ggml_experts(
         && desc.up.out_dim == inter
         && desc.down.in_dim == inter
         && desc.down.out_dim == hidden;
-    let gate_up = ggml::entry(desc.gate.dtype, ggml::Stage::GateUp);
-    let down = ggml::entry(desc.down.dtype, ggml::Stage::Down);
+    let columns = u32::try_from(shape.moe.slot_rows(n_tok)).unwrap_or(u32::MAX);
+    let groups = columns.min(shape.moe.experts);
+    let GgmlTier {
+        gate_up,
+        down,
+        launches,
+        lanes: step_lanes,
+    } = ggml_tier(desc, hidden, inter, groups, device);
     let (Some(gate_up), Some(down)) = (gate_up, down) else {
         return Err(CoreError::Unsupported {
             what: "a routed bank in a block format with no expert entry instantiated",
@@ -1931,8 +1993,6 @@ pub fn ggml_experts(
             backend: "engine",
         });
     }
-    let columns = u32::try_from(shape.moe.slot_rows(n_tok)).unwrap_or(u32::MAX);
-    let groups = columns.min(shape.moe.experts);
     let at =
         |role: Role| Operand::Weight(WeightRef::layer(layer, role).spanning(WeightPart::Whole));
     // A target layer's banks may be streamed into slots sized for the widest
@@ -1979,7 +2039,10 @@ pub fn ggml_experts(
     ops.extend(tail(hidden, inter));
     ops.push(stride(Role::ExpertGate, &desc.gate)?);
     ops.push(stride(Role::ExpertUp, &desc.up)?);
-    plan.launch(gate_up, ggml::launch(inter, groups), Args::of(&ops));
+    if let Some((l, _)) = step_lanes {
+        ops.push(Operand::U32(l));
+    }
+    plan.launch(gate_up, launches[0], Args::of(&ops));
     plan.append(activate(
         shape,
         Operand::Scratch(Buf::MoeGate),
@@ -1996,7 +2059,10 @@ pub fn ggml_experts(
     ];
     ops.extend(tail(inter, hidden));
     ops.push(stride(Role::ExpertDown, &desc.down)?);
-    plan.launch(down, ggml::launch(hidden, groups), Args::of(&ops));
+    if let Some((_, l)) = step_lanes {
+        ops.push(Operand::U32(l));
+    }
+    plan.launch(down, launches[1], Args::of(&ops));
     Ok(plan)
 }
 

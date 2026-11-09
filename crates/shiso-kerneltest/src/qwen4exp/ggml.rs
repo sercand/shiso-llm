@@ -200,6 +200,13 @@ enum Stage {
     GateUp,
     Down,
     Embed,
+    Gemm,
+    GemmGateUp,
+    GemmDown,
+    StepMatvec,
+    StepMatvec4,
+    StepGateUp,
+    StepDown,
 }
 
 /// The entry name of `stage` for `format`.
@@ -211,6 +218,13 @@ fn entry(format: Format, stage: Stage) -> &'static str {
                 Stage::GateUp => concat!("q4e_g_experts_gate_up_", $n, "_kernel"),
                 Stage::Down => concat!("q4e_g_experts_down_", $n, "_kernel"),
                 Stage::Embed => concat!("q4e_g_embed_", $n, "_kernel"),
+                Stage::Gemm => concat!("q4e_g_gemm_", $n, "_kernel"),
+                Stage::GemmGateUp => concat!("q4e_g_experts_gemm_gate_up_", $n, "_kernel"),
+                Stage::GemmDown => concat!("q4e_g_experts_gemm_down_", $n, "_kernel"),
+                Stage::StepMatvec => concat!("q4e_g_step_matvec_", $n, "_kernel"),
+                Stage::StepMatvec4 => concat!("q4e_g_step_matvec4_", $n, "_kernel"),
+                Stage::StepGateUp => concat!("q4e_g_step_gate_up_", $n, "_kernel"),
+                Stage::StepDown => concat!("q4e_g_step_down_", $n, "_kernel"),
             }
         };
     }
@@ -353,13 +367,60 @@ pub fn the_dense_projection_matches_the_host_in_every_format(gpu: &Gpu) {
 /// padded wider than one expert, as a streamed pool sized for another layer's
 /// format lays them out.
 pub fn the_routed_stages_match_the_host_in_every_format(gpu: &Gpu) {
-    let (hidden, inter, experts, used, tokens) = (512usize, 256usize, 6usize, 2usize, 5usize);
     for (i, format) in FORMATS.into_iter().enumerate() {
-        let seed = 300 + 10 * i as u32;
+        routed(gpu, format, Tier::Step, 5, 300 + 10 * i as u32);
+    }
+}
+
+/// Which kernels a routed case runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    /// The step entries, one warp an output row.
+    Step,
+    /// The prompt entries on tensor cores, activations rounded to halves.
+    Prompt,
+    /// The CUDA step entries at these lanes a row of gate/up and of down.
+    Lanes(u32, u32),
+}
+
+/// One routed case over `tokens` tokens: gate and up, then down, against the
+/// host. Returns the gate stage's output, which reads nothing but the
+/// activations.
+fn routed(gpu: &Gpu, format: Format, tier: Tier, tokens: usize, seed: u32) -> Vec<f32> {
+    let (hidden, inter, experts, used) = (512usize, 256usize, 6usize, 2usize);
+    // (entry, output rows a block, threads, dynamic shared memory) of each
+    // stage.
+    let (gu, dn) = match tier {
+        Tier::Step => (
+            (Stage::GateUp, ROWS, 32 * ROWS, 0),
+            (Stage::Down, ROWS, 32 * ROWS, 0),
+        ),
+        Tier::Lanes(gl, dl) => (
+            (Stage::StepGateUp, 4 * 16 / gl as usize, 128, 0),
+            (Stage::StepDown, 4 * 32 / dl as usize, 128, 0),
+        ),
+        Tier::Prompt => (
+            (
+                Stage::GemmGateUp,
+                GEMM_GATE_UP_ROWS / 2,
+                2 * GEMM_GATE_UP_ROWS,
+                gemm_smem(GEMM_GATE_UP_ROWS, GEMM_EXPERT_COLS),
+            ),
+            (
+                Stage::GemmDown,
+                GEMM_DOWN_ROWS,
+                2 * GEMM_DOWN_ROWS,
+                gemm_smem(GEMM_DOWN_ROWS, GEMM_EXPERT_COLS),
+            ),
+        ),
+    };
+    let budget = 2e-4;
+    {
         let gate = Bank::new(format, experts, inter, hidden, seed);
         let up = Bank::new(format, experts, inter, hidden, seed + 1);
         let down = Bank::new(format, experts, hidden, inter, seed + 2);
         let x = signal(tokens * hidden, seed + 3);
+        let x = if tier == Tier::Prompt { halves(&x) } else { x };
         // Token t picks experts (t + k) % experts; slot map reverses the bank.
         let ids: Vec<usize> = (0..tokens * used)
             .map(|c| (c / used + c % used) % experts)
@@ -397,31 +458,41 @@ pub fn the_routed_stages_match_the_host_in_every_format(gpu: &Gpu) {
         let map_b = gpu.upload(&u32_le(&map));
         let out_gate = gpu.upload(&vec![0u8; cols * inter * 4]);
         let out_up = gpu.upload(&vec![0u8; cols * inter * 4]);
-        let block = Extent3::linear((32 * ROWS) as u32);
         run(
             gpu,
-            KernelRef::new(MODULE, entry(format, Stage::GateUp)),
-            &LaunchArgs::new(
-                Extent3::new(inter.div_ceil(ROWS) as u32, experts as u32, 1),
-                block,
-                &[
-                    KernelArg::Buffer(out_gate.view()),
-                    KernelArg::Buffer(out_up.view()),
-                    KernelArg::Buffer(gw.view()),
-                    KernelArg::Buffer(uw.view()),
-                    KernelArg::Buffer(xs.view()),
-                    KernelArg::Buffer(sorted_b.view()),
-                    KernelArg::Buffer(bounds_b.view()),
-                    KernelArg::Buffer(active_b.view()),
-                    KernelArg::Buffer(map_b.view()),
-                    KernelArg::U32(hidden as u32),
-                    KernelArg::U32(inter as u32),
-                    KernelArg::U32(experts as u32),
-                    KernelArg::U32(used as u32),
-                    KernelArg::U32(gate_stride),
-                    KernelArg::U32(up_stride),
-                ],
-            ),
+            KernelRef::new(MODULE, entry(format, gu.0)),
+            &LaunchArgs {
+                smem_bytes: gu.3,
+                ..LaunchArgs::new(
+                    Extent3::new(inter.div_ceil(gu.1) as u32, experts as u32, 1),
+                    Extent3::linear(gu.2 as u32),
+                    &[
+                        KernelArg::Buffer(out_gate.view()),
+                        KernelArg::Buffer(out_up.view()),
+                        KernelArg::Buffer(gw.view()),
+                        KernelArg::Buffer(uw.view()),
+                        KernelArg::Buffer(xs.view()),
+                        KernelArg::Buffer(sorted_b.view()),
+                        KernelArg::Buffer(bounds_b.view()),
+                        KernelArg::Buffer(active_b.view()),
+                        KernelArg::Buffer(map_b.view()),
+                        KernelArg::U32(hidden as u32),
+                        KernelArg::U32(inter as u32),
+                        KernelArg::U32(experts as u32),
+                        KernelArg::U32(used as u32),
+                        KernelArg::U32(gate_stride),
+                        KernelArg::U32(up_stride),
+                        KernelArg::U32(match tier {
+                            Tier::Lanes(gl, _) => gl,
+                            _ => 0,
+                        }),
+                    ][..if matches!(tier, Tier::Lanes(..)) {
+                        16
+                    } else {
+                        15
+                    }],
+                )
+            },
         );
         drain(gpu);
         let got_gate = gpu.read_f32(&out_gate);
@@ -438,9 +509,9 @@ pub fn the_routed_stages_match_the_host_in_every_format(gpu: &Gpu) {
             &format!("{} gate", format.name()),
             &got_gate,
             &want_gate,
-            2e-4,
+            budget,
         );
-        assert_close(&format!("{} up", format.name()), &got_up, &want_up, 2e-4);
+        assert_close(&format!("{} up", format.name()), &got_up, &want_up, budget);
 
         // Down over the host's own activations, so it is graded on its own.
         let mid: Vec<f32> = want_gate
@@ -448,29 +519,49 @@ pub fn the_routed_stages_match_the_host_in_every_format(gpu: &Gpu) {
             .zip(&want_up)
             .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
             .collect();
+        // The fixture's random banks are not normalized, so a column's
+        // activations can pass the half range; scaled into it, they test the
+        // same sums.
+        let mid = if tier == Tier::Prompt {
+            let peak = mid.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+            halves(&mid.iter().map(|v| v / peak).collect::<Vec<_>>())
+        } else {
+            mid
+        };
         let mid_b = gpu.upload(&f32_bytes(&mid));
         let out_down = gpu.upload(&vec![0u8; cols * hidden * 4]);
         run(
             gpu,
-            KernelRef::new(MODULE, entry(format, Stage::Down)),
-            &LaunchArgs::new(
-                Extent3::new(hidden.div_ceil(ROWS) as u32, experts as u32, 1),
-                block,
-                &[
-                    KernelArg::Buffer(out_down.view()),
-                    KernelArg::Buffer(dw.view()),
-                    KernelArg::Buffer(mid_b.view()),
-                    KernelArg::Buffer(sorted_b.view()),
-                    KernelArg::Buffer(bounds_b.view()),
-                    KernelArg::Buffer(active_b.view()),
-                    KernelArg::Buffer(map_b.view()),
-                    KernelArg::U32(inter as u32),
-                    KernelArg::U32(hidden as u32),
-                    KernelArg::U32(experts as u32),
-                    KernelArg::U32(used as u32),
-                    KernelArg::U32(down_stride),
-                ],
-            ),
+            KernelRef::new(MODULE, entry(format, dn.0)),
+            &LaunchArgs {
+                smem_bytes: dn.3,
+                ..LaunchArgs::new(
+                    Extent3::new(hidden.div_ceil(dn.1) as u32, experts as u32, 1),
+                    Extent3::linear(dn.2 as u32),
+                    &[
+                        KernelArg::Buffer(out_down.view()),
+                        KernelArg::Buffer(dw.view()),
+                        KernelArg::Buffer(mid_b.view()),
+                        KernelArg::Buffer(sorted_b.view()),
+                        KernelArg::Buffer(bounds_b.view()),
+                        KernelArg::Buffer(active_b.view()),
+                        KernelArg::Buffer(map_b.view()),
+                        KernelArg::U32(inter as u32),
+                        KernelArg::U32(hidden as u32),
+                        KernelArg::U32(experts as u32),
+                        KernelArg::U32(used as u32),
+                        KernelArg::U32(down_stride),
+                        KernelArg::U32(match tier {
+                            Tier::Lanes(_, dl) => dl,
+                            _ => 0,
+                        }),
+                    ][..if matches!(tier, Tier::Lanes(..)) {
+                        13
+                    } else {
+                        12
+                    }],
+                )
+            },
         );
         drain(gpu);
         let got_down = gpu.read_f32(&out_down);
@@ -483,7 +574,100 @@ pub fn the_routed_stages_match_the_host_in_every_format(gpu: &Gpu) {
             &format!("{} down", format.name()),
             &got_down,
             &want_down,
-            2e-4,
+            budget,
+        );
+        got_gate
+    }
+}
+
+/// Output rows and columns a dense prompt block covers (`Q4E_GG_DENSE_BM`,
+/// `Q4E_GG_DENSE_BN`).
+const GEMM_ROWS: usize = 128;
+const GEMM_COLS: usize = 128;
+/// Output rows a gate/up and a down prompt block cover (`Q4E_GG_GATE_UP_BM`,
+/// half of each matrix; `Q4E_GG_DOWN_BM`), and the columns a routed block
+/// takes at a time (`Q4E_GG_EXPERT_BN`).
+const GEMM_GATE_UP_ROWS: usize = 256;
+const GEMM_DOWN_ROWS: usize = 128;
+const GEMM_EXPERT_COLS: usize = 64;
+
+/// `Q4E_GG_SMEM(rows, cols)`.
+const fn gemm_smem(rows: usize, cols: usize) -> u32 {
+    (2 * (rows + cols) * 40 * 2 + 2 * rows * 2 * 4) as u32
+}
+
+/// Every value rounded to half precision, as the prompt kernels round their
+/// activations; the host oracle then sees the operands the device multiplies.
+fn halves(v: &[f32]) -> Vec<f32> {
+    v.iter().map(|&x| f16::from_f32(x).to_f32()).collect()
+}
+
+fn gemm(gpu: &Gpu, format: Format, bank: &Bank, x: &[f32], rows: usize) -> Vec<f32> {
+    let w = gpu.upload(&bank.bytes);
+    let xs = gpu.upload(&f32_bytes(&x[..rows * bank.in_dim]));
+    let out = gpu.upload(&vec![0u8; rows * bank.out_dim * 4]);
+    let args = [
+        KernelArg::Buffer(out.view()),
+        KernelArg::Buffer(w.view()),
+        KernelArg::Buffer(xs.view()),
+        KernelArg::U32(bank.in_dim as u32),
+        KernelArg::U32(bank.out_dim as u32),
+        KernelArg::U32(rows as u32),
+    ];
+    let grid = Extent3::new(
+        bank.out_dim.div_ceil(GEMM_ROWS) as u32,
+        rows.div_ceil(GEMM_COLS) as u32,
+        1,
+    );
+    run(
+        gpu,
+        KernelRef::new(MODULE, entry(format, Stage::Gemm)),
+        &LaunchArgs {
+            smem_bytes: gemm_smem(GEMM_ROWS, GEMM_COLS),
+            ..LaunchArgs::new(grid, Extent3::linear((2 * GEMM_ROWS) as u32), &args)
+        },
+    );
+    drain(gpu);
+    gpu.read_f32(&out)
+}
+
+/// Every block format's prompt projection on tensor cores matches the host
+/// over half-rounded activations, across partial row and column tiles, and a
+/// row's result does not move with the chunk width.
+pub fn the_prompt_projection_matches_the_host_in_every_block_format(gpu: &Gpu) {
+    for (i, format) in FORMATS.into_iter().skip(1).enumerate() {
+        let (out_dim, in_dim, rows) = (137usize, 512usize, 70usize);
+        let bank = Bank::new(format, 1, out_dim, in_dim, 501 + i as u32);
+        let x = halves(&signal(rows * in_dim, 17 + i as u32));
+        let got = gemm(gpu, format, &bank, &x, rows);
+        let want: Vec<f32> = (0..rows)
+            .flat_map(|r| bank.project(0, &x[r * in_dim..(r + 1) * in_dim]))
+            .collect();
+        assert_close(format.name(), &got, &want, 2e-4);
+        let few = gemm(gpu, format, &bank, &x, 5);
+        assert!(
+            few == got[..5 * out_dim],
+            "{}: a row moved with the chunk width",
+            format.name()
+        );
+    }
+}
+
+/// The prompt pass's routed stages on tensor cores match the host, including
+/// an expert with more columns than one tile, and a column's result does not
+/// move when the pass is narrower.
+pub fn the_prompt_routed_stages_match_the_host_in_every_block_format(gpu: &Gpu) {
+    for (i, format) in FORMATS.into_iter().skip(1).enumerate() {
+        let seed = 700 + 10 * i as u32;
+        // 200 tokens of two picks over six experts put about 67 columns on
+        // each: a tile of 64 and a remainder.
+        let wide = routed(gpu, format, Tier::Prompt, 200, seed);
+        let narrow = routed(gpu, format, Tier::Prompt, 3, seed);
+        let inter = 256;
+        assert!(
+            narrow[..inter] == wide[..inter],
+            "{}: column 0 moved with the pass width",
+            format.name()
         );
     }
 }
@@ -559,4 +743,89 @@ pub fn the_ngram_row_decode_places_iq4_nl_rows_exactly(gpu: &Gpu) {
         gpu.read_f32(&out) == bank.values,
         "decoded n-gram rows differ"
     );
+}
+
+fn step_matvec(
+    gpu: &Gpu,
+    format: Format,
+    bank: &Bank,
+    x: &[f32],
+    rows: usize,
+    lpr: u32,
+    four: bool,
+) -> Vec<f32> {
+    let w = gpu.upload(&bank.bytes);
+    let xs = gpu.upload(&f32_bytes(&x[..rows * bank.in_dim]));
+    let out = gpu.upload(&vec![0u8; rows * bank.out_dim * 4]);
+    let args = [
+        KernelArg::Buffer(out.view()),
+        KernelArg::Buffer(w.view()),
+        KernelArg::Buffer(xs.view()),
+        KernelArg::U32(bank.in_dim as u32),
+        KernelArg::U32(bank.out_dim as u32),
+        KernelArg::U32(rows as u32),
+        KernelArg::U32(lpr),
+    ];
+    let per_block = 128 / lpr as usize * if four { 4 } else { 1 };
+    let grid = Extent3::new(
+        bank.out_dim.div_ceil(per_block) as u32,
+        rows.div_ceil(COLS) as u32,
+        1,
+    );
+    run(
+        gpu,
+        KernelRef::new(
+            MODULE,
+            entry(
+                format,
+                if four {
+                    Stage::StepMatvec4
+                } else {
+                    Stage::StepMatvec
+                },
+            ),
+        ),
+        &LaunchArgs::new(grid, Extent3::linear(128), &args),
+    );
+    drain(gpu);
+    gpu.read_f32(&out)
+}
+
+/// The CUDA step entries: every format's dense projection at a half
+/// warp, a warp and a whole block a row, and the routed stages at a half warp
+/// and a warp, match the host; a row's result does not move when it runs
+/// alone, which is what lets a verify reproduce a step.
+pub fn the_lane_step_entries_match_the_host_in_every_block_format(gpu: &Gpu) {
+    for (i, format) in FORMATS.into_iter().enumerate() {
+        let (out_dim, in_dim, rows) = (37usize, 1024usize, 11usize);
+        let bank = Bank::new(format, 1, out_dim, in_dim, 1301 + i as u32);
+        let x = signal(rows * in_dim, 31 + i as u32);
+        let want: Vec<f32> = (0..rows)
+            .flat_map(|r| bank.project(0, &x[r * in_dim..(r + 1) * in_dim]))
+            .collect();
+        for lpr in [16, 32, 128] {
+            let got = step_matvec(gpu, format, &bank, &x, rows, lpr, false);
+            assert_close(&format!("{} lpr {lpr}", format.name()), &got, &want, 2e-4);
+            let one = step_matvec(gpu, format, &bank, &x, 1, lpr, false);
+            assert!(
+                one == got[..out_dim],
+                "{} lpr {lpr}: row 0 moved alone",
+                format.name()
+            );
+            // Four output rows a unit sum each row as one does.
+            let four = step_matvec(gpu, format, &bank, &x, rows, lpr, true);
+            assert!(
+                four == got,
+                "{} lpr {lpr}: four rows a unit moved a row",
+                format.name()
+            );
+        }
+        // Single precision has no routed step entries.
+        if format == Format::F32 {
+            continue;
+        }
+        for (gl, dl) in [(32, 16), (16, 32)] {
+            routed(gpu, format, Tier::Lanes(gl, dl), 5, 1500 + 10 * i as u32);
+        }
+    }
 }

@@ -87,7 +87,7 @@ use shiso_modelfile::{GgufError, GgufFile, TensorDesc, TensorView};
 use shiso_ple::{PleRowType, PleStream};
 
 use crate::qwen4exp::binding::{
-    AttnRoles, BlockRoles, DraftBinding, ExpertRoles, MixRoles, ModelBinding, NGRAM_BIAS,
+    AttnRoles, BlockRoles, DraftBinding, DraftFc, ExpertRoles, MixRoles, ModelBinding, NGRAM_BIAS,
     NGRAM_TABLE, NgramRoles, RecurrentRoles, bind_draft, bind_qwen4exp,
 };
 use crate::qwen4exp::config::Qwen4ExpConfig;
@@ -260,6 +260,7 @@ impl Qwen4ExpModel {
         opts: SparseOptions,
         placement: GgufPlacement,
     ) -> CoreResult<Self> {
+        let mut opts = opts;
         let file = GgufFile::open_shared(path).map_err(open_failure)?;
         let binding = bind_qwen4exp(&file, config)?;
         let ngram = {
@@ -275,7 +276,23 @@ impl Qwen4ExpModel {
         let source = Arc::new(GgufExperts::open(&file, layers, experts)?);
         let slots = gguf_slots(backend.as_ref(), &file, &source, experts, placement)?;
         let mut weights = import(backend, &file, &binding, opts.pack_halves, slots.is_some())?;
-        if let Some(sidecar) = sidecars.draft {
+        // A block drafter drafts in a head's place, as on the trellis arm: the
+        // sidecar is told apart by what it is, not by a second flag.
+        let mut block = None;
+        if let Some(sidecar) = sidecars
+            .draft
+            .filter(|p| crate::qwen35::block_draft::is_block_drafter(p))
+        {
+            if let Some(list) = sidecars.counts {
+                weights.block_vocabulary =
+                    narrow_head(backend, &weights, list, config.shape().vocab)?;
+            }
+            let parts = open_block_drafter(backend, sidecar, config)?;
+            opts.block_draft = Some(
+                parts.footprint(config.shape().vocab, shiso_engine::block_draft::ABSORB_ROWS)?,
+            );
+            block = Some(parts);
+        } else if let Some(sidecar) = sidecars.draft {
             let _tag = ledger::scope(MemTag::DraftWeights);
             // Its own mapping, dropped with the target's: the head's tensors
             // take handles on it exactly as the target's do on the checkpoint.
@@ -304,6 +321,9 @@ impl Qwen4ExpModel {
         let free = device_free(backend.as_ref());
         let mut stack =
             SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
+        if let Some(parts) = block {
+            stack.bind_block_drafter(parts)?;
+        }
         if let Some(slots) = slots {
             let slots = beside_stack(backend.as_ref(), free, slots, source.slot_bytes());
             let used = shape.moe.used;
@@ -711,7 +731,8 @@ impl Qwen4ExpModel {
 /// The files a GGUF load reads beside the checkpoint.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Sidecars<'a> {
-    /// A draft head's own GGUF file.
+    /// A draft head's own GGUF file, or a block drafter, which drafts in the
+    /// head's place.
     pub draft: Option<&'a Path>,
     /// The `id count` list a narrowed draft vocabulary is chosen from.
     pub counts: Option<&'a Path>,
@@ -999,11 +1020,18 @@ fn import_draft(
             backend: "qwen4exp",
         });
     };
+    let (fc_embed, fc_hidden) = match &binding.fc {
+        DraftFc::Split { embed, hidden } => (
+            weight(backend, file, embed)?,
+            weight(backend, file, hidden)?,
+        ),
+        DraftFc::Joined(view) => split_joined(backend, view)?,
+    };
     Ok(DraftHead {
         norm_embed: vector(backend, file, &binding.norm_embed)?,
         norm_hidden: vector(backend, file, &binding.norm_hidden)?,
-        fc_embed: weight(backend, file, &binding.fc_embed)?,
-        fc_hidden: weight(backend, file, &binding.fc_hidden)?,
+        fc_embed,
+        fc_hidden,
         layer: SparseLayer {
             attn_mix: import_mix(backend, file, &binding.layer.attn_mix, pack)?,
             ffn_mix: import_mix(backend, file, &binding.layer.ffn_mix, pack)?,
@@ -1015,6 +1043,48 @@ fn import_draft(
         output_mix: import_mix(backend, file, &binding.output_mix, pack)?,
         head: None,
     })
+}
+
+/// The two halves of a joined input projection (`[out, 2 * in]`, the
+/// embedding's columns first) as two weights of their own.
+///
+/// A row's halves are whole blocks of its stored format, so each half is the
+/// row's own bytes, copied as stored: nothing is decoded or re-encoded.
+fn split_joined(backend: &Arc<dyn Backend>, view: &TensorView<'_>) -> CoreResult<(Weight, Weight)> {
+    let dims = view.shape.dims();
+    let wide = extent(dims.first().copied().unwrap_or(0))?;
+    let out_dim = extent(dims.get(1).copied().unwrap_or(1))?;
+    let half = wide / 2;
+    let row = Weight::payload_bytes(view.dtype, wide, 1);
+    let part = Weight::payload_bytes(view.dtype, half, 1);
+    let (Some(row), Some(part)) = (row, part) else {
+        return Err(CoreError::ShapeMismatch {
+            field: "joined draft projection width",
+            expected: u64::from(half) * 2,
+            got: u64::from(wide),
+        });
+    };
+    let (row, part) = (
+        usize::try_from(row).unwrap_or(usize::MAX),
+        usize::try_from(part).unwrap_or(usize::MAX),
+    );
+    if wide % 2 != 0 || part * 2 != row || view.data.len() != row * out_dim as usize {
+        return Err(CoreError::ShapeMismatch {
+            field: "joined draft projection halves",
+            expected: (row * out_dim as usize) as u64,
+            got: view.data.len() as u64,
+        });
+    }
+    let mut embed = Vec::with_capacity(part * out_dim as usize);
+    let mut hidden = Vec::with_capacity(part * out_dim as usize);
+    for r in view.data.chunks_exact(row) {
+        embed.extend_from_slice(&r[..part]);
+        hidden.extend_from_slice(&r[part..]);
+    }
+    Ok((
+        Weight::uploaded(backend, view.dtype, half, out_dim, 1, embed)?,
+        Weight::uploaded(backend, view.dtype, half, out_dim, 1, hidden)?,
+    ))
 }
 
 /// Moves every bound tensor to the device.
