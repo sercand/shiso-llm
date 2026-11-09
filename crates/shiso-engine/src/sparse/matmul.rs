@@ -2188,6 +2188,14 @@ fn half_input(out: &mut Plan, src: Operand, in_dim: u32, rows: u32, device: Devi
     Operand::Scratch(Buf::HalfActivation)
 }
 
+/// Rounds `rows` rows of `in_dim` single-precision activations at `src` into
+/// the shared half buffer and returns it: the half operand a prompt pass's
+/// GGUF routed stages read.
+pub fn round_to_half(out: &mut Plan, src: Operand, in_dim: u32, rows: u32) -> Operand {
+    convert_into(out, src, in_dim, rows);
+    Operand::Scratch(Buf::HalfActivation)
+}
+
 /// The rounding launch itself.
 fn convert_into(out: &mut Plan, src: Operand, in_dim: u32, rows: u32) {
     let elements = u64::from(rows) * u64::from(in_dim);

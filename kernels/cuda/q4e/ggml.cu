@@ -369,6 +369,9 @@ Q4E_G_INSTANTIATE(Q4E_G_Q2_0, q2_0)
 /* Dynamic shared memory a `bm x bn` tile takes: two buffers of the weight
  * and activation tiles, two of the run scales. */
 #define Q4E_GG_SMEM(bm, bn) (2u * ((bm) + (bn)) * Q4E_GG_LD * 2u + 2u * (bm) * 2u * 4u)
+/* The same for a routed prompt block, whose half activations take three
+ * buffers. */
+#define Q4E_GG_SMEM_H(bm, bn) ((2u * (bm) + 3u * (bn)) * Q4E_GG_LD * 2u + 2u * (bm) * 2u * 4u)
 
 __device__ __forceinline__ uint32_t q4e_gg_h2(float a, float b) {
     const __half2 h = __floats2half2_rn(a, b);
@@ -673,21 +676,37 @@ struct q4e_gg_half {
  * by `BN / 2` columns; a thread decodes one 16-weight run and converts
  * `32 BN / (2 BM)` activations a step, one step ahead of the products in
  * registers, into a double-buffered tile. */
-template <int T, uint32_t BM, uint32_t BN>
+__device__ __forceinline__ void q4e_gg_cp16(void *dst, const void *src, bool live) {
+    const uint32_t d = (uint32_t) __cvta_generic_to_shared(dst);
+    const int n = live ? 16 : 0; /* zero-fills a column past the tile's */
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(src), "r"(n));
+}
+__device__ __forceinline__ void q4e_gg_cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N>
+__device__ __forceinline__ void q4e_gg_cp_wait() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+}
+
+/* Stages of the half activation tile when the activations arrive as halves:
+ * one being multiplied, one landed, one in flight. */
+#define Q4E_GG_HSTAGES 3u
+
+template <int T, uint32_t BM, uint32_t BN, bool HX = false>
 __device__ __forceinline__ void q4e_gg_tile(uint8_t *smem, const q4e_gg_half *h,
                                             uint64_t row_bytes, uint32_t out_dim, uint32_t in_dim,
-                                            const float *const *xrow, const uint32_t *col,
+                                            const void *const *xrow, const uint32_t *col,
                                             uint32_t n_valid) {
     constexpr uint32_t THREADS = 2u * BM;
     constexpr uint32_t BPT = BN * Q4E_GG_BK / THREADS; /* activations a thread */
     constexpr uint32_t BQ = Q4E_GG_BK / BPT;           /* threads a column */
     constexpr uint32_t NT = BN / 16u;                  /* a warp's column groups of 8 */
     static_assert(BPT % 4u == 0u && BPT <= 16u, "a thread converts whole float4s of one run");
+    constexpr uint32_t NB = HX ? Q4E_GG_HSTAGES : 2u; /* activation tile buffers */
     __half(*sa)[BM][Q4E_GG_LD] = reinterpret_cast<__half(*)[BM][Q4E_GG_LD]>(smem);
     __half(*sb)[BN][Q4E_GG_LD] =
         reinterpret_cast<__half(*)[BN][Q4E_GG_LD]>(smem + 2u * BM * Q4E_GG_LD * 2u);
     float(*ss)[BM][2] =
-        reinterpret_cast<float(*)[BM][2]>(smem + 2u * (BM + BN) * Q4E_GG_LD * 2u);
+        reinterpret_cast<float(*)[BM][2]>(smem + (2u * BM + NB * BN) * Q4E_GG_LD * 2u);
 
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
@@ -708,6 +727,19 @@ __device__ __forceinline__ void q4e_gg_tile(uint8_t *smem, const q4e_gg_half *h,
     const uint32_t bq = (tid % BQ) * BPT;
 
     const float *b_src = nullptr;
+    /* Half activations: `BN * 4` sixteen-byte pieces a step, a thread each
+     * (or none). */
+    const __half *hx_src = nullptr;
+    const uint32_t hn = tid >> 2;
+    const uint32_t hq = tid & 3u;
+    auto issue_x = [&](uint32_t ks) {
+        if (HX && tid < BN * 4u) {
+            const __half *src = hx_src != nullptr ? hx_src + ks * Q4E_GG_BK + hq * 8u
+                                                  : reinterpret_cast<const __half *>(xrow[0]);
+            q4e_gg_cp16(&sb[ks % NB][hn][hq * 8u], src, hx_src != nullptr);
+        }
+        q4e_gg_cp_commit();
+    };
     uint32_t ra[8];
     uint32_t rb[BPT / 2u];
     float rs;
@@ -720,7 +752,7 @@ __device__ __forceinline__ void q4e_gg_tile(uint8_t *smem, const q4e_gg_half *h,
     };
     auto fetch = [&](uint32_t ks, staged &st) {
         if (a_live) q4e_gg_fetch<T>(a_row, ks * 2u + ac, st.a);
-        if (b_src != nullptr) {
+        if (!HX && b_src != nullptr) {
             const float4 *p = (const float4 *) (b_src + ks * Q4E_GG_BK + bq);
 #pragma unroll
             for (uint32_t j = 0; j < BPT / 4u; ++j) st.b[j] = p[j];
@@ -737,7 +769,8 @@ __device__ __forceinline__ void q4e_gg_tile(uint8_t *smem, const q4e_gg_half *h,
 #pragma unroll
             for (int j = 0; j < 8; ++j) ra[j] = 0u;
         }
-        if (b_src != nullptr) {
+        if (HX) {
+        } else if (b_src != nullptr) {
 #pragma unroll
             for (uint32_t j = 0; j < BPT / 4u; ++j) {
                 rb[2 * j] = q4e_gg_h2(st.b[j].x, st.b[j].y);
@@ -752,9 +785,11 @@ __device__ __forceinline__ void q4e_gg_tile(uint8_t *smem, const q4e_gg_half *h,
         uint4 *pa = (uint4 *) &sa[buf][ar][ac * 16u];
         pa[0] = make_uint4(ra[0], ra[1], ra[2], ra[3]);
         pa[1] = make_uint4(ra[4], ra[5], ra[6], ra[7]);
-        uint2 *pb = (uint2 *) &sb[buf][bn][bq];
+        if (!HX) {
+            uint2 *pb = (uint2 *) &sb[buf][bn][bq];
 #pragma unroll
-        for (uint32_t j = 0; j < BPT / 4u; ++j) pb[j] = make_uint2(rb[2 * j], rb[2 * j + 1]);
+            for (uint32_t j = 0; j < BPT / 4u; ++j) pb[j] = make_uint2(rb[2 * j], rb[2 * j + 1]);
+        }
         ss[buf][ar][ac] = rs;
     };
 
@@ -771,18 +806,37 @@ __device__ __forceinline__ void q4e_gg_tile(uint8_t *smem, const q4e_gg_half *h,
     /* A previous tile is done with both buffers, and the column table the
      * caller filled is visible. */
     __syncthreads();
-    b_src = xrow[bn];
+    if (HX) {
+        hx_src = tid < BN * 4u ? reinterpret_cast<const __half *>(xrow[hn]) : nullptr;
+        issue_x(0u);
+        issue_x(1u);
+    } else {
+        b_src = reinterpret_cast<const float *>(xrow[bn]);
+    }
     staged st0, st1;
     fetch(0u, st0);
     if (nk > 1u) fetch(1u, st1);
     decode(0u, st0);
     store(0u);
+    if (HX) q4e_gg_cp_wait<1>();
     __syncthreads();
-    for (uint32_t ks = 0; ks < nk; ++ks) {
+    /* One step: `nx` holds step ks + 1 (fetched a step ago), and step ks + 2
+     * is fetched into `fx`, free since its step was decoded. The two swap
+     * roles step to step rather than copying, because a copy would wait on
+     * the loads it copies and the step would wait out its own fetch. The
+     * activation stage step ks + 2 takes was last read by step ks - 1, which
+     * every warp finished before the barrier that ended it. */
+    auto step = [&](uint32_t ks, staged &fx, const staged &nx) {
         const uint32_t buf = ks & 1u;
-        /* st1 holds step ks + 1; step ks + 2 goes into st0, free since its
-         * step was decoded. */
-        if (ks + 2u < nk) fetch(ks + 2u, st0);
+        const uint32_t xb = HX ? ks % NB : buf;
+        if (ks + 2u < nk) fetch(ks + 2u, fx);
+        if (HX) {
+            if (ks + 2u < nk) {
+                issue_x(ks + 2u);
+            } else {
+                q4e_gg_cp_commit();
+            }
+        }
         if (n_on) {
 #pragma unroll
             for (uint32_t c = 0; c < 2u; ++c) {
@@ -804,7 +858,7 @@ __device__ __forceinline__ void q4e_gg_tile(uint8_t *smem, const q4e_gg_half *h,
                     if (nb < n_valid) {
                         uint32_t b[4];
                         const uint32_t n = nb + (lane & 7u) + ((lane >> 4) << 3);
-                        q4e_gg_ldsm4(b, &sb[buf][n][c * 16u + ((lane >> 3) & 1u) * 8u]);
+                        q4e_gg_ldsm4(b, &sb[xb][n][c * 16u + ((lane >> 3) & 1u) * 8u]);
 #pragma unroll
                         for (uint32_t mi = 0; mi < 2u; ++mi) {
 #pragma unroll
@@ -823,11 +877,15 @@ __device__ __forceinline__ void q4e_gg_tile(uint8_t *smem, const q4e_gg_half *h,
             }
         }
         if (ks + 1u < nk) {
-            decode(ks + 1u, st1);
+            decode(ks + 1u, nx);
             store(buf ^ 1u);
         }
-        st1 = st0;
+        if (HX) q4e_gg_cp_wait<1>(); /* step ks + 1's activations landed */
         __syncthreads();
+    };
+    for (uint32_t ks = 0; ks < nk; ks += 2u) {
+        step(ks, st0, st1);
+        if (ks + 1u < nk) step(ks + 1u, st1, st0);
     }
 
     /* A warp's 32 rows sit in one half. */
@@ -855,7 +913,7 @@ template <int T, uint32_t BM, uint32_t BN>
 __device__ __forceinline__ void q4e_gg_matmul(float *out, const uint8_t *w, const float *x,
                                               uint32_t in_dim, uint32_t out_dim, uint32_t rows) {
     extern __shared__ __align__(16) uint8_t q4e_gg_dyn[];
-    __shared__ const float *xrow[BN];
+    __shared__ const void *xrow[BN];
     __shared__ uint32_t col[BN];
     const uint32_t col0 = blockIdx.y * BN;
     if (threadIdx.x < BN) {
@@ -872,12 +930,12 @@ __device__ __forceinline__ void q4e_gg_matmul(float *out, const uint8_t *w, cons
 /* A routed stage of a prompt pass over an active expert's sorted columns,
  * `Q4E_GG_EXPERT_BN` at a time, its two halves as the entry sets them. */
 template <int T, uint32_t BM>
-__device__ __forceinline__ void q4e_gg_expert(const q4e_gg_half *h, const float *x,
+__device__ __forceinline__ void q4e_gg_expert(const q4e_gg_half *h, const __half *x,
                                               const int *sorted, int c0, int c1, uint32_t in_dim,
                                               uint32_t out_dim, uint32_t x_div) {
     extern __shared__ __align__(16) uint8_t q4e_gg_dyn[];
     constexpr uint32_t BN = Q4E_GG_EXPERT_BN;
-    __shared__ const float *xrow[BN];
+    __shared__ const void *xrow[BN];
     __shared__ uint32_t col[BN];
     for (int cb = c0; cb < c1; cb += (int) BN) {
         __syncthreads(); /* the previous tile has read its column table */
@@ -892,8 +950,8 @@ __device__ __forceinline__ void q4e_gg_expert(const q4e_gg_half *h, const float 
                 col[threadIdx.x] = 0u;
             }
         }
-        q4e_gg_tile<T, BM, BN>(q4e_gg_dyn, h, q4e_g_row_bytes<T>(in_dim), out_dim, in_dim,
-                               xrow, col, min(BN, (uint32_t) (c1 - cb)));
+        q4e_gg_tile<T, BM, BN, true>(q4e_gg_dyn, h, q4e_g_row_bytes<T>(in_dim), out_dim, in_dim,
+                                     xrow, col, min(BN, (uint32_t) (c1 - cb)));
     }
 }
 
@@ -903,7 +961,7 @@ __device__ __forceinline__ void q4e_gg_expert(const q4e_gg_half *h, const float 
 template <int T, uint32_t BM>
 __device__ __forceinline__ void q4e_gg_gate_up(
         float *out_gate, float *out_up, const uint8_t *gate_w, const uint8_t *up_w,
-        const float *x, const int *sorted, const int *bounds, const int *active,
+        const __half *x, const int *sorted, const int *bounds, const int *active,
         const uint32_t *map, uint32_t in_dim, uint32_t out_dim, uint32_t n_expert,
         uint32_t n_used, uint32_t gate_stride, uint32_t up_stride) {
     if ((int) blockIdx.y >= active[n_expert]) return;
@@ -922,7 +980,7 @@ __device__ __forceinline__ void q4e_gg_gate_up(
  * arguments, `BM` rows of the matrix a block. */
 template <int T, uint32_t BM>
 __device__ __forceinline__ void q4e_gg_down(
-        float *out, const uint8_t *down_w, const float *mid, const int *sorted,
+        float *out, const uint8_t *down_w, const __half *mid, const int *sorted,
         const int *bounds, const int *active, const uint32_t *map, uint32_t in_dim,
         uint32_t out_dim, uint32_t n_expert, uint32_t stride) {
     if ((int) blockIdx.y >= active[n_expert]) return;
@@ -950,7 +1008,7 @@ __device__ __forceinline__ void q4e_gg_down(
     extern "C" __global__ void __launch_bounds__(2u * Q4E_GG_GATE_UP_BM)                        \
     q4e_g_experts_gemm_gate_up_##NAME##_kernel(                                                 \
             float *out_gate, float *out_up, const uint8_t *gate_w, const uint8_t *up_w,         \
-            const float *x, const int *sorted, const int *bounds, const int *active,            \
+            const __half *x, const int *sorted, const int *bounds, const int *active,           \
             const uint32_t *map, uint32_t in_dim, uint32_t out_dim, uint32_t n_expert,          \
             uint32_t n_used, uint32_t gate_stride, uint32_t up_stride) {                        \
         q4e_gg_gate_up<T, Q4E_GG_GATE_UP_BM>(out_gate, out_up, gate_w, up_w, x, sorted, bounds, \
@@ -959,7 +1017,7 @@ __device__ __forceinline__ void q4e_gg_down(
     }                                                                                           \
     extern "C" __global__ void __launch_bounds__(2u * Q4E_GG_DOWN_BM)                           \
     q4e_g_experts_gemm_down_##NAME##_kernel(                                                    \
-            float *out, const uint8_t *down_w, const float *mid, const int *sorted,             \
+            float *out, const uint8_t *down_w, const __half *mid, const int *sorted,            \
             const int *bounds, const int *active, const uint32_t *map, uint32_t in_dim,         \
             uint32_t out_dim, uint32_t n_expert, uint32_t n_used, uint32_t stride) {            \
         (void) n_used;                                                                          \
@@ -1322,3 +1380,15 @@ Q4E_GS_INSTANTIATE(Q4E_G_IQ4_NL, iq4_nl)
 Q4E_GS_INSTANTIATE(Q4E_G_IQ2_S, iq2_s)
 Q4E_GS_INSTANTIATE(Q4E_G_IQ4_XS, iq4_xs)
 Q4E_GS_INSTANTIATE(Q4E_G_Q2_0, q2_0)
+
+/* A prompt pass's routed activation into halves, for the down stage's tensor
+ * cores: `out[i] = silu(gate[i]) * up[i]` in single precision as
+ * `q4e_swiglu_kernel` computes it, then rounded. `out, gate, up, n`; grid
+ * `ceil(n / 256)`, 256 threads. */
+extern "C" __global__ void q4e_g_swiglu_half_kernel(__half *out, const float *gate, const float *up,
+                                                    uint64_t n) {
+    const uint64_t i = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = gate[i];
+    out[i] = __float2half_rn((g / (1.0f + __expf(-g))) * up[i]);
+}

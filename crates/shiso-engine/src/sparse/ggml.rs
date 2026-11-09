@@ -166,6 +166,13 @@ pub const fn gemm_rows_launch(out_dim: u32, rows: u32) -> Launch {
     )
 }
 
+/// Dynamic shared memory a routed prompt block takes (`Q4E_GG_SMEM_H`): its
+/// half activations arrive by asynchronous copy into three buffers.
+#[must_use]
+pub const fn gemm_smem_half(rows: u32, cols: u32) -> u32 {
+    (2 * rows + 3 * cols) * 40 * 2 + 2 * rows * 2 * 4
+}
+
 /// The routed gate/up prompt launch over `groups` active experts; a block
 /// covers half its rows of each matrix.
 #[must_use]
@@ -173,7 +180,7 @@ pub const fn gemm_gate_up_launch(out_dim: u32, groups: u32) -> Launch {
     Launch::new(
         Extent3::new(out_dim.div_ceil(GEMM_GATE_UP_ROWS / 2), groups, 1),
         2 * GEMM_GATE_UP_ROWS,
-        gemm_smem(GEMM_GATE_UP_ROWS, GEMM_EXPERT_COLS),
+        gemm_smem_half(GEMM_GATE_UP_ROWS, GEMM_EXPERT_COLS),
     )
 }
 
@@ -183,7 +190,7 @@ pub const fn gemm_down_launch(out_dim: u32, groups: u32) -> Launch {
     Launch::new(
         Extent3::new(out_dim.div_ceil(GEMM_DOWN_ROWS), groups, 1),
         2 * GEMM_DOWN_ROWS,
-        gemm_smem(GEMM_DOWN_ROWS, GEMM_EXPERT_COLS),
+        gemm_smem_half(GEMM_DOWN_ROWS, GEMM_EXPERT_COLS),
     )
 }
 

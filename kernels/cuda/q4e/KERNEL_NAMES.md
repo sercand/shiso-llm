@@ -52,8 +52,8 @@ back to the kernel it belongs to.
 | `q4e_bf16` | `bf16.cu` | 12 | 0 |
 | `q4e_gdn_fused` | `gdn_fused.cu` | 2 | 0 |
 | `q4e_ffn` | `ffn.cu` | 3 | 0 |
-| `q4e_ggml` | `ggml.cu` | 83 | 0 |
-| **total** | 20 units | **191** | **105** |
+| `q4e_ggml` | `ggml.cu` | 84 | 0 |
+| **total** | 20 units | **192** | **105** |
 
 ## Plain entries, by module
 
@@ -285,8 +285,12 @@ entry takes its step twin's arguments; a step entry takes them and `lpr` last.
   16-weight run's stored codes enter the tile as exact halves and its stored
   scale multiplies the run's 16-term product; activations rounded to halves.
 - `q4e_g_experts_gemm_gate_up_*` - gate and up of a prompt pass, the same rows
-  of both matrices a block.
-- `q4e_g_experts_gemm_down_*` - down of a prompt pass.
+  of both matrices a block; `x` is the block input rounded to halves once
+  (`q4e_f32_to_f16_kernel`), staged by asynchronous copy.
+- `q4e_g_experts_gemm_down_*` - down of a prompt pass; `mid` is halves.
+- `q4e_g_swiglu_half_kernel` - `q4e_swiglu_kernel`'s activation rounded to
+  halves for the down stage (`out, gate, up, n`), grid `ceil(n / 256)`, 256
+  threads.
 - `q4e_g_step_matvec_*` - a step or verify pass's dense projection, `lpr`
   lanes a row (`lpr` up to 128: past 32 a row's warps fold through shared
   memory, lowest warp first).
@@ -958,8 +962,8 @@ the table; the block-quantized entry does not, so its caller owns the range.
 | `q4e_g_experts_down_*` | `(ceil(out_dim / Q4E_G_ROWS), min(n_tok * n_used, n_expert))` | `32 * Q4E_G_ROWS` | `0` |
 | `q4e_g_embed_*` | `n_tok` | `32` | `0` |
 | `q4e_g_gemm_*` | `(ceil(out_dim / Q4E_GG_DENSE_BM), ceil(n_tok / Q4E_GG_DENSE_BN))` | `2 * Q4E_GG_DENSE_BM` | `Q4E_GG_SMEM(Q4E_GG_DENSE_BM, Q4E_GG_DENSE_BN)` |
-| `q4e_g_experts_gemm_gate_up_*` | `(ceil(out_dim / (Q4E_GG_GATE_UP_BM / 2)), min(n_tok * n_used, n_expert))` | `2 * Q4E_GG_GATE_UP_BM` | `Q4E_GG_SMEM(Q4E_GG_GATE_UP_BM, Q4E_GG_EXPERT_BN)` **opt-in** |
-| `q4e_g_experts_gemm_down_*` | `(ceil(out_dim / Q4E_GG_DOWN_BM), min(n_tok * n_used, n_expert))` | `2 * Q4E_GG_DOWN_BM` | `Q4E_GG_SMEM(Q4E_GG_DOWN_BM, Q4E_GG_EXPERT_BN)` |
+| `q4e_g_experts_gemm_gate_up_*` | `(ceil(out_dim / (Q4E_GG_GATE_UP_BM / 2)), min(n_tok * n_used, n_expert))` | `2 * Q4E_GG_GATE_UP_BM` | `Q4E_GG_SMEM_H(Q4E_GG_GATE_UP_BM, Q4E_GG_EXPERT_BN)` **opt-in** |
+| `q4e_g_experts_gemm_down_*` | `(ceil(out_dim / Q4E_GG_DOWN_BM), min(n_tok * n_used, n_expert))` | `2 * Q4E_GG_DOWN_BM` | `Q4E_GG_SMEM_H(Q4E_GG_DOWN_BM, Q4E_GG_EXPERT_BN)` |
 | `q4e_g_step_matvec_*` | `(ceil(out_dim / (Q4E_GS_WARPS * 32 / lpr)), ceil(n_tok / Q4E_GS_COLS))` | `32 * Q4E_GS_WARPS` | `0` |
 | `q4e_g_step_matvec4_*` | `(ceil(out_dim / (4 * Q4E_GS_WARPS * 32 / lpr)), ceil(n_tok / Q4E_GS_COLS))` | `32 * Q4E_GS_WARPS` | `0` |
 | `q4e_g_step_gate_up_*` | `(ceil(out_dim / (Q4E_GS_WARPS * 16 / lpr)), min(n_tok * n_used, n_expert))` | `32 * Q4E_GS_WARPS` | `0` |

@@ -404,13 +404,13 @@ fn routed(gpu: &Gpu, format: Format, tier: Tier, tokens: usize, seed: u32) -> Ve
                 Stage::GemmGateUp,
                 GEMM_GATE_UP_ROWS / 2,
                 2 * GEMM_GATE_UP_ROWS,
-                gemm_smem(GEMM_GATE_UP_ROWS, GEMM_EXPERT_COLS),
+                gemm_smem_half(GEMM_GATE_UP_ROWS, GEMM_EXPERT_COLS),
             ),
             (
                 Stage::GemmDown,
                 GEMM_DOWN_ROWS,
                 2 * GEMM_DOWN_ROWS,
-                gemm_smem(GEMM_DOWN_ROWS, GEMM_EXPERT_COLS),
+                gemm_smem_half(GEMM_DOWN_ROWS, GEMM_EXPERT_COLS),
             ),
         ),
     };
@@ -451,7 +451,15 @@ fn routed(gpu: &Gpu, format: Format, tier: Tier, tokens: usize, seed: u32) -> Ve
             gpu.upload(&up_bytes),
             gpu.upload(&down_bytes),
         );
-        let xs = gpu.upload(&f32_bytes(&x));
+        // The routed prompt entries read their activations as halves.
+        let act = |v: &[f32]| {
+            if tier == Tier::Prompt {
+                half_bytes(v)
+            } else {
+                f32_bytes(v)
+            }
+        };
+        let xs = gpu.upload(&act(&x));
         let sorted_b = gpu.upload(&i32_le(&sorted));
         let bounds_b = gpu.upload(&i32_le(&bounds));
         let active_b = gpu.upload(&i32_le(&active));
@@ -528,7 +536,7 @@ fn routed(gpu: &Gpu, format: Format, tier: Tier, tokens: usize, seed: u32) -> Ve
         } else {
             mid
         };
-        let mid_b = gpu.upload(&f32_bytes(&mid));
+        let mid_b = gpu.upload(&act(&mid));
         let out_down = gpu.upload(&vec![0u8; cols * hidden * 4]);
         run(
             gpu,
@@ -592,6 +600,19 @@ const GEMM_DOWN_ROWS: usize = 128;
 const GEMM_EXPERT_COLS: usize = 64;
 
 /// `Q4E_GG_SMEM(rows, cols)`.
+/// `Q4E_GG_SMEM_H(rows, cols)`: a routed prompt block's three half
+/// activation buffers.
+const fn gemm_smem_half(rows: usize, cols: usize) -> u32 {
+    ((2 * rows + 3 * cols) * 40 * 2 + 2 * rows * 2 * 4) as u32
+}
+
+/// Values as little-endian halves.
+fn half_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter()
+        .flat_map(|&x| f16::from_f32(x).to_le_bytes())
+        .collect()
+}
+
 const fn gemm_smem(rows: usize, cols: usize) -> u32 {
     (2 * (rows + cols) * 40 * 2 + 2 * rows * 2 * 4) as u32
 }

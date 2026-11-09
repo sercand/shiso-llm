@@ -1860,6 +1860,38 @@ pub fn affine_experts(
     Ok(plan)
 }
 
+/// The routed activation between a GGUF bank's gate/up and down stages, and
+/// the operand the down stage reads: on the prompt entries the activation
+/// written as halves into the shared half buffer, the down stage's tensor-core
+/// operand; otherwise [`activate`]'s single-precision rows.
+fn ggml_activate(plan: &mut Plan, shape: &SparseShape, n_tok: u32, half: bool) -> Operand {
+    let inter = shape.moe.intermediate;
+    if half {
+        let n = shape.moe.slot_rows(n_tok) * u64::from(inter);
+        // `out, gate, up, n`
+        plan.launch(
+            Entry::plain(kernels::MOD_GGML, "q4e_g_swiglu_half_kernel"),
+            kernels::elementwise(n),
+            Args::of(&[
+                Operand::Scratch(Buf::HalfActivation),
+                Operand::Scratch(Buf::MoeGate),
+                Operand::Scratch(Buf::MoeUp),
+                Operand::U64(n),
+            ]),
+        );
+        Operand::Scratch(Buf::HalfActivation)
+    } else {
+        plan.append(activate(
+            shape,
+            Operand::Scratch(Buf::MoeGate),
+            Operand::Scratch(Buf::MoeUp),
+            Operand::Scratch(Buf::MoeMid),
+            n_tok,
+        ));
+        Operand::Scratch(Buf::MoeMid)
+    }
+}
+
 /// The entries a GGUF routed stage pair takes on this pass, their launches,
 /// and the lanes a row the CUDA step entries take last.
 struct GgmlTier {
@@ -1867,6 +1899,10 @@ struct GgmlTier {
     down: Option<Entry>,
     launches: [kernels::Launch; 2],
     lanes: Option<(u32, u32)>,
+    /// Whether the stages read their activations as halves: the prompt
+    /// entries, which take the block input rounded once and the activation
+    /// written as halves.
+    half: bool,
 }
 
 /// Picks [`GgmlTier`]: both stages take one tier or neither does, so a
@@ -1893,6 +1929,7 @@ fn ggml_tier(desc: &ExpertDesc, hidden: u32, inter: u32, groups: u32, device: De
                 ggml::gemm_down_launch(hidden, groups),
             ],
             lanes: None,
+            half: true,
         },
         (_, (Some(g), Some(d))) => GgmlTier {
             gate_up: Some(g),
@@ -1902,12 +1939,14 @@ fn ggml_tier(desc: &ExpertDesc, hidden: u32, inter: u32, groups: u32, device: De
                 ggml::step_down_launch(hidden, groups, lanes.1),
             ],
             lanes: Some(lanes),
+            half: false,
         },
         _ => GgmlTier {
             gate_up: ggml::entry(desc.gate.dtype, ggml::Stage::GateUp),
             down: ggml::entry(desc.down.dtype, ggml::Stage::Down),
             launches: [ggml::launch(inter, groups), ggml::launch(hidden, groups)],
             lanes: None,
+            half: false,
         },
     }
 }
@@ -1979,6 +2018,7 @@ pub fn ggml_experts(
         down,
         launches,
         lanes: step_lanes,
+        half,
     } = ggml_tier(desc, hidden, inter, groups, device);
     let (Some(gate_up), Some(down)) = (gate_up, down) else {
         return Err(CoreError::Unsupported {
@@ -2027,6 +2067,15 @@ pub fn ggml_experts(
         ]
     };
     let mut plan = Plan::new();
+    // The prompt stages read halves: the block input rounded once here, and
+    // the activation the half SwiGLU below writes, both in the shared half
+    // buffer (sized for the widest stream, which either fits) one after the
+    // other.
+    let x = if half {
+        matmul::round_to_half(&mut plan, Operand::Scratch(Buf::Mixed), hidden, n_tok)
+    } else {
+        Operand::Scratch(Buf::Mixed)
+    };
     // `out_gate, out_up, gate_w, up_w, x, sorted, bounds, active, map, in_dim,
     //  out_dim, n_expert, n_used, gate_stride, up_stride`
     let mut ops = vec![
@@ -2034,7 +2083,7 @@ pub fn ggml_experts(
         Operand::Scratch(Buf::MoeUp),
         at(Role::ExpertGate),
         at(Role::ExpertUp),
-        Operand::Scratch(Buf::Mixed),
+        x,
     ];
     ops.extend(tail(hidden, inter));
     ops.push(stride(Role::ExpertGate, &desc.gate)?);
@@ -2043,20 +2092,10 @@ pub fn ggml_experts(
         ops.push(Operand::U32(l));
     }
     plan.launch(gate_up, launches[0], Args::of(&ops));
-    plan.append(activate(
-        shape,
-        Operand::Scratch(Buf::MoeGate),
-        Operand::Scratch(Buf::MoeUp),
-        Operand::Scratch(Buf::MoeMid),
-        n_tok,
-    ));
+    let mid = ggml_activate(&mut plan, shape, n_tok, half);
     // `out, down_w, mid, sorted, bounds, active, map, in_dim, out_dim,
     //  n_expert, n_used, stride`
-    let mut ops = vec![
-        Operand::Scratch(Buf::MoeDown),
-        at(Role::ExpertDown),
-        Operand::Scratch(Buf::MoeMid),
-    ];
+    let mut ops = vec![Operand::Scratch(Buf::MoeDown), at(Role::ExpertDown), mid];
     ops.extend(tail(inter, hidden));
     ops.push(stride(Role::ExpertDown, &desc.down)?);
     if let Some((_, l)) = step_lanes {
