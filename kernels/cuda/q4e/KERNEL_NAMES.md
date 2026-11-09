@@ -52,7 +52,8 @@ back to the kernel it belongs to.
 | `q4e_bf16` | `bf16.cu` | 12 | 0 |
 | `q4e_gdn_fused` | `gdn_fused.cu` | 2 | 0 |
 | `q4e_ffn` | `ffn.cu` | 3 | 0 |
-| **total** | 19 units | **108** | **105** |
+| `q4e_ggml` | `ggml.cu` | 84 | 0 |
+| **total** | 20 units | **192** | **105** |
 
 ## Plain entries, by module
 
@@ -225,6 +226,130 @@ in_dim, n_expert, n_used, inter, splits, gate_splits, rows`; grid
 - `q4e_ffn_combine_kernel` - `q4e_moe_combine_kernel` then
   `q4e_shared_add_kernel` in one pass (`out, down, weights, shared, logit,
   n_embd, n_used`), grid `(ceil(n_embd / 256), rows)`, 256 threads.
+
+### `q4e_ggml`
+
+Not an upstream unit: the twin of `kernels/metal/q4e/ggml.metal`, the dense
+projections, routed expert stages and vocabulary rows over weights kept in
+their GGUF blocks, one entry per stage and format (`f32`, `q8_0`, `q6_k`,
+`iq3_xxs`, `iq4_nl`, `iq2_s`, `iq4_xs`, `q2_0`), each a C-linkage wrapper over
+one template body. The argument order is the Metal twin's:
+
+- `q4e_g_matvec_*` - `out, w, x, in_dim, out_dim, rows`.
+- `q4e_g_experts_gate_up_*` - `out_gate, out_up, gate_w, up_w, x, sorted,
+  bounds, active, map, in_dim, out_dim, n_expert, n_used, gate_stride,
+  up_stride`; a stride is the bytes between expert slots (the pool's slot
+  width when the bank is streamed).
+- `q4e_g_experts_down_*` - `out, down_w, mid, sorted, bounds, active, map,
+  in_dim, out_dim, n_expert, n_used, stride`.
+- `q4e_g_embed_*` - `out, tokens, w, n_tokens, n_embd`.
+
+- `q4e_g_matvec_f32_kernel`
+- `q4e_g_matvec_q8_0_kernel`
+- `q4e_g_matvec_q6_k_kernel`
+- `q4e_g_matvec_iq3_xxs_kernel`
+- `q4e_g_matvec_iq4_nl_kernel`
+- `q4e_g_matvec_iq2_s_kernel`
+- `q4e_g_matvec_iq4_xs_kernel`
+- `q4e_g_matvec_q2_0_kernel`
+- `q4e_g_experts_gate_up_f32_kernel`
+- `q4e_g_experts_gate_up_q8_0_kernel`
+- `q4e_g_experts_gate_up_q6_k_kernel`
+- `q4e_g_experts_gate_up_iq3_xxs_kernel`
+- `q4e_g_experts_gate_up_iq4_nl_kernel`
+- `q4e_g_experts_gate_up_iq2_s_kernel`
+- `q4e_g_experts_gate_up_iq4_xs_kernel`
+- `q4e_g_experts_gate_up_q2_0_kernel`
+- `q4e_g_experts_down_f32_kernel`
+- `q4e_g_experts_down_q8_0_kernel`
+- `q4e_g_experts_down_q6_k_kernel`
+- `q4e_g_experts_down_iq3_xxs_kernel`
+- `q4e_g_experts_down_iq4_nl_kernel`
+- `q4e_g_experts_down_iq2_s_kernel`
+- `q4e_g_experts_down_iq4_xs_kernel`
+- `q4e_g_experts_down_q2_0_kernel`
+- `q4e_g_embed_f32_kernel`
+- `q4e_g_embed_q8_0_kernel`
+- `q4e_g_embed_q6_k_kernel`
+- `q4e_g_embed_iq3_xxs_kernel`
+- `q4e_g_embed_iq4_nl_kernel`
+- `q4e_g_embed_iq2_s_kernel`
+- `q4e_g_embed_iq4_xs_kernel`
+- `q4e_g_embed_q2_0_kernel`
+
+CUDA-only entries, which the Metal twin does not have: the prompt pass on
+tensor cores and the step passes with a row split over `lpr` lanes. A prompt
+entry takes its step twin's arguments; a step entry takes them and `lpr` last.
+
+- `q4e_g_gemm_*` - a prompt chunk's dense projection on tensor cores: each
+  16-weight run's stored codes enter the tile as exact halves and its stored
+  scale multiplies the run's 16-term product; activations rounded to halves.
+- `q4e_g_experts_gemm_gate_up_*` - gate and up of a prompt pass, the same rows
+  of both matrices a block; `x` is the block input rounded to halves once
+  (`q4e_f32_to_f16_kernel`), staged by asynchronous copy.
+- `q4e_g_experts_gemm_down_*` - down of a prompt pass; `mid` is halves.
+- `q4e_g_swiglu_half_kernel` - `q4e_swiglu_kernel`'s activation rounded to
+  halves for the down stage (`out, gate, up, n`), grid `ceil(n / 256)`, 256
+  threads.
+- `q4e_g_step_matvec_*` - a step or verify pass's dense projection, `lpr`
+  lanes a row (`lpr` up to 128: past 32 a row's warps fold through shared
+  memory, lowest warp first).
+- `q4e_g_step_matvec4_*` - the same sums, four output rows a unit, so a pass
+  of several activation rows reads each once for four rows.
+- `q4e_g_step_gate_up_*`, `q4e_g_step_down_*` - the routed stages of a step or
+  verify pass, `lpr` lanes a row; gate/up units alternate the two matrices.
+
+- `q4e_g_gemm_q8_0_kernel`
+- `q4e_g_gemm_q6_k_kernel`
+- `q4e_g_gemm_iq3_xxs_kernel`
+- `q4e_g_gemm_iq4_nl_kernel`
+- `q4e_g_gemm_iq2_s_kernel`
+- `q4e_g_gemm_iq4_xs_kernel`
+- `q4e_g_gemm_q2_0_kernel`
+- `q4e_g_experts_gemm_gate_up_q8_0_kernel`
+- `q4e_g_experts_gemm_gate_up_q6_k_kernel`
+- `q4e_g_experts_gemm_gate_up_iq3_xxs_kernel`
+- `q4e_g_experts_gemm_gate_up_iq4_nl_kernel`
+- `q4e_g_experts_gemm_gate_up_iq2_s_kernel`
+- `q4e_g_experts_gemm_gate_up_iq4_xs_kernel`
+- `q4e_g_experts_gemm_gate_up_q2_0_kernel`
+- `q4e_g_experts_gemm_down_q8_0_kernel`
+- `q4e_g_experts_gemm_down_q6_k_kernel`
+- `q4e_g_experts_gemm_down_iq3_xxs_kernel`
+- `q4e_g_experts_gemm_down_iq4_nl_kernel`
+- `q4e_g_experts_gemm_down_iq2_s_kernel`
+- `q4e_g_experts_gemm_down_iq4_xs_kernel`
+- `q4e_g_experts_gemm_down_q2_0_kernel`
+- `q4e_g_step_matvec_f32_kernel`
+- `q4e_g_step_matvec_q8_0_kernel`
+- `q4e_g_step_matvec_q6_k_kernel`
+- `q4e_g_step_matvec_iq3_xxs_kernel`
+- `q4e_g_step_matvec_iq4_nl_kernel`
+- `q4e_g_step_matvec_iq2_s_kernel`
+- `q4e_g_step_matvec_iq4_xs_kernel`
+- `q4e_g_step_matvec_q2_0_kernel`
+- `q4e_g_step_matvec4_f32_kernel`
+- `q4e_g_step_matvec4_q8_0_kernel`
+- `q4e_g_step_matvec4_q6_k_kernel`
+- `q4e_g_step_matvec4_iq3_xxs_kernel`
+- `q4e_g_step_matvec4_iq4_nl_kernel`
+- `q4e_g_step_matvec4_iq2_s_kernel`
+- `q4e_g_step_matvec4_iq4_xs_kernel`
+- `q4e_g_step_matvec4_q2_0_kernel`
+- `q4e_g_step_gate_up_q8_0_kernel`
+- `q4e_g_step_gate_up_q6_k_kernel`
+- `q4e_g_step_gate_up_iq3_xxs_kernel`
+- `q4e_g_step_gate_up_iq4_nl_kernel`
+- `q4e_g_step_gate_up_iq2_s_kernel`
+- `q4e_g_step_gate_up_iq4_xs_kernel`
+- `q4e_g_step_gate_up_q2_0_kernel`
+- `q4e_g_step_down_q8_0_kernel`
+- `q4e_g_step_down_q6_k_kernel`
+- `q4e_g_step_down_iq3_xxs_kernel`
+- `q4e_g_step_down_iq4_nl_kernel`
+- `q4e_g_step_down_iq2_s_kernel`
+- `q4e_g_step_down_iq4_xs_kernel`
+- `q4e_g_step_down_q2_0_kernel`
 
 ### `q4e_moe`
 
@@ -827,6 +952,22 @@ token and the stream broadcast is left to `q4e_hc_init_kernel`, which is what a
 stack whose residual is initialised separately wants. The two that take
 `n_vocab` clamp an out-of-range id (and a negative one) rather than reading past
 the table; the block-quantized entry does not, so its caller owns the range.
+
+### `q4e_ggml`
+
+| Kernel | Grid | Block | Dynamic shared memory |
+|---|---|---|---|
+| `q4e_g_matvec_*` | `(ceil(out_dim / Q4E_G_ROWS), ceil(rows / Q4E_G_COLS))` | `32 * Q4E_G_ROWS` | `0` |
+| `q4e_g_experts_gate_up_*` | `(ceil(out_dim / Q4E_G_ROWS), min(n_tok * n_used, n_expert))` | `32 * Q4E_G_ROWS` | `0` |
+| `q4e_g_experts_down_*` | `(ceil(out_dim / Q4E_G_ROWS), min(n_tok * n_used, n_expert))` | `32 * Q4E_G_ROWS` | `0` |
+| `q4e_g_embed_*` | `n_tok` | `32` | `0` |
+| `q4e_g_gemm_*` | `(ceil(out_dim / Q4E_GG_DENSE_BM), ceil(n_tok / Q4E_GG_DENSE_BN))` | `2 * Q4E_GG_DENSE_BM` | `Q4E_GG_SMEM(Q4E_GG_DENSE_BM, Q4E_GG_DENSE_BN)` |
+| `q4e_g_experts_gemm_gate_up_*` | `(ceil(out_dim / (Q4E_GG_GATE_UP_BM / 2)), min(n_tok * n_used, n_expert))` | `2 * Q4E_GG_GATE_UP_BM` | `Q4E_GG_SMEM_H(Q4E_GG_GATE_UP_BM, Q4E_GG_EXPERT_BN)` **opt-in** |
+| `q4e_g_experts_gemm_down_*` | `(ceil(out_dim / Q4E_GG_DOWN_BM), min(n_tok * n_used, n_expert))` | `2 * Q4E_GG_DOWN_BM` | `Q4E_GG_SMEM_H(Q4E_GG_DOWN_BM, Q4E_GG_EXPERT_BN)` |
+| `q4e_g_step_matvec_*` | `(ceil(out_dim / (Q4E_GS_WARPS * 32 / lpr)), ceil(n_tok / Q4E_GS_COLS))` | `32 * Q4E_GS_WARPS` | `0` |
+| `q4e_g_step_matvec4_*` | `(ceil(out_dim / (4 * Q4E_GS_WARPS * 32 / lpr)), ceil(n_tok / Q4E_GS_COLS))` | `32 * Q4E_GS_WARPS` | `0` |
+| `q4e_g_step_gate_up_*` | `(ceil(out_dim / (Q4E_GS_WARPS * 16 / lpr)), min(n_tok * n_used, n_expert))` | `32 * Q4E_GS_WARPS` | `0` |
+| `q4e_g_step_down_*` | `(ceil(out_dim / (Q4E_GS_WARPS * 32 / lpr)), min(n_tok * n_used, n_expert))` | `32 * Q4E_GS_WARPS` | `0` |
 
 ### Templates
 

@@ -39,7 +39,7 @@ const SUPPORTED_VERSION: u32 = 3;
 const DEFAULT_ALIGNMENT: u64 = 32;
 /// Largest accepted `general.alignment`, which is a page.
 const MAX_ALIGNMENT: u32 = 4096;
-/// `split.count` above which a model is a multi-file split, which is refused.
+/// `split.count` above which a model is a multi-file split.
 const SINGLE_FILE: u32 = 1;
 
 /// Everything that can go wrong while opening or reading a model file.
@@ -111,12 +111,13 @@ pub enum GgufError {
         /// Name of the offending tensor.
         tensor: Box<str>,
     },
-    /// The model is one shard of a multi-file split.
+    /// The model is one shard of a multi-file split whose other shards could
+    /// not be found.
     ///
-    /// A split needs several files stitched into one address range, which a
-    /// single memory mapping cannot express. Refusing is deliberate: silently
-    /// reading only the first shard would produce a model that loads and then
-    /// answers with garbage.
+    /// A split opens only from its first shard, named
+    /// `<stem>-00001-of-<count>.gguf`, with every sibling beside it. Anything
+    /// else is refused: silently reading only one shard would produce a model
+    /// that loads and then answers with garbage.
     #[error("model is split into {count} files; shard 00001-of-{count:05}.gguf is only one part")]
     SplitUnsupported {
         /// Number of shards the metadata declared.
@@ -529,6 +530,11 @@ impl fmt::Debug for Mapping {
 #[derive(Debug)]
 pub struct GgufFile {
     mapping: Arc<Mapping>,
+    /// Every shard's mapping, the first one being `mapping`; one entry for a
+    /// single file.
+    shards: Vec<Arc<Mapping>>,
+    /// The shard each entry of `tensors` lives in, by index.
+    shard_of: Vec<u16>,
     version: u32,
     alignment: u64,
     tensor_data_pos: u64,
@@ -609,14 +615,37 @@ impl GgufFile {
         let metadata = GgufMetadata::parse(&mut cursor, &mapping, header.n_kv)?;
         let alignment = declared_alignment(&metadata)?;
 
+        let (mut tensors, tensor_data_pos) =
+            parse_tensor_directory(&mut cursor, file_len, alignment, header.n_tensors)?;
+        let mut shard_of = vec![0u16; tensors.len()];
+        let mut shards = vec![Arc::clone(&mapping)];
+
+        // A split's later shards each carry their own header, metadata and
+        // directory, with offsets relative to themselves; only the first
+        // shard's metadata describes the model.
         if let Some(count) = metadata.get_u32("split.count")
             && count > SINGLE_FILE
         {
-            return Err(GgufError::SplitUnsupported { count });
+            let siblings =
+                split_siblings(path, count).ok_or(GgufError::SplitUnsupported { count })?;
+            for (n, sibling) in siblings.iter().enumerate() {
+                let part = Arc::new(Mapping::open(sibling, shared)?);
+                let mut cursor = Cursor::new(part.bytes());
+                let header = read_header(&mut cursor)?;
+                let own = GgufMetadata::parse(&mut cursor, &part, header.n_kv)?;
+                let own_alignment = declared_alignment(&own)?;
+                let (descs, _) = parse_tensor_directory(
+                    &mut cursor,
+                    part.len(),
+                    own_alignment,
+                    header.n_tensors,
+                )?;
+                let id = u16::try_from(n + 1).map_err(|_| GgufError::SplitUnsupported { count })?;
+                shard_of.extend(std::iter::repeat_n(id, descs.len()));
+                tensors.extend(descs);
+                shards.push(part);
+            }
         }
-
-        let (tensors, tensor_data_pos) =
-            parse_tensor_directory(&mut cursor, file_len, alignment, header.n_tensors)?;
 
         let index = build_index(&tensors);
         tracing::debug!(
@@ -630,6 +659,8 @@ impl GgufFile {
 
         Ok(Self {
             mapping,
+            shards,
+            shard_of,
             version: header.version,
             alignment,
             tensor_data_pos,
@@ -681,7 +712,7 @@ impl GgufFile {
     pub fn get(&self, name: &str) -> Option<TensorView<'_>> {
         let desc = self.find(name)?;
         let range = self.clamped_range(desc);
-        self.mapping.bytes().get(range).map(|data| TensorView {
+        self.shard(desc).bytes().get(range).map(|data| TensorView {
             name: &desc.name,
             dtype: desc.dtype,
             data,
@@ -689,8 +720,9 @@ impl GgufFile {
         })
     }
 
-    /// The whole mapping as shareable host bytes, for zero-copy weight
-    /// registration with a device backend.
+    /// The first shard's mapping - the whole file unless it is a split - as
+    /// shareable host bytes, for zero-copy weight registration with a device
+    /// backend. A split's tensor lives in [`GgufFile::mapping_of`].
     ///
     /// Cloning the returned `Arc` is what keeps the file mapped while the
     /// device is still reading through it.
@@ -711,7 +743,36 @@ impl GgufFile {
         self.mapping.release(range);
     }
 
-    /// Byte range `desc` occupies within [`GgufFile::mapping`].
+    /// The mapping `desc`'s payload lives in, as shareable host bytes.
+    #[must_use]
+    pub fn mapping_of(&self, desc: &TensorDesc) -> Arc<dyn HostBytes> {
+        let shared: Arc<Mapping> = Arc::clone(self.shard(desc));
+        shared
+    }
+
+    /// The file `desc`'s payload lives in.
+    #[must_use]
+    pub fn path_of(&self, desc: &TensorDesc) -> &Path {
+        &self.shard(desc).path
+    }
+
+    /// [`GgufFile::release_cached`] for a range of `desc`'s own shard.
+    pub fn release_cached_of(&self, desc: &TensorDesc, range: Range<usize>) {
+        self.shard(desc).release(range);
+    }
+
+    /// The shard `desc` was read from; the first for a descriptor this file
+    /// did not hand out.
+    fn shard(&self, desc: &TensorDesc) -> &Arc<Mapping> {
+        let n = self
+            .index
+            .get(&desc.name)
+            .and_then(|&i| self.shard_of.get(i))
+            .map_or(0, |&s| usize::from(s));
+        self.shards.get(n).unwrap_or(&self.mapping)
+    }
+
+    /// Byte range `desc` occupies within [`GgufFile::mapping_of`].
     ///
     /// The range is clamped to the mapping, so a descriptor taken from a
     /// different model yields a truncated or empty range instead of a panic.
@@ -731,13 +792,27 @@ impl GgufFile {
     }
 
     fn clamped_range(&self, desc: &TensorDesc) -> Range<usize> {
-        let len = self.mapping.bytes().len();
+        let len = self.shard(desc).bytes().len();
         let start = usize::try_from(desc.abs_offset).unwrap_or(len);
         let end = start
             .saturating_add(usize::try_from(desc.bytes).unwrap_or(0))
             .min(len);
         start..end
     }
+}
+
+/// The later shards of the split whose first shard is `path`, when `path` is
+/// named `<stem>-00001-of-<count>.gguf` and every sibling exists beside it.
+fn split_siblings(path: &Path, count: u32) -> Option<Vec<PathBuf>> {
+    let name = path.file_name()?.to_str()?;
+    let first = format!("-00001-of-{count:05}.gguf");
+    let stem = name.strip_suffix(&first)?;
+    (2..=count)
+        .map(|n| {
+            let sibling = path.with_file_name(format!("{stem}-{n:05}-of-{count:05}.gguf"));
+            sibling.is_file().then_some(sibling)
+        })
+        .collect()
 }
 
 /// Builds the name to directory-index map behind [`GgufFile::find`].

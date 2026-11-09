@@ -354,6 +354,46 @@ impl ExpertStream {
         self.state.lock().stats
     }
 
+    /// Bytes one slot of `role`'s `part` array occupies: the stride between
+    /// consecutive slots of [`ExpertStream::bank`].
+    ///
+    /// A source whose experts are not one size in every layer - a
+    /// mixed-precision export - sizes the array at its widest, and a stage
+    /// over a narrower layer reads its slots at this stride, not at its own
+    /// expert's size.
+    ///
+    /// # Errors
+    ///
+    /// As [`ExpertStream::bank`].
+    pub fn slot_stride(&self, role: Role, part: WeightPart) -> CoreResult<u64> {
+        let matrix = match role {
+            Role::ExpertGate => 0,
+            Role::ExpertUp => 1,
+            Role::ExpertDown => 2,
+            _ => {
+                return Err(CoreError::Unsupported {
+                    what: "a streamed tensor that is not one of the routed banks",
+                    backend: "engine",
+                });
+            }
+        };
+        let array =
+            self.parts
+                .iter()
+                .position(|have| *have == part)
+                .ok_or(CoreError::Unsupported {
+                    what: "a part the streamed bank's format does not have",
+                    backend: "engine",
+                })?;
+        self.layout
+            .get(matrix * self.parts.len() + array)
+            .copied()
+            .ok_or(CoreError::Unsupported {
+                what: "a projection the streamed bank does not have",
+                backend: "engine",
+            })
+    }
+
     /// The pool array an expert role and part resolve to.
     ///
     /// # Errors

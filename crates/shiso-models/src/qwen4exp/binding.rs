@@ -179,14 +179,27 @@ pub(crate) struct DraftBinding<'a> {
     pub(crate) norm_embed: TensorView<'a>,
     /// Norm over the target hidden state it starts from.
     pub(crate) norm_hidden: TensorView<'a>,
-    /// The projection of the normed embedding.
-    pub(crate) fc_embed: TensorView<'a>,
-    /// The projection of the normed hidden state.
-    pub(crate) fc_hidden: TensorView<'a>,
+    /// The projections of the normed embedding and hidden state.
+    pub(crate) fc: DraftFc<'a>,
     /// The head's single layer.
     pub(crate) layer: BoundLayer<'a>,
     /// The mix that collapses the head's streams.
     pub(crate) output_mix: MixRoles<'a>,
+}
+
+/// How a draft head stores the projections of its two inputs.
+#[derive(Debug)]
+pub(crate) enum DraftFc<'a> {
+    /// One matrix for each: the embedding's, then the hidden state's.
+    Split {
+        /// The projection of the normed embedding.
+        embed: TensorView<'a>,
+        /// The projection of the normed hidden state.
+        hidden: TensorView<'a>,
+    },
+    /// One matrix over the two inputs side by side, the embedding's first
+    /// (`[out, 2 * hidden]`): a row's first half is the embedding's row.
+    Joined(TensorView<'a>),
 }
 
 /// Every tensor a checkpoint of this family has to carry.
@@ -362,6 +375,10 @@ pub fn bind_qwen4exp<'f>(
 
 /// The architecture a draft head sidecar declares.
 const DRAFT_ARCH: &str = "qwen4exp-mtp";
+/// The architecture a next-token-prediction layer sidecar declares: the
+/// target's own, its one layer numbered past the target's last, under
+/// `blk.N.nextn.*` beside that layer's ordinary block tensors.
+const TARGET_ARCH: &str = "qwen4exp";
 
 /// Binds a draft head sidecar against the target it drafts for.
 ///
@@ -382,6 +399,9 @@ pub(crate) fn bind_draft<'f>(
 ) -> CoreResult<DraftBinding<'f>> {
     let meta = file.metadata();
     let arch = meta.architecture().unwrap_or_default().to_owned();
+    if arch == TARGET_ARCH && meta.arch_u32("nextn_predict_layers").unwrap_or(0) > 0 {
+        return bind_nextn(file, config);
+    }
     if arch != DRAFT_ARCH {
         return Err(CoreError::UnknownArch { model_type: arch });
     }
@@ -405,8 +425,10 @@ pub(crate) fn bind_draft<'f>(
     Ok(DraftBinding {
         norm_embed: require(file, "mtp.pre_fc_norm_embedding.weight")?,
         norm_hidden: require(file, "mtp.pre_fc_norm_hidden.weight")?,
-        fc_embed: require(file, "mtp.fc_embedding.weight")?,
-        fc_hidden: require(file, "mtp.fc_hidden.weight")?,
+        fc: DraftFc::Split {
+            embed: require(file, "mtp.fc_embedding.weight")?,
+            hidden: require(file, "mtp.fc_hidden.weight")?,
+        },
         layer: BoundLayer {
             attn_mix: mix(file, 0, "attn")?,
             ffn_mix: mix(file, 0, "ffn")?,
@@ -418,6 +440,57 @@ pub(crate) fn bind_draft<'f>(
             norm: require(file, "mtp.hc_norm.weight")?,
             down: require(file, "mtp.hc_down.weight")?,
             up: require(file, "mtp.hc_up.weight")?,
+            inject: None,
+        },
+    })
+}
+
+/// Binds a next-token-prediction sidecar: one layer, numbered one past the
+/// target's last, whose head reads the target's embedding and output
+/// projection (it stores neither of its own).
+///
+/// The layer's block is an ordinary attention block under the target's
+/// names; the head's own tensors sit under `blk.N.nextn.*`: the two input
+/// norms, the joined input projection `eh_proj`, and the stream mix that
+/// collapses its output (`hc_head_*`, no injection).
+fn bind_nextn<'f>(file: &'f GgufFile, config: &Qwen4ExpConfig) -> CoreResult<DraftBinding<'f>> {
+    let meta = file.metadata();
+    let hidden = u64::from(config.shape().hidden);
+    let declared = meta.arch_u32("embedding_length").map_or(0, u64::from);
+    if declared != hidden {
+        return Err(CoreError::ShapeMismatch {
+            field: "draft head residual width",
+            expected: hidden,
+            got: declared,
+        });
+    }
+    let layers = config.shape().n_layers();
+    let blocks = meta.arch_u32("block_count").unwrap_or(0);
+    let predict = meta.arch_u32("nextn_predict_layers").unwrap_or(0);
+    if predict != 1 || blocks != layers + 1 {
+        return Err(CoreError::ShapeMismatch {
+            field: "next-token-prediction layers past the target's",
+            expected: u64::from(layers) + 1,
+            got: u64::from(blocks),
+        });
+    }
+    let il = layers;
+    let nextn = |name: &str| require(file, &format!("blk.{il}.nextn.{name}.weight"));
+    Ok(DraftBinding {
+        norm_embed: nextn("enorm")?,
+        norm_hidden: nextn("hnorm")?,
+        fc: DraftFc::Joined(nextn("eh_proj")?),
+        layer: BoundLayer {
+            attn_mix: mix(file, il, "attn")?,
+            ffn_mix: mix(file, il, "ffn")?,
+            block: BlockRoles::Attn(Box::new(attn(file, il)?)),
+            experts: experts(file, il)?,
+            ngram: None,
+        },
+        output_mix: MixRoles {
+            norm: nextn("hc_head_norm")?,
+            down: nextn("hc_head_down")?,
+            up: nextn("hc_head_up")?,
             inject: None,
         },
     })

@@ -133,6 +133,10 @@ pub const MOD_BF16: &str = "q4e_bf16";
 /// compute. Not an upstream unit, for the reason [`MOD_MODELOPT`] is not; see
 /// [`crate::sparse::moe::fused_route`].
 pub const MOD_FFN: &str = "q4e_ffn";
+/// The GGUF block entries (`q4e/ggml.metal`): projections, routed expert
+/// stages and vocabulary rows over weights kept in their stored blocks. See
+/// [`crate::sparse::ggml`].
+pub const MOD_GGML: &str = "q4e_ggml";
 /// The logits stages run before any pick: today, the suppress stage.
 pub const MOD_SAMPLE: &str = "sample";
 /// The row gather that opens a pass, at each stored element type of a

@@ -47,6 +47,7 @@ pub mod exec;
 pub mod exl3;
 pub mod expand;
 pub mod gather;
+pub mod ggml;
 pub mod headslice;
 pub mod hyper;
 pub mod indexer;

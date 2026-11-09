@@ -1,10 +1,11 @@
 // q4e ple entries: Metal port of kernels/cuda/q4e/ple.cu (see q4e_common.h for conventions).
 //
-// The n-gram embedding block's gate and its dilated convolution. Ported:
-// q4e_ple_gated_value_kernel, q4e_ple_conv_kernel. Not ported: the two row
-// decoders (q4e_ple_dequant_kernel, q4e_ple_dequant_exl3_kernel), whose row
-// format the Metal path replaces, and q4e_ple_conv_batch_kernel, which reads a
-// device array of per-row window pointers the Metal binding cannot pack yet.
+// The n-gram embedding block's gate and its dilated convolution, and the
+// block-quantized row decoder. Ported: q4e_ple_gated_value_kernel,
+// q4e_ple_conv_kernel, q4e_ple_dequant_kernel. Not ported: the trellis row
+// decoder (q4e_ple_dequant_exl3_kernel), whose checkpoint runs on CUDA only,
+// and q4e_ple_conv_batch_kernel, which reads a device array of per-row window
+// pointers the Metal binding cannot pack yet.
 
 /// `q4e_ple_gated_value_kernel` (ple.cu:84): per (token, stream) threadgroup,
 /// `gate = sigmoid(sgn(s) * sqrt(max(|s|, 1e-6)))` with
@@ -102,4 +103,38 @@ kernel void q4e_ple_conv_kernel(device float *out [[buffer(0)]],
     }
 
     for (uint i = 0; i < hist; i++) state[ulong(i) * channels + c] = win[i];
+}
+
+/// `q4e_ple_dequant_kernel` (ple.cu:18): the streamed IQ4_NL rows into the
+/// flat per-token embedding. Row `r` belongs to token `r / n_heads` and lands
+/// in head slot `r % n_heads`, heads slowest within the token's row.
+///
+/// Buffers: 0 `out`, 1 `rows` (`n_rows * row_bytes`), 2 `head_dim`,
+/// 3 `n_heads`, 4 `row_bytes`, 5 `n_rows`. Grid `n_rows`, block 32.
+kernel void q4e_ple_dequant_kernel(device float *out [[buffer(0)]],
+                                   device const uchar *rows [[buffer(1)]],
+                                   constant uint &head_dim [[buffer(2)]],
+                                   constant uint &n_heads [[buffer(3)]],
+                                   constant uint &row_bytes [[buffer(4)]],
+                                   constant uint &n_rows [[buffer(5)]],
+                                   uint3 group [[threadgroup_position_in_grid]],
+                                   uint3 tid [[thread_position_in_threadgroup]],
+                                   uint3 tpg [[threads_per_threadgroup]]) {
+    const uint r = group.x;
+    if (r >= n_rows) {
+        return;
+    }
+    device const uchar *src = rows + ulong(r) * row_bytes;
+    const uint t = r / n_heads;
+    const uint h = r % n_heads;
+    device float *dst = out + ulong(t) * n_heads * head_dim + ulong(h) * head_dim;
+    for (uint b = tid.x; b < head_dim / 32u; b += tpg.x) {
+        device const uchar *blk = src + ulong(b) * 18ul;
+        const float d = float(*(device const half *)blk);
+        for (uint j = 0; j < 16u; ++j) {
+            const uchar q = blk[2u + j];
+            dst[b * 32u + j] = d * float(IQ4NL[q & 0xFu]);
+            dst[b * 32u + j + 16u] = d * float(IQ4NL[q >> 4u]);
+        }
+    }
 }

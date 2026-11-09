@@ -31,6 +31,7 @@ use shiso_core::error::{CoreError, CoreResult};
 
 use crate::sparse::bind::{Args, Operand, WeightRef};
 use crate::sparse::exl3::{self, Fanout, GemmShape, Staging};
+use crate::sparse::ggml;
 use crate::sparse::kernels::{
     self, Elem, Entry, Launch, MOD_BF16, MOD_EXL3, MOD_MATVEC, MOD_MXFP8, MOD_MXFP8_A8,
     TemplateArgs, blocks_for,
@@ -168,6 +169,17 @@ pub struct Combine {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Projection {
+    /// A weight kept in its GGUF blocks (or a multi-row single-precision
+    /// one), through the block entries' one-simdgroup-a-row kernel.
+    Ggml {
+        /// The projection itself.
+        entry: Entry,
+        /// Its launch, rows on the second axis.
+        launch: Launch,
+        /// Lanes a row, the trailing argument of the CUDA step entries;
+        /// absent for the entries without it.
+        lanes: Option<u32>,
+    },
     /// A single-precision weight, with its contraction split.
     Float {
         /// The projection itself.
@@ -746,7 +758,17 @@ pub fn plan(
         });
     }
     match dtype {
-        DType::F32 => Ok(float(in_dim, out_dim)),
+        // The split single-precision tier takes one row; a wider pass - the
+        // stream mixes' injections over a prompt - takes the block entries'.
+        // Where the CUDA step entries exist a one-row step takes them too, so
+        // a verify row's router logits are a single-row step's, bit for bit.
+        DType::F32
+            if rows == 1 && ggml_step(DType::F32, ggml::Stage::StepMatvec, device).is_none() =>
+        {
+            Ok(float(in_dim, out_dim))
+        }
+        DType::F32 => ggml(dtype, in_dim, out_dim, rows, device),
+        stored if ggml::is_block(stored) => ggml(stored, in_dim, out_dim, rows, device),
         DType::F16 => half(in_dim, out_dim, rows, device),
         DType::F16Pack12 => packed_half(in_dim, out_dim, rows, device),
         DType::BF16 => brain(in_dim, out_dim, rows, device),
@@ -762,6 +784,80 @@ pub fn plan(
             what: "a block-quantized weight, whose activation quantizer is not in this kernel set",
             backend: "engine",
         }),
+    }
+}
+
+/// The GGUF block tier: weights decoded a 32-weight sub-block at a time in
+/// registers, any row count in one launch - or, for a prompt pass on a
+/// device with the tensor-core prompt kernels, the block format's prompt
+/// entry, at every prompt width.
+fn ggml(
+    dtype: DType,
+    in_dim: u32,
+    out_dim: u32,
+    rows: u32,
+    device: Device,
+) -> CoreResult<Projection> {
+    let per = dtype.block_elems().get();
+    if !in_dim.is_multiple_of(per.max(ggml::SUB_BLOCK)) {
+        return Err(CoreError::ShapeMismatch {
+            field: "block-quantized contraction width",
+            expected: u64::from(per.max(ggml::SUB_BLOCK)),
+            got: u64::from(in_dim),
+        });
+    }
+    if let Some(entry) = ggml_prompt(dtype, ggml::Stage::Gemm, device) {
+        return Ok(Projection::Ggml {
+            entry,
+            launch: ggml::gemm_rows_launch(out_dim, rows),
+            lanes: None,
+        });
+    }
+    if let Some(entry) = ggml_step(dtype, ggml::step_stage(rows).0, device) {
+        let lanes = ggml::step_lanes(in_dim);
+        return Ok(Projection::Ggml {
+            entry,
+            launch: ggml::step_launch(out_dim, rows, lanes),
+            lanes: Some(lanes),
+        });
+    }
+    let entry = ggml::entry(dtype, ggml::Stage::Matvec).ok_or(CoreError::Unsupported {
+        what: "a block-quantized weight with no block entry instantiated",
+        backend: "engine",
+    })?;
+    Ok(Projection::Ggml {
+        entry,
+        launch: ggml::rows_launch(out_dim, rows),
+        lanes: None,
+    })
+}
+
+/// The CUDA step entry `stage` of a GGUF block format, when this pass takes
+/// one: a step or verify pass on a device whose kernel set has the CUDA
+/// block entries ([`PromptMatmul::Tensor`] is that probe, as for
+/// [`ggml_prompt`]). Every step pass takes it whatever its row count, so a
+/// verify row is summed as a single-row step sums it.
+#[must_use]
+pub fn ggml_step(dtype: DType, stage: ggml::Stage, device: Device) -> Option<Entry> {
+    if !device.row_invariant() && matches!(device.prompt_matmul, PromptMatmul::Tensor) {
+        ggml::entry(dtype, stage)
+    } else {
+        None
+    }
+}
+
+/// The tensor-core prompt entry `stage` of a GGUF block format, when this
+/// pass takes one: a prompt pass (whose rows are held to every prompt width,
+/// not to a step's sums) on a device whose kernel set has the tensor-core
+/// prompt modules. [`PromptMatmul::Tensor`] is that probe: the kernel tree
+/// that builds the brain-float module builds `q4e_ggml`'s prompt entries
+/// beside it.
+#[must_use]
+pub fn ggml_prompt(dtype: DType, stage: ggml::Stage, device: Device) -> Option<Entry> {
+    if device.row_invariant() && matches!(device.prompt_matmul, PromptMatmul::Tensor) {
+        ggml::entry(dtype, stage)
+    } else {
+        None
     }
 }
 
@@ -1310,6 +1406,32 @@ pub fn project(
     rows: u32,
     device: Device,
 ) -> CoreResult<()> {
+    // A single-precision weight over a prompt chunk - a GGUF router or a
+    // stream mix's injection - multiplies on the BLAS tier in strict single
+    // precision: the warp-a-row block entry re-reads its activations once a
+    // row of the weight (a 512-expert router over a 2k-token chunk took 7 ms
+    // a layer there), and the pinned reduction keeps the rows held to every
+    // prompt width. Strict, because a router's choice is what a rounding of
+    // its logits would move. Every prompt width takes it, a one-row chunk
+    // too, so where a prompt was cut moves no bit.
+    if weight.dtype == DType::F32 && device.row_invariant() && device.blas {
+        out.push(Step::Blas {
+            op_a: GemmOp::Transposed,
+            op_b: GemmOp::AsStored,
+            m: weight.out_dim,
+            n: rows,
+            k: weight.in_dim,
+            lda: weight.in_dim,
+            ldb: weight.in_dim,
+            ldc: weight.out_dim,
+            a: Operand::Weight(bound.weight),
+            b: bound.src,
+            c: bound.dst,
+            dtype: GemmDType::F32Strict,
+            reduction: device.reduction(),
+        });
+        return Ok(());
+    }
     let passes = match weight.dtype {
         DType::F16 | DType::F16Pack12 => {
             half_in_passes(weight.in_dim, weight.out_dim, rows, device)
@@ -1605,6 +1727,25 @@ fn project_one(
 ) -> CoreResult<()> {
     let w = Operand::Weight(bound.weight);
     match plan(weight.dtype, weight.in_dim, weight.out_dim, rows, device)? {
+        // `out, w, x, in_dim, out_dim, rows`.
+        Projection::Ggml {
+            entry,
+            launch,
+            lanes,
+        } => {
+            let mut ops = vec![
+                bound.dst,
+                w,
+                bound.src,
+                Operand::U32(weight.in_dim),
+                Operand::U32(weight.out_dim),
+                Operand::U32(rows),
+            ];
+            if let Some(lanes) = lanes {
+                ops.push(Operand::U32(lanes));
+            }
+            out.launch(entry, launch, Args::of(&ops));
+        }
         // `out, w, x, in_dim, chunk` - and where the contraction was split the
         // projection writes the shared partial slab instead of the destination,
         // split-major, for the fold below to add up.
@@ -2047,6 +2188,14 @@ fn half_input(out: &mut Plan, src: Operand, in_dim: u32, rows: u32, device: Devi
     Operand::Scratch(Buf::HalfActivation)
 }
 
+/// Rounds `rows` rows of `in_dim` single-precision activations at `src` into
+/// the shared half buffer and returns it: the half operand a prompt pass's
+/// GGUF routed stages read.
+pub fn round_to_half(out: &mut Plan, src: Operand, in_dim: u32, rows: u32) -> Operand {
+    convert_into(out, src, in_dim, rows);
+    Operand::Scratch(Buf::HalfActivation)
+}
+
 /// The rounding launch itself.
 fn convert_into(out: &mut Plan, src: Operand, in_dim: u32, rows: u32) {
     let elements = u64::from(rows) * u64::from(in_dim);
@@ -2475,7 +2624,7 @@ mod tests {
 
     #[test]
     fn a_block_quantized_weight_names_the_companion_this_build_does_not_carry() {
-        for dtype in [DType::Q8_0, DType::Q4_K, DType::Q6_K, DType::Q5_0] {
+        for dtype in [DType::Q4_K, DType::Q5_0] {
             let err = plan(dtype, 2_560, 2_560, 1, GPU)
                 .expect_err("no activation quantizer is vendored here");
             assert!(
@@ -2483,6 +2632,35 @@ mod tests {
                 "{dtype:?}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_gguf_block_weight_and_a_wide_float_one_take_the_block_entries() {
+        for dtype in [
+            DType::Q8_0,
+            DType::Q6_K,
+            DType::IQ2_S,
+            DType::IQ4_NL,
+            DType::Q2_0,
+        ] {
+            for rows in [1, 7, 512] {
+                let p = plan(dtype, 2_560, 640, rows, GPU).expect("a block entry");
+                assert!(
+                    matches!(p, Projection::Ggml { .. }),
+                    "{dtype:?} at {rows}: {p:?}"
+                );
+            }
+        }
+        assert!(matches!(
+            plan(DType::F32, 10_240, 4, 1, GPU).expect("one row"),
+            Projection::Float { .. }
+        ));
+        assert!(matches!(
+            plan(DType::F32, 10_240, 4, 9, GPU).expect("a prompt chunk"),
+            Projection::Ggml { .. }
+        ));
+        let err = plan(DType::Q6_K, 640, 2_560, 1, GPU).expect_err("640 is not whole q6_K blocks");
+        assert!(matches!(err, CoreError::ShapeMismatch { .. }), "{err:?}");
     }
 
     #[test]

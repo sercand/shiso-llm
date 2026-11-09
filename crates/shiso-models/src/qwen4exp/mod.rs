@@ -22,6 +22,7 @@ mod ckpt;
 mod config;
 pub mod exl3;
 pub mod fp8;
+pub mod gguf_experts;
 pub mod mlx;
 mod model;
 pub mod modelopt_mixed;
@@ -42,7 +43,7 @@ pub use config::{
     ROPE_ORIGINAL_CONTEXT, ROPE_THETA, STREAM_RANK, STREAMS, VOCAB, is_attention, layer_kinds,
     shape,
 };
-pub use model::{Drafter, Qwen4ExpModel, StreamedLoad};
+pub use model::{Drafter, GgufPlacement, Qwen4ExpModel, Sidecars, StreamedLoad};
 
 use crate::catalog::FamilyFacts;
 

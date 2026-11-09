@@ -23,7 +23,8 @@
 //! ordinary dense launch runs.
 //!
 //! A row-major float head (the brain-float one an export stores unquantized)
-//! has no such mixing: a block is 128 consecutive rows, one contiguous byte
+//! or a GGUF block-quantized one (whose blocks run along a row) has no such
+//! mixing: a block is 128 consecutive rows, one contiguous byte
 //! range, and the slice is those ranges copied in order. Blocks are kept for
 //! it anyway, so both heads are cut by the same choice of ids.
 
@@ -230,8 +231,14 @@ pub fn build(backend: &Arc<dyn Backend>, source: &Weight, blocks: &[u32]) -> Cor
     })
 }
 
-/// Bytes of one row of a row-major float head, `None` for any other format.
+/// Bytes of one row of a row-major float or GGUF block head, `None` for any
+/// other format.
 fn row_bytes(source: &Weight) -> Option<u64> {
+    // A GGUF block format's row is whole blocks of its own bytes, so its rows
+    // copy as a float head's do, as stored.
+    if crate::sparse::ggml::is_block(source.dtype) {
+        return Weight::payload_bytes(source.dtype, source.in_dim, 1);
+    }
     let element = match source.dtype {
         shiso_core::DType::F32 => 4,
         shiso_core::DType::F16 | shiso_core::DType::BF16 => 2,
