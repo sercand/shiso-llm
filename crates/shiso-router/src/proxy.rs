@@ -174,7 +174,6 @@ pub(crate) async fn proxy_request(desc: ProxyRequestDesc) -> Result<Response, Ap
     })?;
 
     let mut row = LogRow::new(key.id.clone(), probe.model.clone(), path.clone());
-    row.service_tier = service_tier(&headers);
     if let Some(t) = &tracer {
         row.id = t.id().to_string();
     }
@@ -196,6 +195,15 @@ pub(crate) async fn proxy_request(desc: ProxyRequestDesc) -> Result<Response, Ap
     // downstream — the allowlist, the log row, the name sent upstream —
     // works from that, so aliases are synonyms and never a second identity.
     let model = route.name.as_str();
+    // The effective tier is the operator's choice when this key forces flex
+    // for this model, and the client's hint otherwise. Recording it after
+    // alias resolution means the log matches the canonical model.
+    let force_flex = key.forces_flex(model);
+    row.service_tier = if force_flex {
+        Some("flex".to_string())
+    } else {
+        service_tier(&headers)
+    };
     // Absent a target rename, a request that came in under an alias is
     // still forwarded as the canonical model name: the backend has never
     // heard of the alias.
@@ -214,11 +222,17 @@ pub(crate) async fn proxy_request(desc: ProxyRequestDesc) -> Result<Response, Ap
     // tee, which holds it for the life of the response.
     let active = state.active.register(&row, &key.name);
 
-    if !key.allows_model(model) {
-        let err = AppError::Forbidden(format!(
-            "model {:?} is not allowed for this API key",
-            probe.model
-        ));
+    if !key.allows_model(model, route.private) {
+        // A private model the key does not name must be indistinguishable
+        // from an unknown one: a 403 would confirm that it exists.
+        let err = if route.private {
+            AppError::UnknownModel(probe.model.clone())
+        } else {
+            AppError::Forbidden(format!(
+                "model {:?} is not allowed for this API key",
+                probe.model
+            ))
+        };
         return Err(reject(&state, row, started, err, tracer.as_deref()));
     }
 
@@ -374,6 +388,7 @@ pub(crate) async fn proxy_request(desc: ProxyRequestDesc) -> Result<Response, Ap
             rename,
             inject_usage: inject,
             clamp_tokens,
+            force_flex,
             dialect,
             form_model: form_model.clone(),
         };
@@ -382,11 +397,11 @@ pub(crate) async fn proxy_request(desc: ProxyRequestDesc) -> Result<Response, Ap
             Err(e) => return Err(reject(&state, row, started, e, tracer.as_deref())),
         };
 
-        let url = match join_url(&backend.base_url, &path) {
+        let url = match join_url(backend.base_url_for(kind), &path) {
             Ok(u) => u,
             Err(e) => return Err(reject(&state, row, started, e, tracer.as_deref())),
         };
-        let out_headers = upstream_headers(&headers, backend, kind);
+        let out_headers = upstream_headers(&headers, backend, kind, force_flex);
         if let Some(t) = &tracer {
             t.upstream_request(
                 &backend.name,
@@ -701,6 +716,9 @@ struct BodyEdits<'a> {
     /// target on a `grouped` backend, so a remote fallback still gets the
     /// client's own value.
     clamp_tokens: Option<i64>,
+    /// Force the flex service tier: the header is overridden everywhere,
+    /// and the JSON body field is set where the wire format has one.
+    force_flex: bool,
     /// Which field carries that limit on this endpoint.
     dialect: Dialect,
     /// Set when the body is a multipart form (transcriptions): where the
@@ -710,8 +728,17 @@ struct BodyEdits<'a> {
 }
 
 impl BodyEdits<'_> {
+    /// True when forcing flex has a body representation on this endpoint.
+    /// Anthropic Messages has no standard `service_tier` request field, so
+    /// forcing it there is header-only — adding an unknown field would risk
+    /// an upstream rejection.
+    fn sets_body_flex(&self) -> bool {
+        self.force_flex && matches!(self.dialect, Dialect::OpenAiChat | Dialect::OpenAiResponses)
+    }
+
     fn is_noop(&self) -> bool {
         self.rename.is_none()
+            && !self.sets_body_flex()
             && (self.form_model.is_some() || (!self.inject_usage && self.clamp_tokens.is_none()))
     }
 }
@@ -739,6 +766,13 @@ fn prepare_body(body: &Bytes, edits: &BodyEdits<'_>) -> Result<Bytes, AppError> 
         obj.insert(
             "model".to_string(),
             serde_json::Value::String(new_model.to_string()),
+        );
+    }
+    if edits.sets_body_flex() {
+        // "Force" means the operator's choice wins over the client's.
+        obj.insert(
+            "service_tier".to_string(),
+            serde_json::Value::String("flex".to_string()),
         );
     }
     if edits.inject_usage {
@@ -841,7 +875,12 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 /// the header the wire format being spoken (`kind`) expects. A dual-kind
 /// backend gets Bearer auth on OpenAI endpoints and x-api-key on
 /// `/v1/messages`.
-fn upstream_headers(inbound: &HeaderMap, backend: &Backend, kind: BackendKind) -> HeaderMap {
+fn upstream_headers(
+    inbound: &HeaderMap,
+    backend: &Backend,
+    kind: BackendKind,
+    force_flex: bool,
+) -> HeaderMap {
     let mut out = HeaderMap::new();
 
     let content_type = inbound
@@ -858,8 +897,14 @@ fn upstream_headers(inbound: &HeaderMap, backend: &Backend, kind: BackendKind) -
     // Service tier is a provider-side routing/priority hint the client owns
     // (OpenAI and Anthropic both read it); it carries no credential, so a
     // transparent proxy forwards it rather than silently downgrading the
-    // caller's tier.
-    if let Some(tier) = inbound.get(SERVICE_TIER_HEADER) {
+    // caller's tier. A key configured to force flex on this model overrides
+    // whatever the client asked for.
+    if force_flex {
+        out.insert(
+            HeaderName::from_static(SERVICE_TIER_HEADER),
+            HeaderValue::from_static("flex"),
+        );
+    } else if let Some(tier) = inbound.get(SERVICE_TIER_HEADER) {
         out.insert(HeaderName::from_static(SERVICE_TIER_HEADER), tier.clone());
     }
     // The client's User-Agent is forwarded verbatim: providers key
@@ -979,6 +1024,7 @@ mod tests {
             rename,
             inject_usage,
             clamp_tokens: None,
+            force_flex: false,
             dialect: Dialect::OpenAiChat,
             form_model: None,
         }
@@ -989,6 +1035,7 @@ mod tests {
             rename: None,
             inject_usage: false,
             clamp_tokens: Some(cap),
+            force_flex: false,
             dialect,
             form_model: None,
         }
@@ -1213,6 +1260,7 @@ mod tests {
             rename,
             inject_usage: true,
             clamp_tokens: Some(256),
+            force_flex: false,
             dialect: Dialect::OpenAiTranscriptions,
             form_model: span,
         }
@@ -1261,6 +1309,7 @@ mod tests {
                 rename: Some("upstream-m"),
                 inject_usage: true,
                 clamp_tokens: Some(256),
+                force_flex: false,
                 dialect: Dialect::OpenAiChat,
                 form_model: None,
             },
@@ -1387,6 +1436,7 @@ mod tests {
             &inbound,
             &backend(vec![BackendKind::Openai]),
             BackendKind::Openai,
+            false,
         );
         assert!(out.get(QOS_CLASS_HEADER).is_none());
         assert!(out.get(QOS_MAX_WAIT_HEADER).is_none());
@@ -1450,6 +1500,7 @@ mod tests {
             name: "b".into(),
             kinds,
             base_url: url::Url::parse("http://example.com").unwrap(),
+            anthropic_base_url: None,
             api_key: Some("sk-secret".into()),
             anthropic_version: "2023-06-01".into(),
             inject_usage: true,
@@ -1488,6 +1539,7 @@ mod tests {
             &inbound,
             &backend(vec![BackendKind::Openai]),
             BackendKind::Openai,
+            false,
         );
         assert_eq!(out.get(header::AUTHORIZATION).unwrap(), "Bearer sk-secret");
         assert!(out.get("x-api-key").is_none());
@@ -1513,6 +1565,7 @@ mod tests {
             &inbound,
             &backend(vec![BackendKind::Openai]),
             BackendKind::Openai,
+            false,
         );
         assert_eq!(out.get(header::USER_AGENT).unwrap(), "OpenAI/Go 3.41.0");
         assert_eq!(out.get("x-stainless-lang").unwrap(), "go");
@@ -1526,6 +1579,7 @@ mod tests {
             &HeaderMap::new(),
             &backend(vec![BackendKind::Openai]),
             BackendKind::Openai,
+            false,
         );
         assert!(out.get(header::USER_AGENT).is_none());
     }
@@ -1563,17 +1617,83 @@ mod tests {
     }
 
     #[test]
+    fn forced_flex_sets_service_tier_only_where_the_field_exists() {
+        // The client's own tier is overwritten: "force" wins.
+        let body = Bytes::from_static(br#"{"model":"m","service_tier":"priority"}"#);
+        for dialect in [Dialect::OpenAiChat, Dialect::OpenAiResponses] {
+            let out = prepare_body(
+                &body,
+                &BodyEdits {
+                    force_flex: true,
+                    dialect,
+                    ..edits(None, false)
+                },
+            )
+            .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(v["service_tier"], "flex");
+            assert_eq!(v["model"], "m");
+        }
+
+        // Anthropic gets the header only; adding an unknown field to the
+        // body risks an upstream rejection, and the field is not standard.
+        let out = prepare_body(
+            &body,
+            &BodyEdits {
+                force_flex: true,
+                dialect: Dialect::Anthropic,
+                ..edits(None, false)
+            },
+        )
+        .unwrap();
+        assert_eq!(out, body);
+
+        // Without forcing, the body is still forwarded untouched.
+        let out = prepare_body(&body, &edits(None, false)).unwrap();
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn forced_flex_overrides_the_forwarded_service_tier() {
+        let mut inbound = HeaderMap::new();
+        inbound.insert("x-service-tier", HeaderValue::from_static("priority"));
+        for kind in [BackendKind::Openai, BackendKind::Anthropic] {
+            let out = upstream_headers(&inbound, &backend(vec![kind]), kind, true);
+            assert_eq!(out.get("x-service-tier").unwrap(), "flex");
+        }
+
+        // A client that said nothing gets the forced header too.
+        let out = upstream_headers(
+            &HeaderMap::new(),
+            &backend(vec![BackendKind::Openai]),
+            BackendKind::Openai,
+            true,
+        );
+        assert_eq!(out.get("x-service-tier").unwrap(), "flex");
+
+        // Unforced requests keep the old behavior.
+        let out = upstream_headers(
+            &inbound,
+            &backend(vec![BackendKind::Openai]),
+            BackendKind::Openai,
+            false,
+        );
+        assert_eq!(out.get("x-service-tier").unwrap(), "priority");
+    }
+
+    #[test]
     fn headers_forward_the_service_tier_hint() {
         let mut inbound = HeaderMap::new();
         inbound.insert("x-service-tier", HeaderValue::from_static("priority"));
         for kind in [BackendKind::Openai, BackendKind::Anthropic] {
-            let out = upstream_headers(&inbound, &backend(vec![kind]), kind);
+            let out = upstream_headers(&inbound, &backend(vec![kind]), kind, false);
             assert_eq!(out.get("x-service-tier").unwrap(), "priority");
         }
         let out = upstream_headers(
             &HeaderMap::new(),
             &backend(vec![BackendKind::Openai]),
             BackendKind::Openai,
+            false,
         );
         assert!(out.get("x-service-tier").is_none());
     }
@@ -1585,6 +1705,7 @@ mod tests {
             &inbound,
             &backend(vec![BackendKind::Anthropic]),
             BackendKind::Anthropic,
+            false,
         );
         assert_eq!(out.get("x-api-key").unwrap(), "sk-secret");
         assert_eq!(out.get("anthropic-version").unwrap(), "2023-06-01");
@@ -1595,10 +1716,10 @@ mod tests {
     fn headers_dual_kind_backend_follow_endpoint_kind() {
         let inbound = HeaderMap::new();
         let b = backend(vec![BackendKind::Openai, BackendKind::Anthropic]);
-        let out = upstream_headers(&inbound, &b, BackendKind::Openai);
+        let out = upstream_headers(&inbound, &b, BackendKind::Openai, false);
         assert_eq!(out.get(header::AUTHORIZATION).unwrap(), "Bearer sk-secret");
         assert!(out.get("x-api-key").is_none());
-        let out = upstream_headers(&inbound, &b, BackendKind::Anthropic);
+        let out = upstream_headers(&inbound, &b, BackendKind::Anthropic, false);
         assert_eq!(out.get("x-api-key").unwrap(), "sk-secret");
         assert_eq!(out.get("anthropic-version").unwrap(), "2023-06-01");
         assert!(out.get(header::AUTHORIZATION).is_none());
@@ -1613,7 +1734,7 @@ mod tests {
         );
         let mut b = backend(vec![BackendKind::Openai]);
         b.api_key = None;
-        let out = upstream_headers(&inbound, &b, BackendKind::Openai);
+        let out = upstream_headers(&inbound, &b, BackendKind::Openai, false);
         assert!(out.get(header::AUTHORIZATION).is_none());
         assert!(out.get("x-api-key").is_none());
     }
@@ -1627,6 +1748,7 @@ mod tests {
             &inbound,
             &backend(vec![BackendKind::Anthropic]),
             BackendKind::Anthropic,
+            false,
         );
         assert_eq!(out.get("anthropic-version").unwrap(), "2024-01-01");
         assert_eq!(out.get("anthropic-beta").unwrap(), "some-beta");

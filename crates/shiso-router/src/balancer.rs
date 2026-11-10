@@ -13,6 +13,8 @@ pub struct Backend {
     /// API kinds this base_url serves; a gateway may speak both.
     pub kinds: Vec<BackendKind>,
     pub base_url: Url,
+    /// Anthropic-only endpoint; `None` means `base_url` serves every kind.
+    pub anthropic_base_url: Option<Url>,
     /// `None` for backends that need no key (e.g. a local vllm instance).
     pub api_key: Option<String>,
     pub anthropic_version: String,
@@ -30,6 +32,16 @@ pub struct Backend {
 impl Backend {
     pub fn supports(&self, kind: BackendKind) -> bool {
         self.kinds.contains(&kind)
+    }
+
+    /// The endpoint to join this request's path onto. A backend that
+    /// exposes Anthropic on its own URL uses it for `/v1/messages` only;
+    /// every other kind keeps the primary `base_url`.
+    pub fn base_url_for(&self, kind: BackendKind) -> &Url {
+        match kind {
+            BackendKind::Anthropic => self.anthropic_base_url.as_ref().unwrap_or(&self.base_url),
+            BackendKind::Openai => &self.base_url,
+        }
     }
 
     /// True when this backend contends for an exclusive group's lease.
@@ -110,17 +122,20 @@ pub struct ModelRoute {
     /// Canonical model name: what gets logged, billed, allowlisted, and
     /// (absent a target rename) sent upstream.
     pub name: String,
+    /// Reachable only by keys that name it explicitly; see `KeyRecord`.
+    pub private: bool,
     pub targets: Vec<Target>,
     pub qos: RouteQos,
     current: Mutex<Vec<i64>>,
 }
 
 impl ModelRoute {
-    pub fn new(name: String, targets: Vec<Target>, qos: RouteQos) -> Self {
+    pub fn new(name: String, private: bool, targets: Vec<Target>, qos: RouteQos) -> Self {
         let n = targets.len();
         assert!(n > 0, "a route needs at least one target");
         ModelRoute {
             name,
+            private,
             targets,
             qos,
             current: Mutex::new(vec![0; n]),
@@ -204,6 +219,7 @@ mod tests {
             name: name.to_string(),
             kinds,
             base_url: Url::parse("http://example.com").unwrap(),
+            anthropic_base_url: None,
             api_key: Some("k".into()),
             anthropic_version: "2023-06-01".into(),
             inject_usage: true,
@@ -218,6 +234,7 @@ mod tests {
     fn route_of(targets: &[(u32, Vec<BackendKind>)]) -> ModelRoute {
         ModelRoute::new(
             "m".to_string(),
+            false,
             targets
                 .iter()
                 .enumerate()
@@ -279,6 +296,40 @@ mod tests {
         });
         assert_eq!(p.cached_input_per_mtok, 0.3);
         assert_eq!(p.cache_write_per_mtok, 3.75);
+    }
+
+    #[test]
+    fn anthropic_base_url_overrides_only_the_anthropic_kind() {
+        let mut b = Backend {
+            name: "dual".into(),
+            kinds: vec![BackendKind::Openai, BackendKind::Anthropic],
+            base_url: Url::parse("https://api.example.com/openai").unwrap(),
+            anthropic_base_url: Some(Url::parse("https://api.example.com/anthropic").unwrap()),
+            api_key: None,
+            anthropic_version: "2023-06-01".into(),
+            inject_usage: true,
+            class: SchedulingClass::Unrestricted,
+            group: None,
+            max_concurrency: None,
+            max_tokens_cap: None,
+            tok_s_estimate: None,
+        };
+        assert_eq!(
+            b.base_url_for(BackendKind::Openai).as_str(),
+            "https://api.example.com/openai"
+        );
+        assert_eq!(
+            b.base_url_for(BackendKind::Anthropic).as_str(),
+            "https://api.example.com/anthropic"
+        );
+
+        // Falling back is not the same as requiring the override: a dual-kind
+        // backend without one serves both APIs from base_url.
+        b.anthropic_base_url = None;
+        assert_eq!(
+            b.base_url_for(BackendKind::Anthropic).as_str(),
+            "https://api.example.com/openai"
+        );
     }
 
     #[test]
@@ -388,6 +439,7 @@ mod tests {
     fn route_with_fallbacks(targets: &[(u32, Vec<BackendKind>, bool)]) -> ModelRoute {
         ModelRoute::new(
             "m".to_string(),
+            false,
             targets
                 .iter()
                 .enumerate()

@@ -75,7 +75,27 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         crate::image::DEFAULT_MAX_UPLOAD_BYTES,
         crate::image::ImageService::max_upload_bytes,
     );
-    let routes = Router::new()
+    let routes = api_routes(upload_limit, image_upload_limit);
+
+    routes
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
+        // The default panic body is kept deliberately: overriding it is how a
+        // backtrace ends up in a response.
+        .layer(CatchPanicLayer::new())
+        .with_state(state)
+}
+
+/// The proxy/API route table, before the outer layers are applied.
+///
+/// Split out of `build_router` so the layering story there stays readable;
+/// the two limits are the only inputs that vary by configured service.
+fn api_routes(upload_limit: usize, image_upload_limit: usize) -> Router<Arc<AppState>> {
+    Router::new()
         .route("/health", get(misc_handlers::health))
         .route("/metrics", get(misc_handlers::metrics))
         .route("/debug/memory", get(misc_handlers::memory_report))
@@ -155,19 +175,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .method_not_allowed_fallback(misc_handlers::method_not_allowed)
         .fallback(misc_handlers::not_found)
-        .layer(DefaultBodyLimit::max(max_body_bytes()));
-
-    routes
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
-        // The default panic body is kept deliberately: overriding it is how a
-        // backtrace ends up in a response.
-        .layer(CatchPanicLayer::new())
-        .with_state(state)
+        .layer(DefaultBodyLimit::max(max_body_bytes()))
 }
 
 /// The configured body ceiling.

@@ -154,6 +154,11 @@ pub struct BackendDef {
     pub kinds: Vec<BackendKind>,
     /// Base URL of upstream backend.
     pub base_url: String,
+    /// Base URL for the Anthropic wire format when the provider exposes it
+    /// on a different endpoint than its OpenAI-compatible one (DeepInfra,
+    /// for example). `None` means `base_url` serves every kind.
+    #[serde(default)]
+    pub anthropic_base_url: Option<String>,
     /// Literal API key for outbound authentication.
     #[serde(default)]
     pub api_key: Option<String>,
@@ -196,6 +201,8 @@ pub struct BackendView {
     pub kinds: Vec<BackendKind>,
     /// Base URL.
     pub base_url: String,
+    /// Anthropic-only base URL; `None` means `base_url` serves every kind.
+    pub anthropic_base_url: Option<String>,
     /// Whether backend has an API key configured.
     pub has_api_key: bool,
     /// Environment variable name holding the API key.
@@ -223,6 +230,7 @@ impl BackendDef {
             name: self.name.clone(),
             kinds: self.kinds.clone(),
             base_url: self.base_url.clone(),
+            anthropic_base_url: self.anthropic_base_url.clone(),
             has_api_key: self.api_key.is_some(),
             api_key_env: self.api_key_env.clone(),
             anthropic_version: self.anthropic_version.clone(),
@@ -256,6 +264,11 @@ pub struct ModelDef {
     /// upstream as `name`, so an alias is purely a router-side synonym.
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Reachable only by keys whose allowlist names this model. A key with
+    /// no allowlist ("all models") deliberately does not include it, and
+    /// the model is hidden from that key's `GET /v1/models`.
+    #[serde(default)]
+    pub private: bool,
     /// Default pricing for every target; targets may override.
     #[serde(default)]
     pub pricing: Option<PricingCfg>,
@@ -357,6 +370,16 @@ pub(crate) fn validate_backend(b: &BackendDef, known_groups: &[String]) -> Resul
         seen.push(k);
     }
     Url::parse(&b.base_url).map_err(|e| format!("backend {:?}: invalid base_url: {e}", b.name))?;
+    if let Some(url) = &b.anthropic_base_url {
+        Url::parse(url)
+            .map_err(|e| format!("backend {:?}: invalid anthropic_base_url: {e}", b.name))?;
+        if !b.kinds.contains(&BackendKind::Anthropic) {
+            return Err(format!(
+                "backend {:?}: anthropic_base_url set but kinds does not include anthropic",
+                b.name
+            ));
+        }
+    }
     if b.api_key.is_some() && b.api_key_env.is_some() {
         return Err(format!(
             "backend {:?}: set at most one of api_key / api_key_env, not both",
@@ -784,15 +807,16 @@ fn write_group(conn: &Connection, def: &GroupDef) -> Result<()> {
 
 fn write_backend(conn: &Connection, def: &BackendDef) -> Result<()> {
     conn.execute(
-        "INSERT INTO backends (name, kinds, base_url, api_key, api_key_env,
+        "INSERT INTO backends (name, kinds, base_url, anthropic_base_url, api_key, api_key_env,
                                anthropic_version, inject_usage, scheduling_class,
                                exclusive_group_id, max_concurrency, max_tokens_cap,
                                tok_s_estimate)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         rusqlite::params![
             def.name,
             serde_json::to_string(&def.kinds).context("serializing backend kinds")?,
             def.base_url,
+            def.anthropic_base_url,
             def.api_key,
             def.api_key_env,
             def.anthropic_version,
@@ -809,12 +833,13 @@ fn write_backend(conn: &Connection, def: &BackendDef) -> Result<()> {
 
 fn write_model(conn: &Connection, def: &ModelDef) -> Result<()> {
     conn.execute(
-        "INSERT INTO models (name, aliases, pricing, qos_max_wait_ms,
+        "INSERT INTO models (name, aliases, private, pricing, qos_max_wait_ms,
                              qos_background_max_wait_ms, on_shed_without_fallback)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             def.name,
             aliases_to_sql(&def.aliases)?,
+            def.private,
             pricing_to_sql(&def.pricing)?,
             def.qos_max_wait_ms,
             def.qos_background_max_wait_ms,
@@ -860,9 +885,9 @@ fn read_groups(conn: &Connection) -> Result<Vec<GroupDef>> {
 
 fn read_backends(conn: &Connection) -> Result<Vec<BackendDef>> {
     let mut stmt = conn.prepare(
-        "SELECT name, kinds, base_url, api_key, api_key_env, anthropic_version, inject_usage,
-                scheduling_class, exclusive_group_id, max_concurrency, max_tokens_cap,
-                tok_s_estimate
+        "SELECT name, kinds, base_url, anthropic_base_url, api_key, api_key_env, anthropic_version,
+                inject_usage, scheduling_class, exclusive_group_id, max_concurrency,
+                max_tokens_cap, tok_s_estimate
          FROM backends ORDER BY name",
     )?;
     let rows = stmt
@@ -875,10 +900,10 @@ fn read_backends(conn: &Connection) -> Result<Vec<BackendDef>> {
                     format!("invalid backend kinds JSON: {e}").into(),
                 )
             })?;
-            let class: String = row.get(7)?;
+            let class: String = row.get(8)?;
             let scheduling_class = SchedulingClass::parse(&class).ok_or_else(|| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    7,
+                    8,
                     rusqlite::types::Type::Text,
                     format!("invalid scheduling class {class:?}").into(),
                 )
@@ -887,15 +912,16 @@ fn read_backends(conn: &Connection) -> Result<Vec<BackendDef>> {
                 name: row.get(0)?,
                 kinds,
                 base_url: row.get(2)?,
-                api_key: row.get(3)?,
-                api_key_env: row.get(4)?,
-                anthropic_version: row.get(5)?,
-                inject_usage: row.get(6)?,
+                anthropic_base_url: row.get(3)?,
+                api_key: row.get(4)?,
+                api_key_env: row.get(5)?,
+                anthropic_version: row.get(6)?,
+                inject_usage: row.get(7)?,
                 scheduling_class,
-                exclusive_group_id: row.get(8)?,
-                max_concurrency: row.get(9)?,
-                max_tokens_cap: row.get(10)?,
-                tok_s_estimate: row.get(11)?,
+                exclusive_group_id: row.get(9)?,
+                max_concurrency: row.get(10)?,
+                max_tokens_cap: row.get(11)?,
+                tok_s_estimate: row.get(12)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -904,17 +930,17 @@ fn read_backends(conn: &Connection) -> Result<Vec<BackendDef>> {
 
 fn read_models(conn: &Connection) -> Result<Vec<ModelDef>> {
     let mut stmt = conn.prepare(
-        "SELECT name, aliases, pricing, qos_max_wait_ms, qos_background_max_wait_ms,
+        "SELECT name, aliases, private, pricing, qos_max_wait_ms, qos_background_max_wait_ms,
                 on_shed_without_fallback
          FROM models ORDER BY name",
     )?;
     let mut models: Vec<ModelDef> = stmt
         .query_map([], |row| {
-            let on_shed: String = row.get(5)?;
+            let on_shed: String = row.get(6)?;
             let on_shed_without_fallback =
                 OnShedWithoutFallback::parse(&on_shed).ok_or_else(|| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        5,
+                        6,
                         rusqlite::types::Type::Text,
                         format!("invalid on_shed_without_fallback {on_shed:?}").into(),
                     )
@@ -922,9 +948,10 @@ fn read_models(conn: &Connection) -> Result<Vec<ModelDef>> {
             Ok(ModelDef {
                 name: row.get(0)?,
                 aliases: aliases_from_sql(row.get::<_, Option<String>>(1)?, 1)?,
-                pricing: pricing_from_sql(row.get::<_, Option<String>>(2)?, 2)?,
-                qos_max_wait_ms: row.get(3)?,
-                qos_background_max_wait_ms: row.get(4)?,
+                private: row.get(2)?,
+                pricing: pricing_from_sql(row.get::<_, Option<String>>(3)?, 3)?,
+                qos_max_wait_ms: row.get(4)?,
+                qos_background_max_wait_ms: row.get(5)?,
                 on_shed_without_fallback,
                 targets: Vec::new(),
             })
@@ -1017,6 +1044,7 @@ mod tests {
             name: name.into(),
             kinds: vec![BackendKind::Openai],
             base_url: "https://api.openai.com".into(),
+            anthropic_base_url: None,
             api_key: Some("sk-secret".into()),
             api_key_env: None,
             anthropic_version: None,
@@ -1054,6 +1082,7 @@ mod tests {
         ModelDef {
             name: name.into(),
             aliases: Vec::new(),
+            private: false,
             pricing: Some(PricingCfg {
                 input_per_mtok: 1.0,
                 output_per_mtok: 2.0,
@@ -1289,6 +1318,24 @@ mod tests {
         clashing.aliases = vec!["gpt-4o".into()];
         assert!(validate_no_name_conflict(&clashing, &others).is_err());
         assert!(validate_no_name_conflict(&ok, []).is_ok());
+    }
+
+    #[test]
+    fn anthropic_base_url_must_be_a_url_and_requires_the_anthropic_kind() {
+        let no_groups: &[String] = &[];
+        let mut b = backend("dual");
+        b.kinds = vec![BackendKind::Openai, BackendKind::Anthropic];
+        b.anthropic_base_url = Some("https://api.deepinfra.com/anthropic".into());
+        assert!(validate_backend(&b, no_groups).is_ok());
+
+        b.anthropic_base_url = Some("not a url".into());
+        assert!(validate_backend(&b, no_groups).is_err());
+
+        // A backend that does not speak Anthropic has no use for the field,
+        // and accepting it silently would hide a misconfiguration.
+        let mut openai_only = backend("openai");
+        openai_only.anthropic_base_url = Some("https://api.deepinfra.com/anthropic".into());
+        assert!(validate_backend(&openai_only, no_groups).is_err());
     }
 
     #[test]

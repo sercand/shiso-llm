@@ -27,6 +27,8 @@ pub(crate) struct CreateTokenRequest {
     pub token_limit_reset: Option<ResetInterval>,
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
+    #[serde(default)]
+    pub flex_models: Option<Vec<String>>,
 }
 
 /// PATCH body: absent field = leave unchanged, `null` = clear (for the
@@ -48,6 +50,8 @@ pub(crate) struct UpdateTokenRequest {
     pub token_limit_reset: Option<ResetInterval>,
     #[serde(deserialize_with = "some_option")]
     pub allowed_models: Option<Option<Vec<String>>>,
+    #[serde(deserialize_with = "some_option")]
+    pub flex_models: Option<Option<Vec<String>>>,
 }
 
 #[expect(
@@ -71,7 +75,10 @@ pub(crate) async fn create_token(
     validate_credit_limit(req.credit_limit)?;
     validate_token_limit(req.token_limit)?;
     if let Some(models) = &req.allowed_models {
-        validate_allowlist(&state, models)?;
+        validate_model_list(&state, models, "allowed_models")?;
+    }
+    if let Some(models) = &req.flex_models {
+        validate_model_list(&state, models, "flex_models")?;
     }
 
     let token = generate_token();
@@ -82,6 +89,7 @@ pub(crate) async fn create_token(
     record.token_limit = req.token_limit;
     record.token_limit_reset = req.token_limit_reset.unwrap_or_default();
     record.allowed_models = req.allowed_models;
+    record.flex_models = req.flex_models;
 
     let db = state.db.clone();
     let record_clone = record.clone();
@@ -173,9 +181,15 @@ pub(crate) async fn update_token(
     }
     if let Some(models) = req.allowed_models {
         if let Some(models) = &models {
-            validate_allowlist(&state, models)?;
+            validate_model_list(&state, models, "allowed_models")?;
         }
         record.allowed_models = models;
+    }
+    if let Some(models) = req.flex_models {
+        if let Some(models) = &models {
+            validate_model_list(&state, models, "flex_models")?;
+        }
+        record.flex_models = models;
     }
 
     let limits_changed = record.credit_limit != before.credit_limit
@@ -262,25 +276,25 @@ fn validate_token_limit(limit: Option<i64>) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Allowlist entries must name configured models — a typo here would
-/// silently lock the key out of the model it was meant to reach. Aliases
-/// are rejected for the same reason: the proxy checks the allowlist against
-/// the canonical name an alias resolves to, so an aliased entry would never
-/// match anything.
-fn validate_allowlist(state: &AppState, models: &[String]) -> Result<(), AppError> {
+/// Allowlist/flex-list entries must name configured models — a typo here
+/// would silently lock the key out of the model it was meant to reach (or
+/// silently never force flex). Aliases are rejected for the same reason:
+/// the proxy matches these lists against the canonical name an alias
+/// resolves to, so an aliased entry would never match anything.
+fn validate_model_list(state: &AppState, models: &[String], field: &str) -> Result<(), AppError> {
     let routing = state.routing();
     for m in models {
         match routing.model_named(m) {
             Some(def) if def.name == *m => {}
             Some(def) => {
                 return Err(AppError::BadRequest(format!(
-                    "allowed_models entry {m:?} is an alias of model {:?} — list the model name",
+                    "{field} entry {m:?} is an alias of model {:?} — list the model name",
                     def.name
                 )));
             }
             None => {
                 return Err(AppError::BadRequest(format!(
-                    "allowed_models entry {m:?} is not a configured model"
+                    "{field} entry {m:?} is not a configured model"
                 )));
             }
         }

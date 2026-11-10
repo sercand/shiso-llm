@@ -23,6 +23,8 @@ pub(crate) struct CreateBackendRequest {
     pub kinds: Vec<BackendKind>,
     pub base_url: String,
     #[serde(default)]
+    pub anthropic_base_url: Option<String>,
+    #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
@@ -54,6 +56,8 @@ pub(crate) struct CreateBackendRequest {
 pub(crate) struct UpdateBackendRequest {
     pub kinds: Option<Vec<BackendKind>>,
     pub base_url: Option<String>,
+    #[serde(deserialize_with = "some_option")]
+    pub anthropic_base_url: Option<Option<String>>,
     #[serde(deserialize_with = "some_option")]
     pub api_key: Option<Option<String>>,
     #[serde(deserialize_with = "some_option")]
@@ -117,6 +121,7 @@ pub(crate) async fn create_backend(
         name: req.name.trim().to_string(),
         kinds: req.kinds,
         base_url: req.base_url.trim().to_string(),
+        anthropic_base_url: blank_to_none(req.anthropic_base_url),
         api_key: blank_to_none(req.api_key),
         api_key_env: blank_to_none(req.api_key_env),
         anthropic_version: blank_to_none(req.anthropic_version),
@@ -159,6 +164,9 @@ pub(crate) async fn update_backend(
     }
     if let Some(base_url) = req.base_url {
         def.base_url = base_url.trim().to_string();
+    }
+    if let Some(url) = req.anthropic_base_url {
+        def.anthropic_base_url = blank_to_none(url);
     }
     if let Some(api_key) = req.api_key {
         def.api_key = blank_to_none(api_key);

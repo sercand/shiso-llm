@@ -978,6 +978,7 @@ mod tests {
             name: name.into(),
             kinds: vec![BackendKind::Openai],
             base_url: "http://127.0.0.1:1".into(),
+            anthropic_base_url: None,
             api_key: None,
             api_key_env: None,
             anthropic_version: None,
@@ -1016,6 +1017,7 @@ mod tests {
             .map(|b| ModelDef {
                 name: format!("m-{}", b.name),
                 aliases: Vec::new(),
+                private: false,
                 pricing: None,
                 qos_max_wait_ms: None,
                 qos_background_max_wait_ms: None,
@@ -1048,6 +1050,7 @@ mod tests {
             .map(|b| ModelDef {
                 name: format!("m-{}", b.name),
                 aliases: Vec::new(),
+                private: false,
                 pricing: None,
                 qos_max_wait_ms: None,
                 qos_background_max_wait_ms: None,

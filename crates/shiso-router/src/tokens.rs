@@ -37,8 +37,11 @@ pub fn synthetic_key_name(token_id: &str) -> Option<&'static str> {
 /// plus the per-backend scheduling class / concurrency / token-cap columns,
 /// the per-model QoS deadline columns, and `model_targets.fallback_only`;
 /// version 7 added `request_logs.service_tier`, the client's
-/// `x-service-tier` hint as it was forwarded.
-const SCHEMA_VERSION: i64 = 7;
+/// `x-service-tier` hint as it was forwarded; version 8 added private model
+/// routes (`models.private`), per-key forced-flex model lists
+/// (`tokens.flex_models`), and a separate Anthropic endpoint per backend
+/// (`backends.anthropic_base_url`).
+const SCHEMA_VERSION: i64 = 8;
 
 /// A client API key as stored — everything except the secret, which exists
 /// only as a SHA-256 hash. Records are immutable snapshots: admin updates
@@ -61,8 +64,12 @@ pub struct KeyRecord {
     pub token_limit: Option<i64>,
     /// Reset interval for token budget.
     pub token_limit_reset: ResetInterval,
-    /// Models this key may call; `None` = all configured models.
+    /// Models this key may call; `None` = all public models. Private models
+    /// always need an explicit entry.
     pub allowed_models: Option<Vec<String>>,
+    /// Canonical models for which this key's requests are forced to the
+    /// `flex` service tier, overriding whatever the client asked for.
+    pub flex_models: Option<Vec<String>>,
 }
 
 impl KeyRecord {
@@ -78,6 +85,7 @@ impl KeyRecord {
             token_limit: None,
             token_limit_reset: ResetInterval::Never,
             allowed_models: None,
+            flex_models: None,
         }
     }
 
@@ -92,11 +100,28 @@ impl KeyRecord {
     }
 
     /// Checks whether the key permits calling the specified model.
-    pub fn allows_model(&self, model: &str) -> bool {
+    ///
+    /// An absent allowlist grants every *public* model, not every model: a
+    /// private route is reachable only when the key names it explicitly.
+    /// The synthetic admin-console key is exempt, because the admin token
+    /// already authorizes it and a setup test must not be blocked by a
+    /// privacy rule it cannot edit.
+    pub fn allows_model(&self, model: &str, private: bool) -> bool {
+        if self.id == ADMIN_KEY_ID {
+            return true;
+        }
         match &self.allowed_models {
-            None => true,
+            None => !private,
             Some(list) => list.iter().any(|m| m == model),
         }
+    }
+
+    /// Whether this key forces `model`'s requests to the flex tier.
+    /// Matching is on the canonical name, like `allows_model`.
+    pub fn forces_flex(&self, model: &str) -> bool {
+        self.flex_models
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|m| m == model))
     }
 
     /// Checks whether the key has credit or token limits configured.
@@ -163,8 +188,8 @@ impl Db {
         conn.execute(
             "INSERT INTO tokens (id, name, token_hash, created_at, disabled,
                                  credit_limit, credit_limit_reset,
-                                 token_limit, token_limit_reset, allowed_models)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                 token_limit, token_limit_reset, allowed_models, flex_models)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 record.id,
                 record.name,
@@ -176,6 +201,7 @@ impl Db {
                 record.token_limit,
                 record.token_limit_reset.as_str(),
                 allowed_models_to_sql(&record.allowed_models)?,
+                flex_models_to_sql(&record.flex_models)?,
             ],
         )?;
         Ok(())
@@ -223,7 +249,7 @@ impl Db {
             "UPDATE tokens SET name = ?2, disabled = ?3,
                     credit_limit = ?4, credit_limit_reset = ?5,
                     token_limit = ?6, token_limit_reset = ?7,
-                    allowed_models = ?8
+                    allowed_models = ?8, flex_models = ?9
              WHERE id = ?1",
             rusqlite::params![
                 record.id,
@@ -234,6 +260,7 @@ impl Db {
                 record.token_limit,
                 record.token_limit_reset.as_str(),
                 allowed_models_to_sql(&record.allowed_models)?,
+                flex_models_to_sql(&record.flex_models)?,
             ],
         )?;
         Ok(Some(hash))
@@ -268,7 +295,7 @@ impl Db {
 }
 
 const RECORD_COLUMNS: &str = "id, name, created_at, disabled, credit_limit, \
-     credit_limit_reset, token_limit, token_limit_reset, allowed_models";
+     credit_limit_reset, token_limit, token_limit_reset, allowed_models, flex_models";
 
 fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -291,7 +318,8 @@ fn migrate(conn: &Connection) -> Result<()> {
             credit_limit_reset TEXT NOT NULL DEFAULT 'never',
             token_limit        INTEGER,
             token_limit_reset  TEXT NOT NULL DEFAULT 'never',
-            allowed_models     TEXT
+            allowed_models     TEXT,
+            flex_models        TEXT
         );",
     )?;
 
@@ -320,6 +348,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         (
             "allowed_models",
             "ALTER TABLE tokens ADD COLUMN allowed_models TEXT",
+        ),
+        (
+            "flex_models",
+            "ALTER TABLE tokens ADD COLUMN flex_models TEXT",
         ),
     ] {
         if !existing.contains(col) {
@@ -369,6 +401,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             name               TEXT PRIMARY KEY,
             kinds              TEXT NOT NULL,
             base_url           TEXT NOT NULL,
+            anthropic_base_url TEXT,
             api_key            TEXT,
             api_key_env        TEXT,
             anthropic_version  TEXT,
@@ -382,6 +415,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS models (
             name                    TEXT PRIMARY KEY,
             aliases                 TEXT,
+            private                 INTEGER NOT NULL DEFAULT 0,
             pricing                 TEXT,
             qos_max_wait_ms         INTEGER,
             qos_background_max_wait_ms INTEGER,
@@ -432,6 +466,10 @@ fn migrate(conn: &Connection) -> Result<()> {
             "tok_s_estimate",
             "ALTER TABLE backends ADD COLUMN tok_s_estimate REAL",
         ),
+        (
+            "anthropic_base_url",
+            "ALTER TABLE backends ADD COLUMN anthropic_base_url TEXT",
+        ),
     ] {
         if !existing.contains(col) {
             conn.execute(ddl, [])?;
@@ -451,6 +489,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         (
             "on_shed_without_fallback",
             "ALTER TABLE models ADD COLUMN on_shed_without_fallback TEXT NOT NULL DEFAULT 'wait'",
+        ),
+        (
+            "private",
+            "ALTER TABLE models ADD COLUMN private INTEGER NOT NULL DEFAULT 0",
         ),
     ] {
         if !existing.contains(col) {
@@ -513,6 +555,14 @@ fn allowed_models_to_sql(models: &Option<Vec<String>>) -> Result<Option<String>>
         .transpose()
 }
 
+/// Returns `Ok(None)` when the key forces no model to flex.
+fn flex_models_to_sql(models: &Option<Vec<String>>) -> Result<Option<String>> {
+    models
+        .as_ref()
+        .map(|m| serde_json::to_string(m).context("serializing flex_models"))
+        .transpose()
+}
+
 fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<KeyRecord> {
     record_from_offset_row(row, 0)
 }
@@ -539,6 +589,18 @@ fn record_from_offset_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::R
             })
         })
         .transpose()?;
+    let flex: Option<String> = row.get(offset + 9)?;
+    let flex_models = flex
+        .map(|json| {
+            serde_json::from_str::<Vec<String>>(&json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    offset + 9,
+                    rusqlite::types::Type::Text,
+                    format!("invalid flex_models JSON: {e}").into(),
+                )
+            })
+        })
+        .transpose()?;
     Ok(KeyRecord {
         id: row.get(offset)?,
         name: row.get(offset + 1)?,
@@ -549,6 +611,7 @@ fn record_from_offset_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::R
         token_limit: row.get(offset + 6)?,
         token_limit_reset: parse_reset(offset + 7, row.get(offset + 7)?)?,
         allowed_models,
+        flex_models,
     })
 }
 
@@ -654,6 +717,41 @@ mod tests {
     }
 
     #[test]
+    fn private_models_need_an_explicit_allowlist() {
+        let mut key = record("k", "k");
+        // No allowlist means "all public models", not "all models": a
+        // private model stays out of reach until it is named explicitly.
+        assert!(key.allows_model("public", false));
+        assert!(!key.allows_model("secret", true));
+
+        key.allowed_models = Some(vec!["secret".into()]);
+        assert!(key.allows_model("secret", true));
+        assert!(!key.allows_model("public", false));
+
+        // The console runs as a synthetic key so setup tests are never
+        // blocked by an access rule an operator just added.
+        let admin = KeyRecord::admin_console();
+        assert!(admin.allows_model("secret", true));
+    }
+
+    #[test]
+    fn flex_models_round_trip_and_match_the_canonical_name() {
+        let (_dir, db) = temp_db();
+        let mut rec = record("id1", "flex");
+        rec.flex_models = Some(vec!["gpt-4o".into()]);
+        db.insert(&rec, &hash_token("tok")).unwrap();
+
+        let got = db.get("id1").unwrap().unwrap();
+        assert_eq!(got.flex_models, Some(vec!["gpt-4o".to_string()]));
+        assert!(got.forces_flex("gpt-4o"));
+        assert!(!got.forces_flex("o3"));
+
+        // No list means "never force": the client keeps its own tier.
+        let plain = record("id2", "plain");
+        assert!(!plain.forces_flex("gpt-4o"));
+    }
+
+    #[test]
     fn limits_and_allowlist_round_trip() {
         let (_dir, db) = temp_db();
         let mut rec = record("id1", "limited");
@@ -675,8 +773,8 @@ mod tests {
             got.allowed_models,
             Some(vec!["gpt-4o".to_string(), "claude-sonnet".to_string()])
         );
-        assert!(got.allows_model("gpt-4o"));
-        assert!(!got.allows_model("o3"));
+        assert!(got.allows_model("gpt-4o", false));
+        assert!(!got.allows_model("o3", false));
         assert!(db.get("missing").unwrap().is_none());
     }
 
@@ -816,6 +914,85 @@ mod tests {
         drop(db);
         let db = Db::open(&path).unwrap();
         assert_eq!(db.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migrates_a_v7_database_to_the_new_access_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        // A v7 database: every table in its current shape except the three
+        // columns this version adds, with a row in each table that gains one.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tokens (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL, disabled INTEGER NOT NULL DEFAULT 0,
+                    credit_limit REAL, credit_limit_reset TEXT NOT NULL DEFAULT 'never',
+                    token_limit INTEGER, token_limit_reset TEXT NOT NULL DEFAULT 'never',
+                    allowed_models TEXT);
+                 CREATE TABLE backends (
+                    name TEXT PRIMARY KEY, kinds TEXT NOT NULL, base_url TEXT NOT NULL,
+                    api_key TEXT, api_key_env TEXT, anthropic_version TEXT,
+                    inject_usage INTEGER NOT NULL DEFAULT 1,
+                    scheduling_class TEXT NOT NULL DEFAULT 'unrestricted',
+                    exclusive_group_id TEXT, max_concurrency INTEGER,
+                    max_tokens_cap INTEGER, tok_s_estimate REAL);
+                 CREATE TABLE models (
+                    name TEXT PRIMARY KEY, aliases TEXT, pricing TEXT,
+                    qos_max_wait_ms INTEGER, qos_background_max_wait_ms INTEGER,
+                    on_shed_without_fallback TEXT NOT NULL DEFAULT 'wait');
+                 CREATE TABLE model_targets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL,
+                    position INTEGER NOT NULL, backend TEXT NOT NULL, rename TEXT,
+                    weight INTEGER NOT NULL DEFAULT 1, pricing TEXT,
+                    fallback_only INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE request_logs (
+                    id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, token_id TEXT NOT NULL,
+                    model TEXT NOT NULL, backend TEXT, upstream_model TEXT, path TEXT NOT NULL,
+                    status INTEGER, streamed INTEGER NOT NULL DEFAULT 0, ttfb_ms INTEGER,
+                    duration_ms INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER,
+                    cached_tokens INTEGER, cache_write_tokens INTEGER, total_tokens INTEGER,
+                    cost REAL, finish_reason TEXT, error TEXT, service_tier TEXT);
+                 INSERT INTO tokens (id, name, token_hash, created_at)
+                   VALUES ('k', 'key', 'aa', '2025-01-01T00:00:00Z');
+                 INSERT INTO backends (name, kinds, base_url)
+                   VALUES ('b', '[\"openai\"]', 'https://api.openai.com');
+                 INSERT INTO models (name) VALUES ('m');
+                 INSERT INTO model_targets (model, position, backend) VALUES ('m', 0, 'b');",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 7).unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let version: i64 = db
+            .with_read(|conn| Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // Existing rows keep their old behavior: public model, no Anthropic
+        // override, no forced-flex list.
+        let (private, anthropic_base_url, flex_models): (bool, Option<String>, Option<String>) = db
+            .with_read(|conn| {
+                Ok((
+                    conn.query_row("SELECT private FROM models WHERE name = 'm'", [], |r| {
+                        r.get(0)
+                    })?,
+                    conn.query_row(
+                        "SELECT anthropic_base_url FROM backends WHERE name = 'b'",
+                        [],
+                        |r| r.get(0),
+                    )?,
+                    conn.query_row("SELECT flex_models FROM tokens WHERE id = 'k'", [], |r| {
+                        r.get(0)
+                    })?,
+                ))
+            })
+            .unwrap();
+        assert!(!private);
+        assert_eq!(anthropic_base_url, None);
+        assert_eq!(flex_models, None);
     }
 
     #[test]

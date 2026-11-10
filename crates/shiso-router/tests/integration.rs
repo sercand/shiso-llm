@@ -48,6 +48,8 @@ struct TestBackendSeed {
     kind: Vec<shiso_router::catalog::BackendKind>,
     base_url: String,
     #[serde(default)]
+    anthropic_base_url: Option<String>,
+    #[serde(default)]
     api_key: Option<String>,
     #[serde(default)]
     api_key_env: Option<String>,
@@ -92,6 +94,8 @@ struct TestModelSeed {
     name: String,
     #[serde(default)]
     aliases: Vec<String>,
+    #[serde(default)]
+    private: bool,
     #[serde(default)]
     pricing: Option<shiso_router::catalog::PricingCfg>,
     #[serde(default)]
@@ -144,6 +148,7 @@ fn seed_test_db(db: &Db, config_body: &str) {
             name: b.name,
             kinds: b.kind,
             base_url: b.base_url,
+            anthropic_base_url: b.anthropic_base_url,
             api_key: b.api_key,
             api_key_env: b.api_key_env,
             anthropic_version: b.anthropic_version,
@@ -160,6 +165,7 @@ fn seed_test_db(db: &Db, config_body: &str) {
         let def = shiso_router::catalog::ModelDef {
             name: m.name,
             aliases: m.aliases,
+            private: m.private,
             pricing: m.pricing,
             qos_max_wait_ms: m.qos.as_ref().and_then(|q| q.max_wait_ms),
             qos_background_max_wait_ms: m.qos.as_ref().and_then(|q| q.background_max_wait_ms),
@@ -3928,6 +3934,7 @@ async fn catalog_persists_across_restarts() {
         name: "stored".into(),
         kinds: vec![shiso_router::catalog::BackendKind::Openai],
         base_url: "http://127.0.0.1:1".into(),
+        anthropic_base_url: None,
         api_key: None,
         api_key_env: None,
         anthropic_version: None,
@@ -4476,4 +4483,252 @@ async fn splats_are_routed_renamed_and_logged() {
         assert_eq!(row["completion_tokens"], 614_700);
         assert_eq!(row["total_tokens"], 614_700);
     }
+}
+
+// ---- private models, per-kind base URLs, forced flex --------------------
+
+/// A private model is invisible to a key whose allowlist is absent, and a
+/// direct call is indistinguishable from an unknown model. Naming it in the
+/// allowlist is what grants access.
+#[tokio::test]
+async fn private_models_require_an_explicit_allowlist_and_stay_hidden() {
+    let mock = echo_backend("private").await;
+    let config = format!(
+        "{}[[models]]\nname = \"public-model\"\n[[models.targets]]\nbackend = \"b1\"\n\
+         [[models]]\nname = \"secret-model\"\nprivate = true\n[[models.targets]]\nbackend = \"b1\"\n",
+        backend_toml("b1", &mock.uri(), "k")
+    );
+    let router = TestRouter::start(&config).await;
+    let (open_token, _) = router.create_token().await;
+
+    // The admin API round-trips the flag the UI edits.
+    let (status, models) = router
+        .admin(reqwest::Method::GET, "/admin/models", None)
+        .await;
+    assert_eq!(status, 200);
+    let secret = models
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "secret-model")
+        .expect("secret-model is configured");
+    assert_eq!(secret["private"], true);
+
+    // An unrestricted key sees only the public route.
+    let list: serde_json::Value = router
+        .client
+        .get(router.url("/v1/models"))
+        .bearer_auth(&open_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["public-model"], "{list}");
+
+    // The private route does not exist as far as this key is concerned.
+    let resp = router
+        .client
+        .post(router.url("/v1/chat/completions"))
+        .bearer_auth(&open_token)
+        .body(r#"{"model":"secret-model","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "a private model must not confirm itself"
+    );
+
+    // The public route still works.
+    let resp = router
+        .client
+        .post(router.url("/v1/chat/completions"))
+        .bearer_auth(&open_token)
+        .body(r#"{"model":"public-model","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // An allowlist entry grants the private route, listing included.
+    let (status, created) = router
+        .admin(
+            reqwest::Method::POST,
+            "/admin/tokens",
+            Some(serde_json::json!({
+                "name": "vip",
+                "allowed_models": ["secret-model"],
+            })),
+        )
+        .await;
+    assert_eq!(status, 201, "{created}");
+    let vip = created["token"].as_str().unwrap();
+
+    let list: serde_json::Value = router
+        .client
+        .get(router.url("/v1/models"))
+        .bearer_auth(vip)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["data"][0]["id"], "secret-model", "{list}");
+
+    let resp = router
+        .client
+        .post(router.url("/v1/chat/completions"))
+        .bearer_auth(vip)
+        .body(r#"{"model":"secret-model","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+/// The Anthropic override is used for `/v1/messages` only; every OpenAI
+/// endpoint keeps the primary base URL.
+#[tokio::test]
+async fn anthropic_base_url_serves_messages_from_its_own_endpoint() {
+    let openai = MockServer::start().await;
+    let anthropic = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": "openai"})))
+        .mount(&openai)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": "anthropic"})),
+        )
+        .mount(&anthropic)
+        .await;
+
+    let config = format!(
+        "[[backends]]\nname = \"dual\"\nkind = [\"openai\", \"anthropic\"]\n\
+         base_url = {:?}\nanthropic_base_url = {:?}\napi_key = \"k\"\n\
+         [[models]]\nname = \"chat-model\"\n[[models.targets]]\nbackend = \"dual\"\n\
+         [[models]]\nname = \"claude-model\"\n[[models.targets]]\nbackend = \"dual\"\n",
+        openai.uri(),
+        anthropic.uri()
+    );
+    let router = TestRouter::start(&config).await;
+    let (token, _) = router.create_token().await;
+
+    let resp = router
+        .client
+        .post(router.url("/v1/chat/completions"))
+        .bearer_auth(&token)
+        .body(r#"{"model":"chat-model","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(openai.received_requests().await.unwrap().len(), 1);
+    assert_eq!(anthropic.received_requests().await.unwrap().len(), 0);
+
+    let resp = router
+        .client
+        .post(router.url("/v1/messages"))
+        .header("x-api-key", &token)
+        .body(r#"{"model":"claude-model","max_tokens":10,"messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(anthropic.received_requests().await.unwrap().len(), 1);
+    assert_eq!(openai.received_requests().await.unwrap().len(), 1);
+
+    // The admin API round-trips the field the UI edits.
+    let (status, backends) = router
+        .admin(reqwest::Method::GET, "/admin/backends", None)
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(backends[0]["anthropic_base_url"], anthropic.uri());
+}
+
+/// A key configured for flex on a model overrides both the header and the
+/// body field, and the effective tier is what the log records. A key
+/// without the setting keeps the client's own tier.
+#[tokio::test]
+async fn a_key_can_force_flex_on_selected_models() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+        })))
+        .mount(&mock)
+        .await;
+
+    let router = TestRouter::start(
+        &(backend_toml("b1", &mock.uri(), "k")
+            + "[[models]]\nname = \"gpt-test\"\n[[models.targets]]\nbackend = \"b1\"\n"),
+    )
+    .await;
+
+    let (status, created) = router
+        .admin(
+            reqwest::Method::POST,
+            "/admin/tokens",
+            Some(serde_json::json!({"name": "flex", "flex_models": ["gpt-test"]})),
+        )
+        .await;
+    assert_eq!(status, 201, "{created}");
+    let forced = created["token"].as_str().unwrap();
+
+    let resp = router
+        .client
+        .post(router.url("/v1/chat/completions"))
+        .bearer_auth(forced)
+        .header("x-service-tier", "priority")
+        .body(r#"{"model":"gpt-test","service_tier":"priority","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(received[0].headers.get("x-service-tier").unwrap(), "flex");
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(body["service_tier"], "flex", "the body field is forced too");
+
+    router.wait_for_logs(1).await;
+    let (_, page) = router
+        .admin(reqwest::Method::GET, "/admin/logs", None)
+        .await;
+    assert_eq!(page["items"][0]["service_tier"], "flex");
+
+    // A key without the setting is still the client's own tier.
+    let (plain, _) = router.create_token().await;
+    let resp = router
+        .client
+        .post(router.url("/v1/chat/completions"))
+        .bearer_auth(plain)
+        .header("x-service-tier", "priority")
+        .body(r#"{"model":"gpt-test","service_tier":"priority","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(
+        received[1].headers.get("x-service-tier").unwrap(),
+        "priority"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&received[1].body).unwrap();
+    assert_eq!(body["service_tier"], "priority");
 }
