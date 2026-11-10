@@ -22,8 +22,8 @@ pub(crate) async fn list_models(
     let mut names: Vec<&str> = routing
         .models
         .iter()
+        .filter(|m| key.allows_model(&m.name, m.private))
         .map(|m| m.name.as_str())
-        .filter(|name| key.allows_model(name))
         .collect();
     names.sort_unstable();
     Json(models_response(

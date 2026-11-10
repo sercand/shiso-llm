@@ -45,6 +45,8 @@ pub(crate) struct ModelBody {
     #[serde(default)]
     pub aliases: Vec<String>,
     #[serde(default)]
+    pub private: bool,
+    #[serde(default)]
     pub pricing: Option<PricingCfg>,
     #[serde(default)]
     pub qos_max_wait_ms: Option<i64>,
@@ -86,6 +88,7 @@ pub(crate) async fn replace_model(
     let def = ModelDef {
         name,
         aliases: trimmed(body.aliases),
+        private: body.private,
         pricing: body.pricing,
         qos_max_wait_ms: body.qos_max_wait_ms,
         qos_background_max_wait_ms: body.qos_background_max_wait_ms,

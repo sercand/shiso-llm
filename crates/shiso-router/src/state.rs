@@ -50,6 +50,12 @@ impl Routing {
             let api_key = b.resolved_api_key()?;
             let base_url = Url::parse(&b.base_url)
                 .with_context(|| format!("backend {:?}: invalid base_url", b.name))?;
+            let anthropic_base_url = b
+                .anthropic_base_url
+                .as_deref()
+                .map(Url::parse)
+                .transpose()
+                .with_context(|| format!("backend {:?}: invalid anthropic_base_url", b.name))?;
             // A dangling group would leave the backend un-schedulable in a
             // way nothing downstream could detect, so fail the whole
             // rebuild here — the previous snapshot keeps serving.
@@ -73,6 +79,7 @@ impl Routing {
                     name: b.name.clone(),
                     kinds: b.kinds.clone(),
                     base_url,
+                    anthropic_base_url,
                     api_key,
                     anthropic_version: b
                         .anthropic_version
@@ -119,7 +126,7 @@ impl Routing {
                 background_max_wait_ms: m.qos_background_max_wait_ms,
                 on_shed_without_fallback: m.on_shed_without_fallback,
             };
-            let route = Arc::new(ModelRoute::new(m.name.clone(), targets, qos));
+            let route = Arc::new(ModelRoute::new(m.name.clone(), m.private, targets, qos));
             for name in m.call_names() {
                 // The admin API and the config loader both reject conflicts
                 // before a write, so this only fires on a hand-edited DB.
@@ -286,6 +293,7 @@ mod tests {
             name: "b".into(),
             kinds: vec![BackendKind::Openai],
             base_url: "http://127.0.0.1:1".into(),
+            anthropic_base_url: None,
             api_key: None,
             api_key_env: None,
             anthropic_version: None,
@@ -302,6 +310,7 @@ mod tests {
         ModelDef {
             name: name.into(),
             aliases: aliases.iter().map(|a| a.to_string()).collect(),
+            private: false,
             pricing: None,
             qos_max_wait_ms: None,
             qos_background_max_wait_ms: None,

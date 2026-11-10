@@ -23,7 +23,9 @@ The router picks a backend based on the `model` field in the request body, swaps
 - **Failover** — on connection failure or upstream 5xx, the next backend is tried. Safe by construction: nothing is sent to the client until an upstream has answered. 4xx responses are relayed immediately (no retry).
 - **Model renaming** — a route target can rewrite the model name before forwarding (e.g. inbound `gpt-4o` becomes `llama-3.3-70b` on a local vLLM backend).
 - **Raw streaming** — response bodies (including SSE) are piped through as raw bytes with no re-serialization or buffering. Request bodies are forwarded byte-for-byte unless a rename or usage injection applies.
-- **Key auth & controls** — clients authenticate with router-issued keys (`Authorization: Bearer` or `x-api-key`, both accepted), stored in SQLite as SHA-256 hashes. Keys can be disabled/re-enabled and restricted to a model allowlist.
+- **Key auth & controls** — clients authenticate with router-issued keys (`Authorization: Bearer` or `x-api-key`, both accepted), stored in SQLite as SHA-256 hashes. Keys can be disabled/re-enabled and restricted to a model allowlist. A key with no allowlist gets every public model; **private** models are reachable only when a key names them explicitly, and are hidden from that key's model list.
+- **Forced flex** — a key can force the `flex` service tier on selected models. The override replaces both the forwarded `x-service-tier` header and the OpenAI `service_tier` body field, and the effective tier is what the logs record.
+- **Per-kind base URLs** — a backend may point `/v1/messages` at a different endpoint (`anthropic_base_url`) than its OpenAI-compatible one, for providers that split the two APIs.
 - **Request logs** — every proxied request is recorded (model, backend, status, latency, token usage incl. cached tokens, cost, finish reason, errors) without slowing the streaming path: the response is observed by a tee and rows are written by an async batching task.
 - **Usage limits** — per-key credit (USD) and token-count limits, each with a `never`/`daily`/`weekly`/`monthly` UTC reset window. Token limits make free internal backends (vLLM) boundable too. Exhausted keys get `429 insufficient_quota`.
 - **Model pricing** — per-model (or per-target) USD-per-million-token rates, including discounted cache-read and Anthropic cache-write rates, drive logged costs and credit limits.
@@ -275,7 +277,7 @@ resident, because memory is not the constraint here — compute is.
 
 ## Admin UI
 
-Open `/admin/ui` (on the admin listener if `admin_listen` is set, otherwise the main one) and sign in with the admin token. It covers key management (create with limits/allowlist, edit, disable, delete), per-key usage stat cards, a 30-day token chart split by input/output, backend, model and exclusive-group editors (including scheduling class, concurrency, token caps and QoS deadlines), and a filterable request log with a detail drawer. The page is a single embedded file that talks to the JSON API below — a custom UI (e.g. Next.js) can use the same API.
+Open `/admin/ui` (on the admin listener if `admin_listen` is set, otherwise the main one) and sign in with the admin token. It covers key management (create with limits, allowlist and forced-flex models; edit, disable, delete), per-key usage stat cards, a 30-day token chart split by input/output, backend, model and exclusive-group editors (including private models, per-kind base URLs, scheduling class, concurrency, token caps and QoS deadlines), and a filterable request log with a detail drawer. The page is a single embedded file that talks to the JSON API below — a custom UI (e.g. Next.js) can use the same API.
 
 ## Admin API
 
@@ -283,21 +285,21 @@ All endpoints require `Authorization: Bearer <admin token>`. When `admin_listen`
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/admin/tokens` | Create a key. Body: `{"name", "credit_limit"?, "credit_limit_reset"?, "token_limit"?, "token_limit_reset"?, "allowed_models"?}`. Returns the plaintext token once. |
+| `POST` | `/admin/tokens` | Create a key. Body: `{"name", "credit_limit"?, "credit_limit_reset"?, "token_limit"?, "token_limit_reset"?, "allowed_models"?, "flex_models"?}`. Returns the plaintext token once. |
 | `GET` | `/admin/tokens` | List keys with limit settings and current-window usage — never secrets. |
 | `GET` | `/admin/tokens/{id}` | Key detail with today / this-week / this-month / all-time usage aggregates. |
-| `PATCH` | `/admin/tokens/{id}` | Update any of name, `disabled`, limits, resets, `allowed_models` (`null` clears). Takes effect immediately. |
+| `PATCH` | `/admin/tokens/{id}` | Update any of name, `disabled`, limits, resets, `allowed_models`, `flex_models` (`null` clears). Takes effect immediately. |
 | `DELETE` | `/admin/tokens/{id}` | Delete a key (request logs are retained). Takes effect immediately. |
 | `GET` | `/admin/logs` | Request logs; filters `token_id`, `model`, `status`, `since`/`until` (RFC3339); keyset pagination via `limit` + `cursor`/`next_cursor`. |
 | `GET` | `/admin/logs/{id}` | One log row. |
 | `GET` | `/admin/usage` | Aggregates (`requests`, tokens, `cost`) with `group_by=day\|model\|token` and the same filters. |
 | `GET` | `/admin/models` | Model routes with their pricing and targets. |
-| `POST` | `/admin/models` | Create a model route. Body: `{"name", "aliases"?, "pricing"?, "targets":[{"backend", "model"?, "weight"?, "pricing"?}]}`. |
+| `POST` | `/admin/models` | Create a model route. Body: `{"name", "aliases"?, "private"?, "pricing"?, "targets":[{"backend", "model"?, "weight"?, "pricing"?}]}`. |
 | `GET` | `/admin/models/{name}` | One model route. |
-| `PUT` | `/admin/models/{name}` | Replace a model's aliases, pricing and target list wholesale. Names are not renameable (aliases are). |
+| `PUT` | `/admin/models/{name}` | Replace a model's aliases, private flag, pricing and target list wholesale. Names are not renameable (aliases are). |
 | `DELETE` | `/admin/models/{name}` | Delete a model route; requests for that name then 404. |
 | `GET` | `/admin/backends` | Backends with `has_api_key`/`api_key_env` — stored secrets are never returned. |
-| `POST` | `/admin/backends` | Create a backend. Body: `{"name", "kinds":["openai"\|"anthropic"], "base_url", "api_key"?, "api_key_env"?, "anthropic_version"?, "inject_usage"?}`. |
+| `POST` | `/admin/backends` | Create a backend. Body: `{"name", "kinds":["openai"\|"anthropic"], "base_url", "anthropic_base_url"?, "api_key"?, "api_key_env"?, "anthropic_version"?, "inject_usage"?}`. |
 | `GET` | `/admin/backends/{name}` | One backend. |
 | `PATCH` | `/admin/backends/{name}` | Update any field; absent = unchanged, `null` = clear. Setting one key source clears the other. |
 | `DELETE` | `/admin/backends/{name}` | Delete a backend; `409` while a model still targets it. |
@@ -318,7 +320,7 @@ Reset intervals are `never` (default), `daily`, `weekly` (Monday 00:00 UTC), or 
 
 ## Behavior details
 
-- **Header handling** — outbound headers are built from an allowlist (`content-type`, `accept`, `anthropic-version`, `anthropic-beta`); client credentials and hop-by-hop headers are never forwarded. Upstream response headers are relayed minus hop-by-hop headers.
+- **Header handling** — outbound headers are built from an allowlist (`content-type`, `accept`, `anthropic-version`, `anthropic-beta`); client credentials and hop-by-hop headers are never forwarded. `x-service-tier` is forwarded as the client's own hint unless the key forces flex on the model, in which case it is replaced with `flex` (and the OpenAI body field `service_tier` is set to `flex` too). Upstream response headers are relayed minus hop-by-hop headers.
 - **Timeouts** — 10 s connect timeout, 120 s read (idle-stall) timeout, no total timeout so long-running SSE streams are never cut off.
 - **Errors** — rendered as provider-style JSON (`{"error":{"message","type"}}`): 400 invalid body, 401 bad token, 403 disabled key / model not allowed, 404 unknown model, 429 limit exhausted, 503 QoS deadline missed with no fallback (`on_shed_without_fallback = "error"`), 502 all backends unreachable. If every backend returns 5xx, the last upstream 5xx response is relayed verbatim.
 - **Usage capture** — streaming OpenAI-style chat requests get `stream_options.include_usage: true` injected so usage appears in the stream (the extra final chunk passes through to the client, as OpenRouter does; set `inject_usage = false` on backends that reject `stream_options`). Anthropic and Responses streams already carry usage. Token counts are normalized so `prompt_tokens` always includes cached tokens; costs bill cache reads/writes at their configured rates.

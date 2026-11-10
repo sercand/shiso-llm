@@ -400,19 +400,32 @@ function resetSelect(name, value) {
   </select>`;
 }
 
-function allowlistChecks(allowed) {
+function modelChecks(name, selected) {
   return `<div class="grid grid-cols-2 gap-1 rounded-lg border border-neutral-800 p-2 max-h-40 overflow-y-auto">
     ${CATALOG.map(m => `<label class="flex items-center gap-2 text-sm text-neutral-300">
-      <input type="checkbox" name="allowed_models" value="${esc(m.name)}"
-        ${allowed && allowed.includes(m.name) ? "checked" : ""}
-        class="accent-emerald-500"> ${esc(m.name)}</label>`).join("")}
-  </div>
-  <p class="mt-1 text-xs text-neutral-500">None checked = all models allowed.</p>`;
+      <input type="checkbox" name="${name}" value="${esc(m.name)}"
+        ${selected && selected.includes(m.name) ? "checked" : ""}
+        class="accent-emerald-500"> ${esc(m.name)}${
+          m.private ? ' <span class="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-400">private</span>' : ""
+        }</label>`).join("")}
+  </div>`;
+}
+
+function allowlistChecks(allowed) {
+  return `${modelChecks("allowed_models", allowed)}
+  <p class="mt-1 text-xs text-neutral-500">None checked = all public models. Private models always need to be checked.</p>`;
+}
+
+function flexChecks(flex) {
+  return `${modelChecks("flex_models", flex)}
+  <p class="mt-1 text-xs text-neutral-500">Requests for these models are forced to the <code>flex</code> service tier, overriding the client's choice.</p>`;
 }
 
 function readKeyForm(form) {
   const num = v => v.trim() === "" ? null : Number(v);
-  const allowed = [...form.querySelectorAll('input[name=allowed_models]:checked')].map(c => c.value);
+  const checked = name => [...form.querySelectorAll(`input[name=${name}]:checked`)].map(c => c.value);
+  const allowed = checked("allowed_models");
+  const flex = checked("flex_models");
   return {
     name: form.name.value.trim(),
     credit_limit: num(form.credit_limit.value),
@@ -420,6 +433,7 @@ function readKeyForm(form) {
     token_limit: num(form.token_limit.value),
     token_limit_reset: form.token_limit_reset.value,
     allowed_models: allowed.length ? allowed : null,
+    flex_models: flex.length ? flex : null,
   };
 }
 
@@ -440,7 +454,8 @@ function keyFormFields(k = {}) {
       <label class="block text-sm">Reset
         <div class="mt-1">${resetSelect("token_limit_reset", k.token_limit_reset || "never")}</div></label>
     </div>
-    <div class="text-sm">Allowed models${allowlistChecks(k.allowed_models)}</div>`;
+    <div class="text-sm">Allowed models${allowlistChecks(k.allowed_models)}</div>
+    <div class="text-sm">Force flex on models${flexChecks(k.flex_models)}</div>`;
 }
 
 function closeModal() { $("#modal-root").innerHTML = ""; }
@@ -1189,7 +1204,9 @@ async function renderKeys() {
         ${inOutLine(k.usage.window_prompt_tokens, k.usage.window_completion_tokens)}
         ${progressBar(k.usage.window_tokens, k.token_limit)}
       </td>
-      <td class="px-4 py-3 text-sm text-neutral-400">${k.allowed_models ? esc(k.allowed_models.join(", ")) : "all models"}</td>
+      <td class="px-4 py-3 text-sm text-neutral-400">${k.allowed_models ? esc(k.allowed_models.join(", ")) : "all public models"}${
+        k.flex_models ? `<div class="mt-1 text-xs text-amber-400">flex: ${esc(k.flex_models.join(", "))}</div>` : ""
+      }</td>
     </tr>`).join("");
 
   $("#view").innerHTML = `
@@ -1407,7 +1424,8 @@ async function renderModels() {
     <tr class="border-t border-neutral-800">
       <td class="px-4 py-3 font-medium">
         <a class="text-sky-400 hover:underline" href="#/analytics/models/${encodeURIComponent(m.name)}"
-          title="Usage analytics">${esc(m.name)}</a>${aliasList(m.aliases)}</td>
+          title="Usage analytics">${esc(m.name)}</a>${m.private
+            ? ' <span class="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-400">private</span>' : ""}${aliasList(m.aliases)}</td>
       <td class="px-4 py-3">${m.targets.map(targetChip).join("")}</td>
       <td class="px-4 py-3 text-sm text-neutral-400">${priceSummary(m.pricing)}</td>
       <td class="px-4 py-3 text-sm text-neutral-400">${qosSummary(m)}</td>
@@ -1479,6 +1497,11 @@ function openModelForm(name) {
         <span class="text-xs text-neutral-500">Comma-separated extra names clients may call. They route,
           bill and log as the model name above.</span>
       </label>
+      <label class="flex items-center gap-2 text-sm text-neutral-300">
+        <input type="checkbox" name="private" class="accent-amber-500" ${m && m.private ? "checked" : ""}>
+        Private — only keys whose allowlist names this model can use it</label>
+      <p class="-mt-2 text-xs text-neutral-500">A key with no allowlist gets every public model, but never
+        a private one. Private models are also hidden from that key's model list.</p>
       <div class="text-sm">Default pricing${priceFields("m_", m && m.pricing)}</div>
       <details class="rounded-lg border border-neutral-800 p-3"
         ${m && (m.qos_max_wait_ms != null || m.qos_background_max_wait_ms != null) ? "open" : ""}>
@@ -1543,10 +1566,10 @@ function openModelForm(name) {
       };
       if (m) {
         await api("/admin/models/" + encodeURIComponent(m.name),
-          { method: "PUT", body: JSON.stringify({ aliases, pricing, targets, ...qos }) });
+          { method: "PUT", body: JSON.stringify({ aliases, private: form.private.checked, pricing, targets, ...qos }) });
       } else {
         await api("/admin/models",
-          { method: "POST", body: JSON.stringify({ name: form.name.value.trim(), aliases, pricing, targets, ...qos }) });
+          { method: "POST", body: JSON.stringify({ name: form.name.value.trim(), aliases, private: form.private.checked, pricing, targets, ...qos }) });
       }
       closeModal();
       toast("Saved");
@@ -1608,7 +1631,10 @@ async function renderBackends() {
       </td>
       <td class="px-4 py-3">${b.kinds.map(k =>
         `<span class="mr-1 rounded bg-neutral-800 px-2 py-0.5 text-xs">${esc(k)}</span>`).join("")}</td>
-      <td class="px-4 py-3 font-mono text-xs text-neutral-400">${esc(b.base_url)}</td>
+      <td class="px-4 py-3 font-mono text-xs text-neutral-400">${esc(b.base_url)}${
+        b.anthropic_base_url
+          ? `<div class="mt-1 text-[11px] text-neutral-500">anthropic: ${esc(b.anthropic_base_url)}</div>` : ""
+      }</td>
       <td class="px-4 py-3 text-sm">${credentialSummary(b)}</td>
       <td class="px-4 py-3 text-sm text-neutral-400">${b.inject_usage ? "on" : "off"}</td>
       <td class="px-4 py-3 text-sm">${schedulingSummary(b)}</td>
@@ -1656,6 +1682,11 @@ function openBackendForm(name) {
       </div>
       <label class="block text-sm">Base URL
         ${input("base_url", 'required placeholder="https://api.openai.com"', b ? b.base_url : "")}</label>
+      <label class="block text-sm">Anthropic base URL (optional)
+        ${input("anthropic_base_url", 'placeholder="same as base URL"', b ? (b.anthropic_base_url || "") : "")}
+        <span class="text-xs text-neutral-500">Used only for <code>/v1/messages</code>. Set it when the
+          provider exposes Anthropic on a different endpoint; blank means the base URL above serves both.</span>
+      </label>
       <div class="grid grid-cols-2 gap-3">
         <label class="block text-sm">API key
           ${input("api_key", `type="password" autocomplete="new-password" placeholder="${b && b.has_api_key ? "unchanged" : "none"}"`)}</label>
@@ -1739,6 +1770,7 @@ function openBackendForm(name) {
       const body = {
         kinds,
         base_url: form.base_url.value.trim(),
+        anthropic_base_url: form.anthropic_base_url.value.trim() || null,
         anthropic_version: form.anthropic_version.value.trim() || null,
         inject_usage: form.inject_usage.checked,
         scheduling_class: cls,
