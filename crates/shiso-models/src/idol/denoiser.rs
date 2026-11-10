@@ -11,8 +11,9 @@
 //!
 //! The time embedding, the shared modulation and the camera's two ends are a
 //! single row each and run on the host; everything over token rows runs on
-//! the device. The rotary angles are predicted on the device and turned into
-//! cosine and sine tables on the host, because the driver has no cosine.
+//! the device. The rotary positions are predicted on the device, and one
+//! launch turns a block's queries and keys by them and applies the per-head
+//! norm ([`super::splat_ops::rope_norm`]).
 //!
 //! The reference runs the blocks in fp16; this runs f32 throughout (see the
 //! module doc of [`super::nn`]).
@@ -29,10 +30,10 @@ use super::conditioning::Conditioning;
 use super::config::{DenoiserArgs, IdolConfig};
 use super::generator::Prepared;
 use super::nn::{
-    Affine, AttnShape, HeadNorm, Pairing, Qkv, add_gated_in_place, attention, bytes, host_lin,
-    layer_norm, linear, point_embed_v1, read_linear, rotate_in_place, turned,
+    Affine, AttnShape, HEAD_NORM_EPS, HeadNorm, HeavyKey, Qkv, add_gated_in_place, attention,
+    bytes, host_lin, layer_norm, linear, point_embed_v1, read_linear,
 };
-use super::splat_ops::{RotaryCall, rotary_tables};
+use super::splat_ops::{ATTN_HEAD, RopeNormCall, rope_norm};
 use crate::diffusion::lin::Lin;
 use crate::diffusion::ops::{ModulateCall, Ops, SliceExt};
 use crate::diffusion::weights::StStore;
@@ -196,9 +197,7 @@ enum Norms {
 struct Block {
     norms: Norms,
     q: Lin,
-    q_turn: Lin,
     k: Lin,
-    k_turn: Lin,
     v: Lin,
     q_norm: HeadNorm,
     k_norm: HeadNorm,
@@ -229,6 +228,22 @@ pub(crate) struct IdolDenoiser {
     cam: [HostLinear; 2],
     out: Lin,
     cam_out: HostLinear,
+}
+
+/// The rows one block runs over.
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    /// Rows held on the device.
+    rows: usize,
+    /// The row that stands for several identical ones, when there is one.
+    heavy: Option<HeavyKey>,
+}
+
+impl Span {
+    /// `rows` rows, each standing for itself.
+    const fn plain(rows: usize) -> Self {
+        Self { rows, heavy: None }
+    }
 }
 
 /// The denoiser's answer: a velocity for the latent and one for the camera.
@@ -269,6 +284,12 @@ fn load_block(
     let width = args.model_channels;
     let heads = args.num_heads;
     let head_dim = width / heads;
+    if head_dim != ATTN_HEAD || head_dim * heads != width {
+        return Err(ImageGenError::Checkpoint(format!(
+            "the denoiser attends {ATTN_HEAD}-wide heads, the checkpoint has {heads} heads over \
+             {width}"
+        )));
+    }
     let (w, b) = read_linear(store, &format!("{base}attn.qkv"))?;
     let b = b.ok_or_else(|| ImageGenError::Checkpoint(format!("{base}attn.qkv has no bias")))?;
     if w.len() != 3 * width * width || b.len() != 3 * width {
@@ -285,8 +306,6 @@ fn load_block(
     let (qw, qb) = part(0);
     let (kw, kb) = part(1);
     let (vw, vb) = part(2);
-    let (qtw, qtb) = turned(qw, Some(qb), heads, head_dim, Pairing::Adjacent);
-    let (ktw, ktb) = turned(kw, Some(kb), heads, head_dim, Pairing::Adjacent);
     let norms = if modulated {
         Norms::Modulated(store.f32_vec(&format!("{base}shift_table"))?)
     } else {
@@ -298,9 +317,7 @@ fn load_block(
     Ok(Block {
         norms,
         q: host_lin(ops, qw, Some(qb), width, width)?,
-        q_turn: host_lin(ops, &qtw, qtb.as_deref(), width, width)?,
         k: host_lin(ops, kw, Some(kb), width, width)?,
-        k_turn: host_lin(ops, &ktw, ktb.as_deref(), width, width)?,
         v: host_lin(ops, vw, Some(vb), width, width)?,
         q_norm: HeadNorm::load(store, ops, &format!("{base}attn.q_norm"), heads, head_dim)?,
         k_norm: HeadNorm::load(store, ops, &format!("{base}attn.k_norm"), heads, head_dim)?,
@@ -375,6 +392,15 @@ impl IdolDenoiser {
     /// computes this once per conditioning and hands it to every
     /// [`IdolDenoiser::forward`].
     ///
+    /// A conditioning whose rows are all the same row - the guidance pass's
+    /// zero conditioning - is refined and answered as that one row with
+    /// [`Prepared::copies`] set to its length. Nothing in the network tells
+    /// equal conditioning rows apart (they carry no position; their rotary
+    /// angles are predicted from their content), so they stay equal through
+    /// every block, and `n` equal keys weigh in a softmax as one key scoring
+    /// `ln(n)` higher. The joint blocks then run 8194 rows instead of 12294:
+    /// the attention at 0.44 of its cost and the linears at 0.67.
+    ///
     /// # Errors
     ///
     /// [`ImageGenError::Backend`] for streams of the wrong width or a device
@@ -392,10 +418,20 @@ impl IdolDenoiser {
                 cond.vae.len()
             )));
         }
+        // Held rows and what each stands for.
+        let (held, copies) = if n_c > 1
+            && all_rows_equal(&cond.dinov3, a.cond_channels)
+            && all_rows_equal(&cond.vae, a.cond2_channels)
+        {
+            (1, n_c)
+        } else {
+            (n_c, 1)
+        };
+        let n_c = held;
         let mut times = PassTimes::new();
         let stream = ops.alloc_f32("denoiser cond", n_c * width)?;
-        let f1 = ops.upload_scratch("denoiser cond", &cond.dinov3)?;
-        let f2 = ops.upload_scratch("denoiser cond", &cond.vae)?;
+        let f1 = ops.upload_scratch("denoiser cond", &cond.dinov3[..n_c * a.cond_channels])?;
+        let f2 = ops.upload_scratch("denoiser cond", &cond.vae[..n_c * a.cond2_channels])?;
         let c1 = linear(ops, "denoiser cond", &self.cond1, f1.view(), n_c)?;
         let c2 = linear(ops, "denoiser cond", &self.cond2, f2.view(), n_c)?;
         ops.add(
@@ -406,12 +442,21 @@ impl IdolDenoiser {
             n_c * width,
         )?;
         drop((f1, f2, c1, c2));
+        // A lone held row attends only to itself, where its weight cancels.
         for (repo, block) in self.context_repo.iter().zip(&self.context_refiner) {
-            self.block(block, repo, stream.view(), n_c, None, &mut times)?;
+            self.block(
+                block,
+                repo,
+                stream.view(),
+                Span::plain(n_c),
+                None,
+                &mut times,
+            )?;
         }
         Ok(Prepared {
             rows: n_c,
             stream: ops.download("denoiser cond readback", stream.view(), n_c * width)?,
+            copies,
         })
     }
 
@@ -441,6 +486,18 @@ impl IdolDenoiser {
         let width = a.model_channels;
         let (n_x, n_c) = (a.q_token_length, prepared.rows);
         let rows = n_x + n_c + 1;
+        // Held rows standing for several are attended as one weighted key
+        // each; the refiner only ever answers one such row.
+        let heavy = match (prepared.copies, n_c) {
+            (1, _) => None,
+            (copies, 1) if copies > 1 => Some(HeavyKey { key: n_x, copies }),
+            (copies, _) => {
+                return Err(ImageGenError::Backend(format!(
+                    "the denoiser attends one repeated conditioning row, got {n_c} rows \
+                     standing for {copies} each"
+                )));
+            }
+        };
         if prepared.stream.len() != n_c * width {
             return Err(ImageGenError::Backend(format!(
                 "the denoiser reads {n_c} conditioning rows of {width}, got {} values",
@@ -484,7 +541,14 @@ impl IdolDenoiser {
         )?;
         drop((z, h_x));
         for (repo, block) in self.noise_repo.iter().zip(&self.noise_refiner) {
-            self.block(block, repo, stream(0, n_x)?, n_x, Some(&t_mod), &mut times)?;
+            self.block(
+                block,
+                repo,
+                stream(0, n_x)?,
+                Span::plain(n_x),
+                Some(&t_mod),
+                &mut times,
+            )?;
         }
 
         // The conditioning stream, refined once per request: copied in, as
@@ -512,7 +576,14 @@ impl IdolDenoiser {
             .map_err(|e| ImageGenError::Backend(format!("denoiser camera row: {e}")))?;
 
         for (repo, block) in self.repo.iter().zip(&self.blocks) {
-            self.block(block, repo, h.view(), rows, Some(&t_mod), &mut times)?;
+            self.block(
+                block,
+                repo,
+                h.view(),
+                Span { rows, heavy },
+                Some(&t_mod),
+                &mut times,
+            )?;
         }
 
         // Read-out: a parameter-free norm, the final time modulation, the heads.
@@ -566,8 +637,8 @@ impl IdolDenoiser {
         })
     }
 
-    /// One block over `rows` rows of `x`, in place, with its rotary positions
-    /// predicted by `repo` from the block's input.
+    /// One block over `span`'s rows of `x`, in place, with its rotary
+    /// positions predicted by `repo` from the block's input.
     #[expect(
         clippy::too_many_lines,
         clippy::many_single_char_names,
@@ -578,14 +649,15 @@ impl IdolDenoiser {
         block: &Block,
         repo: &Repo,
         x: shiso_core::DeviceView<'_>,
-        rows: usize,
+        span: Span,
         t_mod: Option<&[f32]>,
         times: &mut PassTimes,
     ) -> Result<(), ImageGenError> {
+        let Span { rows, heavy } = span;
         let ops = &*self.ops;
         let width = self.args.model_channels;
         let count = rows * width;
-        let (cos_m1, sin) = times.time(ops, |t| &mut t.rotary, || self.rotary(repo, x, rows))?;
+        let offsets = times.time(ops, |t| &mut t.rotary, || self.offsets(repo, x, rows))?;
 
         let modulation = match (&block.norms, t_mod) {
             (Norms::Modulated(table), Some(t_mod)) => {
@@ -635,25 +707,34 @@ impl IdolDenoiser {
         };
 
         let h = norm("denoiser norm1", 0)?;
-        let project = |lin: &Lin, turn: &Lin, head_norm: &HeadNorm| -> Result<_, ImageGenError> {
-            let y = linear(ops, "denoiser qk", lin, h.view(), rows)?;
-            let t = linear(ops, "denoiser qk", turn, h.view(), rows)?;
-            rotate_in_place(
-                ops,
-                "denoiser rope",
-                y.view(),
-                t.view(),
-                cos_m1.view(),
-                sin.view(),
-                count,
-            )?;
-            head_norm.apply(ops, "denoiser qk norm", y.view(), rows)?;
-            Ok(y)
-        };
-        let q = project(&block.q, &block.q_turn, &block.q_norm)?;
-        let k = project(&block.k, &block.k_turn, &block.k_norm)?;
+        let q = linear(ops, "denoiser qk", &block.q, h.view(), rows)?;
+        let k = linear(ops, "denoiser qk", &block.k, h.view(), rows)?;
         let v = linear(ops, "denoiser v", &block.v, h.view(), rows)?;
         drop(h);
+        times.time(
+            ops,
+            |t| &mut t.rotary,
+            || {
+                rope_norm(
+                    ops,
+                    &RopeNormCall {
+                        step: "denoiser rope",
+                        q: q.view(),
+                        k: k.view(),
+                        offsets: offsets.view(),
+                        rates: repo.rates.view(),
+                        axis: repo.axis.view(),
+                        gamma_q: block.q_norm.gamma(),
+                        gamma_k: block.k_norm.gamma(),
+                        rows,
+                        heads: self.args.num_heads,
+                        head_dim: self.head_dim,
+                        eps: HEAD_NORM_EPS,
+                    },
+                )
+            },
+        )?;
+        drop(offsets);
         let attended = times.time(
             ops,
             |t| &mut t.attention,
@@ -671,11 +752,12 @@ impl IdolDenoiser {
                         keys: rows,
                         heads: self.args.num_heads,
                         head_dim: self.head_dim,
+                        heavy,
                     },
                 )
             },
         )?;
-        drop((q, k, v, cos_m1, sin));
+        drop((q, k, v));
         let o = linear(ops, "denoiser attn out", &block.out, attended.view(), rows)?;
         drop(attended);
         if modulation.is_some() {
@@ -718,24 +800,16 @@ impl IdolDenoiser {
         }
     }
 
-    /// The rotary tables for `rows` rows of `x`: `cos - 1` and `sin`, each
-    /// `(rows, width)`, every pair `(2j, 2j + 1)` of a head turning by the same
-    /// angle.
-    fn rotary<'o>(
+    /// The rotary positions `repo` predicts for `rows` rows of `x`: three
+    /// offsets per head, `(rows, heads, 3)`.
+    fn offsets<'o>(
         &'o self,
         repo: &Repo,
         x: shiso_core::DeviceView<'_>,
         rows: usize,
-    ) -> Result<
-        (
-            crate::diffusion::ops::Scratch<'o>,
-            crate::diffusion::ops::Scratch<'o>,
-        ),
-        ImageGenError,
-    > {
+    ) -> Result<crate::diffusion::ops::Scratch<'o>, ImageGenError> {
         let ops = &*self.ops;
         let width = self.args.model_channels;
-        let heads = self.args.num_heads;
         let pairs = self.head_dim / 2;
         if repo.pairs != pairs {
             return Err(ImageGenError::Checkpoint(format!(
@@ -762,26 +836,18 @@ impl IdolDenoiser {
             content.view(),
             rows * repo.gate.out_dim,
         )?;
-        let offsets = linear(ops, "denoiser repo", &repo.project, gate.view(), rows)?;
-        drop(gate);
-        let cos_m1 = ops.alloc_f32("denoiser rope", rows * width)?;
-        let sin = ops.alloc_f32("denoiser rope", rows * width)?;
-        rotary_tables(
-            ops,
-            &RotaryCall {
-                step: "denoiser rope",
-                cos_m1: cos_m1.view(),
-                sin: sin.view(),
-                offsets: offsets.view(),
-                rates: repo.rates.view(),
-                axis: repo.axis.view(),
-                rows,
-                heads,
-                head_dim: self.head_dim,
-            },
-        )?;
-        Ok((cos_m1, sin))
+        linear(ops, "denoiser repo", &repo.project, gate.view(), rows)
     }
+}
+
+/// Whether every `width`-wide row of `values` is bit for bit the first one.
+fn all_rows_equal(values: &[f32], width: usize) -> bool {
+    let mut rows = values.chunks_exact(width);
+    let Some(first) = rows.next() else {
+        return false;
+    };
+    let same = |a: &f32, b: &f32| a.to_bits() == b.to_bits();
+    rows.all(|row| row.iter().zip(first).all(|(a, b)| same(a, b)))
 }
 
 /// The read-out's parameter-free norm and modulation on one host row.

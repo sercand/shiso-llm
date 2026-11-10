@@ -76,10 +76,15 @@ pub struct FlowState {
 /// saves its blocks on every pass but the first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Prepared {
-    /// Conditioning rows.
+    /// Refined rows held in `stream`.
     pub rows: usize,
     /// The refined rows, `(rows, model_channels)` row-major, on the host.
     pub stream: Vec<f32>,
+    /// How many rows of the sequence each held row stands for: 1, or the
+    /// conditioning's whole length when its rows were all the same row (the
+    /// zero conditioning of the guidance pass), which then refines to one
+    /// row repeated and is held, and attended, once.
+    pub copies: usize,
 }
 
 /// The denoiser: one velocity evaluation.
@@ -373,6 +378,7 @@ mod tests {
             Ok(Prepared {
                 rows: cond.rows,
                 stream: Vec::new(),
+                copies: 1,
             })
         }
 

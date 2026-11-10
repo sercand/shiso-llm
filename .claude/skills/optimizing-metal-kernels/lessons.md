@@ -55,6 +55,13 @@ shapes differ.
   - 8 rows × 4 heads per block spilled registers and ran 1.7× slower.
 - **Window attention:** 64 columns × 16 keys took 14.7 ms. 32 keys took 27.5 ms (lost occupancy), and staging K/V in threadgroup memory took 18.6 ms (4 barriers per block).
 - **A 64-bit integer divide** is a software routine of ~3000 cycles per key. Paged-KV math uses 32-bit.
+- **`precise::exp` in a softmax costs a third of a flash-attention launch** (`splat/splat.metal`, `kernel_splat_attn_f32`, 12294 rows x 16 heads of 64, f32 throughout, cool):
+  - 193 ms with `precise::exp`, 130 ms with the fast `exp` (3.2 -> 4.75 TFLOP/s). The fast form costs nothing measurable: replacing it with a multiply-add gave the same 129 ms.
+  - Every argument is a score less its running maximum, so at most zero; -inf (a masked key) still answers zero. The cases' 1e-5 bound against the f64 oracle held, and the denoiser's velocity against the reference did not move (worst 1.3e-4).
+  - Two row blocks per simdgroup (each K fragment reused for 16 query rows) spilled registers even with 64-wide heads: 230 ms against 130.
+- **Identical rows are one weighted key.** `n` equal keys with equal values weigh `n exp(s) v` in a softmax, which is one key scoring `s + ln(n)`.
+  - The splat denoiser's guidance pass has a zero conditioning: 4101 rows that are, and stay, the same row. Holding it once took that pass from 12294 rows to 8194 (attention x0.44, linears x0.67). Its error against the reference did not grow (mean 1.5e-4 of rms, from 2e-4).
+  - Look for this before tuning a kernel: it was worth more than any change inside one.
 - **The KV cache is f16.**
 
 ## Fusion and launch count
@@ -65,6 +72,7 @@ shapes differ.
 - **flux2 fused GEMM:**
   - It builds the `[dense | silu(g)*u]` input while staging and applies the gated residual in the epilogue. One launch replaces swiglu, concat, linear and add.
   - Together with skipping an unused preview decode, FLUX.2 512² at 4 steps went **165 s → ~16 s**, within 1 LSB of the old output.
+- **A rotation carried by a second projection is a seventh GEMM** (`kernel_splat_rope_norm_f32`): the splat denoiser turned q and k by per-token angles as `q cos + turn(q) sin`, with `turn(q)` from a permuted copy of the weight. One elementwise launch that turns and head-norms q and k in place replaced 2 of a block's 7 width-squared GEMMs, the sine and cosine tables, six gated adds and two RMS norms: 811 -> 551 launches a pass.
 - **Audio decoder fused entries:** `add_rms_norm`, `qk_norm_rope_append`, `matvec3` and `matvec_silu` (`shiso-models/src/audio_ops/fused.rs`).
 - **MoE routing:** route, sort and inverse sort run in one threadgroup, bit-identical to the four-launch version with 1/6 of the dependent launches.
   - The prefix-scan sort replaced a 60 µs-per-layer serial walk.

@@ -257,6 +257,7 @@ fn attend_into(
             keys,
             heads: shape.heads,
             head_dim: shape.head_dim,
+            heavy: None,
         },
     )?;
     drop((q, k, v));

@@ -29,7 +29,7 @@ pub(crate) const REQUIRED_KERNELS: &[&str] = &[
     "kernel_splat_window_attn_f32",
     "kernel_splat_deform_im2col_f32",
     "kernel_splat_attn_f32",
-    "kernel_splat_rotary_tables_f32",
+    "kernel_splat_rope_norm_f32",
 ];
 
 /// Threads per threadgroup, every entry.
@@ -63,6 +63,10 @@ struct AttnArgs {
     heads: u32,
     width: u32,
     scale: f32,
+    /// The weighted key's row, or `u32::MAX` for none.
+    heavy_key: u32,
+    /// The log of the rows it stands for.
+    heavy_bias: f32,
 }
 
 #[repr(C)]
@@ -119,34 +123,40 @@ struct DeformArgs {
     rows: u32,
 }
 
-const _: () = assert!(size_of::<AttnArgs>() == 20);
-const _: () = assert!(size_of::<RotaryArgs>() == 16);
+const _: () = assert!(size_of::<AttnArgs>() == 28);
+const _: () = assert!(size_of::<RopeArgs>() == 16);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct RotaryArgs {
+struct RopeArgs {
     row0: u32,
     rows: u32,
     heads: u32,
-    head_dim: u32,
+    eps: f32,
 }
 
-/// One set of rotary tables.
-pub(crate) struct RotaryCall<'a> {
+/// One rotary turn and head norm of a block's queries and keys.
+pub(crate) struct RopeNormCall<'a> {
     pub step: &'static str,
-    /// `cos(angle) - 1`, `(rows, heads * head_dim)`.
-    pub cos_m1: DeviceView<'a>,
-    /// `sin(angle)`, the same shape.
-    pub sin: DeviceView<'a>,
+    /// The queries, `(rows, heads * head_dim)`, turned and normed in place.
+    pub q: DeviceView<'a>,
+    /// The keys, the same shape, turned by the same angles.
+    pub k: DeviceView<'a>,
     /// The predicted positions, `(rows, heads, 3)`.
     pub offsets: DeviceView<'a>,
     /// Each pair's frequency times pi, rounded once to f32 (`head_dim / 2`).
     pub rates: DeviceView<'a>,
     /// Which of the three positions each pair turns by, as `u32`.
     pub axis: DeviceView<'a>,
+    /// The queries' norm weight, `(heads, head_dim)`.
+    pub gamma_q: DeviceView<'a>,
+    /// The keys' norm weight, the same shape.
+    pub gamma_k: DeviceView<'a>,
     pub rows: usize,
     pub heads: usize,
     pub head_dim: usize,
+    /// The norm's floor on `mean(x^2)`.
+    pub eps: f32,
 }
 const _: () = assert!(size_of::<UnaryArgs>() == 4);
 const _: () = assert!(size_of::<ResizeArgs>() == 20);
@@ -239,11 +249,17 @@ fn arg_u32(step: &'static str, value: usize) -> Result<u32, ImageGenError> {
 ///
 /// # Errors
 ///
+/// A shape's [`super::nn::HeavyKey`] is one key row standing for several
+/// identical ones; its score gets the log of the count added.
+///
+/// # Errors
+///
 /// [`ImageGenError::Backend`] for a head of another width, an empty side, a
-/// count past the argument block or the grid, or a device failure.
+/// weighted key outside the keys or standing for no row, a count past the
+/// argument block or the grid, or a device failure.
 #[expect(
     clippy::cast_precision_loss,
-    reason = "a head width (64) is exact in f32"
+    reason = "a head width (64) is exact in f32, and a copy count is a sequence length"
 )]
 pub(crate) fn fused_attention<'o>(
     ops: &'o Ops,
@@ -256,7 +272,16 @@ pub(crate) fn fused_attention<'o>(
         keys,
         heads,
         head_dim,
+        heavy,
     } = shape;
+    if let Some(heavy) = heavy
+        && (heavy.key >= keys || heavy.copies == 0)
+    {
+        return Err(ImageGenError::Backend(format!(
+            "{step}: key {} standing for {} rows is not one of {keys} keys",
+            heavy.key, heavy.copies
+        )));
+    }
     if head_dim != ATTN_HEAD || queries == 0 || keys == 0 || heads == 0 {
         return Err(ImageGenError::Backend(format!(
             "{step}: the fused attention takes {ATTN_HEAD}-wide heads and at least one query, \
@@ -277,6 +302,8 @@ pub(crate) fn fused_attention<'o>(
         heads: arg_u32(step, heads)?,
         width: arg_u32(step, width)?,
         scale: 1.0 / (head_dim as f32).sqrt(),
+        heavy_key: heavy.map_or(Ok(u32::MAX), |h| arg_u32(step, h.key))?,
+        heavy_bias: heavy.map_or(0.0, |h| (h.copies as f32).ln()),
     };
     // Every view must hold its rows: the kernel reads by index, not by view.
     for (name, view, rows) in [
@@ -311,48 +338,49 @@ pub(crate) fn fused_attention<'o>(
     Ok(out)
 }
 
-/// The rotary tables `cos(angle) - 1` and `sin(angle)` for every pair of
-/// every head, `angle = offsets[row][head][axis[j]] * rates[j]`, in launches
-/// of at most [`MAX_GRID_ROWS`] rows. A free function over [`Ops`] for the
-/// reason [`fused_attention`] is.
+/// The rotary turn and per-head RMS norm of `q` and `k` in place
+/// (`kernel_splat_rope_norm_f32`): every pair of every 64-wide head turns by
+/// `angle = offsets[row][head][axis[j]] * rates[j]`, and the turned head is
+/// scaled to `x / sqrt(mean(x^2) + eps) * gamma`. In launches of at most
+/// [`MAX_GRID_ROWS`] rows. A free function over [`Ops`] for the reason
+/// [`fused_attention`] is.
 ///
 /// # Errors
 ///
-/// [`ImageGenError::Backend`] for an odd head, a count past the argument
-/// block, or a device failure.
-pub(crate) fn rotary_tables(ops: &Ops, call: &RotaryCall<'_>) -> Result<(), ImageGenError> {
-    if !call.head_dim.is_multiple_of(2) {
+/// [`ImageGenError::Backend`] for a head of another width, a count past the
+/// argument block, or a device failure.
+pub(crate) fn rope_norm(ops: &Ops, call: &RopeNormCall<'_>) -> Result<(), ImageGenError> {
+    if call.head_dim != ATTN_HEAD {
         return Err(ImageGenError::Backend(format!(
-            "{}: a {}-wide head has no whole pairs to turn",
+            "{}: the fused rotary turn takes {ATTN_HEAD}-wide heads, got {}",
             call.step, call.head_dim
         )));
     }
-    let pairs = call.heads * call.head_dim / 2;
+    let heads = arg_u32(call.step, call.heads)?;
     for (row0, rows) in row_chunks(0, call.rows) {
-        let args = RotaryArgs {
+        let args = RopeArgs {
             row0: arg_u32(call.step, row0)?,
             rows: arg_u32(call.step, call.rows)?,
-            heads: arg_u32(call.step, call.heads)?,
-            head_dim: arg_u32(call.step, call.head_dim)?,
+            heads,
+            eps: call.eps,
         };
         ops.backend()
             .run(
-                KernelRef::new(MODULE, "kernel_splat_rotary_tables_f32"),
+                KernelRef::new(MODULE, "kernel_splat_rope_norm_f32"),
                 &LaunchArgs {
-                    grid: Extent3::new(
-                        arg_u32(call.step, pairs)?.div_ceil(BLOCK),
-                        arg_u32(call.step, rows)?,
-                        1,
-                    ),
+                    // A simdgroup of 32 lanes is one head's 32 pairs.
+                    grid: Extent3::new(heads.div_ceil(2), arg_u32(call.step, rows)?, 1),
                     block: Extent3::linear(BLOCK),
                     smem_bytes: 0,
                     args: &[
                         KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                        KernelArg::Buffer(call.cos_m1),
-                        KernelArg::Buffer(call.sin),
+                        KernelArg::Buffer(call.q),
+                        KernelArg::Buffer(call.k),
                         KernelArg::Buffer(call.offsets),
                         KernelArg::Buffer(call.rates),
                         KernelArg::Buffer(call.axis),
+                        KernelArg::Buffer(call.gamma_q),
+                        KernelArg::Buffer(call.gamma_k),
                     ],
                 },
             )
