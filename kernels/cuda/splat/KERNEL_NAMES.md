@@ -21,7 +21,7 @@ kernel_splat_gelu_erf_f32
 kernel_splat_merge2x2_f32
 kernel_splat_relu_f32
 kernel_splat_resize_bilinear_f32
-kernel_splat_rotary_tables_f32
+kernel_splat_rope_norm_f32
 kernel_splat_sigmoid_f32
 kernel_splat_window_attn_f32
 ```

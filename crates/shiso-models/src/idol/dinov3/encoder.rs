@@ -7,7 +7,7 @@
 //! model's own affine norm and the conditioning's parameter-free one. The
 //! output is the conditioning stream, `(5 + patches, hidden)`.
 //!
-//! The rotary turn uses the half-split pairing ([`Pairing::Halves`]) with the
+//! The rotary turn uses the half-split pairing ([`turned`]) with the
 //! tables of [`super::rope_tables`]; the five prefix rows get the identity
 //! (cosine one, sine zero), which is how the reference leaves them unrotated.
 
@@ -21,8 +21,8 @@ use crate::diffusion::lin::Lin;
 use crate::diffusion::ops::{Conv2dCall, Ops, SliceExt};
 use crate::diffusion::weights::StStore;
 use crate::idol::nn::{
-    Affine, AttnShape, Pairing, Qkv, add_gated_in_place, attention, bytes, host_lin, layer_norm,
-    linear, read_linear, rotate_in_place, turned,
+    Affine, AttnShape, Qkv, add_gated_in_place, attention, bytes, host_lin, layer_norm, linear,
+    read_linear, rotate_in_place, turned,
 };
 
 /// Epsilon of the conditioning's parameter-free norm (`F.layer_norm`'s
@@ -74,13 +74,7 @@ fn load_turned(
     config: &DinoConfig,
 ) -> Result<(Lin, Lin), ImageGenError> {
     let (w, bias) = read_linear(store, name)?;
-    let (tw, tb) = turned(
-        &w,
-        bias.as_deref(),
-        config.heads,
-        config.head_dim(),
-        Pairing::Halves,
-    );
+    let (tw, tb) = turned(&w, bias.as_deref(), config.heads, config.head_dim());
     Ok((
         host_lin(ops, &w, bias.as_deref(), config.hidden, config.hidden)?,
         host_lin(ops, &tw, tb.as_deref(), config.hidden, config.hidden)?,
@@ -308,6 +302,7 @@ impl DinoV3 {
                 keys: tokens,
                 heads: cfg.heads,
                 head_dim: cfg.head_dim(),
+                heavy: None,
             },
         )?;
         drop((queries, keys, values));

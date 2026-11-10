@@ -277,7 +277,7 @@ fn the_denoiser_matches_the_reference_velocity() {
     let v = denoiser
         .forward(&latent, &camera, 700.0, &prepared)
         .expect("the denoiser runs");
-    // Measured: worst 3.2e-4, mean 9.3e-6.
+    // Measured: worst 1.3e-4, mean 4.4e-6.
     close_mean(
         &v.latent,
         &out_latent,
@@ -293,10 +293,10 @@ fn the_denoiser_matches_the_reference_velocity() {
     let v = denoiser
         .forward(&latent, &camera, 700.0, &negative)
         .expect("the negative pass runs");
-    // Zero conditioning gives 4101 near-identical context rows, and the 24
-    // joint blocks amplify f32 rounding more there: the streams agree to
-    // 2.2e-6 after the first joint block and the velocity to a mean of 2e-4
-    // (worst 4.1e-3).
+    // Zero conditioning gives 4101 identical context rows, which the
+    // denoiser holds as one weighted row, and the 24 joint blocks amplify f32
+    // rounding more there: the velocity agrees to a mean of 1.5e-4 (worst
+    // 3.0e-3). Holding the rows out in full measured 2e-4 and 4.1e-3.
     close_mean(
         &v.latent,
         &neg_latent,
@@ -567,6 +567,7 @@ impl crate::idol::generator::Denoiser for Still {
         Ok(crate::idol::generator::Prepared {
             rows: cond.rows,
             stream: Vec::new(),
+            copies: 1,
         })
     }
 
@@ -734,6 +735,7 @@ fn the_fused_attention_matches_the_gemm_path() {
             keys,
             heads,
             head_dim: 64,
+            heavy: None,
         };
         let fused = fused_attention(&ops, "test fused", qkv(), shape).expect("fused");
         let fused = ops
@@ -772,4 +774,97 @@ fn a_prepared_stream_is_reusable() {
         .expect("the second pass runs");
     assert_eq!(first.latent, second.latent, "latent velocity");
     assert_eq!(first.camera, second.camera, "camera velocity");
+}
+
+/// A conditioning of one repeated row attends as one weighted key: the
+/// collapsed pass against the same rows held out in full.
+#[test]
+#[ignore = "needs the splat checkpoint (SHISO_TEST_MODEL_IDOL), the idol fixtures and a Metal device"]
+fn a_repeated_conditioning_row_attends_as_one_weighted_key() {
+    use crate::idol::denoiser::IdolDenoiser;
+
+    let case = "weighted key";
+    let dir = need!(case, checkpoint("SHISO_TEST_MODEL_IDOL"));
+    let cond = need!(case, fixture_conditioning());
+    let latent = read_f32(&need!(case, fixture("den_in_latent.f32")));
+    let camera = read_f32(&need!(case, fixture("den_in_camera.f32")));
+    let backend = need!(case, device());
+    let ops = Arc::new(Ops::new(&backend).expect("the diffusion kernel set"));
+    let denoiser = IdolDenoiser::load(&dir, ops).expect("the denoiser loads");
+    let collapsed = denoiser
+        .context(&crate::idol::conditioning::Conditioning::zero(cond.rows))
+        .expect("the zero conditioning refines");
+    assert_eq!((collapsed.rows, collapsed.copies), (1, cond.rows));
+    let full = crate::idol::generator::Prepared {
+        rows: cond.rows,
+        stream: collapsed.stream.repeat(cond.rows),
+        copies: 1,
+    };
+    let a = denoiser
+        .forward(&latent, &camera, 700.0, &collapsed)
+        .expect("the collapsed pass runs");
+    let b = denoiser
+        .forward(&latent, &camera, 700.0, &full)
+        .expect("the full pass runs");
+    // The same sum in another order, through 24 blocks that amplify rounding
+    // on this conditioning (see the reference case's bound).
+    close_mean(
+        &a.latent,
+        &b.latent,
+        1e-2,
+        5e-4,
+        "collapsed latent velocity",
+    );
+    close(&a.camera, &b.camera, 1e-3, "collapsed camera velocity");
+}
+
+/// Where one denoiser pass spends its time: the batched pass (lower median
+/// of four, after a warm-up) and the per-kernel profile of one more.
+#[test]
+#[ignore = "needs the splat checkpoint (SHISO_TEST_MODEL_IDOL), the idol fixtures and a Metal device"]
+#[expect(
+    clippy::print_stderr,
+    reason = "the profile table is the case's report"
+)]
+fn the_denoiser_pass_profile() {
+    use crate::idol::denoiser::IdolDenoiser;
+
+    let case = "denoiser profile";
+    let dir = need!(case, checkpoint("SHISO_TEST_MODEL_IDOL"));
+    let cond = need!(case, fixture_conditioning());
+    let latent = read_f32(&need!(case, fixture("den_in_latent.f32")));
+    let camera = read_f32(&need!(case, fixture("den_in_camera.f32")));
+    let backend = need!(case, device());
+    let ops = Arc::new(Ops::new(&backend).expect("the diffusion kernel set"));
+    let denoiser = IdolDenoiser::load(&dir, ops).expect("the denoiser loads");
+    let prepared = if std::env::var_os("SHISO_IDOL_PROFILE_NEGATIVE").is_some() {
+        denoiser.context(&crate::idol::conditioning::Conditioning::zero(cond.rows))
+    } else {
+        denoiser.context(&cond)
+    }
+    .expect("the conditioning refines");
+    let pass = || {
+        denoiser
+            .forward(&latent, &camera, 700.0, &prepared)
+            .expect("the pass runs");
+    };
+    pass();
+    let mut times: Vec<f64> = (0..4)
+        .map(|_| {
+            let began = std::time::Instant::now();
+            pass();
+            began.elapsed().as_secs_f64()
+        })
+        .collect();
+    eprintln!("batched passes: {times:.3?}");
+    times.sort_by(f64::total_cmp);
+    let batched = times[1];
+    let profiler = backend.as_profiler().expect("the Metal backend profiles");
+    let region = shiso_core::ProfileRegion::open(profiler).expect("opens");
+    pass();
+    let report = region.finish().expect("finishes");
+    eprintln!(
+        "batched pass (lower median of 4) {batched:.3}s\n{}",
+        report.table(40)
+    );
 }

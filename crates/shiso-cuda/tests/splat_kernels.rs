@@ -75,7 +75,8 @@ cases!(
     window_attention_at_the_production_window,
     deform_im2col_samples_bilinearly_with_the_mask,
     attention_matches_the_softmax_oracle,
+    attention_weighs_a_heavy_key_as_its_copies,
     attention_survives_large_scores,
     attention_at_the_joint_shape,
-    rotary_tables_match_the_angle_formula,
+    rope_norm_turns_and_scales_each_head,
 );

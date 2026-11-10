@@ -82,16 +82,20 @@ struct splat_args_attn {
     uint heads;
     uint width;
     float scale;
+    // One key that stands for many identical rows: its score gets
+    // `heavy_bias` (the log of the count) added. `heavy_key >= keys` for none.
+    uint heavy_key;
+    float heavy_bias;
 };
-static_assert(sizeof(splat_args_attn) == 20, "splat_args_attn layout");
+static_assert(sizeof(splat_args_attn) == 28, "splat_args_attn layout");
 
-struct splat_args_rotary {
+struct splat_args_rope {
     uint row0;
     uint rows;
     uint heads;
-    uint head_dim;
+    float eps;
 };
-static_assert(sizeof(splat_args_rotary) == 16, "splat_args_rotary layout");
+static_assert(sizeof(splat_args_rope) == 16, "splat_args_rope layout");
 
 // `out[i] = max(in[i], 0)`.
 kernel void kernel_splat_relu_f32(
@@ -417,9 +421,22 @@ kernel void kernel_splat_deform_im2col_f32(
 // Keys past the end score -inf and are never read; query rows past the end
 // load zero and are never written.
 //
+// `heavy_key` is one key standing for `n` identical rows of the sequence:
+// `n` equal keys with equal values contribute `n exp(s) v` to the sum, which
+// is one key scoring `s + log(n)`. The denoiser's unconditional pass has 4101
+// such rows (a zero conditioning refines to one row repeated), and attends
+// 8194 rows instead of 12294 this way.
+//
+// The exponentials are the fast form: every argument is at most zero (a score
+// less its running maximum), where it agrees with the precise one to the
+// cases' 1e-5, and -inf still answers zero. `precise::exp` cost a third of
+// the launch.
+//
 // Measured on an M1 Max at the denoiser's joint attention (12294 rows, 16
-// heads): 194 ms per launch (3.2 TFLOP/s), against 800 ms for the same
-// attention as transposes, score GEMMs, softmax and P.V GEMMs.
+// heads), cool: 130 ms per launch (4.75 TFLOP/s), against 193 ms with
+// `precise::exp` and 800 ms for the same attention as transposes, score
+// GEMMs, softmax and P.V GEMMs. Two row blocks per simdgroup (the K fragment
+// reused across 16 rows) spilled: 230 ms.
 //
 // Grid `(ceil(queries / 64), heads)` of 256 threads.
 kernel void kernel_splat_attn_f32(
@@ -523,8 +540,11 @@ kernel void kernel_splat_attn_f32(
         float block_max = -INFINITY;
         SPLAT_UNROLL for (uint b = 0; b < NB; ++b) {
             SPLAT_UNROLL for (uint c = 0; c < 2u; ++c) {
-                if (s0 + 8u * b + fn + c >= keys) {
+                const uint key = s0 + 8u * b + fn + c;
+                if (key >= keys) {
                     sf[b].thread_elements()[c] = -INFINITY;
+                } else if (key == args.heavy_key) {
+                    sf[b].thread_elements()[c] += args.heavy_bias;
                 }
                 block_max = max(block_max, sf[b].thread_elements()[c]);
             }
@@ -532,11 +552,11 @@ kernel void kernel_splat_attn_f32(
         block_max = max(block_max, simd_shuffle_xor(block_max, 1));
         block_max = max(block_max, simd_shuffle_xor(block_max, 8));
         const float new_max = max(run_max, block_max);
-        const float alpha = precise::exp(run_max - new_max);
+        const float alpha = exp(run_max - new_max);
         float block_sum = 0.0f;
         SPLAT_UNROLL for (uint b = 0; b < NB; ++b) {
             SPLAT_UNROLL for (uint c = 0; c < 2u; ++c) {
-                const float p = precise::exp(sf[b].thread_elements()[c] - new_max);
+                const float p = exp(sf[b].thread_elements()[c] - new_max);
                 sf[b].thread_elements()[c] = p;
                 block_sum += p;
             }
@@ -568,45 +588,74 @@ kernel void kernel_splat_attn_f32(
     }
 }
 
-// The denoiser's rotary tables from its predicted positions: for row `r`,
-// head `h` and pair `j < head_dim / 2`, with
-// `angle = offsets[(r * heads + h) * 3 + axis[j]] * rates[j]`, both columns
-// `2j` and `2j + 1` of the head get
-// `cos_m1 = cos(angle) - 1` and `sin = sin(angle)`. Tables are
-// `(rows, heads * head_dim)` row-major.
+// One pair of one head's row, turned by `(c, s)` and scaled by the head's
+// RMS norm: the lane's two values of `x`, in place. Called by every lane of
+// a simdgroup at once; the sum of squares folds across the 32 lanes in a
+// fixed order.
+static inline void splat_rope_norm_pair(device float *x, device const float *gamma,
+                                        float c, float s, float eps) {
+    const float a = x[0];
+    const float b = x[1];
+    const float ra = a * c - b * s;
+    const float rb = b * c + a * s;
+    float ss = ra * ra + rb * rb;
+    ss += simd_shuffle_xor(ss, 1);
+    ss += simd_shuffle_xor(ss, 2);
+    ss += simd_shuffle_xor(ss, 4);
+    ss += simd_shuffle_xor(ss, 8);
+    ss += simd_shuffle_xor(ss, 16);
+    const float inv = 1.0f / sqrt(ss / float(SPLAT_ATTN_HEAD) + eps);
+    x[0] = ra * inv * gamma[0];
+    x[1] = rb * inv * gamma[1];
+}
+
+// The denoiser's rotary turn and per-head norm of its queries and keys, in
+// place, from its predicted positions: for row `r`, head `h` (64 wide) and
+// pair `j < 32`, with `angle = offsets[(r * heads + h) * 3 + axis[j]] * rates[j]`,
+// the pair `(a, b)` at columns `(2j, 2j + 1)` of the head becomes
+// `(a cos - b sin, b cos + a sin)`, and the turned head `x` then
+// `x / sqrt(mean(x^2) + eps) * gamma[h]`. `q` and `k` are
+// `(rows, heads * 64)` row-major and turn by the same angles; `gamma_q` and
+// `gamma_k` are `(heads, 64)`.
+//
+// One launch in place of the tables this used to write (`cos - 1` and `sin`,
+// two buffers the size of `q`), the two extra projections that formed the
+// turned partner of `q` and `k`, four gated adds, two RMS norms and two more
+// gated adds for gamma: measured on an M1 Max at the joint shape, 48 GEMMs
+// of 7 ms and 4 ms of elementwise launches a pass, for 0.6 ms a launch here.
 //
 // The angles reach the hundreds, where the fast sine is off by far more than
-// the host's f32 `sin_cos` the tables replace, hence `precise::`. `rates` are
-// the pair frequencies already multiplied by pi on the host: the library is
-// built with fast math, which may reassociate a three-way product, and one
-// multiply leaves the compiler no order to choose.
+// an f32 `sin_cos`, hence `precise::`. `rates` are the pair frequencies
+// already multiplied by pi on the host: the library is built with fast math,
+// which may reassociate a three-way product, and one multiply leaves the
+// compiler no order to choose.
 //
-// Grid `(ceil(heads * head_dim / 2 / 64), rows in this launch)` of 64
-// threads, one per pair; this launch's first row is `row0`, so the driver
-// can split a long table across launches.
-kernel void kernel_splat_rotary_tables_f32(
-        constant splat_args_rotary & args [[buffer(0)]],
-        device float *cos_m1                 [[buffer(1)]],
-        device float *sin_out                [[buffer(2)]],
-        device const float *offsets          [[buffer(3)]],
-        device const float *rates            [[buffer(4)]],
-        device const uint *axis              [[buffer(5)]],
+// Grid `(ceil(heads / 2), rows in this launch)` of 64 threads: a simdgroup
+// is one head, a lane one pair. This launch's first row is `row0`, so the
+// driver can split a long sequence across launches.
+kernel void kernel_splat_rope_norm_f32(
+        constant splat_args_rope & args [[buffer(0)]],
+        device float *q                    [[buffer(1)]],
+        device float *k                    [[buffer(2)]],
+        device const float *offsets        [[buffer(3)]],
+        device const float *rates          [[buffer(4)]],
+        device const uint *axis            [[buffer(5)]],
+        device const float *gamma_q        [[buffer(6)]],
+        device const float *gamma_k        [[buffer(7)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
-        ushort3 tpitg[[thread_position_in_threadgroup]]) {
-    const uint pairs = args.head_dim / 2u;
-    const uint p = tgpig.x * SPLAT_BLOCK + tpitg.x;
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint HD = SPLAT_ATTN_HEAD;
+    const uint head = tgpig.x * 2u + sg;
     const uint row = args.row0 + tgpig.y;
-    if (p >= args.heads * pairs || row >= args.rows) {
+    if (head >= args.heads || row >= args.rows) {
         return;
     }
-    const uint head = p / pairs;
-    const uint j = p - head * pairs;
-    const float angle = offsets[((uint64_t) row * args.heads + head) * 3u + axis[j]] * rates[j];
-    const float c = precise::cos(angle) - 1.0f;
+    const float angle = offsets[((uint64_t) row * args.heads + head) * 3u + axis[lane]] * rates[lane];
+    const float c = precise::cos(angle);
     const float s = precise::sin(angle);
-    const uint64_t at = (uint64_t) row * (args.heads * args.head_dim) + head * args.head_dim + 2u * j;
-    cos_m1[at] = c;
-    cos_m1[at + 1u] = c;
-    sin_out[at] = s;
-    sin_out[at + 1u] = s;
+    const uint g = head * HD + 2u * lane;
+    const uint64_t at = (uint64_t) row * (args.heads * HD) + g;
+    splat_rope_norm_pair(q + at, gamma_q + g, c, s, args.eps);
+    splat_rope_norm_pair(k + at, gamma_k + g, c, s, args.eps);
 }

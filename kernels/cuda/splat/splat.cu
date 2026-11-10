@@ -71,16 +71,18 @@ struct splat_args_attn {
     u32 heads;
     u32 width;
     float scale;
+    u32 heavy_key;
+    float heavy_bias;
 };
-static_assert(sizeof(splat_args_attn) == 20, "splat_args_attn layout");
+static_assert(sizeof(splat_args_attn) == 28, "splat_args_attn layout");
 
-struct splat_args_rotary {
+struct splat_args_rope {
     u32 row0;
     u32 rows;
     u32 heads;
-    u32 head_dim;
+    float eps;
 };
-static_assert(sizeof(splat_args_rotary) == 16, "splat_args_rotary layout");
+static_assert(sizeof(splat_args_rope) == 16, "splat_args_rope layout");
 
 extern "C" __global__ void kernel_splat_relu_f32(
         const splat_args_unary args, float* out, const float* in) {
@@ -337,6 +339,9 @@ extern "C" __global__ void kernel_splat_attn_f32(
             for (u32 off = 16u; off > 0u; off /= 2u) {
                 score += __shfl_xor_sync(0xffffffffu, score, off);
             }
+            if (j == args.heavy_key) {
+                score += args.heavy_bias;
+            }
             const float new_max = fmaxf(run_max, score);
             const float alpha = expf(run_max - new_max);
             const float p = expf(score - new_max);
@@ -351,26 +356,43 @@ extern "C" __global__ void kernel_splat_attn_f32(
     }
 }
 
-/* The denoiser's rotary tables, the Metal twin's contract and launch. The
- * module is built without fast math, so sinf and cosf are the full-range
- * versions the large angles need. */
-extern "C" __global__ void kernel_splat_rotary_tables_f32(
-        const splat_args_rotary args, float* cos_m1, float* sin_out,
-        const float* offsets, const float* rates, const u32* axis) {
-    const u32 pairs = args.head_dim / 2u;
-    const u32 p = blockIdx.x * SPLAT_BLOCK + threadIdx.x;
+/* One pair of one head's row, turned and scaled by the head's RMS norm, in
+ * place; the sum of squares is a warp-wide sum in a fixed order. */
+static __device__ __forceinline__ void splat_rope_norm_pair(
+        float* x, const float* gamma, float c, float s, float eps) {
+    const float a = x[0];
+    const float b = x[1];
+    const float ra = a * c - b * s;
+    const float rb = b * c + a * s;
+    float ss = ra * ra + rb * rb;
+    for (u32 off = 1u; off < 32u; off *= 2u) {
+        ss += __shfl_xor_sync(0xffffffffu, ss, off);
+    }
+    const float inv = 1.0f / sqrtf(ss / (float)SPLAT_ATTN_HEAD + eps);
+    x[0] = ra * inv * gamma[0];
+    x[1] = rb * inv * gamma[1];
+}
+
+/* The denoiser's rotary turn and per-head norm of q and k in place, the
+ * Metal twin's contract and launch: grid (ceil(heads / 2), rows) of 64
+ * threads, a warp one head and a lane one pair. The module is built without
+ * fast math, so sinf and cosf are the full-range versions the large angles
+ * need. */
+extern "C" __global__ void kernel_splat_rope_norm_f32(
+        const splat_args_rope args, float* q, float* k, const float* offsets,
+        const float* rates, const u32* axis, const float* gamma_q,
+        const float* gamma_k) {
+    const u32 lane = threadIdx.x % 32u;
+    const u32 head = blockIdx.x * 2u + threadIdx.x / 32u;
     const u32 row = args.row0 + blockIdx.y;
-    if (p >= args.heads * pairs || row >= args.rows) {
+    if (head >= args.heads || row >= args.rows) {
         return;
     }
-    const u32 head = p / pairs;
-    const u32 j = p - head * pairs;
-    const float angle = __fmul_rn(offsets[((u64)row * args.heads + head) * 3u + axis[j]], rates[j]);
-    const float c = cosf(angle) - 1.0f;
+    const float angle = __fmul_rn(offsets[((u64)row * args.heads + head) * 3u + axis[lane]], rates[lane]);
+    const float c = cosf(angle);
     const float s = sinf(angle);
-    const u64 at = (u64)row * (args.heads * args.head_dim) + head * args.head_dim + 2u * j;
-    cos_m1[at] = c;
-    cos_m1[at + 1u] = c;
-    sin_out[at] = s;
-    sin_out[at + 1u] = s;
+    const u32 g = head * SPLAT_ATTN_HEAD + 2u * lane;
+    const u64 at = (u64)row * (args.heads * SPLAT_ATTN_HEAD) + g;
+    splat_rope_norm_pair(q + at, gamma_q + g, c, s, args.eps);
+    splat_rope_norm_pair(k + at, gamma_k + g, c, s, args.eps);
 }

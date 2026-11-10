@@ -34,7 +34,7 @@ pub const ENTRIES: [&str; 9] = [
     "kernel_splat_window_attn_f32",
     "kernel_splat_deform_im2col_f32",
     "kernel_splat_attn_f32",
-    "kernel_splat_rotary_tables_f32",
+    "kernel_splat_rope_norm_f32",
 ];
 
 const MODULE: &str = "splat";
@@ -103,6 +103,10 @@ struct AttnArgs {
     heads: u32,
     width: u32,
     scale: f32,
+    /// The weighted key's row (`u32::MAX` for none) and the log of the rows
+    /// it stands for.
+    heavy_key: u32,
+    heavy_bias: f32,
 }
 
 /// The fused attention's fixed head width, query rows per threadgroup and
@@ -112,16 +116,16 @@ const ATTN_QROWS: usize = 64;
 const ATTN_THREADS: u32 = 256;
 
 const _: () = assert!(size_of::<UnaryArgs>() == 4);
-const _: () = assert!(size_of::<AttnArgs>() == 20);
-const _: () = assert!(size_of::<RotaryArgs>() == 16);
+const _: () = assert!(size_of::<AttnArgs>() == 28);
+const _: () = assert!(size_of::<RopeArgs>() == 16);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct RotaryArgs {
+struct RopeArgs {
     row0: u32,
     rows: u32,
     heads: u32,
-    head_dim: u32,
+    eps: f32,
 }
 const _: () = assert!(size_of::<ResizeArgs>() == 20);
 const _: () = assert!(size_of::<MergeArgs>() == 12);
@@ -760,6 +764,17 @@ fn attn_oracle(
 
 /// Launches the fused attention over device q, k, v and reads the answer.
 fn attn_launch(gpu: &Gpu, qkv: (&[f32], &[f32], &[f32]), queries: usize, heads: usize) -> Vec<f32> {
+    attn_launch_heavy(gpu, qkv, (queries, heads), None)
+}
+
+/// As [`attn_launch`], with key `heavy.0` standing for `heavy.1` identical
+/// rows when given.
+fn attn_launch_heavy(
+    gpu: &Gpu,
+    qkv: (&[f32], &[f32], &[f32]),
+    (queries, heads): (usize, usize),
+    heavy: Option<(usize, usize)>,
+) -> Vec<f32> {
     let width = heads * ATTN_HEAD;
     let keys = qkv.1.len() / width;
     let [q, k, v] = [qkv.0, qkv.1, qkv.2].map(|b| upload(gpu, b));
@@ -770,6 +785,8 @@ fn attn_launch(gpu: &Gpu, qkv: (&[f32], &[f32], &[f32]), queries: usize, heads: 
         heads: heads as u32,
         width: width as u32,
         scale: 1.0 / (ATTN_HEAD as f32).sqrt(),
+        heavy_key: heavy.map_or(u32::MAX, |(key, _)| key as u32),
+        heavy_bias: heavy.map_or(0.0, |(_, copies)| (copies as f32).ln()),
     };
     run(
         gpu,
@@ -806,6 +823,40 @@ pub fn attention_matches_the_softmax_oracle(gpu: &Gpu) {
     let got = attn_launch(gpu, (&q, &k, &v), queries, heads);
     let want = attn_oracle((&q, &k, &v), keys, heads, 0..queries);
     close(&got, &want, 1e-5, 0.1, "fused attention, ragged");
+}
+
+/// One key standing for 37 identical rows against the oracle over the rows
+/// held out in full: the weighted key sits mid-block, with keys on both
+/// sides, and a second launch puts it last, in a partial block.
+///
+/// # Panics
+///
+/// When the device's answer is outside the case's bound.
+pub fn attention_weighs_a_heavy_key_as_its_copies(gpu: &Gpu) {
+    let (queries, keys, heads, copies) = (45, 77, 3, 37);
+    let width = heads * ATTN_HEAD;
+    let q = signal(queries * width, 44);
+    let k = signal(keys * width, 45);
+    let v = signal(keys * width, 46);
+    for heavy in [20, keys - 1] {
+        let got = attn_launch_heavy(gpu, (&q, &k, &v), (queries, heads), Some((heavy, copies)));
+        // The same sequence with the heavy row written out `copies` times.
+        let repeat = |rows: &[f32]| -> Vec<f32> {
+            let row = &rows[heavy * width..(heavy + 1) * width];
+            let mut all = rows.to_vec();
+            for _ in 1..copies {
+                all.extend_from_slice(row);
+            }
+            all
+        };
+        let want = attn_oracle(
+            (&q, &repeat(&k), &repeat(&v)),
+            keys + copies - 1,
+            heads,
+            0..queries,
+        );
+        close(&got, &want, 1e-5, 0.1, "fused attention, weighted key");
+    }
 }
 
 /// Scores past 88, where `exp` overflows f32: a softmax that exponentiated
@@ -907,6 +958,8 @@ pub(crate) fn bench_attention(gpu: &Gpu) -> crate::bench::Fixture {
         heads: heads as u32,
         width: width as u32,
         scale: 1.0 / (ATTN_HEAD as f32).sqrt(),
+        heavy_key: u32::MAX,
+        heavy_bias: 0.0,
     };
     let bytes = (4 * rows * width * 4) as u64;
     let flops = (4 * rows * rows * ATTN_HEAD * heads) as u64;
@@ -930,78 +983,103 @@ pub(crate) fn bench_attention(gpu: &Gpu) -> crate::bench::Fixture {
     })
 }
 
-/// The rotary tables across two launches (70000 rows, past one launch's
-/// 65535 on the grid's second axis), at offsets up to 64 so the angles reach
-/// the hundreds, where a fast sine is off by far more than the bound.
+/// The rotary turn and head norm across two launches (70000 rows, past one
+/// launch's 65535 on the grid's second axis) of three heads, so the last
+/// threadgroup's second simdgroup has no head, at offsets up to 64 so the
+/// angles reach the hundreds, where a fast sine is off by far more than the
+/// bound.
 ///
 /// The oracle forms each angle in `f32` exactly as the kernel's contract
 /// does (`offset * rate`, the rate being the frequency times pi rounded once)
-/// and takes its sine and cosine in `f64`: the bound is then the kernel's
-/// own trigonometry.
+/// and turns, sums and scales in `f64`.
 ///
 /// # Panics
 ///
 /// When the device's answer is outside the case's bound.
-pub fn rotary_tables_match_the_angle_formula(gpu: &Gpu) {
-    let (rows, heads, head_dim) = (70_000usize, 2usize, 8usize);
-    let pairs = head_dim / 2;
-    let width = heads * head_dim;
+pub fn rope_norm_turns_and_scales_each_head(gpu: &Gpu) {
+    let (rows, heads) = (70_000usize, 3usize);
+    let pairs = ATTN_HEAD / 2;
+    let width = heads * ATTN_HEAD;
+    let eps = 1e-24f32;
     let offsets: Vec<f32> = signal(rows * heads * 3, 71)
         .into_iter()
         .map(|x| x * 64.0)
         .collect();
-    let rates = [0.1f32, 0.7, 2.3, 4.0].map(|f| f * std::f32::consts::PI);
-    let axis = [0u32, 1, 2, 0];
+    let rates: Vec<f32> = (0..pairs)
+        .map(|j| (0.1 + 0.13 * j as f32) * std::f32::consts::PI)
+        .collect();
+    let axis: Vec<u32> = (0..pairs as u32).map(|j| j % 3).collect();
+    let q = signal(rows * width, 72);
+    let k = signal(rows * width, 73);
+    let gamma_q: Vec<f32> = signal(width, 74).into_iter().map(|x| 1.5 + x).collect();
+    let gamma_k: Vec<f32> = signal(width, 75).into_iter().map(|x| 1.5 + x).collect();
+    let d_q = upload(gpu, &q);
+    let d_k = upload(gpu, &k);
     let d_offsets = upload(gpu, &offsets);
     let d_rates = upload(gpu, &rates);
     let d_axis = gpu.upload(bytemuck::cast_slice(&axis));
-    let cos_m1 = upload(gpu, &vec![f32::NAN; rows * width]);
-    let sin = upload(gpu, &vec![f32::NAN; rows * width]);
+    let d_gamma_q = upload(gpu, &gamma_q);
+    let d_gamma_k = upload(gpu, &gamma_k);
     let per_launch = 65_535usize;
     for row0 in (0..rows).step_by(per_launch) {
         let count = per_launch.min(rows - row0);
-        let args = RotaryArgs {
+        let args = RopeArgs {
             row0: row0 as u32,
             rows: rows as u32,
             heads: heads as u32,
-            head_dim: head_dim as u32,
+            eps,
         };
         launch(
             gpu,
-            "kernel_splat_rotary_tables_f32",
-            Extent3::new(((heads * pairs) as u32).div_ceil(BLOCK), count as u32, 1),
+            "kernel_splat_rope_norm_f32",
+            Extent3::new((heads as u32).div_ceil(2), count as u32, 1),
             &[
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
-                KernelArg::Buffer(cos_m1.view()),
-                KernelArg::Buffer(sin.view()),
+                KernelArg::Buffer(d_q.view()),
+                KernelArg::Buffer(d_k.view()),
                 KernelArg::Buffer(d_offsets.view()),
                 KernelArg::Buffer(d_rates.view()),
                 KernelArg::Buffer(d_axis.view()),
+                KernelArg::Buffer(d_gamma_q.view()),
+                KernelArg::Buffer(d_gamma_k.view()),
             ],
         );
     }
     drain(gpu);
-    let mut want_cos = vec![0.0f64; rows * width];
-    let mut want_sin = vec![0.0f64; rows * width];
-    for r in 0..rows {
-        for h in 0..heads {
-            for j in 0..pairs {
-                let offset = offsets[(r * heads + h) * 3 + axis[j] as usize];
-                let angle = f64::from(offset * rates[j]);
-                let at = r * width + h * head_dim + 2 * j;
-                for c in [at, at + 1] {
-                    want_cos[c] = angle.cos() - 1.0;
-                    want_sin[c] = angle.sin();
+    let oracle = |x: &[f32], gamma: &[f32]| -> Vec<f64> {
+        let mut want = vec![0.0f64; rows * width];
+        for r in 0..rows {
+            for h in 0..heads {
+                let at = r * width + h * ATTN_HEAD;
+                let mut turned = [0.0f64; ATTN_HEAD];
+                for j in 0..pairs {
+                    let offset = offsets[(r * heads + h) * 3 + axis[j] as usize];
+                    let (sin, cos) = f64::from(offset * rates[j]).sin_cos();
+                    let (a, b) = (f64::from(x[at + 2 * j]), f64::from(x[at + 2 * j + 1]));
+                    turned[2 * j] = a * cos - b * sin;
+                    turned[2 * j + 1] = b * cos + a * sin;
+                }
+                let mean = turned.iter().map(|v| v * v).sum::<f64>() / ATTN_HEAD as f64;
+                let inv = 1.0 / (mean + f64::from(eps)).sqrt();
+                for (d, v) in turned.iter().enumerate() {
+                    want[at + d] = v * inv * f64::from(gamma[h * ATTN_HEAD + d]);
                 }
             }
         }
-    }
+        want
+    };
     close(
-        &gpu.read_f32(&cos_m1),
-        &want_cos,
-        2e-6,
+        &gpu.read_f32(&d_q),
+        &oracle(&q, &gamma_q),
+        1e-5,
         1.0,
-        "rotary cos - 1",
+        "rope norm q",
     );
-    close(&gpu.read_f32(&sin), &want_sin, 2e-6, 1.0, "rotary sin");
+    close(
+        &gpu.read_f32(&d_k),
+        &oracle(&k, &gamma_k),
+        1e-5,
+        1.0,
+        "rope norm k",
+    );
 }

@@ -16,6 +16,11 @@
 //!   projection whose weight rows are the query weight's, permuted and
 //!   negated at load. The two products then meet through two gated adds with
 //!   full-size gates (`q + (cos - 1) * q`, then `+ sin * turn(q)`).
+//!   This is the image tower's turn, whose angles are a fixed table. The
+//!   denoiser predicts its angles per token and block, and turns and norms
+//!   its queries and keys in one launch of the family's own module instead
+//!   ([`super::splat_ops::rope_norm`]): the second projection was a seventh
+//!   of its linears.
 //! - **Per-head RMS norm** (`normalize(x) * gamma * sqrt(d)`): the driver's
 //!   row RMS norm over `(tokens * heads, d)` rows with a unit weight, which is
 //!   `normalize(x) * sqrt(d)`, then the per-head gamma as a gated add.
@@ -298,26 +303,19 @@ pub(crate) fn add_gated_in_place(
     })
 }
 
-/// How a head's dimensions pair up for a rotation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Pairing {
-    /// `(i, i + d/2)`: the half-split rotation (`rotate_half`).
-    Halves,
-    /// `(2i, 2i + 1)`: the interleaved, complex-number rotation.
-    Adjacent,
-}
-
 /// The rotation's partner map: `turn(q)[j] = sign[j] * q[source[j]]`, within
-/// one head of `head_dim`, such that `rope(q) = q * cos + turn(q) * sin`.
+/// one head of `head_dim`, such that `rope(q) = q * cos + turn(q) * sin`, for
+/// the half-split rotation that pairs `(i, i + d/2)` (`rotate_half`).
 #[must_use]
-pub(crate) fn turn_map(pairing: Pairing, head_dim: usize) -> Vec<(usize, f32)> {
+pub(crate) fn turn_map(head_dim: usize) -> Vec<(usize, f32)> {
     let half = head_dim / 2;
     (0..head_dim)
-        .map(|j| match pairing {
-            Pairing::Halves if j < half => (j + half, -1.0),
-            Pairing::Halves => (j - half, 1.0),
-            Pairing::Adjacent if j.is_multiple_of(2) => (j + 1, -1.0),
-            Pairing::Adjacent => (j - 1, 1.0),
+        .map(|j| {
+            if j < half {
+                (j + half, -1.0)
+            } else {
+                (j - half, 1.0)
+            }
         })
         .collect()
 }
@@ -330,10 +328,9 @@ pub(crate) fn turned(
     bias: Option<&[f32]>,
     heads: usize,
     head_dim: usize,
-    pairing: Pairing,
 ) -> (Vec<f32>, Option<Vec<f32>>) {
     let in_dim = w.len() / (heads * head_dim);
-    let map = turn_map(pairing, head_dim);
+    let map = turn_map(head_dim);
     let mut tw = vec![0.0f32; w.len()];
     let mut tb = bias.map(|b| vec![0.0f32; b.len()]);
     for h in 0..heads {
@@ -375,6 +372,7 @@ pub(crate) fn rotate_in_place(
 /// A per-head RMS norm's gamma, `(heads, head_dim)`, stored as `gamma - 1`.
 #[derive(Debug)]
 pub(crate) struct HeadNorm {
+    gamma: DeviceBuffer,
     gamma_m1: DeviceBuffer,
     ones: DeviceBuffer,
     heads: usize,
@@ -383,7 +381,7 @@ pub(crate) struct HeadNorm {
 
 /// The norm's floor on `mean(x^2)`: the reference divides by
 /// `max(|x|, 1e-12)`, so only an all-zero head can tell the two apart.
-const HEAD_NORM_EPS: f32 = 1e-24;
+pub(crate) const HEAD_NORM_EPS: f32 = 1e-24;
 
 impl HeadNorm {
     /// Reads `{name}.gamma`, `(heads, head_dim)`.
@@ -407,11 +405,18 @@ impl HeadNorm {
         }
         let gamma_m1: Vec<f32> = gamma.iter().map(|g| g - 1.0).collect();
         Ok(Self {
+            gamma: ops.upload_f32("head norm", &gamma)?,
             gamma_m1: ops.upload_f32("head norm", &gamma_m1)?,
             ones: ops.upload_f32("head norm", &vec![1.0; head_dim])?,
             heads,
             head_dim,
         })
+    }
+
+    /// The weight itself, `(heads, head_dim)`: what a launch that folds the
+    /// norm into another step multiplies by.
+    pub(crate) fn gamma(&self) -> shiso_core::DeviceView<'_> {
+        self.gamma.view()
     }
 
     /// Normalises every head of `tokens` packed `(tokens, heads * head_dim)`
@@ -463,6 +468,19 @@ pub(crate) struct AttnShape {
     pub heads: usize,
     /// Width of one head.
     pub head_dim: usize,
+    /// One key that stands for several identical rows, when there is one.
+    pub heavy: Option<HeavyKey>,
+}
+
+/// A key (and value) row that stands for `copies` identical rows of the
+/// sequence: `copies` equal keys with equal values weigh `copies exp(s) v` in
+/// the softmax, which is the one key scoring `s + ln(copies)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeavyKey {
+    /// The key's row.
+    pub key: usize,
+    /// How many rows it stands for.
+    pub copies: usize,
 }
 
 /// `softmax(q k^T / sqrt(head_dim)) v` per head: the fused kernel
@@ -499,7 +517,8 @@ pub(crate) fn attention<'o>(
 ///
 /// # Errors
 ///
-/// A device failure.
+/// A device failure, or a shape with a [`HeavyKey`]: no launch here adds a
+/// bias to one score column, so the weighted form is the fused kernel's alone.
 #[expect(
     clippy::cast_precision_loss,
     reason = "a head width (64) is exact in f32"
@@ -516,7 +535,13 @@ pub(crate) fn attention_gemm<'o>(
         keys,
         heads,
         head_dim,
+        heavy,
     } = shape;
+    if heavy.is_some() {
+        return Err(ImageGenError::Backend(format!(
+            "{step}: the GEMM attention has no weighted key (heads of {head_dim})"
+        )));
+    }
     let width = heads * head_dim;
     let q_t = ops.alloc_f32(step, queries * width)?;
     let k_t = ops.alloc_f32(step, keys * width)?;
@@ -597,20 +622,7 @@ mod tests {
     fn the_half_split_turn_is_rotate_half() {
         // rotate_half([a, b, c, d]) = [-c, -d, a, b].
         let q = [1.0, 2.0, 3.0, 4.0];
-        assert_eq!(
-            turn(&q, &turn_map(Pairing::Halves, 4)),
-            vec![-3.0, -4.0, 1.0, 2.0]
-        );
-    }
-
-    #[test]
-    fn the_adjacent_turn_multiplies_each_pair_by_i() {
-        // (a + ib) * i = -b + ia, pair by pair.
-        let q = [1.0, 2.0, 3.0, 4.0];
-        assert_eq!(
-            turn(&q, &turn_map(Pairing::Adjacent, 4)),
-            vec![-2.0, 1.0, -4.0, 3.0]
-        );
+        assert_eq!(turn(&q, &turn_map(4)), vec![-3.0, -4.0, 1.0, 2.0]);
     }
 
     #[test]
@@ -627,15 +639,13 @@ mod tests {
                 .map(|r| b[r] + w[r * in_dim] * x[0] + w[r * in_dim + 1] * x[1])
                 .collect()
         };
-        for pairing in [Pairing::Halves, Pairing::Adjacent] {
-            let (tw, tb) = turned(&w, Some(&b), heads, head_dim, pairing);
-            let q = project(&w, &b);
-            let tq = project(&tw, tb.as_deref().expect("a bias"));
-            let map = turn_map(pairing, head_dim);
-            for h in 0..heads {
-                let want = turn(&q[h * head_dim..(h + 1) * head_dim], &map);
-                assert_eq!(&tq[h * head_dim..(h + 1) * head_dim], want.as_slice());
-            }
+        let (tw, tb) = turned(&w, Some(&b), heads, head_dim);
+        let q = project(&w, &b);
+        let tq = project(&tw, tb.as_deref().expect("a bias"));
+        let map = turn_map(head_dim);
+        for h in 0..heads {
+            let want = turn(&q[h * head_dim..(h + 1) * head_dim], &map);
+            assert_eq!(&tq[h * head_dim..(h + 1) * head_dim], want.as_slice());
         }
     }
 }
