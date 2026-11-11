@@ -76,6 +76,11 @@ shapes differ.
 
 ## Fusion and launch count
 
+- **One command buffer with host-handled fetch cuts beat the per-layer drain by ~1.7x** (qwen4exp UD-IQ3_XXS, M1 Max, 2026-11-11, `--spec-k 0`, full pool): plain decode 7.2 -> **12.1 tok/s** (third request, stable across runs), greedy text bit-identical, and still identical with a 512-slot pool that misses every layer. The serial path drains a command buffer at every layer's `ExpertStream::plan` (~48 commit/drain round trips a step, ~0.29 ms each, plus GPU idle while the host re-encodes). The segmented path (`Exec::run_steps_segmented`, Metal `encode_cut`/`commit_segments`/`wait_cut`/`resume_cut`) encodes the WHOLE step into one buffer with a shared-event signal/wait cut before each layer's experts; the host places the experts at the cut (`fetch_at_cut`, non-draining shared IO) and releases the GPU. Ported from Strata's `mtl_rt.mm::run_graph_seg`. Device time fell 114 -> 76 ms/step: continuous execution keeps the GPU clock up where the per-layer gaps dropped it.
+  - **`wait_cut` must BUSY-SPIN on `signaledValue()`, not block.** A blocking `waitUntilSignaledValue_timeoutMS` wake-up lands on every cut and took decode to 2.8 tok/s; the lock-free spin (Strata does the same) is what makes it fast. Release the backend lock while spinning so read-ahead workers are not blocked.
+  - **Pool size confounds the measurement.** A reference server left running hogged RAM, shrank the pool to 2000 slots (66% hits) and made the segmented path look slow (2.9 tok/s). Check `slots=` and the hit rate in the stream log before judging a decode change; compare at equal pool size.
+  - The n-gram rows land up front in the segmented path (they depend only on the input tokens), losing the prologue overlap the serial path uses; correctness is unchanged.
+
 - **Batching:** every launch goes into one open command buffer and encoder. Only `sync` and host copies flush.
   - Waiting on an `MTLSharedEvent` instead of `waitUntilCompleted` took 145 µs against 210 µs per round trip (4ebe5a0).
 - **Clears:** `fill_zero` runs as a compute kernel, because a blit closes the encoder.

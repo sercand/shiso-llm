@@ -1063,33 +1063,33 @@ impl Backend for MetalBackend {
     }
 
     fn wait_cut(&self, cut: u32) -> CoreResult<()> {
-        let state = self.inner.lock();
-        let value = *state
-            .seg_cuts
-            .get(cut as usize)
-            .ok_or_else(|| MetalError::backend("wait_cut", "no such cut was encoded"))?;
-        // Sliced like a drain, with a bound so a GPU that never reaches the cut
-        // (a wrong event value, a fault) fails the call rather than hanging.
-        let mut slices = 0u32;
-        while !self
-            .cut_event
-            .waitUntilSignaledValue_timeoutMS(value, DRAIN_SLICE_MS)
-        {
-            if state
-                .submitted
-                .iter()
-                .any(|cb| cb.status() == MTLCommandBufferStatus::Error)
-            {
-                break;
-            }
-            slices += 1;
-            if slices > 100 {
+        let value = {
+            let state = self.inner.lock();
+            *state
+                .seg_cuts
+                .get(cut as usize)
+                .ok_or_else(|| MetalError::backend("wait_cut", "no such cut was encoded"))?
+        };
+        // Busy-spin on the timeline value, as Strata's run_graph_seg does: a
+        // blocking wait's wake-up latency lands on every cut, and a decode step
+        // has one per layer. The lock is released while spinning so a read-ahead
+        // worker can still write its slot. Bounded so a GPU that never reaches
+        // the cut (a wrong value, a fault) fails rather than hanging.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self.cut_event.signaledValue() < value {
+            if std::time::Instant::now() > deadline {
+                let state = self.inner.lock();
+                for command_buffer in &state.submitted {
+                    failed(command_buffer, "wait_cut")?;
+                }
                 return Err(MetalError::backend(
                     "wait_cut",
                     "the GPU did not reach the cut",
                 ));
             }
+            std::hint::spin_loop();
         }
+        let state = self.inner.lock();
         for command_buffer in &state.submitted {
             failed(command_buffer, "wait_cut")?;
         }
