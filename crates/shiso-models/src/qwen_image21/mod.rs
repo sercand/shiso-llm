@@ -17,14 +17,8 @@
 //! [`pipeline`] composes them into the served generator
 //! and decides which stay on the device between jobs.
 
+pub(crate) mod conditioning;
 pub(crate) mod config;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the edit pipeline that calls this lands later on this branch"
-    )
-)]
 pub(crate) mod edit;
 pub(crate) mod embed;
 pub(crate) mod pipeline;
@@ -33,13 +27,6 @@ pub(crate) mod rope;
 pub(crate) mod scheduler;
 pub(crate) mod transformer;
 pub(crate) mod vae;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the edit pipeline that calls this lands later on this branch"
-    )
-)]
 pub(crate) mod vae_encode;
 
 use crate::catalog::FamilyFacts;
@@ -49,6 +36,8 @@ pub(crate) const FACTS: FamilyFacts = FamilyFacts {
     name: "qwen_image21",
 };
 
+#[cfg(test)]
+mod conditioning_tests;
 #[cfg(test)]
 mod dit_tests;
 #[cfg(test)]

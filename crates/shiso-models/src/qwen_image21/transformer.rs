@@ -445,6 +445,7 @@ impl QwenDit {
     /// # Errors
     /// [`ImageGenError::Backend`] for an empty prompt, a feature buffer
     /// shorter than `p` rows, or a failed launch.
+    #[cfg(test)]
     pub(crate) fn prefix(
         &self,
         ops: &Ops,

@@ -24,8 +24,9 @@ use shiso_core::Backend;
 use shiso_vision::generator::ImageGenError;
 
 use super::vae::{LatentGrid, QwenVae, QwenVaeDesc};
-use super::vae_encode::{QwenVaeEncoder, VaeEncodeTap, fold_latent_norm, rgba_field};
+use super::vae_encode::{EncodePlan, QwenVaeEncoder, VaeEncodeTap, fold_latent_norm, rgba_field};
 use crate::diffusion::ops::{Ops, avg_down_group};
+use crate::diffusion::weights::StStore;
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors/references/qwen_image21")
@@ -180,7 +181,11 @@ fn encode_matches_reference() {
     let grid = LatentGrid { h: 8, w: 12 };
     // The estimate grows with the picture and is dominated by the
     // full-resolution blocks: a 1024x1024 encode is a few gigabytes.
-    let at = |side: usize| encoder.working_set_bytes(LatentGrid { h: side, w: side });
+    // The plan read from the file's shapes is the loaded encoder's.
+    let plan = EncodePlan::read(&StStore::open(&weights).expect("the VAE file opens"), 64)
+        .expect("the shapes describe an encoder");
+    assert_eq!(plan, encoder.plan());
+    let at = |side: usize| plan.working_set_bytes(LatentGrid { h: side, w: side });
     assert!(at(16) < at(32) && at(32) < at(64));
     eprintln!("working set at 1024x1024: {} MiB", at(64) >> 20);
     assert!((1u64 << 30..8 << 30).contains(&at(64)), "{}", at(64));

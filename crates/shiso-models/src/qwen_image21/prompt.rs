@@ -60,13 +60,6 @@ pub(crate) const DROP_IDX: usize = 14;
 pub(crate) const MAX_PROMPT_TOKENS: usize = 512;
 
 /// The control token standing for one image slot.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the edit pipeline that calls this lands later on this branch"
-    )
-)]
 const IMAGE_PAD: &str = "<|image_pad|>";
 
 /// What an empty prompt is sent as: the vocabulary has no BOS token, so an
@@ -84,19 +77,13 @@ pub(crate) struct PromptIds {
 
 impl PromptIds {
     /// The ids whose encoder rows the transformer reads.
+    #[cfg(test)]
     pub(crate) fn kept(&self) -> &[u32] {
         &self.ids[self.drop..]
     }
 }
 
 /// One edit prompt's encoder input.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the edit pipeline that calls this lands later on this branch"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EditPromptIds {
     /// The full sequence the encoder reads, system turn included.
@@ -108,13 +95,6 @@ pub(crate) struct EditPromptIds {
     pub images: Vec<(std::ops::Range<usize>, (usize, usize))>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the edit pipeline that calls this lands later on this branch"
-    )
-)]
 impl EditPromptIds {
     /// Which of the kept rows (after the drop) are image slots.
     pub(crate) fn image_mask_kept(&self) -> Vec<bool> {
@@ -243,13 +223,6 @@ impl QwenImagePrompt {
     /// [`ImageGenError::ReferenceImage`] for no references or an empty
     /// grid, and [`ImageGenError::PromptTooLong`] when the kept tokens
     /// that are not image slots exceed [`MAX_PROMPT_TOKENS`].
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the edit pipeline that calls this lands later on this branch"
-        )
-    )]
     pub(crate) fn tokenize_edit(
         &self,
         prompt: &str,

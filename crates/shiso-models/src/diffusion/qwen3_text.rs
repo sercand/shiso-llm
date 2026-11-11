@@ -104,13 +104,6 @@ pub(crate) struct ImageRows<'a> {
 }
 
 /// One vision-language prefill's input.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the edit pipeline that calls this lands later on this branch"
-    )
-)]
 #[derive(Debug, Clone)]
 pub(crate) struct VisionPrefill<'a> {
     /// The full id sequence, placeholders included.
@@ -123,13 +116,6 @@ pub(crate) struct VisionPrefill<'a> {
 
 /// What [`check_vision_layout`] judges: a vision prefill's shape, without
 /// its device rows.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the edit pipeline that calls this lands later on this branch"
-    )
-)]
 #[derive(Debug, Clone)]
 pub(crate) struct VisionLayout<'a> {
     /// The full id sequence.
@@ -153,13 +139,6 @@ pub(crate) struct VisionLayout<'a> {
 ///
 /// # Errors
 /// [`ImageGenError::Backend`] naming the first row or count that disagrees.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the edit pipeline that calls this lands later on this branch"
-    )
-)]
 pub(crate) fn check_vision_layout(layout: &VisionLayout<'_>) -> Result<(), ImageGenError> {
     let refuse = |message: String| Err(ImageGenError::Backend(message));
     if layout.positions != layout.ids.len() {
@@ -260,13 +239,6 @@ struct LmConfig {
 }
 
 /// The facts of a vision-language config a prefill over pictures reads.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the edit pipeline that calls this lands later on this branch"
-    )
-)]
 #[derive(Debug, Clone, Copy)]
 struct VisionFacts {
     /// The id standing for one image slot.
@@ -518,13 +490,6 @@ pub(crate) struct TextEncoder {
     layers: Vec<TextLayer>,
     taps: Vec<usize>,
     vision_ids: Vec<u32>,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the edit pipeline that calls this lands later on this branch"
-        )
-    )]
     vision: Option<VisionFacts>,
     freqs: DeviceBuffer,
 }
@@ -761,13 +726,6 @@ impl TextEncoder {
     /// vision-language decoder, [`ImageGenError::Backend`] for a layout
     /// [`check_vision_layout`] refuses or a row buffer shorter than its
     /// run, and those of [`Self::prefill`].
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the edit pipeline that calls this lands later on this branch"
-        )
-    )]
     pub(crate) fn prefill_vision(
         &self,
         ops: &Ops,

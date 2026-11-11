@@ -71,13 +71,6 @@ pub(crate) enum Segment {
     /// This many text tokens.
     Text(usize),
     /// One condition image's latent grid, a token per cell.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the edit pipeline that builds this lands later on this branch"
-        )
-    )]
     Image(LatentGrid),
 }
 

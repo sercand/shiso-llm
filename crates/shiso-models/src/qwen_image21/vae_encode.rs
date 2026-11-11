@@ -58,10 +58,88 @@ struct Downsampler {
 
 #[derive(Debug)]
 struct DownBlock {
-    in_c: usize,
-    out_c: usize,
     resnets: Vec<Resnet>,
     downsampler: Option<Downsampler>,
+}
+
+/// The encoder's channel widths, for the working-set estimate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EncodePlan {
+    /// `(in_c, out_c, downsamples)` per down block.
+    pub blocks: Vec<(usize, usize, bool)>,
+    /// Width of the mid block.
+    pub mid_c: usize,
+    /// Latent channels.
+    pub z_dim: usize,
+}
+
+impl EncodePlan {
+    /// The plan of the encoder in `store`, from its tensor shapes alone:
+    /// nothing is imported, so a host can size an encode before it decides
+    /// to load one.
+    ///
+    /// # Errors
+    /// [`ImageGenError::Checkpoint`] when the file holds no encoder, or one
+    /// whose blocks are not shaped as [`QwenVaeEncoder::load`] reads them.
+    pub(crate) fn read(store: &StStore, z_dim: usize) -> Result<Self, ImageGenError> {
+        let axis = |name: &str, i: usize| -> Result<usize, ImageGenError> {
+            store
+                .require(name)?
+                .shape
+                .get(i)
+                .and_then(|&d| usize::try_from(d).ok())
+                .ok_or_else(|| ImageGenError::Checkpoint(format!("'{name}' has no axis {i}")))
+        };
+        let depth = store
+            .count_blocks("encoder.downsamples.")
+            .ok_or_else(|| ImageGenError::Checkpoint("the VAE file holds no encoder".to_owned()))?;
+        let mut blocks = Vec::with_capacity(depth);
+        let mut width = axis("encoder.conv1.weight", 0)?;
+        for i in 0..depth {
+            let base = format!("encoder.downsamples.{i}.downsamples");
+            let entries = store
+                .count_blocks(&format!("{base}."))
+                .ok_or_else(|| ImageGenError::Checkpoint(format!("{base} is empty")))?;
+            let out_c = axis(&format!("{base}.0.residual.2.weight"), 0)?;
+            let downsamples = store.contains(&format!("{base}.{}.resample.1.weight", entries - 1));
+            blocks.push((width, out_c, downsamples));
+            width = out_c;
+        }
+        Ok(Self {
+            blocks,
+            mid_c: width,
+            z_dim,
+        })
+    }
+
+    /// An upper bound on the bytes of working memory an encode to `grid`
+    /// allocates through the scratch pool.
+    ///
+    /// As in the decoder's estimate, every buffer the encode asks the pool
+    /// for is counted once with no credit for reuse across sizes. Per down
+    /// block that is the block's kept input, two convolution outputs and a
+    /// residual stream at the block's width, the per-pixel norms, and the
+    /// downsampled output.
+    pub(crate) fn working_set_bytes(&self, grid: LatentGrid) -> u64 {
+        let mut spatial = (grid.cells() * SPATIAL_FACTOR * SPATIAL_FACTOR) as u128;
+        let mut elements: u128 = spatial * 4;
+        for &(in_c, out_c, downsamples) in &self.blocks {
+            let (in_c, out_c) = (in_c as u128, out_c as u128);
+            elements += spatial * (in_c + 3 * out_c + 2);
+            if downsamples {
+                spatial /= 4;
+                elements += spatial * out_c;
+            }
+        }
+        // The latent stage: the mid resnets' stream plus one convolution
+        // output, the attention's qkv, transposed operands, context in both
+        // layouts and projection, its score block, then the head and the
+        // tokens in both layouts.
+        let (s, c, z) = (spatial, self.mid_c as u128, self.z_dim as u128);
+        let score_rows = (super::vae::ATTN_SCORE_BUDGET as u128 / s.max(1)).clamp(1, s.max(1));
+        elements += s * (c * (1 + 1 + 3 + 4 + 1) + 2 + 2 * z + 2 * z) + score_rows * s;
+        u64::try_from(elements.saturating_mul(4)).unwrap_or(u64::MAX)
+    }
 }
 
 /// The loaded encoder.
@@ -243,8 +321,6 @@ impl QwenVaeEncoder {
             avg_down_group(block_in, c, factor_s, factor_t)?;
             width = c;
             down_blocks.push(DownBlock {
-                in_c: block_in,
-                out_c: c,
                 resnets,
                 downsampler,
             });
@@ -342,33 +418,22 @@ impl QwenVaeEncoder {
         })
     }
 
-    /// An upper bound on the bytes of working memory an encode to `grid`
-    /// allocates through the scratch pool.
-    ///
-    /// As in the decoder's estimate, every buffer the encode asks the pool
-    /// for is counted once with no credit for reuse across sizes. Per down
-    /// block that is the block's kept input, two convolution outputs and a
-    /// residual stream at the block's width, the per-pixel norms, and the
-    /// downsampled output.
-    pub(crate) fn working_set_bytes(&self, grid: LatentGrid) -> u64 {
-        let mut spatial = (grid.cells() * SPATIAL_FACTOR * SPATIAL_FACTOR) as u128;
-        let mut elements: u128 = spatial * 4;
-        for block in &self.down_blocks {
-            let (in_c, out_c) = (block.in_c as u128, block.out_c as u128);
-            elements += spatial * (in_c + 3 * out_c + 2);
-            if block.downsampler.is_some() {
-                spatial /= 4;
-                elements += spatial * out_c;
-            }
+    /// The loaded encoder's channel plan, for the tests to hold against
+    /// the one [`EncodePlan::read`] derives from the file's shapes.
+    #[cfg(test)]
+    pub(crate) fn plan(&self) -> EncodePlan {
+        EncodePlan {
+            blocks: self
+                .down_blocks
+                .iter()
+                .map(|b| {
+                    let out_c = b.resnets.last().map_or(0, |r| r.conv1.out_c);
+                    (b.resnets[0].conv1.in_c, out_c, b.downsampler.is_some())
+                })
+                .collect(),
+            mid_c: self.conv_out.in_c,
+            z_dim: self.z_dim,
         }
-        // The latent stage: the mid resnets' stream plus one convolution
-        // output, the attention's qkv, transposed operands, context in both
-        // layouts and projection, its score block, then the head and the
-        // tokens in both layouts.
-        let (s, c, z) = (spatial, self.conv_out.in_c as u128, self.z_dim as u128);
-        let score_rows = (super::vae::ATTN_SCORE_BUDGET as u128 / s.max(1)).clamp(1, s.max(1));
-        elements += s * (c * (1 + 1 + 3 + 4 + 1) + 2 + 2 * z + 2 * z) + score_rows * s;
-        u64::try_from(elements.saturating_mul(4)).unwrap_or(u64::MAX)
     }
 
     /// Encodes an interleaved RGBA8 picture of `16 * grid` pixels into the
