@@ -70,6 +70,12 @@ pub enum Stage {
     StepMatvec4,
     /// A step pass's routed gate and up projections, `lpr` lanes a row.
     StepGateUp,
+    /// [`Stage::StepGateUp`] with the `SwiGLU` activation folded into its
+    /// epilogue: one output, `silu(gate) * up`, instead of the two matrices.
+    /// Only the unit path (`lpr * PACKED_UNIT_ROWS <= 32`) is instantiated.
+    /// Kept as a regression lock only: the decode plan does not take it, as
+    /// the epilogue's `precise::exp` measured slower than the separate launch.
+    StepGateUpAct,
     /// A step pass's routed down projection, `lpr` lanes a row.
     StepDown,
 }
@@ -101,7 +107,12 @@ pub const fn entry(dtype: DType, stage: Stage) -> Option<Entry> {
     if matches!(dtype, DType::F32)
         && matches!(
             stage,
-            Stage::Gemm | Stage::GemmGateUp | Stage::GemmDown | Stage::StepGateUp | Stage::StepDown
+            Stage::Gemm
+                | Stage::GemmGateUp
+                | Stage::GemmDown
+                | Stage::StepGateUp
+                | Stage::StepGateUpAct
+                | Stage::StepDown
         )
     {
         return None;
@@ -119,6 +130,7 @@ pub const fn entry(dtype: DType, stage: Stage) -> Option<Entry> {
                 Stage::StepMatvec => concat!("q4e_g_step_matvec_", $n, "_kernel"),
                 Stage::StepMatvec4 => concat!("q4e_g_step_matvec4_", $n, "_kernel"),
                 Stage::StepGateUp => concat!("q4e_g_step_gate_up_", $n, "_kernel"),
+                Stage::StepGateUpAct => concat!("q4e_g_step_gate_up_act_", $n, "_kernel"),
                 Stage::StepDown => concat!("q4e_g_step_down_", $n, "_kernel"),
             }
         };
@@ -369,6 +381,7 @@ mod tests {
                 Stage::StepMatvec,
                 Stage::StepMatvec4,
                 Stage::StepGateUp,
+                Stage::StepGateUpAct,
                 Stage::StepDown,
             ] {
                 assert!(entry(dtype, stage).is_some(), "{dtype:?} {stage:?}");

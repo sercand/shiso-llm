@@ -805,6 +805,88 @@ kernel void q4e_g_step_gate_up_kernel(
     }
 }
 
+/// [`q4e_g_step_gate_up_kernel`] with the SwiGLU activation folded into the
+/// epilogue: one output `silu(gate) * up` instead of the two matrices, so the
+/// separate activation launch and the gate/up round trip through memory are
+/// gone. A unit already holds gate row `o` and up row `o` in the same lane, so
+/// the activation costs no extra read.
+///
+/// Only the unit path is instantiated (`lpr * Q4E_GS_UNIT_ROWS <= 32`), which
+/// is the decode step's; the host picks it only there. The activation is the
+/// separate kernel's own arithmetic - `g / (1 + precise::exp(-g)) * u`, the
+/// division kept, not a sigmoid - so a column's bits are the unfused chain's.
+///
+/// Buffers: out_mid, gate_w, up_w, x, sorted, bounds, active, map, in_dim,
+/// out_dim, n_expert, n_used, gate_stride, up_stride, lpr.
+template <uint T>
+kernel void q4e_g_step_gate_up_act_kernel(
+        device float *out_mid [[buffer(0)]],
+        device const uchar *gate_w [[buffer(1)]],
+        device const uchar *up_w [[buffer(2)]],
+        device const float *x [[buffer(3)]],
+        device const int *sorted [[buffer(4)]],
+        device const int *bounds [[buffer(5)]],
+        device const int *active [[buffer(6)]],
+        device const uint *map [[buffer(7)]],
+        constant uint &in_dim [[buffer(8)]],
+        constant uint &out_dim [[buffer(9)]],
+        constant uint &n_expert [[buffer(10)]],
+        constant uint &n_used [[buffer(11)]],
+        constant uint &gate_stride [[buffer(12)]],
+        constant uint &up_stride [[buffer(13)]],
+        constant uint &lpr [[buffer(14)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint simd [[simdgroup_index_in_threadgroup]]) {
+    if (int(group.y) >= active[n_expert]) {
+        return;
+    }
+    const int expert = active[group.y];
+    const int c0 = bounds[expert];
+    const int c1 = bounds[expert + 1];
+    if (c1 <= c0) {
+        return;
+    }
+    threadgroup uint tab[q4e_gs_tab_words<T>()];
+    q4e_gs_load_tab<T>(tab, simd * 32u + lane, 32u * Q4E_GS_WARPS);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const ulong slot = map[expert];
+    constexpr uint R = Q4E_GS_UNIT_ROWS / 2u;
+    const uint ul = lpr * Q4E_GS_UNIT_ROWS;
+    const uint o0 = ((group.x * Q4E_GS_WARPS + simd) * (32u / ul) + lane / ul) * R;
+    const ulong rb = q4e_g_row_bytes<T>(in_dim);
+    device const uchar *rowp[Q4E_GS_UNIT_ROWS];
+    for (uint r = 0; r < R; ++r) {
+        const ulong at = ulong(min(o0 + r, out_dim - 1u)) * rb;
+        rowp[r] = gate_w + slot * gate_stride + at;
+        rowp[R + r] = up_w + slot * up_stride + at;
+    }
+    for (int c = c0; c < c1; c += 2) {
+        const bool two = c + 1 < c1;
+        const uint col0 = uint(sorted[c]);
+        const uint col1 = uint(sorted[two ? c + 1 : c]);
+        float acc[2u * Q4E_GS_UNIT_ROWS] = {0.0f};
+        q4e_gs_unit<T, Q4E_GS_UNIT_ROWS>(rowp, in_dim, x, ulong(col0 / n_used) * in_dim,
+                                         ulong(col1 / n_used) * in_dim, two, lane % ul, ul,
+                                         tab, acc);
+        for (uint r = 0; r < R; ++r) {
+            const uint o = o0 + r;
+            const bool live = lane % ul == 0u && o < out_dim;
+            // Gate row r is acc[2r..2r+1], the same row of up acc[2(r+R)..].
+            const float g0 = q4e_gs_fold(acc[2u * r], ul);
+            const float g1 = q4e_gs_fold(acc[2u * r + 1u], ul);
+            const float u0 = q4e_gs_fold(acc[2u * (r + R)], ul);
+            const float u1 = q4e_gs_fold(acc[2u * (r + R) + 1u], ul);
+            if (live) {
+                out_mid[ulong(col0) * out_dim + o] = (g0 / (1.0f + precise::exp(-g0))) * u0;
+                if (two) {
+                    out_mid[ulong(col1) * out_dim + o] = (g1 / (1.0f + precise::exp(-g1))) * u1;
+                }
+            }
+        }
+    }
+}
+
 /// The routed down projection of a step pass: `q4e_g_experts_down_kernel`'s
 /// arguments and `lpr` (up to 32). Grid `(ceil(out_dim / (Q4E_GS_WARPS * 32 /
 /// lpr)), groups)`, block `32 * Q4E_GS_WARPS`.
@@ -892,6 +974,13 @@ kernel void q4e_g_step_down_kernel(
                                  constant uint &, constant uint &, constant uint &,             \
                                  constant uint &, constant uint &, constant uint &,             \
                                  constant uint &, uint3, uint, uint);                           \
+    template [[host_name("q4e_g_step_gate_up_act_" NAME "_kernel")]] kernel void                \
+    q4e_g_step_gate_up_act_kernel<T>(device float *, device const uchar *, device const uchar *,\
+                                 device const float *, device const int *, device const int *,  \
+                                 device const int *, device const uint *, constant uint &,      \
+                                 constant uint &, constant uint &, constant uint &,             \
+                                 constant uint &, constant uint &, constant uint &,             \
+                                 uint3, uint, uint);                                            \
     template [[host_name("q4e_g_step_down_" NAME "_kernel")]] kernel void                       \
     q4e_g_step_down_kernel<T>(device float *, device const uchar *, device const float *,       \
                               device const int *, device const int *, device const int *,       \

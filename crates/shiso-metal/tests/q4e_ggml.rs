@@ -63,3 +63,10 @@ fn the_lane_step_entries_match_the_host_in_every_block_format() {
     let Some(gpu) = open() else { return };
     cases::the_lane_step_entries_match_the_host_in_every_block_format(&gpu);
 }
+
+#[test]
+#[ignore = "requires a Metal device"]
+fn the_fused_gate_up_activation_matches_the_unfused_chain() {
+    let Some(gpu) = open() else { return };
+    cases::the_fused_gate_up_activation_matches_the_unfused_chain(&gpu);
+}
