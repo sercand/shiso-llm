@@ -6,6 +6,20 @@
   "convrot": {
    "script_sha256": "d74f74fb74e332f7f41c2ecb62ba79ab016e2d1549679b7894d18c078aa6d340"
   },
+  "edit-tokenizer": {
+   "environment": {
+    "diffusers": "0.41.0.dev0",
+    "diffusers_commit": "d42ebf9c6e0b46103b74283f5324357a67acaa04",
+    "numpy": "2.5.2",
+    "torch": "2.11.0",
+    "transformers": "5.5.0",
+    "turbo": {
+     "repo": "Qwen/Qwen-Image-2.1-Turbo",
+     "revision": "d65dbc9a7e8f6b5479e33dee6030eaab2a906509"
+    }
+   },
+   "script_sha256": "afc3199002788d5212e3acd3f0389bd1ca2c3425abc9f85e8338ef96f51604ea"
+  },
   "embed": {
    "script_sha256": "d74f74fb74e332f7f41c2ecb62ba79ab016e2d1549679b7894d18c078aa6d340"
   },
@@ -501,6 +515,12 @@
     8,
     4096
    ]
+  },
+  "edit_tokenizer.json": {
+   "description": "Edit prompts through the pipeline's own image-conditioned template and processor: the ids the text encoder sees, the image-slot mask after the dropped system turn, the processor's image grids and the vision-language model's 3-axis rotary position ids.",
+   "dtype": "json",
+   "sha256": "98052573d3e39bbde75eca65b050f8426765fa3aaf5e709640ab487ce299d6fe",
+   "shape": null
   },
   "embed.json": {
    "description": "Timestep embedding, shared modulation and txt_in on the real Turbo weights (f32 math) at sigma 1.0, 0.414568, 0.02 and the t = 0 row.",
