@@ -262,3 +262,37 @@ extern "C" __global__ void kernel_dit_dup_up_add_f32(
     out[(u64)c * plane + p] +=
             in[((u64)src * args.h + (y >> 1u)) * args.w + (x >> 1u)];
 }
+
+/* The residual VAE down block's parameter-free shortcut, added in place:
+ * out[o,y,x] += mean over g < group of the folded source channel e = o*group+g,
+ * e = ((c*factor_t + t)*factor_s + sy)*factor_s + sx reading
+ * in[c, y*factor_s + sy, x*factor_s + sx]; a single frame holds only the last
+ * time slot, the others are zero and still counted by the mean.
+ * Grid (ceil(hw/64), out_c) x 64. */
+extern "C" __global__ void kernel_dit_avg_down_add_f32(
+        const dit_args_avg_down args, float* out, const float* in) {
+    const u32 plane = args.h * args.w;
+    const u32 p = blockIdx.x * DIT_BLOCK + threadIdx.x;
+    const u32 o = blockIdx.y;
+    if (p >= plane || o >= args.out_c) {
+        return;
+    }
+    const u32 y = p / args.w;
+    const u32 x = p - y * args.w;
+    const u32 fs = args.factor_s;
+    const u32 in_w = args.w * fs;
+    const u32 in_h = args.h * fs;
+    float sum = 0.0f;
+    for (u32 g = 0u; g < args.group; ++g) {
+        const u32 e = o * args.group + g;
+        const u32 sx = e % fs;
+        const u32 sy = (e / fs) % fs;
+        const u32 t = (e / (fs * fs)) % args.factor_t;
+        if (t + 1u != args.factor_t) {
+            continue;
+        }
+        const u32 c = e / (fs * fs * args.factor_t);
+        sum += in[((u64)c * in_h + (y * fs + sy)) * in_w + (x * fs + sx)];
+    }
+    out[(u64)o * plane + p] += sum / (float)args.group;
+}

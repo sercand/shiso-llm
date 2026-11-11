@@ -1,0 +1,19 @@
+{
+ "picture": {
+  "width": 192,
+  "height": 128,
+  "formula": "rgb(x, y, c) = (7x + 13y + 29c) mod 256, a(x, y) = (3x + 5y) mod 256"
+ },
+ "latent_grid": [
+  8,
+  12
+ ],
+ "normalisation": "(mode - latents_mean) / latents_std",
+ "files": {
+  "input": "vae_encode_input.f32",
+  "down0": "vae_encode_down0.f32",
+  "down1": "vae_encode_down1.f32",
+  "mid": "vae_encode_mid.f32",
+  "latents": "vae_encode_latents.f32"
+ }
+}

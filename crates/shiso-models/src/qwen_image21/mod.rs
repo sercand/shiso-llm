@@ -11,7 +11,8 @@
 //! transformer, split into a once-per-job text prefix and a per-step target
 //! pass; [`scheduler`] builds the sigma ladder the steps walk. [`vae`] is the
 //! RGBA decoder that turns the transformer's 64-channel latent tokens into
-//! the final image. [`edit`] prepares an edit's reference pictures: one
+//! the final image, and [`vae_encode`] the encoder that turns a reference
+//! picture into such tokens. [`edit`] prepares an edit's reference pictures: one
 //! resize per reference, read by both the vision tower and the VAE.
 //! [`pipeline`] composes them into the served generator
 //! and decides which stay on the device between jobs.
@@ -32,6 +33,14 @@ pub(crate) mod rope;
 pub(crate) mod scheduler;
 pub(crate) mod transformer;
 pub(crate) mod vae;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the edit pipeline that calls this lands later on this branch"
+    )
+)]
+pub(crate) mod vae_encode;
 
 use crate::catalog::FamilyFacts;
 
@@ -54,5 +63,7 @@ mod prompt_tests;
 mod tower_tests;
 #[cfg(test)]
 mod transformer_tests;
+#[cfg(test)]
+mod vae_encode_tests;
 #[cfg(test)]
 mod vae_tests;

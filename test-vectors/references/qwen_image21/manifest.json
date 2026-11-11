@@ -52,6 +52,20 @@
   "vae": {
    "script_sha256": "d74f74fb74e332f7f41c2ecb62ba79ab016e2d1549679b7894d18c078aa6d340"
   },
+  "vae-encode": {
+   "environment": {
+    "diffusers": "0.41.0.dev0",
+    "diffusers_commit": "d42ebf9c6e0b46103b74283f5324357a67acaa04",
+    "numpy": "2.5.2",
+    "torch": "2.11.0",
+    "transformers": "5.5.0",
+    "turbo": {
+     "repo": "Qwen/Qwen-Image-2.1-Turbo",
+     "revision": "d65dbc9a7e8f6b5479e33dee6030eaab2a906509"
+    }
+   },
+   "script_sha256": "03048655bb9981d2052ed84614962dc8dd0b83b86124f8a5514f49b17d4ec106"
+  },
   "vision": {
    "environment": {
     "diffusers": "0.41.0.dev0",
@@ -911,6 +925,61 @@
     1152,
     16,
     16
+   ]
+  },
+  "vae_encode.json": {
+   "description": "AutoencoderKLQwenImage21 encode (f32) of one 192 x 128 RGBA picture: the distribution's mode, normalised and packed as the pipeline does, with the first two down blocks and the mid block.",
+   "dtype": "json",
+   "sha256": "eba4b82a21646721c0b3913e5edcd22e4b270ec4dcb0091f740c743d63fcccd2",
+   "shape": null
+  },
+  "vae_encode_down0.f32": {
+   "description": "First down block's output [96, 64, 96].",
+   "dtype": "f32le",
+   "sha256": "56797c1257397114a6fa72a242c8090a6cf768186bea59a7be05f374f1fdf84b",
+   "shape": [
+    96,
+    64,
+    96
+   ]
+  },
+  "vae_encode_down1.f32": {
+   "description": "Second down block's output [192, 32, 48] (its shortcut folds a zero frame in).",
+   "dtype": "f32le",
+   "sha256": "162a0d564db01a7a1774a8f864a8131b4ed79dc09f84055af3311e59a41c8340",
+   "shape": [
+    192,
+    32,
+    48
+   ]
+  },
+  "vae_encode_input.f32": {
+   "description": "The VAE's input [4, 128, 192]: RGBA in [-1, 1].",
+   "dtype": "f32le",
+   "sha256": "f2ea63de5981ba0cdb52598b61c6f533f7336d1936db1e17db85e0ab7e1a8cf2",
+   "shape": [
+    4,
+    128,
+    192
+   ]
+  },
+  "vae_encode_latents.f32": {
+   "description": "The normalised mode latents as the transformer reads them: [96 cells, 64], row-major.",
+   "dtype": "f32le",
+   "sha256": "3213ed8d92222c63b6eec5e0671e936c85fb14d020ec2aecff2cea6b9dcdb263",
+   "shape": [
+    96,
+    64
+   ]
+  },
+  "vae_encode_mid.f32": {
+   "description": "encoder.mid_block output [768, 8, 12].",
+   "dtype": "f32le",
+   "sha256": "e82a601f68db6558b09eda1e38fd97153f41cea20d67af28b35222a788c8407d",
+   "shape": [
+    768,
+    8,
+    12
    ]
   },
   "vae_image.f32": {

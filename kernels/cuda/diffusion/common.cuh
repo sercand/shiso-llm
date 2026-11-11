@@ -199,6 +199,7 @@ struct dit_args_conv_vae {
     u32 in_c, in_h, in_w, out_c, out_h, out_w, k, pad, has_bias, accumulate, silu, reserved;
 };
 struct dit_args_dup_up { u32 out_c, h, w, factor, offset, repeats; };
+struct dit_args_avg_down { u32 out_c, h, w, factor_s, factor_t, group; };
 
 static_assert(sizeof(dit_args_gemm) == 16, "GemmArgs");
 static_assert(sizeof(dit_args_unary) == 4, "UnaryArgs");
@@ -225,3 +226,4 @@ static_assert(sizeof(dit_args_embed) == 8, "EmbedArgs");
 static_assert(sizeof(dit_args_channel_rms) == 16, "ChannelRmsArgs");
 static_assert(sizeof(dit_args_conv_vae) == 48, "ConvVaeArgs");
 static_assert(sizeof(dit_args_dup_up) == 24, "DupUpArgs");
+static_assert(sizeof(dit_args_avg_down) == 24, "AvgDownArgs");

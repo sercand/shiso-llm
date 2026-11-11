@@ -440,6 +440,23 @@ struct dit_args_dup_up {
     uint32_t repeats;
 };
 
+/// The residual VAE encoder's parameter-free downsampling shortcut, added
+/// into a field `factor_s` times smaller than the source along each side.
+/// The source's `(factor_t, factor_s, factor_s)` neighbourhoods are folded
+/// into channels - folded channel `e = ((c * factor_t + t) * factor_s + sy)
+/// * factor_s + sx` - and consecutive runs of `group` folded channels are
+/// averaged into one output channel. A single frame sits in the last time
+/// slot behind a zero frame, so only `t == factor_t - 1` contributes, while
+/// the mean still divides by the whole `group`.
+struct dit_args_avg_down {
+    uint32_t out_c;
+    uint32_t h;
+    uint32_t w;
+    uint32_t factor_s;
+    uint32_t factor_t;
+    uint32_t group;
+};
+
 // The blocks and the driver's Pods are edited together; the host asserts the
 // same widths, and so does this side so a header-only drift fails the compile.
 static_assert(sizeof(dit_args_gemm) == 16, "GemmArgs");
@@ -467,3 +484,4 @@ static_assert(sizeof(dit_args_embed) == 8, "EmbedArgs");
 static_assert(sizeof(dit_args_channel_rms) == 16, "ChannelRmsArgs");
 static_assert(sizeof(dit_args_conv_vae) == 48, "ConvVaeArgs");
 static_assert(sizeof(dit_args_dup_up) == 24, "DupUpArgs");
+static_assert(sizeof(dit_args_avg_down) == 24, "AvgDownArgs");

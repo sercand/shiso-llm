@@ -107,6 +107,7 @@ const ENTRIES: &[&str] = &[
     "kernel_dit_conv2d_rms_gemm_f32",
     "kernel_dit_conv2d_up2_gemm_f32",
     "kernel_dit_dup_up_add_f32",
+    "kernel_dit_avg_down_add_f32",
     "kernel_dit_kv_half_f32",
     "kernel_dit_flash_sdpa_d128_kvh",
 ];
@@ -3420,6 +3421,7 @@ vae_cases!(
     conv2d_rms_is_the_conv_of_the_normalized_activated_field,
     conv2d_up2_is_the_conv_of_the_upsampled_field,
     dup_up_add_matches_the_reshaped_shortcut,
+    avg_down_add_matches_the_folded_shortcut,
 );
 
 #[test]

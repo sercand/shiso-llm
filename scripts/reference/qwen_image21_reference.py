@@ -27,6 +27,7 @@ deleting it deliberately is how it is recaptured.
     block       one transformer block (0 and 31) through the real model, with the
                 block-causal full path and the prefix-KV-cache path compared
     vae         AutoencoderKLQwenImage21 decode of a seeded latent
+    vae-encode  AutoencoderKLQwenImage21 encode of an RGBA picture to normalised mode latents
     text-encoder  Qwen3-VL prompt features (needs ~40 GB of RAM; not run on a laptop)
     text-encoder-streamed  the same features one decoder layer at a time (range-read, evicted after use)
     text-encoder-int8-emulation  f32 layers over the Comfy INT8 text encoder (dequantized, un-rotated) vs those
@@ -1165,6 +1166,87 @@ def cmd_vae(args):
     out.finish()
 
 
+# ---------------------------------------------------------------- vae encode
+
+VAE_ENCODE_PICTURE = (192, 128)  # width, height: a 12 x 8 latent grid
+
+
+def vae_encode_picture(width: int, height: int):
+    """A deterministic RGBA picture with a varying alpha: rgb as `edit_picture`, a(x, y) = (3x + 5y) mod 256."""
+    from PIL import Image
+
+    y, x = np.mgrid[0:height, 0:width]
+    rgb = [(7 * x + 13 * y + 29 * c) % 256 for c in range(3)]
+    alpha = (3 * x + 5 * y) % 256
+    return Image.fromarray(np.stack(rgb + [alpha], axis=-1).astype(np.uint8), "RGBA")
+
+
+def cmd_vae_encode(args):
+    import torch
+    from diffusers import AutoencoderKLQwenImage21, QwenImage21Pipeline
+    from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import retrieve_latents
+    from safetensors.torch import load_file
+
+    cache = Path(args.cache_dir).expanduser()
+    out = Out("vae-encode", own_env=True)
+    cfg_path = turbo_file(cache, "vae/config.json")
+    weights = turbo_file(cache, "vae/diffusion_pytorch_model.safetensors", expect_size=675508656)
+    out.input("vae-weights", {"sha256": sha256_file(weights), "bytes": weights.stat().st_size})
+    vae = AutoencoderKLQwenImage21.from_config(AutoencoderKLQwenImage21.load_config(str(cfg_path.parent)))
+    vae.load_state_dict({k: v.float() for k, v in load_file(str(weights)).items()}, strict=True)
+    vae = vae.float().eval()
+    pipe = stub_pipeline(cache)
+
+    width, height = VAE_ENCODE_PICTURE
+    picture = vae_encode_picture(width, height)
+    # Exactly the pipeline's step 1 and `_encode_vae_image` for a picture already at its condition size.
+    x = pipe.image_processor.preprocess(picture, width=width, height=height).unsqueeze(2).float()
+    assert x.shape == (1, 4, 1, height, width), x.shape
+    rec = {}
+    hooks = [
+        vae.encoder.down_blocks[0].register_forward_hook(lambda m, a, o: rec.setdefault("down0", o.detach().clone())),
+        vae.encoder.down_blocks[1].register_forward_hook(lambda m, a, o: rec.setdefault("down1", o.detach().clone())),
+        vae.encoder.mid_block.register_forward_hook(lambda m, a, o: rec.setdefault("mid", o.detach().clone())),
+    ]
+    with torch.no_grad():
+        mode = retrieve_latents(vae.encode(x), sample_mode="argmax")
+    for hook in hooks:
+        hook.remove()
+    z = vae.config.z_dim
+    mean = torch.tensor(vae.config.latents_mean).view(1, z, 1, 1, 1)
+    std = torch.tensor(vae.config.latents_std).view(1, z, 1, 1, 1)
+    latents = (mode - mean) / std
+    lat_h, lat_w = height // 16, width // 16
+    packed = QwenImage21Pipeline._pack_latents(latents, 1, z, lat_h, lat_w)
+    assert packed.shape == (1, lat_h * lat_w, z), packed.shape
+
+    def field(t):
+        return t[0, :, 0]
+
+    files = {
+        "input": out.f32("vae_encode_input.f32", field(x), "The VAE's input [4, 128, 192]: RGBA in [-1, 1]."),
+        "down0": out.f32("vae_encode_down0.f32", field(rec["down0"]), "First down block's output [96, 64, 96]."),
+        "down1": out.f32("vae_encode_down1.f32", field(rec["down1"]),
+                         "Second down block's output [192, 32, 48] (its shortcut folds a zero frame in)."),
+        "mid": out.f32("vae_encode_mid.f32", field(rec["mid"]), "encoder.mid_block output [768, 8, 12]."),
+        "latents": out.f32("vae_encode_latents.f32", packed[0],
+                           "The normalised mode latents as the transformer reads them: [96 cells, 64], row-major."),
+    }
+    out.json(
+        "vae_encode.json",
+        {
+            "picture": {"width": width, "height": height,
+                        "formula": "rgb(x, y, c) = (7x + 13y + 29c) mod 256, a(x, y) = (3x + 5y) mod 256"},
+            "latent_grid": [lat_h, lat_w],
+            "normalisation": "(mode - latents_mean) / latents_std",
+            "files": files,
+        },
+        "AutoencoderKLQwenImage21 encode (f32) of one 192 x 128 RGBA picture: the distribution's mode, normalised "
+        "and packed as the pipeline does, with the first two down blocks and the mid block.",
+    )
+    out.finish()
+
+
 # ---------------------------------------------------------------- text encoder
 
 def cmd_text_encoder(args):
@@ -1613,7 +1695,8 @@ def main():
                     help="where configs, the VAE and range-read tensors are cached")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, fn in (("tokenizer", cmd_tokenizer), ("sigmas", cmd_sigmas), ("embed", cmd_embed), ("rope", cmd_rope),
-                     ("convrot", cmd_convrot), ("block", cmd_block), ("vae", cmd_vae)):
+                     ("convrot", cmd_convrot), ("block", cmd_block), ("vae", cmd_vae),
+                     ("vae-encode", cmd_vae_encode)):
         p = sub.add_parser(name)
         p.set_defaults(fn=fn)
         if name == "convrot":

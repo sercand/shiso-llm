@@ -109,6 +109,7 @@ cases!(vae:
     conv2d_rms_is_the_conv_of_the_normalized_activated_field,
     conv2d_up2_is_the_conv_of_the_upsampled_field,
     dup_up_add_matches_the_reshaped_shortcut,
+    avg_down_add_matches_the_folded_shortcut,
 );
 
 cases!(prefix:

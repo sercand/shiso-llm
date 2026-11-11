@@ -2614,3 +2614,41 @@ kernel void kernel_dit_dup_up_add_f32(
     out[(uint64_t) c * plane + p] +=
             in[((uint64_t) src * args.h + (y >> 1u)) * args.w + (x >> 1u)];
 }
+
+/// The down block's parameter-free shortcut, added in place into the
+/// downsampler's output (`dit_args_avg_down`): each output value is the
+/// mean of `group` folded source values, summed in folded-channel order,
+/// of which a single frame holds only those in the last time slot. Grid
+/// `(ceil(hw / 64), out_c)` x 64 threads; `out` is `(out_c, h, w)` and `in`
+/// `(in_c, h * factor_s, w * factor_s)`.
+kernel void kernel_dit_avg_down_add_f32(
+        constant dit_args_avg_down & args [[buffer(0)]],
+        device float *out                   [[buffer(1)]],
+        device const float *in              [[buffer(2)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint plane = args.h * args.w;
+    const uint p = tgpig.x * DIT_BLOCK + tpitg.x;
+    const uint o = tgpig.y;
+    if (p >= plane || o >= args.out_c) {
+        return;
+    }
+    const uint y = p / args.w;
+    const uint x = p - y * args.w;
+    const uint fs = args.factor_s;
+    const uint in_w = args.w * fs;
+    const uint in_h = args.h * fs;
+    float sum = 0.0f;
+    for (uint g = 0u; g < args.group; ++g) {
+        const uint e = o * args.group + g;
+        const uint sx = e % fs;
+        const uint sy = (e / fs) % fs;
+        const uint t = (e / (fs * fs)) % args.factor_t;
+        if (t + 1u != args.factor_t) {
+            continue;
+        }
+        const uint c = e / (fs * fs * args.factor_t);
+        sum += in[((uint64_t) c * in_h + (y * fs + sy)) * in_w + (x * fs + sx)];
+    }
+    out[(uint64_t) o * plane + p] += sum / float(args.group);
+}

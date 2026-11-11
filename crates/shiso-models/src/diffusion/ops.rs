@@ -30,7 +30,9 @@ use shiso_vision::generator::ImageGenError;
 use super::quant::RotGroup;
 
 mod vae;
-pub(crate) use vae::{ChannelRmsCall, DupUpCall, VaeConvCall, VaeConvInput, dup_up_map};
+pub(crate) use vae::{
+    AvgDownCall, ChannelRmsCall, DupUpCall, VaeConvCall, VaeConvInput, avg_down_group, dup_up_map,
+};
 
 /// The kernel module every diffusion entry point lives under.
 pub(crate) const MODULE: &str = "diffusion";
@@ -969,6 +971,7 @@ pub(crate) const REQUIRED_KERNELS: &[&str] = &[
     "kernel_dit_conv2d_rms_gemm_f32",
     "kernel_dit_conv2d_up2_gemm_f32",
     "kernel_dit_dup_up_add_f32",
+    "kernel_dit_avg_down_add_f32",
 ];
 
 impl Ops {

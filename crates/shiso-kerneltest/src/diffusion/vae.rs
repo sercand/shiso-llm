@@ -27,11 +27,12 @@ use crate::harness::{Gpu, drain, f32_bytes, run};
 use crate::oracle::signal;
 
 /// Every entry point this file's cases launch.
-pub const ENTRIES: [&str; 4] = [
+pub const ENTRIES: [&str; 5] = [
     "kernel_dit_channel_rms_inv_f32",
     "kernel_dit_conv2d_rms_gemm_f32",
     "kernel_dit_conv2d_up2_gemm_f32",
     "kernel_dit_dup_up_add_f32",
+    "kernel_dit_avg_down_add_f32",
 ];
 
 const MODULE: &str = "diffusion";
@@ -83,6 +84,18 @@ struct DupUpArgs {
     repeats: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct AvgDownArgs {
+    out_c: u32,
+    h: u32,
+    w: u32,
+    factor_s: u32,
+    factor_t: u32,
+    group: u32,
+}
+
+const _: () = assert!(size_of::<AvgDownArgs>() == 24);
 const _: () = assert!(size_of::<ChannelRmsArgs>() == 16);
 const _: () = assert!(size_of::<ConvVaeArgs>() == 48);
 const _: () = assert!(size_of::<DupUpArgs>() == 24);
@@ -595,5 +608,105 @@ pub fn dup_up_add_matches_the_reshaped_shortcut(gpu: &Gpu) {
             1e-6,
             &format!("dup_up {in_c}->{out_c} ft {ft}"),
         );
+    }
+}
+
+/// The reference down shortcut, step by step, for a single frame: pad a
+/// zero frame in front when the block downsamples in time, fold the
+/// `(ft, fs, fs)` neighbourhood of every channel into `ft * fs * fs`
+/// channels, then average consecutive groups of them down to `out_c`.
+/// `x` is `(in_c, h * fs, w * fs)`; the result is `(out_c, h, w)`.
+fn avg_down_host(
+    x: &[f32],
+    in_c: usize,
+    out_c: usize,
+    (h, w): (usize, usize),
+    (ft, fs): (usize, usize),
+) -> Vec<f32> {
+    let (ih, iw) = (h * fs, w * fs);
+    // frames[t][c][y][x], the real frame last.
+    let mut frames = vec![0f32; ft * in_c * ih * iw];
+    frames[(ft - 1) * in_c * ih * iw..].copy_from_slice(x);
+    let factor = ft * fs * fs;
+    // folded[(c, t, sy, sx)][y][x]
+    let mut folded = vec![0f32; in_c * factor * h * w];
+    for c in 0..in_c {
+        for t in 0..ft {
+            for sy in 0..fs {
+                for sx in 0..fs {
+                    let e = ((c * ft + t) * fs + sy) * fs + sx;
+                    for y in 0..h {
+                        for xx in 0..w {
+                            folded[(e * h + y) * w + xx] =
+                                frames[((t * in_c + c) * ih + y * fs + sy) * iw + xx * fs + sx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let group = in_c * factor / out_c;
+    let plane = h * w;
+    let mut out = vec![0f32; out_c * plane];
+    for o in 0..out_c {
+        for p in 0..plane {
+            let sum: f64 = (0..group)
+                .map(|g| f64::from(folded[(o * group + g) * plane + p]))
+                .sum();
+            out[o * plane + p] = (sum / group as f64) as f32;
+        }
+    }
+    out
+}
+
+/// `kernel_dit_avg_down_add_f32` adds the reference's folded-and-averaged
+/// shortcut: with and without a temporal factor (whose zero front frame
+/// halves every group), widening, narrowing and keeping the channels, and
+/// with no spatial factor at all, where it is the identity.
+///
+/// # Panics
+///
+/// When the device disagrees with the oracle.
+pub fn avg_down_add_matches_the_folded_shortcut(gpu: &Gpu) {
+    let (h, w) = (3usize, 5usize);
+    for (in_c, out_c, ft, fs) in [
+        (4usize, 4usize, 1usize, 2usize),
+        (4, 8, 2, 2),
+        (6, 3, 1, 2),
+        (8, 8, 2, 2),
+        (8, 8, 1, 1),
+    ] {
+        let x = signal(in_c * h * fs * w * fs, 41);
+        let prior = signal(out_c * h * w, 42);
+        let shortcut = avg_down_host(&x, in_c, out_c, (h, w), (ft, fs));
+        let want: Vec<f32> = prior.iter().zip(&shortcut).map(|(a, b)| a + b).collect();
+        let args = AvgDownArgs {
+            out_c: out_c as u32,
+            h: h as u32,
+            w: w as u32,
+            factor_s: fs as u32,
+            factor_t: ft as u32,
+            group: (in_c * ft * fs * fs / out_c) as u32,
+        };
+        let d_x = upload(gpu, &x);
+        let d_out = upload(gpu, &prior);
+        launch(
+            gpu,
+            "kernel_dit_avg_down_add_f32",
+            Extent3::new(((h * w) as u32).div_ceil(BLOCK), out_c as u32, 1),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(d_out.view()),
+                KernelArg::Buffer(d_x.view()),
+            ],
+        );
+        drain(gpu);
+        let what = format!("avg_down {in_c}->{out_c} ft {ft} fs {fs}");
+        close(&gpu.read_f32(&d_out), &want, 1e-6, &what);
+        if fs == 1 && ft == 1 && in_c == out_c {
+            let identity: Vec<f32> = prior.iter().zip(&x).map(|(a, b)| a + b).collect();
+            close(&want, &identity, 0.0, &format!("{what} is the identity"));
+        }
     }
 }
