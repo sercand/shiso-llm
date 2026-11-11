@@ -1,4 +1,4 @@
-//! Qwen-Image-2.1 text-to-image.
+//! Qwen-Image-2.1 text-to-image and reference-image editing.
 //!
 //! The family conditions a diffusion transformer on the hidden states of a
 //! Qwen3-VL decoder read over a templated prompt. [`prompt`] holds the
@@ -11,10 +11,20 @@
 //! transformer, split into a once-per-job text prefix and a per-step target
 //! pass; [`scheduler`] builds the sigma ladder the steps walk. [`vae`] is the
 //! RGBA decoder that turns the transformer's 64-channel latent tokens into
-//! the final image. [`pipeline`] composes them into the served generator
+//! the final image. [`edit`] prepares an edit's reference pictures: one
+//! resize per reference, read by both the vision tower and the VAE.
+//! [`pipeline`] composes them into the served generator
 //! and decides which stay on the device between jobs.
 
 pub(crate) mod config;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the edit pipeline that calls this lands later on this branch"
+    )
+)]
+pub(crate) mod edit;
 pub(crate) mod embed;
 pub(crate) mod pipeline;
 pub(crate) mod prompt;
@@ -32,6 +42,8 @@ pub(crate) const FACTS: FamilyFacts = FamilyFacts {
 
 #[cfg(test)]
 mod dit_tests;
+#[cfg(test)]
+mod edit_tests;
 #[cfg(test)]
 mod encoder_tests;
 #[cfg(test)]
