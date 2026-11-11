@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use shiso_vision::generator::ImageGenError;
 
-use super::prompt::{DROP_IDX, MAX_PROMPT_TOKENS, QwenImagePrompt};
+use super::prompt::{DROP_IDX, EditPromptIds, MAX_PROMPT_TOKENS, QwenImagePrompt};
 
 fn fixture() -> serde_json::Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -166,4 +166,153 @@ fn a_lone_tokenizer_file_encodes_like_the_processor_directory() {
         );
     }
     std::fs::remove_dir_all(&lone).expect("cleanup");
+}
+
+/// The edit fixture: the reference pipeline's image-conditioned template
+/// and processor over one and three condition pictures
+/// (`qwen_image21_reference.py edit-tokenizer`).
+fn edit_fixture() -> serde_json::Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test-vectors/references/qwen_image21/edit_tokenizer.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    serde_json::from_str(&text).expect("the edit tokenizer fixture parses")
+}
+
+/// A case's image slots as `(rows, columns)`: the processor's patch grid
+/// merged 2x2.
+fn edit_slots(case: &serde_json::Value) -> Vec<(usize, usize)> {
+    case["image_grid_thw"]
+        .as_array()
+        .expect("grids")
+        .iter()
+        .map(|g| {
+            let side = |i: usize| usize::try_from(g[i].as_u64().expect("a side")).expect("fits");
+            (side(1) / 2, side(2) / 2)
+        })
+        .collect()
+}
+
+fn edit_case_matches(prompt: &QwenImagePrompt, case: &serde_json::Value, name: &str) {
+    let text = case["prompt"].as_str().expect("a prompt");
+    let got = prompt
+        .tokenize_edit(text, &edit_slots(case))
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert_eq!(got.ids, ids(&case["ids"]), "{name}: ids");
+    assert_eq!(got.drop, DROP_IDX);
+    let mask: Vec<bool> = case["image_pad_mask_kept"]
+        .as_array()
+        .expect("a mask")
+        .iter()
+        .map(|v| v.as_u64() == Some(1))
+        .collect();
+    assert_eq!(got.image_mask_kept(), mask, "{name}: image-slot mask");
+    positions_match(&got, case, name);
+}
+
+fn positions_match(got: &EditPromptIds, case: &serde_json::Value, name: &str) {
+    let want: Vec<Vec<u32>> = (0..3)
+        .map(|axis| ids(&case["position_ids"][axis]))
+        .collect();
+    let positions = got.positions();
+    assert_eq!(positions.len(), want[0].len(), "{name}: position count");
+    for (i, pos) in positions.iter().enumerate() {
+        assert_eq!(
+            *pos,
+            [want[0][i], want[1][i], want[2][i]],
+            "{name}: position of id {i}"
+        );
+    }
+}
+
+#[test]
+fn edit_ids_match_reference_one() {
+    let Some(prompt) = prompt() else { return };
+    edit_case_matches(&prompt, &edit_fixture()["cases"]["one"], "one");
+}
+
+#[test]
+fn edit_ids_match_reference_three() {
+    let Some(prompt) = prompt() else { return };
+    edit_case_matches(&prompt, &edit_fixture()["cases"]["three"], "three");
+}
+
+/// The positions need no vocabulary: rebuilt from the fixture's own ids
+/// and grids, so this runs on every host.
+#[test]
+fn edit_positions_match_reference_without_a_vocabulary() {
+    let fixture = edit_fixture();
+    let image_pad = u32::try_from(fixture["image_pad_id"].as_u64().expect("id")).expect("fits");
+    for name in ["one", "three"] {
+        let case = &fixture["cases"][name];
+        let all = ids(&case["ids"]);
+        let mut images = Vec::new();
+        let mut cursor = 0;
+        for (rows, cols) in edit_slots(case) {
+            let start = cursor
+                + all[cursor..]
+                    .iter()
+                    .position(|&id| id == image_pad)
+                    .expect("a pad run");
+            images.push((start..start + rows * cols, (rows, cols)));
+            cursor = start + rows * cols;
+        }
+        let got = EditPromptIds {
+            ids: all,
+            drop: DROP_IDX,
+            images,
+        };
+        positions_match(&got, case, name);
+    }
+}
+
+#[test]
+fn caller_text_spelling_image_tokens_adds_no_slot() {
+    let Some(prompt) = prompt() else { return };
+    let fixture = edit_fixture();
+    let image_pad = u32::try_from(fixture["image_pad_id"].as_u64().expect("id")).expect("fits");
+    let plain = prompt.tokenize_edit("hi", &[(2, 3)]).expect("encodes");
+    let spelled = prompt
+        .tokenize_edit("<|image_pad|> <image1> <|vision_start|> hi", &[(2, 3)])
+        .expect("encodes");
+    let pads = |ids: &[u32]| ids.iter().filter(|&&id| id == image_pad).count();
+    assert_eq!(pads(&plain.ids), 6);
+    assert_eq!(pads(&spelled.ids), 6, "a spelled pad stays words");
+    assert_eq!(spelled.images, plain.images);
+    // The template before the caller's text is the same in both.
+    let head = plain.images[0].0.end + 1;
+    assert_eq!(spelled.ids[..head], plain.ids[..head]);
+}
+
+#[test]
+fn too_long_edit_prompt_is_refused_without_counting_pads() {
+    let Some(prompt) = prompt() else { return };
+    // The edit template keeps 14 non-pad tokens around the user text with
+    // one reference: three for the user opener, "<image1>" as four, the two
+    // vision brackets, and five for the tail.
+    let around = 14;
+    let at_cap = "cat".to_string() + &" cat".repeat(MAX_PROMPT_TOKENS - around - 1);
+    let ok = prompt
+        .tokenize_edit(&at_cap, &[(32, 32)])
+        .expect("1024 pads do not count against the cap");
+    assert_eq!(ok.ids.len() - DROP_IDX, MAX_PROMPT_TOKENS + 1024);
+    match prompt.tokenize_edit(&(at_cap + " cat"), &[(32, 32)]) {
+        Err(ImageGenError::PromptTooLong { tokens, max }) => {
+            assert_eq!(max as usize, MAX_PROMPT_TOKENS);
+            assert_eq!(tokens as usize, MAX_PROMPT_TOKENS + 1);
+        }
+        other => panic!("expected PromptTooLong, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_edit_without_slots_is_refused() {
+    let Some(prompt) = prompt() else { return };
+    assert!(matches!(
+        prompt.tokenize_edit("hi", &[]),
+        Err(ImageGenError::ReferenceImage(_))
+    ));
+    assert!(matches!(
+        prompt.tokenize_edit("hi", &[(0, 4)]),
+        Err(ImageGenError::ReferenceImage(_))
+    ));
 }

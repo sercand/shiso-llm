@@ -23,6 +23,19 @@
 //! The kept prompt (everything after the system turn) is capped at
 //! [`MAX_PROMPT_TOKENS`]; a longer one is refused with its count, never
 //! truncated.
+//!
+//! # Edits
+//!
+//! An edit's user turn opens with one bracketed run of `<|image_pad|>` per
+//! reference picture - `<image1><|vision_start|>...<|vision_end|>`, later
+//! ones after a single space - before the caller's text. Each pad is one
+//! image slot: a 32-pixel tile of the picture, a row of the vision tower's
+//! output in the encoder, and four latent tokens in the transformer. The
+//! pads are not counted against the cap. [`EditPromptIds::positions`] gives
+//! the encoder's three rotary axes for the sequence: text advances all
+//! three together, a picture holds the time axis and spreads its slots over
+//! the other two, and the text after it resumes past the picture's longer
+//! side.
 
 use std::path::Path;
 
@@ -46,6 +59,16 @@ pub(crate) const DROP_IDX: usize = 14;
 /// transformer is given.
 pub(crate) const MAX_PROMPT_TOKENS: usize = 512;
 
+/// The control token standing for one image slot.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the edit pipeline that calls this lands later on this branch"
+    )
+)]
+const IMAGE_PAD: &str = "<|image_pad|>";
+
 /// What an empty prompt is sent as: the vocabulary has no BOS token, so an
 /// empty user turn would leave the encoder nothing of the caller's to read.
 const EMPTY_PROMPT: &str = " ";
@@ -63,6 +86,80 @@ impl PromptIds {
     /// The ids whose encoder rows the transformer reads.
     pub(crate) fn kept(&self) -> &[u32] {
         &self.ids[self.drop..]
+    }
+}
+
+/// One edit prompt's encoder input.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the edit pipeline that calls this lands later on this branch"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EditPromptIds {
+    /// The full sequence the encoder reads, system turn included.
+    pub ids: Vec<u32>,
+    /// Leading encoder rows to drop: always [`DROP_IDX`].
+    pub drop: usize,
+    /// Per reference, in order: its run of image slots in `ids` and the
+    /// slot grid's `(rows, columns)`.
+    pub images: Vec<(std::ops::Range<usize>, (usize, usize))>,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the edit pipeline that calls this lands later on this branch"
+    )
+)]
+impl EditPromptIds {
+    /// Which of the kept rows (after the drop) are image slots.
+    pub(crate) fn image_mask_kept(&self) -> Vec<bool> {
+        let mut mask = vec![false; self.ids.len() - self.drop];
+        for (run, _) in &self.images {
+            for i in run.clone() {
+                mask[i - self.drop] = true;
+            }
+        }
+        mask
+    }
+
+    /// The encoder's `[time, height, width]` rotary position of every id.
+    ///
+    /// Text takes the running position on all three axes. A picture whose
+    /// first slot is reached at position `p` puts slot `(row, column)` at
+    /// `[p, p + row, p + column]`, and the text after it resumes at
+    /// `p + max(rows, columns)`.
+    pub(crate) fn positions(&self) -> Vec<[u32; 3]> {
+        let as_u32 = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
+        let mut positions = Vec::with_capacity(self.ids.len());
+        let mut position = 0usize;
+        let mut images = self.images.iter().peekable();
+        while positions.len() < self.ids.len() {
+            match images.peek() {
+                Some((run, (rows, cols))) if run.start == positions.len() => {
+                    for row in 0..*rows {
+                        for col in 0..*cols {
+                            positions.push([
+                                as_u32(position),
+                                as_u32(position + row),
+                                as_u32(position + col),
+                            ]);
+                        }
+                    }
+                    position += (*rows).max(*cols);
+                    images.next();
+                }
+                _ => {
+                    positions.push([as_u32(position); 3]);
+                    position += 1;
+                }
+            }
+        }
+        positions
     }
 }
 
@@ -136,6 +233,103 @@ impl QwenImagePrompt {
         Ok(PromptIds {
             ids,
             drop: DROP_IDX,
+        })
+    }
+
+    /// Encodes an edit's `prompt` with one run of image slots per
+    /// reference; `slots` is each reference's `(rows, columns)`.
+    ///
+    /// # Errors
+    /// [`ImageGenError::ReferenceImage`] for no references or an empty
+    /// grid, and [`ImageGenError::PromptTooLong`] when the kept tokens
+    /// that are not image slots exceed [`MAX_PROMPT_TOKENS`].
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the edit pipeline that calls this lands later on this branch"
+        )
+    )]
+    pub(crate) fn tokenize_edit(
+        &self,
+        prompt: &str,
+        slots: &[(usize, usize)],
+    ) -> Result<EditPromptIds, ImageGenError> {
+        if slots.is_empty() || slots.iter().any(|&(rows, cols)| rows == 0 || cols == 0) {
+            return Err(ImageGenError::ReferenceImage(format!(
+                "an edit prompt needs at least one reference with a non-empty slot grid, \
+                 got {slots:?}"
+            )));
+        }
+        let prompt = if prompt.trim().is_empty() {
+            EMPTY_PROMPT
+        } else {
+            prompt
+        };
+        // One pad per picture here, widened to the picture's slot count
+        // below: control tokens are atomic, so the neighbours encode the
+        // same beside one pad as beside a thousand.
+        let pictures = (1..=slots.len())
+            .map(|n| format!("<image{n}><|vision_start|>{IMAGE_PAD}<|vision_end|>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let head = format!("{SYSTEM_TURN}{USER_OPEN}{pictures}");
+        let short = if self.tokenizer.spells_control_token(prompt) {
+            let mut ids = self.tokenizer.encode_template(&head)?;
+            ids.extend(self.tokenizer.encode_caller(prompt)?);
+            ids.extend(self.tokenizer.encode_template(TAIL)?);
+            ids
+        } else {
+            self.tokenizer
+                .encode_template(&format!("{head}{prompt}{TAIL}"))?
+        };
+        if short.get(..DROP_IDX) != Some(self.system_ids.as_slice()) {
+            return Err(ImageGenError::Backend(
+                "the encoded prompt does not begin with the system turn's tokens".to_string(),
+            ));
+        }
+        let image_pad = match self.tokenizer.encode_template(IMAGE_PAD)?.as_slice() {
+            [id] => *id,
+            other => {
+                return Err(ImageGenError::Checkpoint(format!(
+                    "{IMAGE_PAD} encodes to {} tokens under this vocabulary, not one",
+                    other.len()
+                )));
+            }
+        };
+        let found = short.iter().filter(|&&id| id == image_pad).count();
+        if found != slots.len() {
+            return Err(ImageGenError::Backend(format!(
+                "the edit prompt encoded {found} image slots for {} references",
+                slots.len()
+            )));
+        }
+        let kept = short.len() - DROP_IDX - slots.len();
+        if kept > MAX_PROMPT_TOKENS {
+            return Err(ImageGenError::PromptTooLong {
+                tokens: u32::try_from(kept).unwrap_or(u32::MAX),
+                max: u32::try_from(MAX_PROMPT_TOKENS).unwrap_or(u32::MAX),
+            });
+        }
+        let mut ids =
+            Vec::with_capacity(short.len() + slots.iter().map(|s| s.0 * s.1).sum::<usize>());
+        let mut images = Vec::with_capacity(slots.len());
+        let mut grids = slots.iter();
+        for id in short {
+            if id == image_pad
+                && let Some(&(rows, cols)) = grids.next()
+            {
+                let start = ids.len();
+                ids.resize(start + rows * cols, image_pad);
+                images.push((start..ids.len(), (rows, cols)));
+            } else {
+                ids.push(id);
+            }
+        }
+        Ok(EditPromptIds {
+            ids,
+            drop: DROP_IDX,
+            images,
         })
     }
 }

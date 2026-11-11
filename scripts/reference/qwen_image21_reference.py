@@ -16,6 +16,7 @@ revisions. It never overwrites a fixture: an existing file stops the run, and
 deleting it deliberately is how it is recaptured.
 
     tokenizer   prompt -> ids through the pipeline's own template and drop_idx
+    edit-tokenizer  prompt + condition images -> ids, image-slot mask and 3-axis encoder positions
     sigmas      Turbo (fixed sample_sigmas) and base (dynamic exp shift) schedules
     embed       timestep embedding, shared modulation and txt_in on real weights
     rope        the 3-axis rotary table for text tokens followed by a latent block
@@ -98,9 +99,13 @@ def refuse_existing(path: Path):
 class Out:
     """Writes fixtures for one subcommand and records them for the manifest."""
 
-    def __init__(self, sub: str):
+    def __init__(self, sub: str, own_env: bool = False):
         ROOT.mkdir(parents=True, exist_ok=True)
         self.sub = sub
+        # The edit captures were taken later, in another environment than the
+        # manifest's "global" block describes; they record their own instead
+        # of rewriting that one.
+        self.own_env = own_env
         self.files = {}
         self.inputs = {}
 
@@ -133,6 +138,11 @@ class Out:
         manifest.setdefault("files", {}).update(self.files)
         manifest.setdefault("inputs", {}).update(self.inputs)
         manifest.setdefault("captures", {})[self.sub] = {"script_sha256": sha256_file(Path(__file__))}
+        if self.own_env:
+            manifest["captures"][self.sub]["environment"] = installed_environment()
+            MANIFEST.write_text(json.dumps(manifest, indent=1, sort_keys=True, ensure_ascii=False) + "\n")
+            print(f"[{self.sub}] wrote {len(self.files)} files under {ROOT}")
+            return
         manifest["global"] = {
             "diffusers_commit": DIFFUSERS_COMMIT,
             "diffusers": diffusers.__version__,
@@ -145,6 +155,25 @@ class Out:
         }
         MANIFEST.write_text(json.dumps(manifest, indent=1, sort_keys=True, ensure_ascii=False) + "\n")
         print(f"[{self.sub}] wrote {len(self.files)} files under {ROOT}")
+
+
+def installed_environment() -> dict:
+    """The libraries this run used, with the diffusers commit read from its install record."""
+    import diffusers, torch, transformers
+    from importlib import metadata
+
+    commit = None
+    record = metadata.distribution("diffusers").read_text("direct_url.json")
+    if record:
+        commit = json.loads(record).get("vcs_info", {}).get("commit_id")
+    return {
+        "diffusers": diffusers.__version__,
+        "diffusers_commit": commit,
+        "transformers": transformers.__version__,
+        "torch": torch.__version__,
+        "numpy": np.__version__,
+        "turbo": {"repo": TURBO_REPO, "revision": TURBO_REV},
+    }
 
 
 def _session():
@@ -402,6 +431,102 @@ def cmd_tokenizer(args):
         "Full token ids the pipeline's text encoder sees for each prompt (pipeline template, drop_idx), the kept ids after "
         "dropping the system prefix, and the tokens as strings. Literal special-token text in a prompt is encoded as the "
         "special id (tokenizer default).",
+    )
+    out.finish()
+
+
+# ---------------------------------------------------------------- edit tokenizer
+
+# Source pictures (width, height) of the edit cases; the pipeline resizes each
+# to the area of 1024x1024 at its own aspect ratio.
+EDIT_SOURCES = {
+    "one": [(64, 64)],
+    "three": [(64, 64), (160, 90), (90, 160)],
+}
+EDIT_PROMPT = "Change the background to a sunset beach"
+
+
+def edit_picture(width: int, height: int):
+    """A deterministic opaque RGBA picture: v(x, y, c) = (7x + 13y + 29c) mod 256."""
+    from PIL import Image
+
+    y, x = np.mgrid[0:height, 0:width]
+    rgb = np.stack([(7 * x + 13 * y + 29 * c) % 256 for c in range(3)], axis=-1).astype(np.uint8)
+    alpha = np.full((height, width, 1), 255, dtype=np.uint8)
+    return Image.fromarray(np.concatenate([rgb, alpha], axis=-1), "RGBA")
+
+
+def edit_condition_images(pipe, sources):
+    """The pipeline's step 1 (`__call__`), verbatim in effect: RGBA, then one resize per picture."""
+    from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_dimensions
+
+    images, sizes = [], []
+    for width, height in sources:
+        img = edit_picture(width, height)
+        w, h, _ = calculate_dimensions(1024 * 1024, width / height)
+        sizes.append((w, h))
+        images.append(pipe.image_processor.resize(img, width=w, height=h))
+    return images, sizes
+
+
+class EditCapture(Capture):
+    """`Capture` that also keeps the vision inputs the pipeline hands the text encoder."""
+
+    def __call__(self, input_ids, attention_mask, output_hidden_states, **kw):
+        self.grid = kw["image_grid_thw"].clone()
+        self.pixel_shape = list(kw["pixel_values"].shape)
+        self.token_types = kw.get("mm_token_type_ids")
+        return super().__call__(input_ids, attention_mask, output_hidden_states)
+
+
+def cmd_edit_tokenizer(args):
+    import torch
+    from transformers import Qwen3VLConfig, Qwen3VLModel
+
+    cache = Path(args.cache_dir).expanduser()
+    out = Out("edit-tokenizer", own_env=True)
+    pipe = stub_pipeline(cache)
+    cap = EditCapture()
+    pipe.text_encoder = cap
+    config = Qwen3VLConfig.from_pretrained(str(turbo_file(cache, "text_encoder/config.json").parent))
+    # `get_rope_index` reads only the config; no weights are built.
+    rope_self = type("R", (), {"config": config})()
+    rope_self.get_vision_position_ids = lambda *a, **k: Qwen3VLModel.get_vision_position_ids(rope_self, *a, **k)
+    cases = {}
+    for key, sources in EDIT_SOURCES.items():
+        images, sizes = edit_condition_images(pipe, sources)
+        embeds, mask, pad_mask = pipe._get_qwen_prompt_embeds(EDIT_PROMPT, images, torch.device("cpu"))
+        ids, attention = cap.seen
+        token_types = cap.token_types
+        if token_types is None:  # a processor that does not emit them: image slots are type 1
+            token_types = (ids == pipe._img_token_id).int()
+        position_ids, _ = Qwen3VLModel.get_rope_index(
+            rope_self, ids, token_types, image_grid_thw=cap.grid, video_grid_thw=None, attention_mask=attention
+        )
+        ids = ids[0].tolist()
+        assert embeds.shape[1] == len(ids) - pipe._drop_idx == int(mask.sum())
+        cases[key] = {
+            "prompt": EDIT_PROMPT,
+            "sources": [list(s) for s in sources],
+            "condition_sizes": [list(s) for s in sizes],
+            "image_grid_thw": cap.grid.tolist(),
+            "pixel_values_shape": cap.pixel_shape,
+            "ids": ids,
+            "drop_idx": pipe._drop_idx,
+            "image_pad_mask_kept": [int(v) for v in pad_mask[0].tolist()],
+            # (3, tokens): the time, height and width position of every id.
+            "position_ids": position_ids[:, 0].tolist(),
+        }
+    out.json(
+        "edit_tokenizer.json",
+        {
+            "template_ti2i": pipe.prompt_template_ti2i,
+            "image_pad_id": pipe._img_token_id,
+            "cases": cases,
+        },
+        "Edit prompts through the pipeline's own image-conditioned template and processor: the ids the text encoder "
+        "sees, the image-slot mask after the dropped system turn, the processor's image grids and the "
+        "vision-language model's 3-axis rotary position ids.",
     )
     out.finish()
 
@@ -1314,6 +1439,8 @@ def main():
                            "qwen_image_2.1_turbo_int8_convrot.safetensors",
                            help=f"local copy of the Comfy INT8 file, used only if it is exactly {COMFY_SIZE} bytes; "
                                 "otherwise the tensors are range-read from the hub")
+    p = sub.add_parser("edit-tokenizer", help="edit prompt ids, image-slot mask and 3-axis encoder positions")
+    p.set_defaults(fn=cmd_edit_tokenizer)
     p = sub.add_parser("text-encoder-streamed", help="layer-streamed text encoder (peak ~2 GB disk, ~3 GB RAM)")
     p.set_defaults(fn=cmd_text_encoder_streamed)
     p = sub.add_parser("text-encoder-int8-emulation",
