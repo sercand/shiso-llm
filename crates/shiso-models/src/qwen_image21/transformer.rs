@@ -64,8 +64,8 @@ use super::rope::{Segment, angle_table, prefix_positions, segment_rows, target_p
 use super::vae::LatentGrid;
 use crate::diffusion::lin::Lin;
 use crate::diffusion::ops::{
-    GemmCall, LayerNormCall, LinearResidualCall, ModulateCall, Ops, QkNormRopeCall, Scratch,
-    SdpaCall, SliceExt, SwigluInput,
+    GemmCall, LayerNormCall, LinearResidualCall, ModulateCall, NarrowKvCall, Ops, QkNormRopeCall,
+    Scratch, SdpaCall, SliceExt, SwigluInput,
 };
 use crate::diffusion::weights::StStore;
 
@@ -99,14 +99,23 @@ struct Block {
     mlp_out: Lin,
 }
 
-/// Every layer's text keys and values after `QK-norm` and `RoPE`, for one
+/// Every layer's prefix keys and values after `QK-norm` and `RoPE`, for one
 /// job's prompt, plus the target grid's rotary table once a step has run.
+///
+/// On a device with the half key/value entries the rows are stored as
+/// packed halves: the fused attention stages every key and value as a
+/// saturating half whatever it reads, so the stored halves are the values
+/// each step would have staged from f32 rows. The steps' output is the same
+/// bits, the cache is half the bytes (2.15 GB instead of 4.3 GB for one
+/// 1024x1024 condition image), and no step narrows the cached rows again.
 #[derive(Debug)]
 pub(crate) struct PrefixKv {
     /// `(layers, tokens, hidden)` keys.
     k: DeviceBuffer,
     /// `(layers, tokens, hidden)` values.
     v: DeviceBuffer,
+    /// Whether `k` and `v` hold packed halves (else f32).
+    half: bool,
     tokens: usize,
     layers: usize,
     hidden: usize,
@@ -200,20 +209,49 @@ impl PrefixKv {
         buffer: &'a DeviceBuffer,
         layer: usize,
     ) -> Result<DeviceView<'a>, ImageGenError> {
-        let span = (self.tokens * self.hidden * 4) as u64;
+        let width = if self.half { 2 } else { 4 };
+        let span = (self.tokens * self.hidden * width) as u64;
         buffer.view().cut(layer as u64 * span, span)
     }
 
-    /// Layer `layer`'s keys, `(tokens, hidden)`.
+    /// Layer `layer`'s keys read back as f32, `(tokens, hidden)`.
     #[cfg(test)]
-    pub(crate) fn keys(&self, layer: usize) -> Result<DeviceView<'_>, ImageGenError> {
-        self.layer(&self.k, layer)
+    pub(crate) fn keys(&self, ops: &Ops, layer: usize) -> Result<Vec<f32>, ImageGenError> {
+        self.read(ops, &self.k, layer)
     }
 
-    /// Layer `layer`'s values, `(tokens, hidden)`.
+    /// Layer `layer`'s values read back as f32, `(tokens, hidden)`.
     #[cfg(test)]
-    pub(crate) fn values(&self, layer: usize) -> Result<DeviceView<'_>, ImageGenError> {
-        self.layer(&self.v, layer)
+    pub(crate) fn values(&self, ops: &Ops, layer: usize) -> Result<Vec<f32>, ImageGenError> {
+        self.read(ops, &self.v, layer)
+    }
+
+    #[cfg(test)]
+    fn read(
+        &self,
+        ops: &Ops,
+        buffer: &DeviceBuffer,
+        layer: usize,
+    ) -> Result<Vec<f32>, ImageGenError> {
+        let count = self.tokens * self.hidden;
+        let view = self.layer(buffer, layer)?;
+        if !self.half {
+            return ops.download("prefix rows", view, count);
+        }
+        // Two halves per f32 slot of the download.
+        let packed = ops.download("prefix rows", view, count / 2)?;
+        Ok(packed
+            .iter()
+            .flat_map(|slot| {
+                let bits = slot.to_bits();
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "splitting a 32-bit slot into its two 16-bit halves"
+                )]
+                [bits as u16, (bits >> 16) as u16]
+            })
+            .map(|bits| half::f16::from_bits(bits).to_f32())
+            .collect())
     }
 }
 
@@ -228,6 +266,9 @@ enum Attend<'a> {
         k: DeviceView<'a>,
         v: DeviceView<'a>,
         segments: &'a [(std::ops::Range<usize>, bool)],
+        /// `k` and `v` take packed halves: the block attends f32 scratch
+        /// rows and narrows them into the views afterwards.
+        half: bool,
         last: bool,
     },
     /// The target: keys and values are scratch, and the layer's cached
@@ -236,6 +277,8 @@ enum Attend<'a> {
         cache_k: DeviceView<'a>,
         cache_v: DeviceView<'a>,
         cache_tokens: usize,
+        /// The cached rows are packed halves.
+        cache_half: bool,
     },
 }
 
@@ -283,6 +326,22 @@ pub(crate) struct QwenDit {
 /// `f32` elements as bytes.
 fn bytes(elements: usize) -> u64 {
     (elements * 4) as u64
+}
+
+impl QwenDit {
+    /// The target's attention over its own rows and the cached prefix,
+    /// which is packed halves or f32.
+    fn attend_target(
+        ops: &Ops,
+        cache_half: bool,
+        call: &SdpaCall<'_>,
+    ) -> Result<(), ImageGenError> {
+        if cache_half {
+            ops.sdpa_half_cache(call)
+        } else {
+            ops.sdpa(call)
+        }
+    }
 }
 
 /// Rows `rows` of a `(tokens, width)` f32 view.
@@ -538,9 +597,17 @@ impl QwenDit {
         let layers = self.blocks.len();
         let (positions, target_frame) = prefix_positions(input.layout);
         let segments = segment_rows(input.layout);
+        let stored_half = ops.half_cache();
+        // f32 slots: a packed half row takes half of them (`h` is even).
+        let slots = if stored_half {
+            layers * p * h / 2
+        } else {
+            layers * p * h
+        };
         let kv = PrefixKv {
-            k: ops.alloc_owned_f32("qwen prefix k", layers * p * h)?,
-            v: ops.alloc_owned_f32("qwen prefix v", layers * p * h)?,
+            k: ops.alloc_owned_f32("qwen prefix k", slots)?,
+            v: ops.alloc_owned_f32("qwen prefix v", slots)?,
+            half: stored_half,
             tokens: p,
             layers,
             hidden: h,
@@ -564,6 +631,7 @@ impl QwenDit {
                         k: kv.layer(&kv.k, l)?,
                         v: kv.layer(&kv.v, l)?,
                         segments: &segments,
+                        half: stored_half,
                         last: !whole_last && l + 1 == layers,
                     },
                 },
@@ -803,6 +871,7 @@ impl QwenDit {
                         cache_k: kv.layer(&kv.k, l)?,
                         cache_v: kv.layer(&kv.v, l)?,
                         cache_tokens: kv.tokens,
+                        cache_half: kv.half,
                     },
                 },
             )?;
@@ -884,15 +953,20 @@ impl QwenDit {
 
         let queries = ops.alloc_f32("qwen q", m * h)?;
         Self::linear(ops, "qwen to_q", &w.to_q, normed.view(), queries.view(), m)?;
-        let target_kv;
+        // The keys and values the block attends are f32. A prefix that
+        // keeps f32 rows writes them straight into its cache; every other
+        // case computes them in scratch.
+        let scratch_kv;
         let (keys, values) = match run.attend {
-            Attend::Prefix { k, v, .. } => (k, v),
-            Attend::Target { .. } => {
-                target_kv = (
+            Attend::Prefix {
+                k, v, half: false, ..
+            } => (k, v),
+            Attend::Prefix { half: true, .. } | Attend::Target { .. } => {
+                scratch_kv = (
                     ops.alloc_f32("qwen k", m * h)?,
                     ops.alloc_f32("qwen v", m * h)?,
                 );
-                (target_kv.0.view(), target_kv.1.view())
+                (scratch_kv.0.view(), scratch_kv.1.view())
             }
         };
         Self::linear(ops, "qwen to_k", &w.to_k, normed.view(), keys, m)?;
@@ -961,31 +1035,52 @@ impl QwenDit {
                 cache_k,
                 cache_v,
                 cache_tokens,
-            } => ops.sdpa(&SdpaCall {
-                step: "qwen target attention",
-                out_txt: dummy,
-                out_img: attn.view(),
-                q_txt: dummy,
-                k_txt: dummy,
-                v_txt: dummy,
-                q_img: queries.view(),
-                k_img: keys,
-                v_img: values,
-                q_offset: 0,
-                k_offset: 0,
-                v_offset: 0,
-                cache_k,
-                cache_v,
-                cache_stride: h,
-                txt_tokens: 0,
-                img_tokens: m,
-                cache_tokens,
+                cache_half,
+            } => Self::attend_target(
+                ops,
+                cache_half,
+                &SdpaCall {
+                    step: "qwen target attention",
+                    out_txt: dummy,
+                    out_img: attn.view(),
+                    q_txt: dummy,
+                    k_txt: dummy,
+                    v_txt: dummy,
+                    q_img: queries.view(),
+                    k_img: keys,
+                    v_img: values,
+                    q_offset: 0,
+                    k_offset: 0,
+                    v_offset: 0,
+                    cache_k,
+                    cache_v,
+                    cache_stride: h,
+                    txt_tokens: 0,
+                    img_tokens: m,
+                    cache_tokens,
+                    heads: self.heads,
+                    head_dim: self.head_dim,
+                    txt_stride: h,
+                    img_stride: h,
+                    causal: false,
+                },
+            )?,
+        }
+        if let Attend::Prefix {
+            k, v, half: true, ..
+        } = run.attend
+        {
+            // The cache keeps what the steps' attention will stage.
+            ops.narrow_kv(&NarrowKvCall {
+                step: "qwen prefix cache",
+                k_half: k,
+                v_half: v,
+                k: keys,
+                v: values,
+                rows: m,
                 heads: self.heads,
                 head_dim: self.head_dim,
-                txt_stride: h,
-                img_stride: h,
-                causal: false,
-            })?,
+            })?;
         }
         if let Attend::Prefix { last: true, .. } = run.attend {
             // The last layer's text stream feeds nothing: its keys and

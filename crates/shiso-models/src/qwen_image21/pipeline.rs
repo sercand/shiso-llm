@@ -523,9 +523,12 @@ impl QwenImage21Model {
         let t = grid.cells();
         let row = 7 * h + 2 * mlp + dit.in_channels + dit.out_channels;
         let as_u64 = |v: usize| u64::try_from(v).unwrap_or(u64::MAX);
+        // The prefix cache is packed halves where the device can attend
+        // them, f32 otherwise.
+        let cache_width = if self.ops.half_cache() { 2 } else { 4 };
         JobPeaks {
             encode: as_u64(tokens * (8 * enc_h + 3 * enc_i) * 4),
-            denoise: as_u64(2 * dit.num_layers * kept * h * 4 + (t + kept) * row * 4),
+            denoise: as_u64(2 * dit.num_layers * kept * h * cache_width + (t + kept) * row * 4),
             decode: state.decoder.plan().working_set_bytes(grid),
         }
     }

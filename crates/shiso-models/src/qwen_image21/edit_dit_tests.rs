@@ -181,9 +181,7 @@ fn text_only_prefix_digest() {
         .upload_f32("latents", &signal(grid.cells() * channels, 8))
         .expect("upload");
     let mut kv = dit.prefix(&ops, feats.view(), p).expect("the prefix");
-    let keys = ops
-        .download("k", kv.keys(0).expect("layer 0"), p * hidden)
-        .expect("read");
+    let keys = kv.keys(&ops, 0).expect("layer 0");
     dit.prepare_steps(&ops, &mut kv, &[0.5], grid)
         .expect("the step tables");
     let out = ops
@@ -260,16 +258,16 @@ fn edit_block_matches_reference() {
             .expect("the interleaved prefix");
         assert_eq!(kv.tokens(), prefix_tokens);
         assert_eq!(kv.target_frame(), 31);
-        for (name, view) in [
-            ("prefix_k", kv.keys(0).expect("keys")),
-            ("prefix_v", kv.values(0).expect("values")),
+        // The cache is read back as stored: packed halves on this device,
+        // so each value carries half's rounding (2^-11 relative at most).
+        for (name, got) in [
+            ("prefix_k", kv.keys(&ops, 0).expect("keys")),
+            ("prefix_v", kv.values(&ops, 0).expect("values")),
         ] {
-            let got = ops
-                .download("prefix", view, prefix_tokens * hidden)
-                .expect("read");
+            assert_eq!(got.len(), prefix_tokens * hidden);
             let err = rel_l2(&got, &read_f32(&format!("{case}_{name}.f32")));
             eprintln!("{case}: {name} rel L2 {err:.3e}");
-            assert!(err <= 1e-4, "{case} {name} rel L2 {err:e}");
+            assert!(err <= 5e-4, "{case} {name} rel L2 {err:e}");
         }
         dit.prepare_steps(&ops, &mut kv, &[sigma], grid)
             .expect("the step tables");

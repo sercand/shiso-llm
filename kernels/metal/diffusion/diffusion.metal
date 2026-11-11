@@ -1963,7 +1963,8 @@ kernel void kernel_dit_kv_half_f32(
         ushort lane [[thread_index_in_simdgroup]], \
         ushort sg [[simdgroup_index_in_threadgroup]]
 
-template <bool CAUSAL, uint RB, uint NSG, uint HD, bool UNIT_SCALE = false, bool KV_HALF = false>
+template <bool CAUSAL, uint RB, uint NSG, uint HD, bool UNIT_SCALE = false, bool KV_HALF = false,
+          bool CACHE_HALF = false>
 kernel void kernel_dit_flash_sdpa(DIT_FLASH_SDPA_PARAMS) {
     const uint QR = 8u * RB * NSG;
     const uint KB = DIT_FA_KEYS;
@@ -2045,7 +2046,13 @@ kernel void kernel_dit_flash_sdpa(DIT_FLASH_SDPA_PARAMS) {
             rk[q] = half4(0.0h);
             rv[q] = half4(0.0h);
             if (e < KB * hd4 && s < keys) {
-                if (KV_HALF) {
+                if (CACHE_HALF && s >= rows) {
+                    // Bindings 9 and 10 carry the cached rows as packed
+                    // halves, narrowed once when the cache was written.
+                    const uint64_t o = (uint64_t) (s - rows) * (args.heads * hd) + h * hd + d;
+                    rk[q] = half4(*((device const packed_half4 *) ((device const half *) cache_k + o)));
+                    rv[q] = half4(*((device const packed_half4 *) ((device const half *) cache_v + o)));
+                } else if (KV_HALF) {
                     // Bindings 4 and 5 carry `kernel_dit_kv_half_f32`'s
                     // packed rows: the same halves, already narrowed.
                     const uint64_t o = (uint64_t) s * (args.heads * hd) + h * hd + d;
@@ -2178,6 +2185,16 @@ kernel void kernel_dit_flash_sdpa<true, DIT_FA_RB, DIT_FA_SG, 128u>(DIT_FLASH_SD
 /// not read. Same staged values, so the same bits as the f32 entry.
 template [[host_name("kernel_dit_flash_sdpa_d128_kvh")]]
 kernel void kernel_dit_flash_sdpa<false, DIT_FA_RB, DIT_FA_SG, 128u, false, true>(DIT_FLASH_SDPA_PARAMS);
+
+/// The same entry over a cache that is stored as half: bindings 4 and 5
+/// are the live rows' packed halves (`kernel_dit_kv_half_f32` with no
+/// cache), bindings 9 and 10 the cached rows' packed halves, `(cache_tokens,
+/// heads * head_dim)` each, written once by that kernel when the cache was
+/// built. A cache kept across many calls is then never narrowed again, and
+/// holds half the bytes. Same staged values, so the same bits as the f32
+/// entry over the f32 cache.
+template [[host_name("kernel_dit_flash_sdpa_d128_kvhc")]]
+kernel void kernel_dit_flash_sdpa<false, DIT_FA_RB, DIT_FA_SG, 128u, false, true, true>(DIT_FLASH_SDPA_PARAMS);
 
 template [[host_name("kernel_dit_flash_sdpa_unit_d64_f32")]]
 kernel void kernel_dit_flash_sdpa<false, DIT_FA_RB, DIT_FA_SG, 64u, true>(DIT_FLASH_SDPA_PARAMS);

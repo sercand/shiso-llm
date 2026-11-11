@@ -617,6 +617,20 @@ pub(crate) struct SdpaCall<'a> {
     pub causal: bool,
 }
 
+/// Keys and values narrowed to packed half rows (see [`Ops::narrow_kv`]).
+pub(crate) struct NarrowKvCall<'a> {
+    pub step: &'static str,
+    /// `(rows, heads * head_dim)` halves out.
+    pub k_half: DeviceView<'a>,
+    pub v_half: DeviceView<'a>,
+    /// `(rows, heads * head_dim)` f32 in.
+    pub k: DeviceView<'a>,
+    pub v: DeviceView<'a>,
+    pub rows: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+}
+
 /// Grouped-query causal attention (the text encoder's prefill).
 pub(crate) struct GqaCall<'a> {
     pub step: &'static str,
@@ -903,8 +917,15 @@ impl Drop for Scratch<'_> {
 /// f32 entry stages, so the output is the same bits either way; a module
 /// without them (the CUDA set today) keeps the f32 entry rather than being
 /// refused.
-pub(crate) const HALF_KV_KERNELS: [&str; 2] =
-    ["kernel_dit_kv_half_f32", "kernel_dit_flash_sdpa_d128_kvh"];
+///
+/// The third entry reads a cache that is *stored* as half
+/// ([`Ops::sdpa_half_cache`]): the cached rows are narrowed once, when the
+/// cache is written, instead of on every call.
+pub(crate) const HALF_KV_KERNELS: [&str; 3] = [
+    "kernel_dit_kv_half_f32",
+    "kernel_dit_flash_sdpa_d128_kvh",
+    "kernel_dit_flash_sdpa_d128_kvhc",
+];
 
 /// Every diffusion kernel entry this driver launches: the module's full
 /// registration in `metal/diffusion/diffusion.metal`. [`Ops::new`] probes the device
@@ -1037,6 +1058,14 @@ impl Ops {
             pool: Mutex::default(),
             half_kv: false,
         })
+    }
+
+    /// Whether a 128-wide-head attention cache can be kept as packed half
+    /// rows ([`Ops::narrow_kv`], [`Ops::sdpa_half_cache`]): true when the
+    /// module carries [`HALF_KV_KERNELS`]. A device without them keeps its
+    /// cache in f32 and attends it through [`Ops::sdpa`].
+    pub(crate) fn half_cache(&self) -> bool {
+        self.half_kv
     }
 
     /// The wrapped device, for direct copies and imports.
@@ -1977,6 +2006,139 @@ impl Ops {
                 KernelArg::Buffer(self.dummy.view()),
                 KernelArg::Buffer(self.dummy.view()),
                 KernelArg::Buffer(self.dummy.view()),
+            ],
+        )
+    }
+
+    /// Narrows `rows` packed `(rows, heads * head_dim)` f32 keys and values
+    /// into packed half rows of the same shape: the conversion the fused
+    /// attention applies to every key and value it stages (saturating), so
+    /// rows stored this way attend exactly as their f32 originals do.
+    ///
+    /// # Errors
+    /// [`ImageGenError::Backend`] on a device without [`HALF_KV_KERNELS`] or
+    /// a failed launch.
+    pub(crate) fn narrow_kv(&self, call: &NarrowKvCall<'_>) -> Result<(), ImageGenError> {
+        if !self.half_kv {
+            return Err(ImageGenError::Backend(format!(
+                "{}: this device's kernel set has no half key/value entries",
+                call.step
+            )));
+        }
+        let width = call.heads * call.head_dim;
+        let args = SdpaArgs {
+            txt_tokens: call.rows as u32,
+            img_tokens: 0,
+            cache_tokens: 0,
+            heads: call.heads as u32,
+            head_dim: call.head_dim as u32,
+            txt_stride: width as u32,
+            img_stride: width as u32,
+            cache_stride: width as u32,
+            q_offset: 0,
+            k_offset: 0,
+            v_offset: 0,
+        };
+        let dummy = self.dummy.view();
+        self.launch(
+            call.step,
+            HALF_KV_KERNELS[0],
+            Extent3::new(grid_for((width / 4) as u32, BLOCK), call.rows as u32, 1),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(call.k_half),
+                KernelArg::Buffer(call.v_half),
+                KernelArg::Buffer(call.k),
+                KernelArg::Buffer(call.v),
+                KernelArg::Buffer(dummy),
+                KernelArg::Buffer(dummy),
+                KernelArg::Buffer(dummy),
+                KernelArg::Buffer(dummy),
+            ],
+        )
+    }
+
+    /// [`Ops::sdpa`] over a cache stored as packed half rows
+    /// ([`Ops::narrow_kv`]): `call.cache_k` and `call.cache_v` are
+    /// `(cache_tokens, heads * head_dim)` halves. The live rows' keys and
+    /// values are narrowed per call, the cached ones are read as they are,
+    /// so a cache kept across the steps of a job is never narrowed again.
+    /// Bit-identical to [`Ops::sdpa`] over the same cache in f32.
+    ///
+    /// # Errors
+    /// [`ImageGenError::Backend`] for a causal call, a head other than 128
+    /// wide, a device without [`HALF_KV_KERNELS`], or a failed launch.
+    pub(crate) fn sdpa_half_cache(&self, call: &SdpaCall<'_>) -> Result<(), ImageGenError> {
+        if call.causal || call.head_dim != 128 || !self.half_kv {
+            return Err(ImageGenError::Backend(format!(
+                "{}: a half cache is attended bidirectionally by 128-wide heads on a device \
+                 with the half key/value entries (causal {}, head {}, entries {})",
+                call.step, call.causal, call.head_dim, self.half_kv
+            )));
+        }
+        let args = SdpaArgs {
+            txt_tokens: call.txt_tokens as u32,
+            img_tokens: call.img_tokens as u32,
+            cache_tokens: call.cache_tokens as u32,
+            heads: call.heads as u32,
+            head_dim: call.head_dim as u32,
+            txt_stride: call.txt_stride as u32,
+            img_stride: call.img_stride as u32,
+            cache_stride: call.cache_stride as u32,
+            q_offset: call.q_offset as u32,
+            k_offset: call.k_offset as u32,
+            v_offset: call.v_offset as u32,
+        };
+        let live_args = SdpaArgs {
+            cache_tokens: 0,
+            ..args
+        };
+        let width = call.heads * call.head_dim;
+        let live = call.txt_tokens + call.img_tokens;
+        // Halves, two per f32 slot; the width is a multiple of eight.
+        let k_half = self.alloc_f32(call.step, live * width / 2)?;
+        let v_half = self.alloc_f32(call.step, live * width / 2)?;
+        let dummy = self.dummy.view();
+        self.launch(
+            call.step,
+            HALF_KV_KERNELS[0],
+            Extent3::new(grid_for((width / 4) as u32, BLOCK), live as u32, 1),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&live_args)),
+                KernelArg::Buffer(k_half.view()),
+                KernelArg::Buffer(v_half.view()),
+                KernelArg::Buffer(call.k_txt),
+                KernelArg::Buffer(call.v_txt),
+                KernelArg::Buffer(call.k_img),
+                KernelArg::Buffer(call.v_img),
+                KernelArg::Buffer(dummy),
+                KernelArg::Buffer(dummy),
+            ],
+        )?;
+        let (cache_k, cache_v) = if call.cache_tokens == 0 {
+            (dummy, dummy)
+        } else {
+            (call.cache_k, call.cache_v)
+        };
+        self.launch(
+            call.step,
+            HALF_KV_KERNELS[2],
+            Extent3::new(grid_for(live as u32, FA_QROWS), call.heads as u32, 1),
+            Extent3::linear(FA_THREADS),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(call.out_txt),
+                KernelArg::Buffer(call.out_img),
+                KernelArg::Buffer(call.q_txt),
+                KernelArg::Buffer(k_half.view()),
+                KernelArg::Buffer(v_half.view()),
+                KernelArg::Buffer(call.q_img),
+                KernelArg::Buffer(dummy),
+                KernelArg::Buffer(dummy),
+                KernelArg::Buffer(cache_k),
+                KernelArg::Buffer(cache_v),
             ],
         )
     }

@@ -110,6 +110,7 @@ const ENTRIES: &[&str] = &[
     "kernel_dit_avg_down_add_f32",
     "kernel_dit_kv_half_f32",
     "kernel_dit_flash_sdpa_d128_kvh",
+    "kernel_dit_flash_sdpa_d128_kvhc",
 ];
 
 // --- argument blocks: byte-for-byte the driver's `#[repr(C)]` Pods ---------
@@ -2863,6 +2864,176 @@ fn flash_sdpa_from_half_kv_is_the_f32_entry_bit_for_bit() {
     );
     assert_bit_identical(&got_txt, &want_txt, "half K/V vs f32 entry: txt rows");
     assert_bit_identical(&got_img, &want_img, "half K/V vs f32 entry: img rows");
+}
+
+/// The route for a cache that is already stored as half: the live rows'
+/// K and V narrowed per call, the cached rows narrowed once beforehand
+/// (here by the same kernel, as the prefix does), and the attention entry
+/// that reads the live halves and the cached halves from two buffers.
+#[expect(
+    clippy::too_many_lines,
+    reason = "two narrowing launches and the attention launch, each with its full binding list"
+)]
+fn run_flash_half_cache(b: &Arc<dyn Backend>, c: &Joint<'_>) -> (Vec<f32>, Vec<f32>) {
+    assert_eq!(
+        c.hd, 128,
+        "the half-cache entry is built for 128-wide heads"
+    );
+    let hidden = c.heads * c.hd;
+    let stream = |v: &[f32]| -> DeviceBuffer {
+        if v.is_empty() {
+            dummy(b)
+        } else {
+            upload_f32(b, v)
+        }
+    };
+    let [q_txt, k_txt, v_txt, q_img, k_img, v_img, cache_k, cache_v] = [
+        c.q_txt, c.k_txt, c.v_txt, c.q_img, c.k_img, c.v_img, c.cache_k, c.cache_v,
+    ]
+    .map(stream);
+    let live = c.txt + c.img;
+    let halves = |rows: usize| alloc(b, (rows * hidden * 2) as u64).expect("alloc");
+    let (k_half, v_half) = (halves(live), halves(live));
+    let (stored_keys, stored_values) = (halves(c.cache), halves(c.cache));
+    let out_bytes = |rows: usize| (rows * hidden * 4) as u64;
+    let out_txt_buf = alloc(b, out_bytes(c.txt)).expect("alloc");
+    let out_img_buf = alloc(b, out_bytes(c.img)).expect("alloc");
+    let args = SdpaArgs {
+        txt_tokens: c.txt as u32,
+        img_tokens: c.img as u32,
+        cache_tokens: c.cache as u32,
+        heads: c.heads as u32,
+        head_dim: c.hd as u32,
+        txt_stride: c.txt_stride as u32,
+        img_stride: c.img_stride as u32,
+        cache_stride: c.cache_stride as u32,
+        q_offset: c.q_off as u32,
+        k_offset: c.k_off as u32,
+        v_offset: c.v_off as u32,
+    };
+    let unread = dummy(b);
+    let narrow =
+        |args: &SdpaArgs, rows: usize, out: [&DeviceBuffer; 2], src: [&DeviceBuffer; 4]| {
+            launch(
+                b,
+                "kernel_dit_kv_half_f32",
+                Extent3::new(grid_for((hidden / 4) as u32, 64), rows as u32, 1),
+                Extent3::linear(64),
+                &[
+                    KernelArg::Bytes(bytes_of(args)),
+                    KernelArg::Buffer(out[0].view()),
+                    KernelArg::Buffer(out[1].view()),
+                    KernelArg::Buffer(src[0].view()),
+                    KernelArg::Buffer(src[1].view()),
+                    KernelArg::Buffer(src[2].view()),
+                    KernelArg::Buffer(src[3].view()),
+                    KernelArg::Buffer(unread.view()),
+                    KernelArg::Buffer(unread.view()),
+                ],
+            );
+        };
+    // The live rows, with no cache in the narrowing.
+    let live_args = SdpaArgs {
+        cache_tokens: 0,
+        ..args
+    };
+    narrow(
+        &live_args,
+        live,
+        [&k_half, &v_half],
+        [&k_txt, &v_txt, &k_img, &v_img],
+    );
+    // The cached rows on their own, read as the narrowing's `txt` rows.
+    let cache_args = SdpaArgs {
+        txt_tokens: c.cache as u32,
+        img_tokens: 0,
+        cache_tokens: 0,
+        txt_stride: c.cache_stride as u32,
+        ..args
+    };
+    narrow(
+        &cache_args,
+        c.cache,
+        [&stored_keys, &stored_values],
+        [&cache_k, &cache_v, &unread, &unread],
+    );
+    launch(
+        b,
+        "kernel_dit_flash_sdpa_d128_kvhc",
+        Extent3::new(grid_for(live as u32, FA_QROWS), c.heads as u32, 1),
+        Extent3::linear(FA_THREADS),
+        &[
+            KernelArg::Bytes(bytes_of(&args)),
+            KernelArg::Buffer(out_txt_buf.view()),
+            KernelArg::Buffer(out_img_buf.view()),
+            KernelArg::Buffer(q_txt.view()),
+            KernelArg::Buffer(k_half.view()),
+            KernelArg::Buffer(v_half.view()),
+            KernelArg::Buffer(q_img.view()),
+            KernelArg::Buffer(unread.view()),
+            KernelArg::Buffer(unread.view()),
+            KernelArg::Buffer(stored_keys.view()),
+            KernelArg::Buffer(stored_values.view()),
+        ],
+    );
+    (
+        read_f32(b, out_txt_buf.view(), c.txt * hidden),
+        read_f32(b, out_img_buf.view(), c.img * hidden),
+    )
+}
+
+/// A cache stored as half gives the bits the f32 entry gives over the f32
+/// cache: the stored halves are the ones that entry stages on every read.
+/// Same shapes as the half-K/V case - fused live rows, a narrower cache,
+/// partial tiles, values past half's range - with 300 cached rows so the
+/// key stream crosses from the live buffer into the cache mid-block and
+/// then runs whole blocks inside it.
+#[test]
+fn flash_sdpa_from_a_half_cache_is_the_f32_entry_bit_for_bit() {
+    let Some(b) = open() else { return };
+    let (heads, hd) = (2usize, 128usize);
+    let hidden = heads * hd;
+    let fused = 3 * hidden;
+    let (txt, img, cache) = (7usize, 70usize, 300usize);
+    let rows = |n: usize, width: usize, seed: usize| -> Vec<f32> {
+        vals(n * width, seed)
+            .iter()
+            .enumerate()
+            .map(|(i, v)| if i % 97 == 5 { v * 2.0e4 } else { v * 0.05 })
+            .collect()
+    };
+    let txt_rows = rows(txt, fused, 94);
+    let img_rows = rows(img, fused, 95);
+    let cache_rows = rows(cache, 2 * hidden, 96);
+    let case = Joint {
+        q_txt: &txt_rows,
+        k_txt: &txt_rows,
+        v_txt: &txt_rows,
+        q_img: &img_rows,
+        k_img: &img_rows,
+        v_img: &img_rows,
+        cache_k: &cache_rows,
+        cache_v: &cache_rows,
+        txt,
+        img,
+        cache,
+        heads,
+        hd,
+        txt_stride: fused,
+        img_stride: fused,
+        cache_stride: 2 * hidden,
+        q_off: 0,
+        k_off: hidden,
+        v_off: 2 * hidden,
+    };
+    let (want_txt, want_img) = run_flash(&b, &case);
+    let (got_txt, got_img) = run_flash_half_cache(&b, &case);
+    assert!(
+        want_txt.iter().chain(&want_img).all(|v| v.is_finite()),
+        "the f32 entry's output is finite"
+    );
+    assert_bit_identical(&got_txt, &want_txt, "half cache vs f32 entry: txt rows");
+    assert_bit_identical(&got_img, &want_img, "half cache vs f32 entry: img rows");
 }
 
 fn expect_all(c: &Joint<'_>) -> Vec<f32> {
