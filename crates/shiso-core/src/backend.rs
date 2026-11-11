@@ -14,7 +14,7 @@ use std::ops::Range;
 
 use crate::buffer::{DeviceView, HostBytes, RawBuffer};
 
-use crate::error::CoreResult;
+use crate::error::{CoreError, CoreResult};
 
 /// A three-dimensional extent: a grid or a block, always three-dimensional.
 ///
@@ -553,6 +553,106 @@ pub trait Backend: Send + Sync + fmt::Debug {
     /// [`crate::CoreError::Backend`] when the device reports a failure while draining
     /// its queue.
     fn sync(&self) -> CoreResult<()>;
+
+    /// Whether this backend can run a whole pass as one command buffer with
+    /// host-handled cuts ([`Backend::encode_cut`]) instead of a drain per fetch.
+    /// `false` keeps the serial path; only a backend that implements the whole
+    /// cut handshake returns `true`.
+    fn supports_segments(&self) -> bool {
+        false
+    }
+
+    /// Encodes a cut into the open command buffer: the GPU signals that it has
+    /// reached this point and then waits for the host to release it. Returns
+    /// the cut's index, which [`Backend::wait_cut`] and [`Backend::resume_cut`]
+    /// take. The launches before the cut and after it stay in ONE buffer,
+    /// committed once by [`Backend::commit_segments`].
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CoreError::Unsupported`] on a backend without segments.
+    fn encode_cut(&self) -> CoreResult<u32> {
+        Err(CoreError::Unsupported {
+            what: "a fetch cut on a backend that runs one command buffer per drain",
+            backend: "core",
+        })
+    }
+
+    /// Commits the command buffer carrying the encoded cuts, without waiting:
+    /// the GPU runs up to the first cut while the host handles it.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CoreError::Unsupported`] on a backend without segments.
+    fn commit_segments(&self) -> CoreResult<()> {
+        Err(CoreError::Unsupported {
+            what: "a segmented commit on a backend that runs one command buffer per drain",
+            backend: "core",
+        })
+    }
+
+    /// Blocks until the GPU has reached `cut` (signalled it), so the host may
+    /// read what the launches before it wrote.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CoreError::Unsupported`] on a backend without segments, or
+    /// [`crate::CoreError::Backend`] if the command buffer faults or the wait
+    /// times out.
+    fn wait_cut(&self, cut: u32) -> CoreResult<()> {
+        let _ = cut;
+        Err(CoreError::Unsupported {
+            what: "a cut wait on a backend that runs one command buffer per drain",
+            backend: "core",
+        })
+    }
+
+    /// Releases the GPU past `cut`, after the host has written what the
+    /// launches after it read.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CoreError::Unsupported`] on a backend without segments.
+    fn resume_cut(&self, cut: u32) -> CoreResult<()> {
+        let _ = cut;
+        Err(CoreError::Unsupported {
+            what: "a cut resume on a backend that runs one command buffer per drain",
+            backend: "core",
+        })
+    }
+
+    /// Reads a shared buffer's bytes WITHOUT draining: the caller has already
+    /// ordered the GPU (a cut wait), so a flush here would deadlock on the
+    /// paused buffer. Only valid on a backend whose buffers are host-visible.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CoreError::Unsupported`] on a backend without segments.
+    fn read_shared(&self, src: DeviceView<'_>, dst: &mut [u8]) -> CoreResult<()> {
+        let _ = (src, dst);
+        Err(CoreError::Unsupported {
+            what: "a non-draining shared read on a backend without segments",
+            backend: "core",
+        })
+    }
+
+    /// Fills shared buffers in place WITHOUT draining, as [`Backend::write_host`]
+    /// does but for a host already ordered against the GPU by a cut.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CoreError::Unsupported`] on a backend without segments.
+    fn write_shared(
+        &self,
+        dsts: &[DeviceView<'_>],
+        fill: &mut dyn FnMut(&mut [&mut [u8]]) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        let _ = (dsts, fill);
+        Err(CoreError::Unsupported {
+            what: "a non-draining shared write on a backend without segments",
+            backend: "core",
+        })
+    }
 
     /// Opens a branch: launches from here to [`Backend::resume`] wait for
     /// everything issued before this call, and may run beside whatever is
