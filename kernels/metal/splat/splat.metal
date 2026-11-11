@@ -436,7 +436,10 @@ kernel void kernel_splat_deform_im2col_f32(
 // heads), cool: 130 ms per launch (4.75 TFLOP/s), against 193 ms with
 // `precise::exp` and 800 ms for the same attention as transposes, score
 // GEMMs, softmax and P.V GEMMs. Two row blocks per simdgroup (the K fragment
-// reused across 16 rows) spilled: 230 ms.
+// reused across 16 rows) spilled: 230 ms. On an M4 the same launch is 207 ms
+// (2.99 TFLOP/s); with every fragment a `simdgroup_half8x8` it was 199 ms and
+// with only K and V staged as half 216 ms, so the f32 form gives up nothing
+// worth its rounding.
 //
 // Grid `(ceil(queries / 64), heads)` of 256 threads.
 kernel void kernel_splat_attn_f32(

@@ -747,6 +747,16 @@ pub struct ServeOptions {
     /// model's 32768..=1048576.
     #[cfg_attr(feature = "clap", arg(long, env = "SHISO_SPLAT_DEFAULT_NUM_GAUSSIANS"))]
     pub splat_default_num_gaussians: Option<u32>,
+    /// How often a splat request that names no `refresh_every` runs a step
+    /// in full. Unset, every step does (1), which is the reference's sampler.
+    /// At 2 to 4, the steps between two full ones (the first two are always
+    /// full) run the conditional pass alone, over the latent only, holding
+    /// the last full step's guidance direction and the conditioning rows'
+    /// keys: faster, and an approximation. Measured on an M4 at 25 steps:
+    /// 362 s at 1, 278 s at 2 (renders score as the reference sampler's do
+    /// against a 50-step request), 250 s at 3 (slightly softer).
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_SPLAT_REFRESH_EVERY"))]
+    pub splat_refresh_every: Option<u32>,
     /// Embedding requests that may wait in the queue beyond the one running,
     /// when `--model` is an embedding checkpoint; the next is refused with a
     /// 503 a retry can fix.
@@ -1130,6 +1140,7 @@ impl Default for ServeOptions {
             splat_max_queue: 2,
             splat_default_steps: None,
             splat_default_num_gaussians: None,
+            splat_refresh_every: None,
             embedding_max_queue: 64,
             image_default_steps: None,
             image_default_size: None,
@@ -1566,6 +1577,11 @@ impl ServeOptions {
                 flag: "splat-default-num-gaussians",
             });
         }
+        if self.splat_refresh_every == Some(0) {
+            return Err(ConfigError::Zero {
+                flag: "splat-refresh-every",
+            });
+        }
         Ok(())
     }
 
@@ -1575,6 +1591,7 @@ impl ServeOptions {
         crate::splat::SplatOverrides {
             steps: self.splat_default_steps,
             num_gaussians: self.splat_default_num_gaussians,
+            refresh_every: self.splat_refresh_every,
         }
     }
 
@@ -2022,6 +2039,7 @@ mod tests {
         let options = ServeOptions {
             splat_default_steps: Some(20),
             splat_default_num_gaussians: Some(65_536),
+            splat_refresh_every: Some(2),
             ..splat_options()
         };
         assert_eq!(
@@ -2029,6 +2047,7 @@ mod tests {
             crate::splat::SplatOverrides {
                 steps: Some(20),
                 num_gaussians: Some(65_536),
+                refresh_every: Some(2),
             }
         );
     }

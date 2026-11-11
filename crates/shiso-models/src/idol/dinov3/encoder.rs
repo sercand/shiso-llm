@@ -81,6 +81,158 @@ fn load_turned(
     ))
 }
 
+/// How a checkpoint names the tower's tensors.
+///
+/// The same weights ship in two exports. One keeps a projection per tensor
+/// (`layer.N.attention.q_proj`); the other packs the three attention
+/// projections into one `(3 * hidden, hidden)` weight (`blocks.N.attn.qkv`)
+/// and carries no attention bias at all. Nothing is lost by the second: the
+/// published tower's query and value biases are zero in every block (read
+/// from the export that keeps them) and it has no key bias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// One tensor per projection.
+    Split,
+    /// The attention projections packed into one weight.
+    Packed,
+}
+
+/// The names of the tensors outside the blocks.
+struct TopNames {
+    cls: &'static str,
+    registers: &'static str,
+    patch_w: &'static str,
+    patch_b: &'static str,
+}
+
+impl Layout {
+    const fn names(self) -> TopNames {
+        match self {
+            Self::Split => TopNames {
+                cls: "embeddings.cls_token",
+                registers: "embeddings.register_tokens",
+                patch_w: "embeddings.patch_embeddings.weight",
+                patch_b: "embeddings.patch_embeddings.bias",
+            },
+            Self::Packed => TopNames {
+                cls: "cls_token",
+                registers: "reg_token",
+                patch_w: "patch_embed.proj.weight",
+                patch_b: "patch_embed.proj.bias",
+            },
+        }
+    }
+}
+
+/// A block of the export that keeps one tensor per projection.
+fn load_split_block(
+    store: &StStore,
+    ops: &Ops,
+    i: usize,
+    config: &DinoConfig,
+) -> Result<Block, ImageGenError> {
+    let base = format!("layer.{i}.");
+    let (q, q_turn) = load_turned(store, ops, &format!("{base}attention.q_proj"), config)?;
+    let (k, k_turn) = load_turned(store, ops, &format!("{base}attention.k_proj"), config)?;
+    Ok(Block {
+        norm1: Affine::load(store, ops, &format!("{base}norm1"))?,
+        q,
+        q_turn,
+        k,
+        k_turn,
+        v: Lin::load(store, ops, &format!("{base}attention.v_proj"))?,
+        o: Lin::load(store, ops, &format!("{base}attention.o_proj"))?,
+        scale1: store.f32_widen(
+            ops,
+            "dino layer scale",
+            &format!("{base}layer_scale1.lambda1"),
+        )?,
+        norm2: Affine::load(store, ops, &format!("{base}norm2"))?,
+        gate: Lin::load(store, ops, &format!("{base}mlp.gate_proj"))?,
+        up: Lin::load(store, ops, &format!("{base}mlp.up_proj"))?,
+        down: Lin::load(store, ops, &format!("{base}mlp.down_proj"))?,
+        scale2: store.f32_widen(
+            ops,
+            "dino layer scale",
+            &format!("{base}layer_scale2.lambda1"),
+        )?,
+    })
+}
+
+/// The attention bias `name` of the packed export, `hidden` values.
+///
+/// # Errors
+///
+/// [`ImageGenError::Checkpoint`] for a bias of another length.
+// `Ok(None)` is an export that carries no such tensor: the published tower's
+// query and value biases are zero, and one export drops them.
+fn packed_bias(
+    store: &StStore,
+    name: &str,
+    hidden: usize,
+) -> Result<Option<Vec<f32>>, ImageGenError> {
+    if !store.contains(name) {
+        return Ok(None);
+    }
+    let bias = store.f32_vec(name)?;
+    if bias.len() != hidden {
+        return Err(ImageGenError::Checkpoint(format!(
+            "{name} is {} values, expected {hidden}",
+            bias.len()
+        )));
+    }
+    Ok(Some(bias))
+}
+
+/// A block of the export that packs the attention projections: the packed
+/// weight's thirds are the query, key and value weights, in that order. The
+/// query and value biases are read when the export carries them
+/// (`attn.q_bias`, `attn.v_bias`) and are absent otherwise.
+fn load_packed_block(
+    store: &StStore,
+    ops: &Ops,
+    i: usize,
+    config: &DinoConfig,
+) -> Result<Block, ImageGenError> {
+    let base = format!("blocks.{i}.");
+    let hidden = config.hidden;
+    let name = format!("{base}attn.qkv.weight");
+    let w = store.f32_vec(&name)?;
+    if w.len() != 3 * hidden * hidden {
+        return Err(ImageGenError::Checkpoint(format!(
+            "{name} is {} values, expected 3 x {hidden} rows of {hidden}",
+            w.len()
+        )));
+    }
+    let part = |i: usize| &w[i * hidden * hidden..(i + 1) * hidden * hidden];
+    let with_turn = |w: &[f32], b: Option<&[f32]>| -> Result<(Lin, Lin), ImageGenError> {
+        let (tw, tb) = turned(w, b, config.heads, config.head_dim());
+        Ok((
+            host_lin(ops, w, b, hidden, hidden)?,
+            host_lin(ops, &tw, tb.as_deref(), hidden, hidden)?,
+        ))
+    };
+    let q_bias = packed_bias(store, &format!("{base}attn.q_bias"), hidden)?;
+    let v_bias = packed_bias(store, &format!("{base}attn.v_bias"), hidden)?;
+    let (q, q_turn) = with_turn(part(0), q_bias.as_deref())?;
+    let (k, k_turn) = with_turn(part(1), None)?;
+    Ok(Block {
+        norm1: Affine::load(store, ops, &format!("{base}norm1"))?,
+        q,
+        q_turn,
+        k,
+        k_turn,
+        v: host_lin(ops, part(2), v_bias.as_deref(), hidden, hidden)?,
+        o: Lin::load(store, ops, &format!("{base}attn.proj"))?,
+        scale1: store.f32_widen(ops, "dino layer scale", &format!("{base}gamma_1"))?,
+        norm2: Affine::load(store, ops, &format!("{base}norm2"))?,
+        gate: Lin::load(store, ops, &format!("{base}mlp.fc1_g"))?,
+        up: Lin::load(store, ops, &format!("{base}mlp.fc1_x"))?,
+        down: Lin::load(store, ops, &format!("{base}mlp.fc2"))?,
+        scale2: store.f32_widen(ops, "dino layer scale", &format!("{base}gamma_2"))?,
+    })
+}
+
 impl DinoV3 {
     /// Opens the tower at `dir` (its `model.safetensors` and `config.json`).
     ///
@@ -93,10 +245,11 @@ impl DinoV3 {
     /// [`ImageGenError::Checkpoint`] for a missing tensor or another shape.
     pub(crate) fn load(dir: &Path, ops: &Ops) -> Result<Self, ImageGenError> {
         let config = DinoConfig::vit_h_plus();
-        check_config(&dir.join("config.json"), &config)?;
+        let layout = check_config(&dir.join("config.json"), &config)?;
         let store = StStore::open(dir)?;
-        let mut prefix = store.f32_vec("embeddings.cls_token")?;
-        prefix.extend(store.f32_vec("embeddings.register_tokens")?);
+        let names = layout.names();
+        let mut prefix = store.f32_vec(names.cls)?;
+        prefix.extend(store.f32_vec(names.registers)?);
         if prefix.len() != (1 + config.registers) * config.hidden {
             return Err(ImageGenError::Checkpoint(format!(
                 "the CLS and register tokens are {} values, expected {}",
@@ -105,49 +258,15 @@ impl DinoV3 {
             )));
         }
         let blocks = (0..config.layers)
-            .map(|i| {
-                let base = format!("layer.{i}.");
-                let (q, q_turn) =
-                    load_turned(&store, ops, &format!("{base}attention.q_proj"), &config)?;
-                let (k, k_turn) =
-                    load_turned(&store, ops, &format!("{base}attention.k_proj"), &config)?;
-                Ok(Block {
-                    norm1: Affine::load(&store, ops, &format!("{base}norm1"))?,
-                    q,
-                    q_turn,
-                    k,
-                    k_turn,
-                    v: Lin::load(&store, ops, &format!("{base}attention.v_proj"))?,
-                    o: Lin::load(&store, ops, &format!("{base}attention.o_proj"))?,
-                    scale1: store.f32_widen(
-                        ops,
-                        "dino layer scale",
-                        &format!("{base}layer_scale1.lambda1"),
-                    )?,
-                    norm2: Affine::load(&store, ops, &format!("{base}norm2"))?,
-                    gate: Lin::load(&store, ops, &format!("{base}mlp.gate_proj"))?,
-                    up: Lin::load(&store, ops, &format!("{base}mlp.up_proj"))?,
-                    down: Lin::load(&store, ops, &format!("{base}mlp.down_proj"))?,
-                    scale2: store.f32_widen(
-                        ops,
-                        "dino layer scale",
-                        &format!("{base}layer_scale2.lambda1"),
-                    )?,
-                })
+            .map(|i| match layout {
+                Layout::Split => load_split_block(&store, ops, i, &config),
+                Layout::Packed => load_packed_block(&store, ops, i, &config),
             })
             .collect::<Result<Vec<_>, ImageGenError>>()?;
         Ok(Self {
             config,
-            patch_w: store.f32_widen(
-                ops,
-                "dino patch embed",
-                "embeddings.patch_embeddings.weight",
-            )?,
-            patch_b: store.f32_widen(
-                ops,
-                "dino patch embed",
-                "embeddings.patch_embeddings.bias",
-            )?,
+            patch_w: store.f32_widen(ops, "dino patch embed", names.patch_w)?,
+            patch_b: store.f32_widen(ops, "dino patch embed", names.patch_b)?,
             prefix,
             blocks,
             norm: Affine::load(&store, ops, "norm")?,
@@ -435,7 +554,7 @@ impl DinoV3 {
     }
 }
 
-/// The fields of the tower's `config.json` that fix its shape.
+/// The fields of the split export's `config.json` that fix its shape.
 #[derive(Debug, serde::Deserialize)]
 struct DinoDocument {
     hidden_size: usize,
@@ -448,12 +567,43 @@ struct DinoDocument {
     use_gated_mlp: bool,
 }
 
-/// Refuses a config document that does not describe `config`.
-fn check_config(path: &Path, config: &DinoConfig) -> Result<(), ImageGenError> {
+/// The packed export's `config.json`: it names an architecture, not a shape.
+#[derive(Debug, serde::Deserialize)]
+struct PackedDocument {
+    architecture: String,
+    num_features: usize,
+}
+
+/// The architecture names the packed export gives this tower: with and
+/// without the (zero) attention biases.
+const PACKED_ARCHITECTURES: [&str; 2] = [
+    "vit_huge_plus_patch16_dinov3",
+    "vit_huge_plus_patch16_dinov3_qkvb",
+];
+
+/// Refuses a config document that does not describe `config`, and answers
+/// which export it belongs to.
+fn check_config(path: &Path, config: &DinoConfig) -> Result<Layout, ImageGenError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| ImageGenError::Checkpoint(format!("{}: {e}", path.display())))?;
-    let doc: DinoDocument = serde_json::from_str(&text)
-        .map_err(|e| ImageGenError::Checkpoint(format!("{}: {e}", path.display())))?;
+    layout_of(&text, config)
+        .map_err(|e| ImageGenError::Checkpoint(format!("{}: {e}", path.display())))
+}
+
+/// [`check_config`] on the document's text.
+fn layout_of(text: &str, config: &DinoConfig) -> Result<Layout, String> {
+    if let Ok(doc) = serde_json::from_str::<PackedDocument>(text) {
+        if !PACKED_ARCHITECTURES.contains(&doc.architecture.as_str())
+            || doc.num_features != config.hidden
+        {
+            return Err(format!(
+                "the document describes a {} of {} features; this tower is {} of {}",
+                doc.architecture, doc.num_features, PACKED_ARCHITECTURES[0], config.hidden
+            ));
+        }
+        return Ok(Layout::Packed);
+    }
+    let doc: DinoDocument = serde_json::from_str(text).map_err(|e| e.to_string())?;
     let found = (
         doc.hidden_size,
         doc.num_hidden_layers,
@@ -471,13 +621,40 @@ fn check_config(path: &Path, config: &DinoConfig) -> Result<(), ImageGenError> {
         config.intermediate,
     );
     if found != want || doc.hidden_act != "silu" || !doc.use_gated_mlp {
-        return Err(ImageGenError::Checkpoint(format!(
-            "{} describes (hidden, layers, heads, registers, patch, intermediate) {found:?} with a \
-             {} {} MLP; this tower is {want:?} with a gated silu MLP",
-            path.display(),
+        return Err(format!(
+            "the document describes (hidden, layers, heads, registers, patch, intermediate) \
+             {found:?} with a {} {} MLP; this tower is {want:?} with a gated silu MLP",
             if doc.use_gated_mlp { "gated" } else { "plain" },
             doc.hidden_act
-        )));
+        ));
     }
-    Ok(())
+    Ok(Layout::Split)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DinoConfig, Layout, layout_of};
+
+    #[test]
+    fn each_export_is_told_by_its_config_document() {
+        let config = DinoConfig::vit_h_plus();
+        let split = r#"{"hidden_size":1280,"num_hidden_layers":32,"num_attention_heads":20,
+            "num_register_tokens":4,"patch_size":16,"intermediate_size":5120,
+            "hidden_act":"silu","use_gated_mlp":true}"#;
+        assert_eq!(layout_of(split, &config), Ok(Layout::Split));
+        let packed = r#"{"architecture":"vit_huge_plus_patch16_dinov3","num_features":1280}"#;
+        assert_eq!(layout_of(packed, &config), Ok(Layout::Packed));
+    }
+
+    #[test]
+    fn another_tower_is_refused_in_either_export() {
+        let config = DinoConfig::vit_h_plus();
+        let packed = r#"{"architecture":"vit_large_patch16_dinov3","num_features":1024}"#;
+        let err = layout_of(packed, &config).expect_err("refused");
+        assert!(err.contains("vit_large_patch16_dinov3"), "{err}");
+        let split = r#"{"hidden_size":1024,"num_hidden_layers":24,"num_attention_heads":16,
+            "num_register_tokens":4,"patch_size":16,"intermediate_size":4096,
+            "hidden_act":"gelu","use_gated_mlp":false}"#;
+        assert!(layout_of(split, &config).is_err());
+    }
 }

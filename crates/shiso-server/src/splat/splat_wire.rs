@@ -1,6 +1,8 @@
 //! Serialization formats for `POST /v1/3d/generations`.
 //!
-//! One picture in, one encoded `.ply` out. Like every other wire module here,
+//! One picture in, one encoded splat file out: a `.ply`, or a `.glb` when
+//! the body's `output_format` or the `Accept` header asks for one. Like every
+//! other wire module here,
 //! this one owns its serde types and hands them to
 //! [`crate::splat::generate`], which converts toward the IR; nothing between the
 //! parse and the encode knows these names exist.
@@ -12,7 +14,7 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use shiso_ir::splat::{Generate, Mode};
+use shiso_ir::splat::{Format, Generate, Mode};
 
 /// A refusal this wire can make on the body alone, naming the field at fault.
 ///
@@ -66,9 +68,68 @@ pub struct SplatGenerationRequest {
     /// Overrides the mode's crop margin when present.
     #[serde(default)]
     pub crop_margin: Option<f32>,
+    /// The file the splat is written as: `ply` (the default) or `glb`, a
+    /// binary glTF carrying the Gaussians through `KHR_gaussian_splatting`.
+    /// Omitted, the `Accept` header decides, and `ply` when it names neither.
+    #[serde(default)]
+    pub output_format: Option<String>,
+    /// Every `refresh_every`-th step runs in full (1-4), and so do the first
+    /// two; the steps between hold the last full step's guidance direction
+    /// and conditioning rows.
+    /// One is the reference's sampler, more is faster and approximate.
+    /// Omitted, the operator's default.
+    #[serde(default)]
+    pub refresh_every: Option<u32>,
     /// Whether to stream progress via SSE.
     #[serde(default)]
     pub stream: Option<bool>,
+}
+
+/// The format an `output_format` value names.
+///
+/// # Errors
+///
+/// A [`WireRefusal`] naming `output_format` for any other value.
+pub fn parse_format(text: &str) -> Result<Format, WireRefusal> {
+    if text.eq_ignore_ascii_case("ply") {
+        Ok(Format::Ply)
+    } else if text.eq_ignore_ascii_case("glb") {
+        Ok(Format::Glb)
+    } else {
+        Err(WireRefusal::new(
+            "output_format",
+            "output_format must be 'ply' or 'glb'",
+        ))
+    }
+}
+
+/// A format's MIME type, as the `Accept` header names it and as a raw answer
+/// is labelled.
+#[must_use]
+pub const fn media_type(format: Format) -> &'static str {
+    match format {
+        Format::Ply => "model/ply",
+        Format::Glb => "model/gltf-binary",
+    }
+}
+
+/// The format an `Accept` header asks for by its MIME type, when it names
+/// one: the first media range, in the header's order, that is a splat
+/// file's type. `*/*`, `application/json` and anything else name none.
+///
+/// A header that names one also asks for the file itself as the answer's
+/// body, not for JSON around its base64.
+#[must_use]
+pub fn accepted_format(accept: &str) -> Option<Format> {
+    accept
+        .split(',')
+        .filter_map(|range| range.split(';').next())
+        .map(str::trim)
+        .find_map(|range| {
+            [Format::Ply, Format::Glb]
+                .into_iter()
+                .find(|format| range.eq_ignore_ascii_case(media_type(*format)))
+        })
 }
 
 impl SplatGenerationRequest {
@@ -78,11 +139,17 @@ impl SplatGenerationRequest {
     /// is the wire's refusal, not the model's. An empty picture is left to the
     /// runtime so both paths answer with the same message.
     ///
+    /// `accepted` is the format the `Accept` header named, if it named one
+    /// ([`accepted_format`]). The body's `output_format` and the header may
+    /// each be silent, but they may not disagree: answering one of two
+    /// contradictory asks would hand a client a file it then misreads.
+    ///
     /// # Errors
     ///
-    /// A [`WireRefusal`] naming `image` for bytes that are not base64, or
-    /// `mode` for a value that is neither `synthetic` nor `real`.
-    pub fn into_ir(self) -> Result<Generate, WireRefusal> {
+    /// A [`WireRefusal`] naming `image` for bytes that are not base64,
+    /// `mode` for a value that is neither `synthetic` nor `real`, or
+    /// `output_format` for an unknown format or one the header contradicts.
+    pub fn into_ir(self, accepted: Option<Format>) -> Result<Generate, WireRefusal> {
         let image = decode_image(&self.image)?;
         let mode = match self.mode.as_deref() {
             None => Mode::Synthetic,
@@ -95,6 +162,25 @@ impl SplatGenerationRequest {
                 ));
             }
         };
+        let named = self
+            .output_format
+            .as_deref()
+            .map(parse_format)
+            .transpose()?;
+        let format = match (named, accepted) {
+            (Some(body), Some(header)) if body != header => {
+                return Err(WireRefusal::new(
+                    "output_format",
+                    format!(
+                        "output_format asks for {} and the Accept header for {}",
+                        media_type(body),
+                        media_type(header)
+                    ),
+                ));
+            }
+            (Some(format), _) | (None, Some(format)) => format,
+            (None, None) => Format::Ply,
+        };
         Ok(Generate {
             image,
             mode,
@@ -104,6 +190,8 @@ impl SplatGenerationRequest {
             rescale_t: self.rescale_t,
             num_gaussians: self.num_gaussians,
             crop_margin: self.crop_margin,
+            format,
+            refresh_every: self.refresh_every,
         })
     }
 }
@@ -127,11 +215,36 @@ fn decode_image(text: &str) -> Result<Vec<u8>, WireRefusal> {
         .map_err(|_err| WireRefusal::new("image", "image must be base64 or a data: URL"))
 }
 
-/// One finished splat in a blocking answer.
-#[derive(Debug, Clone, Serialize)]
+/// One finished splat in a blocking answer: exactly one of the two fields,
+/// named after the file it carries.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SplatData {
     /// The encoded `.ply` file, base64.
-    pub b64_ply: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub b64_ply: Option<String>,
+    /// The encoded `.glb` file, base64.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub b64_glb: Option<String>,
+}
+
+impl SplatData {
+    /// `bytes`, a file of `media_type`, under the field that names its
+    /// format. Any type but the `.glb`'s is the `.ply`.
+    #[must_use]
+    pub fn encode(bytes: &[u8], media_type: &str) -> Self {
+        let text = base64::engine::general_purpose::STANDARD.encode(bytes);
+        if media_type == self::media_type(Format::Glb) {
+            Self {
+                b64_glb: Some(text),
+                ..Self::default()
+            }
+        } else {
+            Self {
+                b64_ply: Some(text),
+                ..Self::default()
+            }
+        }
+    }
 }
 
 /// Token accounting for one request.
@@ -181,8 +294,9 @@ pub struct SplatCompletedEvent {
     pub r#type: &'static str,
     /// Unix time the request started.
     pub created: u64,
-    /// The encoded `.ply` file, base64.
-    pub b64_ply: String,
+    /// The encoded file, base64, as `b64_ply` or `b64_glb`.
+    #[serde(flatten)]
+    pub file: SplatData,
     /// The request's token accounting.
     pub usage: SplatGenerationUsage,
 }

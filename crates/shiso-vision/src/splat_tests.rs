@@ -3,8 +3,8 @@
 #[cfg(test)]
 mod tests {
     use crate::splat::{
-        DEFAULT_GAUSSIANS, DEFAULT_STEPS, MAX_GAUSSIANS, MIN_GAUSSIANS, SplatGenError, SplatJob,
-        SplatLimits, SplatMode,
+        DEFAULT_GAUSSIANS, DEFAULT_STEPS, MAX_GAUSSIANS, MIN_GAUSSIANS, SplatFormat, SplatGenError,
+        SplatJob, SplatLimits, SplatMode,
     };
     use shiso_core::ids::Seed;
 
@@ -18,6 +18,8 @@ mod tests {
             rescale_t: 3.0,
             num_gaussians: 262_144,
             crop_margin: 1.2,
+            format: SplatFormat::Ply,
+            refresh_every: 1,
         }
     }
 
@@ -103,5 +105,21 @@ mod tests {
     fn the_mode_picks_the_crop_margin() {
         assert!((SplatMode::Synthetic.default_crop_margin() - 1.2).abs() < f32::EPSILON);
         assert!((SplatMode::Real.default_crop_margin() - 1.7).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_refresh_interval_is_one_to_the_ceiling() {
+        use crate::splat::MAX_REFRESH_EVERY;
+        for value in [1, 2, MAX_REFRESH_EVERY] {
+            job_with(|job| job.refresh_every = value)
+                .validate()
+                .expect("in range");
+        }
+        for value in [0, MAX_REFRESH_EVERY + 1] {
+            assert!(matches!(
+                job_with(|job| job.refresh_every = value).validate(),
+                Err(SplatGenError::InvalidRefresh { value: got }) if got == value
+            ));
+        }
     }
 }

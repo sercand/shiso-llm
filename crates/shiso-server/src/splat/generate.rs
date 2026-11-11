@@ -1,4 +1,5 @@
-//! `POST /v1/3d/generations`: one picture in, one Gaussian-splat `.ply` out.
+//! `POST /v1/3d/generations`: one picture in, one Gaussian-splat file out, a
+//! `.ply` or a `.glb`.
 //!
 //! This module is the wire's half: it parses the body, picks the blocking or
 //! the streaming core of [`shiso_runtime::splat`], and spells the IR it gets
@@ -12,6 +13,16 @@
 //! and closes with the finished splat. Both readings come from the same job,
 //! so a streamed request's `.ply` and a blocking one's are the same bytes.
 //!
+//! # Two ways to ask for a format, two shapes of answer
+//!
+//! `output_format` in the body picks the file and keeps the JSON answer:
+//! `data[0].b64_ply` or `data[0].b64_glb`. An `Accept` header that names a
+//! splat file's MIME type (`model/gltf-binary`, `model/ply`) picks the file
+//! too, and asks for it as the response body itself, with that
+//! `Content-Type` - what a `curl -o object.glb` or a browser download wants.
+//! A streamed request cannot answer with a file, so there the header only
+//! picks the format and the completed frame carries the base64.
+//!
 //! # Why a streamed request waits for admission
 //!
 //! A request the queue refuses must answer with a status code, not with a 200
@@ -23,10 +34,9 @@ use std::sync::Arc;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::http::{HeaderMap, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures::StreamExt as _;
 use shiso_ir::splat::Splat;
 use tokio::sync::mpsc;
@@ -44,15 +54,29 @@ use crate::state::AppState;
 /// The body is taken as bytes and parsed here rather than through a typed
 /// extractor, for the chat route's reason: a malformed body must answer with
 /// this surface's error shape, not the extractor's.
-pub async fn generate_splats(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    match answer(&state, &body).await {
+pub async fn generate_splats(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // Every `Accept` line counts: a client may send the header more than once.
+    let accepted = headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(super::splat_wire::accepted_format);
+    match answer(&state, accepted, &body).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
 }
 
 /// The handler, with its failures still typed.
-async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppError> {
+async fn answer(
+    state: &Arc<AppState>,
+    accepted: Option<shiso_ir::splat::Format>,
+    body: &Bytes,
+) -> Result<Response, AppError> {
     let parsed: SplatGenerationRequest = serde_json::from_slice(body).map_err(|error| {
         AppError::bad_request(
             format!("the request body is not a 3D generation request: {error}"),
@@ -61,7 +85,7 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
         )
     })?;
     let stream = parsed.stream.unwrap_or(false);
-    let ir = parsed.into_ir().map_err(|refusal| {
+    let ir = parsed.into_ir(accepted).map_err(|refusal| {
         AppError::bad_request(refusal.message, Some(refusal.field), "invalid_request")
     })?;
     // The knobs are judged before the model question, as the image route judges
@@ -77,17 +101,25 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
         stream_splat(state, job).await
     } else {
         let splat = service.generate(job).await?;
-        Ok(buffered(&splat))
+        Ok(if accepted.is_some() {
+            raw(splat)
+        } else {
+            buffered(&splat)
+        })
     }
+}
+
+/// The blocking answer to a request whose `Accept` named the file's type:
+/// the file itself.
+fn raw(splat: shiso_vision::splat::GeneratedSplat) -> Response {
+    ([(header::CONTENT_TYPE, splat.media_type)], splat.bytes).into_response()
 }
 
 /// The blocking answer: one JSON body for the finished splat.
 fn buffered(splat: &shiso_vision::splat::GeneratedSplat) -> Response {
     let body = SplatGenerationResponse {
         created: shiso_runtime::ids::unix_timestamp(),
-        data: vec![SplatData {
-            b64_ply: BASE64_STANDARD.encode(&splat.bytes),
-        }],
+        data: vec![SplatData::encode(&splat.bytes, splat.media_type)],
         usage: SplatGenerationUsage {
             prompt_tokens: 0,
             completion_tokens: splat.completion_tokens,
@@ -239,7 +271,7 @@ fn completed_frame(created: u64, splat: &Splat, usage: shiso_ir::splat::Usage) -
     let body = SplatCompletedEvent {
         r#type: "splat_generation.completed",
         created,
-        b64_ply: BASE64_STANDARD.encode(&splat.bytes),
+        file: SplatData::encode(&splat.bytes, &splat.media_type),
         usage: SplatGenerationUsage {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,

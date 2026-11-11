@@ -18,13 +18,19 @@ use shiso_server::router::build_router;
 use shiso_server::splat::{SplatService, SplatServiceDesc};
 use shiso_server::state::AppState;
 use shiso_vision::splat::{
-    GeneratedSplat, SplatGenError, SplatGenerator, SplatJob, SplatLimits, SplatStepEvent,
+    GeneratedSplat, SplatFormat, SplatGenError, SplatGenerator, SplatJob, SplatLimits,
+    SplatStepEvent,
 };
 use tower::ServiceExt as _;
 
 /// The encoded bytes the mock hands back: a `.ply` signature, no vertices.
 fn ply_bytes() -> Vec<u8> {
     b"ply\nformat binary_little_endian 1.0\n".to_vec()
+}
+
+/// The bytes the mock hands back for a `.glb` job: the container's magic.
+fn glb_bytes() -> Vec<u8> {
+    b"glTF\x02\0\0\0".to_vec()
 }
 
 /// A generator that records every job it is handed, so a test can read the
@@ -80,8 +86,11 @@ impl SplatGenerator for RecordingGenerator {
             }
         }
         Ok(GeneratedSplat {
-            bytes: ply_bytes(),
-            media_type: "model/ply",
+            bytes: match job.format {
+                SplatFormat::Ply => ply_bytes(),
+                SplatFormat::Glb => glb_bytes(),
+            },
+            media_type: job.format.media_type(),
             num_gaussians: job.num_gaussians,
             completion_tokens: 12_294 * job.steps,
         })
@@ -358,4 +367,155 @@ async fn a_streamed_request_sends_admitted_progress_completed_and_done() {
         completed["b64_ply"],
         base64::engine::general_purpose::STANDARD.encode(ply_bytes())
     );
+}
+
+/// POSTs `body` with an `Accept` header and answers the status, the
+/// `Content-Type` and the raw body.
+async fn post_accepting(
+    state: Arc<AppState>,
+    accept: &str,
+    body: serde_json::Value,
+) -> (StatusCode, String, Vec<u8>) {
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/3d/generations")
+                .header("content-type", "application/json")
+                .header("accept", accept)
+                .body(Body::from(body.to_string()))
+                .expect("builds"),
+        )
+        .await
+        .expect("the router answers");
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the body reads");
+    (status, content_type, bytes.to_vec())
+}
+
+#[tokio::test]
+async fn output_format_glb_answers_under_its_own_field() {
+    let (state, generator) = state_with_mock();
+    let (status, body) =
+        post_json(state, json!({"image": "aGVsbG8=", "output_format": "glb"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"][0]["b64_glb"],
+        base64::engine::general_purpose::STANDARD.encode(glb_bytes())
+    );
+    assert!(body["data"][0].get("b64_ply").is_none(), "{body}");
+    assert_eq!(
+        generator.recorded().pop().expect("one job").format,
+        SplatFormat::Glb
+    );
+}
+
+#[tokio::test]
+async fn a_request_that_names_no_format_gets_a_ply() {
+    let (state, generator) = state_with_mock();
+    let (status, body) = post_json(state, body()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["data"][0].get("b64_glb").is_none(), "{body}");
+    assert_eq!(
+        generator.recorded().pop().expect("one job").format,
+        SplatFormat::Ply
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_output_format_is_a_400_naming_the_field() {
+    let (state, generator) = state_with_mock();
+    let (status, body) =
+        post_json(state, json!({"image": "aGVsbG8=", "output_format": "obj"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["param"], "output_format");
+    assert_eq!(generator.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn accepting_gltf_binary_answers_with_the_file_itself() {
+    let (state, generator) = state_with_mock();
+    let (status, content_type, bytes) = post_accepting(state, "model/gltf-binary", body()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type, "model/gltf-binary");
+    assert_eq!(bytes, glb_bytes());
+    assert_eq!(
+        generator.recorded().pop().expect("one job").format,
+        SplatFormat::Glb
+    );
+}
+
+#[tokio::test]
+async fn accepting_a_ply_answers_with_the_file_itself() {
+    let (state, _generator) = state_with_mock();
+    let (status, content_type, bytes) = post_accepting(state, "model/ply", body()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type, "model/ply");
+    assert_eq!(bytes, ply_bytes());
+}
+
+#[tokio::test]
+async fn an_accept_that_names_no_splat_type_keeps_the_json_answer() {
+    let (state, _generator) = state_with_mock();
+    let (status, content_type, bytes) =
+        post_accepting(state, "application/json, */*", body()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        content_type.starts_with("application/json"),
+        "{content_type}"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+    assert!(body["data"][0]["b64_ply"].is_string(), "{body}");
+}
+
+#[tokio::test]
+async fn a_body_and_an_accept_header_that_disagree_are_a_400() {
+    let (state, generator) = state_with_mock();
+    let (status, _content_type, bytes) = post_accepting(
+        state,
+        "model/gltf-binary",
+        json!({"image": "aGVsbG8=", "output_format": "ply"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+    assert_eq!(body["error"]["param"], "output_format");
+    assert_eq!(generator.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_streamed_glb_arrives_in_the_completed_frame() {
+    let (state, _generator) = state_with_mock();
+    // A stream cannot answer with a file, so the header only picks the format.
+    let (status, content_type, bytes) = post_accepting(
+        state,
+        "model/gltf-binary",
+        json!({"image": "aGVsbG8=", "stream": true, "steps": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "{content_type}"
+    );
+    let text = String::from_utf8(bytes).expect("SSE is text");
+    let completed = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .find(|value| value["type"] == "splat_generation.completed")
+        .expect("a completed frame");
+    assert_eq!(
+        completed["b64_glb"],
+        base64::engine::general_purpose::STANDARD.encode(glb_bytes())
+    );
+    assert!(completed.get("b64_ply").is_none(), "{completed}");
 }

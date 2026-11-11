@@ -3,7 +3,8 @@
 //! This is the same narrow waist [`crate::generator`] draws for images: the
 //! wire handlers turn a request body into a [`SplatJob`], the family
 //! implementations in `shiso-models` answer [`SplatGenerator`], and nothing
-//! here names a model family or a file format beyond "a `.ply`".
+//! here names a model family; a file format is one of [`SplatFormat`]'s two
+//! containers and nothing more.
 
 use std::fmt;
 
@@ -34,6 +35,41 @@ impl SplatMode {
     }
 }
 
+/// The file a finished splat is written as.
+///
+/// Both carry the same Gaussians. They differ in container and in what a
+/// reader is expected to do with the values, which is the family's writer's
+/// business; here a format is a name and a media type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SplatFormat {
+    /// The 3D Gaussian-splatting `.ply` every splat viewer reads.
+    #[default]
+    Ply,
+    /// A binary glTF (`.glb`) carrying the Gaussians through the
+    /// `KHR_gaussian_splatting` extension.
+    Glb,
+}
+
+impl SplatFormat {
+    /// The format's MIME type.
+    #[must_use]
+    pub const fn media_type(self) -> &'static str {
+        match self {
+            Self::Ply => "model/ply",
+            Self::Glb => "model/gltf-binary",
+        }
+    }
+
+    /// The format's name on the wire, which is also its file extension.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ply => "ply",
+            Self::Glb => "glb",
+        }
+    }
+}
+
 /// Smallest accepted Gaussian count: 1024 anchors of 32.
 pub const MIN_GAUSSIANS: u32 = 32_768;
 /// Largest accepted Gaussian count.
@@ -50,6 +86,13 @@ pub const DEFAULT_STEPS: u32 = 50;
 pub const DEFAULT_CFG_STRENGTH: f32 = 3.0;
 /// The time-grid shift used when the request names none.
 pub const DEFAULT_RESCALE_T: f32 = 3.0;
+/// The refresh interval used when neither the request nor the operator names
+/// one: every step runs in full, the reference's sampler.
+pub const DEFAULT_REFRESH_EVERY: u32 = 1;
+/// The longest refresh interval a request may ask for. Past it a held step
+/// reads a guidance direction and conditioning keys several steps stale; four
+/// is the longest interval that was measured.
+pub const MAX_REFRESH_EVERY: u32 = 4;
 /// Crop margin for a render or a clean cut-out.
 pub const CROP_MARGIN_SYNTHETIC: f32 = 1.2;
 /// Crop margin for a photograph with background.
@@ -95,6 +138,13 @@ pub struct SplatJob {
     pub num_gaussians: u32,
     /// How much room the square crop leaves around the object.
     pub crop_margin: f32,
+    /// The file the finished splat is written as.
+    pub format: SplatFormat,
+    /// Every `refresh_every`-th step runs in full, and so do the first two;
+    /// the steps between hold the last full step's guidance direction and
+    /// conditioning rows. One is the reference's sampler; more is faster and
+    /// an approximation of it.
+    pub refresh_every: u32,
 }
 
 impl SplatJob {
@@ -106,8 +156,9 @@ impl SplatJob {
     /// # Errors
     /// The first field that is out of range, in field order, as
     /// [`SplatGenError::InvalidSteps`], [`SplatGenError::InvalidGaussians`],
-    /// [`SplatGenError::InvalidCfg`], [`SplatGenError::InvalidRescale`] or
-    /// [`SplatGenError::InvalidCropMargin`].
+    /// [`SplatGenError::InvalidCfg`], [`SplatGenError::InvalidRescale`],
+    /// [`SplatGenError::InvalidCropMargin`] or
+    /// [`SplatGenError::InvalidRefresh`].
     pub fn validate(&self) -> Result<(), SplatGenError> {
         if self.steps == 0 || self.steps > MAX_STEPS {
             return Err(SplatGenError::InvalidSteps { steps: self.steps });
@@ -133,6 +184,11 @@ impl SplatJob {
         if !(self.crop_margin.is_finite() && self.crop_margin > 0.0) {
             return Err(SplatGenError::InvalidCropMargin {
                 value: self.crop_margin,
+            });
+        }
+        if self.refresh_every == 0 || self.refresh_every > MAX_REFRESH_EVERY {
+            return Err(SplatGenError::InvalidRefresh {
+                value: self.refresh_every,
             });
         }
         Ok(())
@@ -189,6 +245,12 @@ pub enum SplatGenError {
         /// The value as requested.
         value: f32,
     },
+    /// The refresh interval is zero or over the family's ceiling.
+    #[error("refresh_every must be between 1 and {MAX_REFRESH_EVERY}, got {value}")]
+    InvalidRefresh {
+        /// The interval as requested.
+        value: u32,
+    },
     /// Background removal failed on the device.
     #[error("background removal failed: {0}")]
     Matting(String),
@@ -198,7 +260,7 @@ pub enum SplatGenError {
     /// Model checkpoint loading failure.
     #[error("model loading failure: {0}")]
     Checkpoint(String),
-    /// Encoding the finished splat as a `.ply` failed.
+    /// Encoding the finished splat as its file failed.
     #[error("splat encoding failed: {0}")]
     Encoding(String),
 }
@@ -206,9 +268,9 @@ pub enum SplatGenError {
 /// Result of a completed splat generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedSplat {
-    /// Encoded `.ply` file bytes.
+    /// The encoded file's bytes, in the job's [`SplatFormat`].
     pub bytes: Vec<u8>,
-    /// MIME type string, always `model/ply`.
+    /// The file's MIME type: the format's [`SplatFormat::media_type`].
     pub media_type: &'static str,
     /// How many Gaussians the file holds.
     pub num_gaussians: u32,

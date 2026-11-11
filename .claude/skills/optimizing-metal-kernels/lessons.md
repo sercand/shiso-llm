@@ -72,6 +72,11 @@ shapes differ.
 - **Identical rows are one weighted key.** `n` equal keys with equal values weigh `n exp(s) v` in a softmax, which is one key scoring `s + ln(n)`.
   - The splat denoiser's guidance pass has a zero conditioning: 4101 rows that are, and stay, the same row. Holding it once took that pass from 12294 rows to 8194 (attention x0.44, linears x0.67). Its error against the reference did not grow (mean 1.5e-4 of rms, from 2e-4).
   - Look for this before tuning a kernel: it was worth more than any change inside one.
+- **Half arithmetic does not buy throughput on an M4** (`kernel_splat_attn_f32`, 12294 rows x 16 heads of 64, M4, 2026-11-11): the f32 kernel runs 207 ms (2.99 TFLOP/s, 82% of the bench's peak). K and V staged as half with f32 accumulation: 216 ms. Every fragment `simdgroup_half8x8`: 199 ms. Four percent for a model's worth of rounding is not a trade; the 2x of the flux2 entry above was the threadgroup staging, not the multiply.
+- **When the kernels are at the ALU ceiling, cut rows, not cycles** (splat denoiser, M4, 25 steps of 262144 Gaussians, 2026-11-11). Attention and the GEMMs both sat near 3 TFLOP/s, so a step's 34 TFLOP was 13.2 s whatever the kernel did. What moved it:
+  - The latent's refiner reads neither conditioning, so a step's two passes share it: the second copies the first's rows. 0.3 s a step, the same bits.
+  - A step between two full ones runs the conditional pass over the latent and the camera alone (8193 of 12294 query rows), attending to the conditioning rows' keys and values as the last full step left them, and adds that step's guidance direction: 6.1 s against 13.2. Every second step held, after two full ones: 362 s -> 278 s, and renders score against a 50-step request's as the exact sampler's do. Holding the second step too sent the flow elsewhere (22.6 dB from the exact 25-step render against 27.7). Holding the guidance direction alone (the conditioning rows still run) was 8.8 s a held step and softened the object more.
+  - Judge such a change on renders, not on the latent: the same seed at 25 and at 50 exact steps differs by 0.78 of the latent's norm, so a latent distance cannot tell an approximation from a step count.
 - **The KV cache is f16.**
 
 ## Fusion and launch count

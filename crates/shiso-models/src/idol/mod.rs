@@ -15,6 +15,7 @@ pub mod dinov3;
 pub mod draws;
 pub mod gaussian;
 pub mod generator;
+pub mod glb;
 pub mod latent;
 pub mod model;
 pub(crate) mod nn;

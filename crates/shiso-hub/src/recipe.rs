@@ -598,6 +598,9 @@ pub enum Modality {
     Video,
     /// Audio stream or clip.
     Audio,
+    /// A 3D object: a Gaussian splat or a mesh.
+    #[serde(rename = "3d")]
+    ThreeD,
 }
 
 impl Modality {
@@ -609,6 +612,7 @@ impl Modality {
             Self::Image => "image",
             Self::Video => "video",
             Self::Audio => "audio",
+            Self::ThreeD => "3d",
         }
     }
 }
@@ -627,6 +631,7 @@ impl FromStr for Modality {
             "image" => Ok(Self::Image),
             "video" => Ok(Self::Video),
             "audio" => Ok(Self::Audio),
+            "3d" => Ok(Self::ThreeD),
             _ => Err(HubError::Validation {
                 reason: format!("unknown modality '{s}'"),
             }),
@@ -861,6 +866,14 @@ pub struct ServerDefaults {
     /// ASR batch size (`--asr-batch`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asr_batch: Option<usize>,
+    /// Euler steps a splat request that names none gets
+    /// (`--splat-default-steps`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub splat_default_steps: Option<u32>,
+    /// How often a splat request that names none runs a step in full
+    /// (`--splat-refresh-every`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub splat_refresh_every: Option<u32>,
     /// Expert residency (`--expert-residency`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expert_residency: Option<ExpertResidency>,
