@@ -219,4 +219,17 @@ impl Backend for CpuBackend {
     fn sync(&self) -> CoreResult<()> {
         Ok(())
     }
+
+    fn read_shared(&self, src: DeviceView<'_>, dst: &mut [u8]) -> CoreResult<()> {
+        // Host memory: a copy is already ordered, nothing to drain.
+        self.copy_d2h(src, dst)
+    }
+
+    fn write_shared(
+        &self,
+        dsts: &[DeviceView<'_>],
+        fill: &mut dyn FnMut(&mut [&mut [u8]]) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        self.write_host(dsts, fill)
+    }
 }

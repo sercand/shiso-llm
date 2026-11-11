@@ -912,6 +912,25 @@ impl<'a> Binder<'a> {
         stream.fetch(backend, layer, self.scratch.view(Buf::MoeIds)?, ids)
     }
 
+    /// [`Binder::fetch_experts`] at a fetch cut: the GPU is paused having
+    /// written the routed ids, so the stream reads them and places the experts
+    /// without draining. The caller releases the GPU only after this returns.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`crate::sparse::stream::ExpertStream::fetch_at_cut`] reports.
+    pub fn fetch_experts_at_cut(
+        &self,
+        backend: &dyn shiso_core::backend::Backend,
+        layer: u32,
+        ids: u32,
+    ) -> CoreResult<()> {
+        let Some(stream) = self.stream else {
+            return Ok(());
+        };
+        stream.fetch_at_cut(backend, layer, self.scratch.view(Buf::MoeIds)?, ids)
+    }
+
     /// Resolves one argument list into what a launch takes.
     ///
     /// # Errors
