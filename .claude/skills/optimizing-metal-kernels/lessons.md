@@ -21,6 +21,14 @@ shapes differ.
 - **8 consecutive weights per lane (16 B loads)** reached 330–410 GB/s against ~150. The 151936-wide vocab head ran at 355 against 175 GB/s (`audio/audio_gemm.metal`).
 - **Matvec re-reads the matrix per row block,** so 64 prompt tokens read every weight 16×. Above `GEMM_MIN_TOKENS` (`projection.rs:~886`) use a GEMM.
 
+- **GGUF block step tier** (`q4e/ggml.metal`, `q4e_g_step_*`; qwen4exp `UD-IQ3_XXS`, M1 Max, 2026-11-11):
+  - Byte-at-a-time loads with a scale multiplied into every weight read 5 GB/s (`IQ4_NL`) and 18 GB/s (`Q6_K`). `packed_uchar4` loads, codes formed four at a time and the block scale applied to the 32-term sum: routed down 1672 -> 377 us, the 248k-row head 2147 -> 1152 us, a plain decode step 3.1 -> 5.3 tok/s.
+  - One simdgroup a row leaves a 640-wide row with 12 idle lanes. Few lanes a row and many rows a threadgroup helped the narrow rows; four rows a lane on the dense projections made a step slower (3.7 ms a layer against 2.9).
+  - What did **not** move a routed launch: decode tables staged in threadgroup memory, several rows sharing one activation read, spinning on the completion event before blocking.
+  - The microbench has a ~100 us floor a launch (`q4_0` 4096x4096 reads 64 GB/s in it, 195 in a model), so it ranks sub-millisecond layouts badly. Rank those on the server's `drain_seconds`.
+- **A streamed model's first bottleneck is memory, not kernels:** the expert pool was sized to the driver's working set (28 GB pool + 13 GB stack on a 64 GB machine with 30 GB in other programs), the pool is wired once read, and the machine swapped: 0.6 tok/s. Held to `Backend::host_available` it is 3.2 tok/s before any kernel changed. Check `sysctl vm.swapusage` before profiling.
+- **Speculation does not pay when a verify row costs a full row:** three verify rows took 0.53 s against 0.18 s for one plain row, for 2.3 tokens a round. Plain decode was faster (5.3 against 4.3 tok/s).
+
 ## Prefill GEMM (simdgroup matrices)
 
 - **64×64 tile layout** (6357b14, `flux2/flux2.metal:~955`, `audio/audio_gemm.metal`):

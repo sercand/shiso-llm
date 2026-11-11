@@ -199,6 +199,51 @@ pub const STEP_WARPS: u32 = 4;
 /// Activation rows a step pass carries (`Q4E_GS_COLS`).
 pub const STEP_COLS: u32 = 8;
 
+/// Which lanes-a-row step entries a device's kernel set has. The two take the
+/// same arguments and launches; what differs is what a lane is fast at, and
+/// so how many of them the host gives a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepTier {
+    /// Lanes that each read 16-weight runs through aligned words and are
+    /// bound by memory: many lanes a row.
+    Runs,
+    /// Lanes that each decode 32-weight sub-blocks and are bound by how many
+    /// threadgroups a launch starts: few lanes a row, many rows a
+    /// threadgroup.
+    Packed,
+}
+
+/// Sub-blocks a lane of a [`StepTier::Packed`] row walks, at least.
+///
+/// Measured on an M1 Max over a plain decode step of the published sparse
+/// checkpoint in `UD-IQ3_XXS`: 2.9 ms of device time a layer at eight, 3.2 at
+/// four, and 3.7 with four rows a lane on top of eight.
+const PACKED_SUB_BLOCKS: u32 = 8;
+
+/// Rows a [`StepTier::Packed`] routed unit computes against one read of the
+/// activations (`Q4E_GS_UNIT_ROWS`): eight of down, or four of gate and the
+/// same four of up.
+pub const PACKED_UNIT_ROWS: u32 = 8;
+
+/// Sub-blocks of a row a routed unit's lanes share out, at least, per lane
+/// of [`step_expert_lanes`]: 2560 wide gives a unit sixteen lanes of five
+/// sub-blocks, 640 wide sixteen lanes of one or two.
+const PACKED_UNIT_SUB_BLOCKS: u32 = 10;
+
+/// Lanes a [`StepTier::Packed`] row takes: the largest power of two that
+/// still leaves each lane [`PACKED_SUB_BLOCKS`] sub-blocks, a simdgroup at
+/// most. From the contraction width alone, so every pass width sums a row
+/// alike.
+#[must_use]
+pub const fn packed_lanes(in_dim: u32) -> u32 {
+    let per = in_dim / SUB_BLOCK / PACKED_SUB_BLOCKS;
+    let mut lanes = 1;
+    while lanes * 2 <= per && lanes < 32 {
+        lanes *= 2;
+    }
+    lanes
+}
+
 /// Lanes a dense step projection gives one output row, from the contraction
 /// width alone, so every pass width sums a row alike: a warp up to 32 runs
 /// of 16 weights, a whole block past that.
@@ -208,8 +253,10 @@ pub const STEP_COLS: u32 = 8;
 /// the 248k-row head 191 -> 203; `Q8_0` 320 x 10240 157 -> 203 at a block a
 /// row, 10240 x 320 124 -> 181 at a warp.
 #[must_use]
-pub const fn step_lanes(in_dim: u32) -> u32 {
-    if in_dim / 16 <= 32 {
+pub const fn step_lanes(in_dim: u32, tier: StepTier) -> u32 {
+    if matches!(tier, StepTier::Packed) {
+        packed_lanes(in_dim)
+    } else if in_dim / 16 <= 32 {
         32
     } else {
         32 * STEP_WARPS
@@ -222,8 +269,21 @@ pub const fn step_lanes(in_dim: u32) -> u32 {
 /// Measured on a GB10 over ten experts (one column each), against the
 /// one-warp entries: `IQ2_S` gate/up 183 -> 83 us, `IQ4_NL` down 95 -> 54 us.
 #[must_use]
-pub const fn step_expert_lanes(in_dim: u32) -> u32 {
-    if in_dim / 16 <= 64 { 16 } else { 32 }
+pub const fn step_expert_lanes(in_dim: u32, tier: StepTier) -> u32 {
+    if matches!(tier, StepTier::Packed) {
+        // A packed routed unit is `PACKED_UNIT_ROWS` rows over that many
+        // times these lanes, a simdgroup at most.
+        let per = in_dim / SUB_BLOCK / PACKED_UNIT_SUB_BLOCKS;
+        let mut lanes = 1;
+        while lanes * 2 <= per && lanes * 2 * PACKED_UNIT_ROWS <= 32 {
+            lanes *= 2;
+        }
+        lanes
+    } else if in_dim / 16 <= 64 {
+        16
+    } else {
+        32
+    }
 }
 
 /// Activation rows past which a dense step projection takes

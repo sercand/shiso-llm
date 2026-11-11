@@ -318,14 +318,20 @@ impl Qwen4ExpModel {
         drop(binding);
         drop(file);
 
-        let free = device_free(backend.as_ref());
+        let free = headroom(backend.as_ref());
         let mut stack =
             SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
         if let Some(parts) = block {
             stack.bind_block_drafter(parts)?;
         }
         if let Some(slots) = slots {
-            let slots = beside_stack(backend.as_ref(), free, slots, source.slot_bytes());
+            let slots = beside_stack(
+                backend.as_ref(),
+                free,
+                placement.reserve,
+                slots,
+                source.slot_bytes(),
+            );
             let used = shape.moe.used;
             let stream = gguf_experts::open_stream(
                 backend,
@@ -386,12 +392,12 @@ impl Qwen4ExpModel {
         tracing::info!(?residency, "routed expert banks");
         let weights = mlx::import(backend, &ck, &config, residency)?;
         let expert_gate = DType::MlxAffine4Gs64;
-        let free = device_free(backend.as_ref());
+        let free = headroom(backend.as_ref());
         let mut stack =
             SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
         if let mlx::ExpertResidency::Streamed { slots } = residency {
             let slots = if sized {
-                beside_stack(backend.as_ref(), free, slots, mlx::slot_bytes())
+                beside_stack(backend.as_ref(), free, reserve, slots, mlx::slot_bytes())
             } else {
                 slots
             };
@@ -576,14 +582,14 @@ impl Qwen4ExpModel {
         } else {
             None
         };
-        let free = device_free(backend.as_ref());
+        let free = headroom(backend.as_ref());
         let mut stack =
             SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
         let stream = if let Some(stream) = early {
             stream
         } else {
             let slots = if sized {
-                beside_stack(backend.as_ref(), free, slots, slot_bytes)
+                beside_stack(backend.as_ref(), free, reserve, slots, slot_bytes)
             } else {
                 slots
             };
@@ -812,12 +818,25 @@ fn gguf_slots(
     Ok(Some(slots.min(all)))
 }
 
-/// What the device reports free, or `None` where it reports nothing.
-fn device_free(backend: &dyn Backend) -> Option<u64> {
-    backend.memory_info().map(|info| info.free)
+/// What the device and its host report free, before a stack is built.
+#[derive(Debug, Clone, Copy)]
+struct Headroom {
+    /// What the driver would still grant, or `None` where it reports nothing.
+    device: Option<u64>,
+    /// What the host could give without paging, on a device that shares its
+    /// memory; `None` elsewhere.
+    host: Option<u64>,
 }
 
-/// A pool sized to the device, less what the stack took after it was sized.
+fn headroom(backend: &dyn Backend) -> Headroom {
+    Headroom {
+        device: backend.memory_info().map(|info| info.free),
+        host: backend.host_available(),
+    }
+}
+
+/// A pool sized to the device, less what the stack took after it was sized
+/// and no larger than the host can back with memory.
 ///
 /// The pool's size has to be known before the weights are imported - it
 /// decides whether the banks are imported at all - so the scratch and cache
@@ -825,27 +844,59 @@ fn device_free(backend: &dyn Backend) -> Option<u64> {
 /// the pool was sized to fill. At a server's prefill chunk that is several
 /// gigabytes, and with it left in, the pool and the stack together overran
 /// the working set of a 64 GB machine: every step waited on the system's
-/// swap, 0.46 tok/s against 5 to 6 with the stack's bytes given back. `free`
-/// is what the device reported free before the stack was built; the floor is
-/// one layer's experts, below which the stream refuses to open anyway.
-fn beside_stack(backend: &dyn Backend, free: Option<u64>, slots: u32, slot_bytes: u64) -> u32 {
-    let (Some(before), Some(after)) = (free, device_free(backend)) else {
+/// swap, 0.46 tok/s against 5 to 6 with the stack's bytes given back.
+///
+/// The working set is the driver's limit for one process and says nothing of
+/// what else the machine holds. On a 64 GB M1 Max with 30 GB in other
+/// programs it let a 28 GB pool and a 13 GB stack in: the pool is wired once
+/// the device has read it, so everything else went to swap (19 of 20 GB) and
+/// a decode step waited on it, 0.6 tok/s. So the pool is also held to what the
+/// host had available before the stack was built, less the stack and
+/// `reserve`; the file cache holds what the pool cannot, and gives way
+/// without swapping.
+///
+/// `before` is what was free before the stack was built; the floor is one
+/// layer's experts, below which the stream refuses to open anyway.
+fn beside_stack(
+    backend: &dyn Backend,
+    before: Headroom,
+    reserve: u64,
+    slots: u32,
+    slot_bytes: u64,
+) -> u32 {
+    let after = backend.memory_info().map(|info| info.free);
+    let (Some(device), Some(after)) = (before.device, after) else {
         return slots;
     };
-    let taken = before.saturating_sub(after);
-    let give_back = u32::try_from(taken.div_ceil(slot_bytes.max(1))).unwrap_or(u32::MAX);
-    let fitted = slots
-        .saturating_sub(give_back)
-        .max(crate::qwen4exp::config::EXPERTS.min(slots));
+    let slot_bytes = slot_bytes.max(1);
+    let taken = device.saturating_sub(after);
+    let give_back = u32::try_from(taken.div_ceil(slot_bytes)).unwrap_or(u32::MAX);
+    let floor = crate::qwen4exp::config::EXPERTS.min(slots);
+    let mut fitted = slots.saturating_sub(give_back);
     if fitted < slots {
         tracing::info!(
             stack_gib = taken >> 30,
-            slots = fitted,
+            slots = fitted.max(floor),
             was = slots,
             "the expert pool gives back what the stack's scratch and cache took"
         );
     }
-    fitted
+    if let Some(host) = before.host {
+        let room = host.saturating_sub(taken).saturating_sub(reserve);
+        let hosted = u32::try_from(room / slot_bytes).unwrap_or(u32::MAX);
+        if hosted < fitted {
+            tracing::info!(
+                host_available_gib = host >> 30,
+                stack_gib = taken >> 30,
+                reserve_gib = reserve >> 30,
+                slots = hosted.max(floor),
+                was = fitted.max(floor),
+                "the expert pool is held to the memory the host has free"
+            );
+            fitted = hosted;
+        }
+    }
+    fitted.max(floor)
 }
 
 fn choose_residency(

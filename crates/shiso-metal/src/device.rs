@@ -920,6 +920,10 @@ impl Backend for MetalBackend {
         })
     }
 
+    fn host_available(&self) -> Option<u64> {
+        host_available()
+    }
+
     /// Every template instantiation the library declares, whatever `module`.
     ///
     /// Metal compiles one flat library, so there is no per-module symbol table
@@ -1125,4 +1129,40 @@ fn failed(
         |err| format!("{status:?}: {}", err.localizedDescription()),
     );
     Err(MetalError::backend(op, detail))
+}
+
+/// Bytes the machine could give a process without swapping: free and
+/// speculative pages, file-backed pages (the file cache, which is dropped
+/// rather than swapped) and purgeable ones.
+fn host_available() -> Option<u64> {
+    let mut raw = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    #[expect(
+        deprecated,
+        reason = "libc points at the mach2 crate for mach_host_self; one call does not warrant a new dependency"
+    )]
+    // SAFETY: `raw` is a zeroed `vm_statistics64` and `count` its length in
+    // `integer_t` words, which is the buffer `HOST_VM_INFO64` writes; the host
+    // port is this task's own send right, valid for the life of the process.
+    let outcome = unsafe {
+        libc::host_statistics64(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO64,
+            raw.as_mut_ptr().cast(),
+            &raw mut count,
+        )
+    };
+    if outcome != libc::KERN_SUCCESS {
+        return None;
+    }
+    // SAFETY: the call succeeded, so the kernel filled the structure; any
+    // field past `count` is still the zero it was initialized to.
+    let pages = unsafe { raw.assume_init() };
+    // SAFETY: `sysconf` reads a constant of the running system.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    let available = u64::from(pages.free_count)
+        + u64::from(pages.speculative_count)
+        + u64::from(pages.external_page_count)
+        + u64::from(pages.purgeable_count);
+    Some(available.saturating_mul(page))
 }

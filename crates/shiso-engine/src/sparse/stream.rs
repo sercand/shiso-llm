@@ -232,6 +232,11 @@ impl fmt::Debug for ExpertStream {
 /// device's queue busy with reads of a few hundred kilobytes each.
 const READERS: usize = 16;
 
+/// Fetches between two info lines of the stream's running totals: a hundred
+/// or so decode steps of a 48-layer stack, so a slow pool shows in the log
+/// without a line per step.
+const STATS_EVERY: u64 = 4096;
+
 /// Threads that read guessed experts while the device computes.
 const PREFETCHERS: usize = 4;
 
@@ -524,6 +529,26 @@ impl ExpertStream {
                 Ok(())
             })
         })
+    }
+
+    /// One info line of the running totals every [`STATS_EVERY`] fetches:
+    /// what a slow pool looks like from the log, without a profile.
+    fn log_totals(&self, clock: u64, totals: &StreamStats) {
+        if !clock.is_multiple_of(STATS_EVERY) {
+            return;
+        }
+        tracing::info!(
+            fetches = totals.fetches,
+            wanted = totals.wanted,
+            hits = totals.hits,
+            prefetched = totals.prefetched,
+            reads = totals.reads,
+            read_gib = totals.read_bytes >> 30,
+            read_seconds = totals.read_seconds,
+            drain_seconds = totals.drain_seconds,
+            slots = self.slots,
+            "routed expert stream, since it opened"
+        );
     }
 
     /// Slots a batch of `n` new experts may take: never-filled ones first,
@@ -921,6 +946,7 @@ impl ExpertStream {
         state.stats.fetches += 1;
         state.stats.drain_seconds += drain;
         let clock = state.clock;
+        self.log_totals(clock, &state.stats);
         let base = layer as usize * self.experts as usize;
         state.stats.wanted += wanted.len() as u64;
         let mut landing: Vec<(u32, Reading)> = Vec::new();

@@ -1917,8 +1917,8 @@ fn ggml_tier(desc: &ExpertDesc, hidden: u32, inter: u32, groups: u32, device: De
         matmul::ggml_step(desc.down.dtype, ggml::Stage::StepDown, device),
     );
     let lanes = (
-        ggml::step_expert_lanes(hidden),
-        ggml::step_expert_lanes(inter),
+        ggml::step_expert_lanes(hidden, matmul::step_tier(device)),
+        ggml::step_expert_lanes(inter, matmul::step_tier(device)),
     );
     match (prompt, step) {
         ((Some(g), Some(d)), _) => GgmlTier {

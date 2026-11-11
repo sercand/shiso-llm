@@ -277,6 +277,19 @@ pub trait Backend: Send + Sync + fmt::Debug {
         None
     }
 
+    /// Bytes the host could hand this process now without paging anything
+    /// out, or `None` when the device's memory is its own.
+    ///
+    /// Only a device that shares memory with its host answers. The driver's
+    /// working set ([`Backend::memory_info`]) is a per-process limit and
+    /// knows nothing of what the rest of the machine holds: a pool sized to
+    /// it alone on a busy machine is paid for in swap, by this process and
+    /// every other. Free pages and file cache count; another process's
+    /// private pages do not.
+    fn host_available(&self) -> Option<u64> {
+        None
+    }
+
     /// The ledger this backend's allocations are counted in, or `None` when
     /// it keeps none.
     ///

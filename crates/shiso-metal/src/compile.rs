@@ -378,6 +378,10 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "sample/suppress.metal",
         include_str!("../../../kernels/metal/sample/suppress.metal"),
     ),
+    (
+        "sample/top_rows.metal",
+        include_str!("../../../kernels/metal/sample/top_rows.metal"),
+    ),
     // --- diffusion DiT kernel set; appended, nothing above this line changed.
     // The header comes first for the same reason every other set's does: the
     // file after it uses its argument blocks, its decoders and its reduction.
