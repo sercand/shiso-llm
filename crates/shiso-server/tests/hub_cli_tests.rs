@@ -90,6 +90,8 @@ fn apply_recipe_defaults_precedence() {
         video_max_frames: Some(120),
         asr_lookahead: Some(8),
         asr_batch: Some(4),
+        splat_default_steps: Some(25),
+        splat_refresh_every: Some(2),
         expert_residency: Some(ExpertResidency::Resident),
         expert_reserve_gb: Some(12),
         expert_slots: Some(4096),
@@ -114,6 +116,8 @@ fn apply_recipe_defaults_precedence() {
     assert_eq!(args.video_max_frames, 120);
     assert_eq!(args.asr_lookahead, 8);
     assert_eq!(args.asr_batch, 4);
+    assert_eq!(args.splat_default_steps, Some(25));
+    assert_eq!(args.splat_refresh_every, Some(2));
     assert_eq!(args.expert_residency, ExpertResidencyChoice::Resident);
     assert_eq!(args.expert_reserve_gb, 12);
     assert_eq!(args.expert_slots, 4096);

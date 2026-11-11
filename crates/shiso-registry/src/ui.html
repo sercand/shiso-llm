@@ -202,6 +202,7 @@
             <label class="checkbox-item"><input type="checkbox" value="text" checked> Text</label>
             <label class="checkbox-item"><input type="checkbox" value="audio"> Audio</label>
             <label class="checkbox-item"><input type="checkbox" value="image"> Image</label>
+            <label class="checkbox-item"><input type="checkbox" value="3d"> 3D</label>
           </div>
         </div>
       </div>
@@ -828,6 +829,14 @@ function renderVariantsList() {
           <div class="col form-group">
             <label>ASR Batch Size (--asr-batch)</label>
             <input type="number" value="${v.server_defaults?.asr_batch || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'asr_batch', this.value)">
+          </div>
+          <div class="col form-group">
+            <label>Splat Default Steps (--splat-default-steps)</label>
+            <input type="number" value="${v.server_defaults?.splat_default_steps || ''}" placeholder="model default" onchange="updateServerDefault(${vIdx}, 'splat_default_steps', this.value)">
+          </div>
+          <div class="col form-group">
+            <label>Splat Refresh Every (--splat-refresh-every)</label>
+            <input type="number" min="1" max="4" value="${v.server_defaults?.splat_refresh_every || ''}" placeholder="1 = every step in full" onchange="updateServerDefault(${vIdx}, 'splat_refresh_every', this.value)">
           </div>
         </div>
         <div class="row">

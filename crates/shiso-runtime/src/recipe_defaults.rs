@@ -115,6 +115,20 @@ pub fn apply_recipe_defaults_unless_set(
         );
     }
 
+    if let Some(steps) = defaults.splat_default_steps
+        && check_override("splat_default_steps")
+    {
+        args.splat_default_steps = Some(steps);
+        tracing::info!(steps, "applied recipe default for splat_default_steps");
+    }
+
+    if let Some(every) = defaults.splat_refresh_every
+        && check_override("splat_refresh_every")
+    {
+        args.splat_refresh_every = Some(every);
+        tracing::info!(every, "applied recipe default for splat_refresh_every");
+    }
+
     apply_engine_defaults(args, explicit, defaults);
 }
 

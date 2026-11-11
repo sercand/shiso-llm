@@ -1,9 +1,9 @@
 //! Turning an IR splat request into a validated job.
 
 use shiso_core::ids::Seed;
-use shiso_ir::splat::{Generate, Mode};
+use shiso_ir::splat::{Format, Generate, Mode};
 use shiso_vision::splat::{
-    DEFAULT_CFG_STRENGTH, DEFAULT_RESCALE_T, SplatGenError, SplatJob, SplatMode,
+    DEFAULT_CFG_STRENGTH, DEFAULT_RESCALE_T, SplatFormat, SplatGenError, SplatJob, SplatMode,
 };
 
 use super::{SplatDefaults, refuse};
@@ -44,6 +44,11 @@ pub fn build_job(
         crop_margin: request
             .crop_margin
             .unwrap_or_else(|| mode.default_crop_margin()),
+        format: match request.format {
+            Format::Ply => SplatFormat::Ply,
+            Format::Glb => SplatFormat::Glb,
+        },
+        refresh_every: request.refresh_every.unwrap_or(defaults.refresh_every),
     };
     job.validate().map_err(refuse)?;
     Ok(job)

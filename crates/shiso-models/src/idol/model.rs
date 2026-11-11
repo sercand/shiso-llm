@@ -5,7 +5,8 @@
 //! picture becomes the 1024 square, the encoders answer the conditioning
 //! (the `VAE` posterior's noise is the job's first draw), the flow integrates
 //! the latent and the camera, the octree places the anchors and the Gaussian
-//! decoder expands them, and the cloud is written as a `.ply`. Every draw
+//! decoder expands them, and the cloud is written as the job's file (a `.ply`
+//! or a `.glb`). Every draw
 //! comes from one [`SeededDraws`] over the job's seed, in the reference's
 //! order.
 
@@ -15,7 +16,8 @@ use std::sync::Arc;
 use shiso_core::Backend;
 use shiso_vision::generator::ImageGenError;
 use shiso_vision::splat::{
-    GeneratedSplat, SplatGenError, SplatGenerator, SplatJob, SplatLimits, SplatStepEvent,
+    GeneratedSplat, SplatFormat, SplatGenError, SplatGenerator, SplatJob, SplatLimits,
+    SplatStepEvent,
 };
 
 use super::conditioner::{Conditioner, IdolConditioner};
@@ -26,9 +28,10 @@ use super::denoiser::IdolDenoiser;
 use super::draws::{Draws, SeededDraws};
 use super::gaussian::{RawOutput, RepresentationConfig, activate};
 use super::generator::{
-    Denoiser, FlowState, GaussianDecoder, OctreeDecoder, Pipeline, PipelineConfig, PipelineError,
-    Prepared, run,
+    Denoiser, FlowState, GaussianDecoder, OctreeDecoder, Pass, Pipeline, PipelineConfig,
+    PipelineError, Prepared, run,
 };
+use super::glb::write_glb;
 use super::octree::CHILDREN;
 use super::ply::{GaussianCloud, write_ply};
 use super::preprocess::{IMAGE_SIZE, Matting, PreprocessError, preprocess};
@@ -40,9 +43,6 @@ use crate::splat_registry::SplatModelDesc;
 /// though guidance runs two passes.
 pub const SEQUENCE_TOKENS: u32 = 12_294;
 
-/// The `.ply` media type.
-const MEDIA_TYPE: &str = "model/ply";
-
 impl Denoiser for IdolDenoiser {
     fn prepare(&self, cond: &Conditioning) -> Result<Prepared, String> {
         self.context(cond).map_err(|e| e.to_string())
@@ -53,14 +53,19 @@ impl Denoiser for IdolDenoiser {
         sample: &FlowState,
         timestep: f32,
         prepared: &Prepared,
+        pass: Pass,
     ) -> Result<FlowState, String> {
         let v = self
-            .forward(&sample.latent, &sample.camera, timestep, prepared)
+            .forward(&sample.latent, &sample.camera, timestep, prepared, pass)
             .map_err(|e| e.to_string())?;
         Ok(FlowState {
             latent: v.latent,
             camera: v.camera,
         })
+    }
+
+    fn release(&self) {
+        Self::release(self);
     }
 }
 
@@ -208,6 +213,7 @@ impl IdolGenerator {
                 rescale_t: job.rescale_t,
                 cfg_strength: job.cfg_strength,
                 num_gaussians: job.num_gaussians,
+                refresh_every: job.refresh_every,
             },
             &cond,
             draws,
@@ -216,13 +222,19 @@ impl IdolGenerator {
         self.ops.trim_pool();
         let generation = generation.map_err(|e| match e {
             PipelineError::AnchorBudget { count, .. } => SplatGenError::InvalidGaussians { count },
+            PipelineError::Refresh => SplatGenError::InvalidRefresh {
+                value: job.refresh_every,
+            },
             PipelineError::Stage { .. } => SplatGenError::Backend(e.to_string()),
         })?;
-        let bytes =
-            write_ply(&generation.cloud).map_err(|e| SplatGenError::Encoding(e.to_string()))?;
+        let bytes = match job.format {
+            SplatFormat::Ply => write_ply(&generation.cloud),
+            SplatFormat::Glb => write_glb(&generation.cloud),
+        }
+        .map_err(|e| SplatGenError::Encoding(e.to_string()))?;
         Ok(GeneratedSplat {
             bytes,
-            media_type: MEDIA_TYPE,
+            media_type: job.format.media_type(),
             num_gaussians: job.num_gaussians,
             completion_tokens: SEQUENCE_TOKENS.saturating_mul(job.steps),
         })

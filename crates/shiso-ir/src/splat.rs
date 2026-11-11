@@ -2,8 +2,8 @@
 //!
 //! Like [`crate::image`], these types carry no serde derives: the wire parses
 //! its own body into a [`Generate`] and spells [`Splats`] and [`Step`] in its
-//! own shape. Nothing here names a model family or a file format; a splat is
-//! bytes and a MIME type.
+//! own shape. Nothing here names a model family; a splat is bytes, a MIME
+//! type and which of the two containers a request asked for.
 
 /// What the picture is, which only chooses the default crop margin.
 ///
@@ -19,6 +19,16 @@ pub enum Mode {
     Synthetic,
     /// A photograph with background. Default crop margin 1.7.
     Real,
+}
+
+/// The file a request wants its splat written as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Format {
+    /// The 3D Gaussian-splatting `.ply`.
+    #[default]
+    Ply,
+    /// A binary glTF (`.glb`) with the Gaussian-splatting extension.
+    Glb,
 }
 
 /// A single-image splat request.
@@ -40,12 +50,16 @@ pub struct Generate {
     pub num_gaussians: Option<u32>,
     /// Overrides the mode's crop margin when present.
     pub crop_margin: Option<f32>,
+    /// The file the splat is written as.
+    pub format: Format,
+    /// How often a step runs in full; `None` is the operator's default.
+    pub refresh_every: Option<u32>,
 }
 
 /// One finished splat file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Splat {
-    /// The encoded `.ply` file.
+    /// The encoded file, in the request's [`Format`].
     pub bytes: Vec<u8>,
     /// Its MIME type.
     pub media_type: String,
@@ -117,7 +131,10 @@ mod tests {
             rescale_t: None,
             num_gaussians: None,
             crop_margin: None,
+            format: Format::default(),
+            refresh_every: None,
         };
+        assert_eq!(request.format, Format::Ply);
         assert_eq!(request.mode, Mode::Synthetic);
         assert_eq!(request.num_gaussians, None);
     }

@@ -17,10 +17,25 @@
 //!
 //! The reference runs the blocks in fp16; this runs f32 throughout (see the
 //! module doc of [`super::nn`]).
+//!
+//! # What one pass leaves for the next
+//!
+//! Two things, both between passes of one request and neither changing an
+//! answer the reference would give:
+//!
+//! - The latent stream after its own refiner ([`Refined`]): a step's guided
+//!   and unguided passes refine the same latent at the same timestep, so the
+//!   second copies the first's rows.
+//! - The conditioning rows' keys and values in every joint block ([`Kept`]),
+//!   when the sampler asks for them with [`Pass::Keep`]. A [`Pass::Held`]
+//!   pass then runs the latent and the camera alone and attends to those
+//!   keys beside its own: the approximation a request opts into with a
+//!   refresh interval, described on
+//!   [`super::generator::Pipeline::refresh_every`].
 
 use std::f32::consts::PI;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use shiso_core::DeviceBuffer;
@@ -28,14 +43,14 @@ use shiso_vision::generator::ImageGenError;
 
 use super::conditioning::Conditioning;
 use super::config::{DenoiserArgs, IdolConfig};
-use super::generator::Prepared;
+use super::generator::{Pass, Prepared};
 use super::nn::{
     Affine, AttnShape, HEAD_NORM_EPS, HeadNorm, HeavyKey, Qkv, add_gated_in_place, attention,
     bytes, host_lin, layer_norm, linear, point_embed_v1, read_linear,
 };
 use super::splat_ops::{ATTN_HEAD, RopeNormCall, rope_norm};
 use crate::diffusion::lin::Lin;
-use crate::diffusion::ops::{ModulateCall, Ops, SliceExt};
+use crate::diffusion::ops::{GemmCall, ModulateCall, Ops, SliceExt};
 use crate::diffusion::weights::StStore;
 
 /// The block norms' epsilon.
@@ -228,21 +243,114 @@ pub(crate) struct IdolDenoiser {
     cam: [HostLinear; 2],
     out: Lin,
     cam_out: HostLinear,
+    /// What the last pass left for the next one.
+    carried: Mutex<Carried>,
+}
+
+/// What a pass leaves for the next one of the same request.
+#[derive(Debug, Default)]
+struct Carried {
+    refined: Option<Refined>,
+    kept: Option<Kept>,
+}
+
+/// The latent stream after the noise refiner, kept from one pass for the next.
+///
+/// The refiner reads the latent, its positions and the timestep and nothing
+/// else, so a step's guided and unguided passes - the same latent at the same
+/// timestep under two conditionings - refine it to the same rows. The second
+/// pass copies them instead of running the two blocks again: the same
+/// launches' output, so the same bits (a 25-step request's file is byte for
+/// byte the one it was before). Measured on an M4 at 8192 latent rows: 0.3 s
+/// of a step's 13.6 s.
+#[derive(Debug)]
+struct Refined {
+    /// The latent the rows were refined from, compared bit for bit.
+    latent: Vec<f32>,
+    /// The timestep they were refined at.
+    timestep: f32,
+    /// The refined rows, `(q_token_length, model_channels)`.
+    rows: DeviceBuffer,
+}
+
+impl Refined {
+    /// Whether these rows are the refinement of `latent` at `timestep`.
+    fn is_for(&self, latent: &[f32], timestep: f32) -> bool {
+        self.timestep.to_bits() == timestep.to_bits()
+            && self.latent.len() == latent.len()
+            && self
+                .latent
+                .iter()
+                .zip(latent)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+}
+
+/// The conditioning rows' keys and values in every joint block, as the last
+/// [`Pass::Keep`] computed them: turned, normed and ready to attend to.
+///
+/// 24 blocks of two `(rows, model_channels)` buffers: 806 MiB at the
+/// checkpoint's 4101 rows, held only while a request that asked for it
+/// integrates ([`IdolDenoiser::release`]).
+#[derive(Debug)]
+struct Kept {
+    /// Conditioning rows in each buffer.
+    rows: usize,
+    /// One pair per joint block.
+    blocks: Vec<KeptBlock>,
+}
+
+/// One joint block's kept conditioning keys and values.
+#[derive(Debug)]
+struct KeptBlock {
+    k: DeviceBuffer,
+    v: DeviceBuffer,
+}
+
+/// Where a block's attention finds the keys and values that are not its own
+/// rows', and where it leaves the ones that are.
+#[derive(Debug, Clone, Copy)]
+enum Keys<'a> {
+    /// The block attends to its own rows and keeps nothing.
+    Own,
+    /// As [`Keys::Own`], and rows `first .. first + kept.rows` of the keys
+    /// and values are copied out.
+    Keep {
+        /// Where they go.
+        into: &'a KeptBlock,
+        /// The first conditioning row.
+        first: usize,
+        /// How many there are.
+        rows: usize,
+    },
+    /// The block attends to its own rows and then to `rows` kept ones.
+    Held {
+        /// The kept keys and values.
+        from: &'a KeptBlock,
+        /// How many there are.
+        rows: usize,
+    },
 }
 
 /// The rows one block runs over.
 #[derive(Debug, Clone, Copy)]
-struct Span {
+struct Span<'a> {
     /// Rows held on the device.
     rows: usize,
     /// The row that stands for several identical ones, when there is one.
     heavy: Option<HeavyKey>,
+    /// The keys beyond the block's own rows.
+    keys: Keys<'a>,
 }
 
-impl Span {
-    /// `rows` rows, each standing for itself.
+impl Span<'_> {
+    /// `rows` rows, each standing for itself, attending to themselves.
     const fn plain(rows: usize) -> Self {
-        Self { rows, heavy: None }
+        Self {
+            rows,
+            heavy: None,
+            keys: Keys::Own,
+        }
     }
 }
 
@@ -380,6 +488,7 @@ impl IdolDenoiser {
             ],
             out: Lin::load(&store, &ops, "out_layer")?,
             cam_out: HostLinear::load(&store, "cam_out_layer")?,
+            carried: Mutex::new(Carried::default()),
             args,
             ops,
         })
@@ -460,13 +569,30 @@ impl IdolDenoiser {
         })
     }
 
+    /// Drops what the passes carried between them: the refined latent and
+    /// the kept conditioning keys. A request's last pass is followed by this,
+    /// so the next request's encoders find the memory free.
+    pub(crate) fn release(&self) {
+        if let Ok(mut carried) = self.carried.lock() {
+            *carried = Carried::default();
+        }
+    }
+
     /// The velocity at `(latent, camera)` for the model timestep `timestep`
     /// (the sampler's `t` times 1000) under the conditioning stream
-    /// `prepared` (from [`IdolDenoiser::context`]).
+    /// `prepared` (from [`IdolDenoiser::context`]), run as `pass` says.
+    ///
+    /// A [`Pass::Held`] pass lays its rows out as the latent then the camera
+    /// and attends to the kept conditioning keys after them. The softmax is
+    /// a sum over the same keys in another order than a full pass's, so a
+    /// held pass straight after the [`Pass::Keep`] it reads, at the same
+    /// latent and timestep, answers that pass's velocity to rounding.
     ///
     /// # Errors
     ///
-    /// [`ImageGenError::Backend`] for inputs of the wrong shape or a device
+    /// [`ImageGenError::Backend`] for inputs of the wrong shape, a
+    /// [`Pass::Keep`] of a collapsed conditioning, a [`Pass::Held`] with no
+    /// kept pass of this conditioning's length before it, or a device
     /// failure.
     #[expect(
         clippy::too_many_lines,
@@ -478,14 +604,61 @@ impl IdolDenoiser {
         camera: &[f32],
         timestep: f32,
         prepared: &Prepared,
+        pass: Pass,
     ) -> Result<Velocity, ImageGenError> {
         let ops = &*self.ops;
         let started = Instant::now();
         let mut times = PassTimes::new();
         let a = &self.args;
         let width = a.model_channels;
-        let (n_x, n_c) = (a.q_token_length, prepared.rows);
+        // A held pass carries no conditioning rows of its own.
+        let n_x = a.q_token_length;
+        let n_c = match pass {
+            Pass::Full | Pass::Keep => prepared.rows,
+            Pass::Held => 0,
+        };
         let rows = n_x + n_c + 1;
+        let mut carried = self
+            .carried
+            .lock()
+            .map_err(|_poison| ImageGenError::Backend("the denoiser's carried state".to_owned()))?;
+        let Carried { refined, kept } = &mut *carried;
+        match pass {
+            Pass::Full => {}
+            Pass::Keep => {
+                if prepared.copies != 1 {
+                    return Err(ImageGenError::Backend(format!(
+                        "a conditioning held as {} row(s) standing for {} each has no rows to keep",
+                        prepared.rows, prepared.copies
+                    )));
+                }
+                if kept.as_ref().is_none_or(|k| k.rows != prepared.rows) {
+                    *kept = None;
+                    let buffer =
+                        || ops.alloc_owned_f32("denoiser kept keys", prepared.rows * width);
+                    *kept = Some(Kept {
+                        rows: prepared.rows,
+                        blocks: (0..self.blocks.len())
+                            .map(|_| {
+                                Ok(KeptBlock {
+                                    k: buffer()?,
+                                    v: buffer()?,
+                                })
+                            })
+                            .collect::<Result<_, ImageGenError>>()?,
+                    });
+                }
+            }
+            Pass::Held => {
+                if kept.as_ref().is_none_or(|k| k.rows != prepared.rows) {
+                    return Err(ImageGenError::Backend(format!(
+                        "a held pass over {} conditioning rows follows no pass that kept them",
+                        prepared.rows
+                    )));
+                }
+            }
+        }
+        let kept = kept.as_ref();
         // Held rows standing for several are attended as one weighted key
         // each; the refiner only ever answers one such row.
         let heavy = match (prepared.copies, n_c) {
@@ -498,7 +671,7 @@ impl IdolDenoiser {
                 )));
             }
         };
-        if prepared.stream.len() != n_c * width {
+        if pass != Pass::Held && prepared.stream.len() != n_c * width {
             return Err(ImageGenError::Backend(format!(
                 "the denoiser reads {n_c} conditioning rows of {width}, got {} values",
                 prepared.stream.len()
@@ -529,39 +702,56 @@ impl IdolDenoiser {
         let stream =
             |first: usize, count: usize| h.view().cut(bytes(first * width), bytes(count * width));
 
-        // The latent stream.
-        let z = ops.upload_scratch("denoiser latent", latent)?;
-        let h_x = linear(ops, "denoiser input", &self.input, z.view(), n_x)?;
-        ops.add(
-            "denoiser positions",
-            stream(0, n_x)?,
-            h_x.view(),
-            self.position.view(),
-            n_x * width,
-        )?;
-        drop((z, h_x));
-        for (repo, block) in self.noise_repo.iter().zip(&self.noise_refiner) {
-            self.block(
-                block,
-                repo,
+        // The latent stream: refined here, or copied from the pass before
+        // when that one refined this latent at this timestep (see `Refined`).
+        if let Some(same) = refined.as_ref().filter(|r| r.is_for(latent, timestep)) {
+            ops.copy("denoiser refined latent", stream(0, n_x)?, same.rows.view())?;
+        } else {
+            let z = ops.upload_scratch("denoiser latent", latent)?;
+            let h_x = linear(ops, "denoiser input", &self.input, z.view(), n_x)?;
+            ops.add(
+                "denoiser positions",
                 stream(0, n_x)?,
-                Span::plain(n_x),
-                Some(&t_mod),
-                &mut times,
+                h_x.view(),
+                self.position.view(),
+                n_x * width,
             )?;
+            drop((z, h_x));
+            for (repo, block) in self.noise_repo.iter().zip(&self.noise_refiner) {
+                self.block(
+                    block,
+                    repo,
+                    stream(0, n_x)?,
+                    Span::plain(n_x),
+                    Some(&t_mod),
+                    &mut times,
+                )?;
+            }
+            // One latent stream (32 MiB), reused by every later pass.
+            let rows = match refined.take() {
+                Some(last) => last.rows,
+                None => ops.alloc_owned_f32("denoiser refined latent", n_x * width)?,
+            };
+            ops.copy("denoiser refined latent", rows.view(), stream(0, n_x)?)?;
+            *refined = Some(Refined {
+                latent: latent.to_vec(),
+                timestep,
+                rows,
+            });
         }
 
         // The conditioning stream, refined once per request: copied in, as
         // the joint blocks below write over these rows.
-        let cond_bytes: Vec<u8> = prepared
-            .stream
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        ops.backend()
-            .copy_h2d(stream(n_x, n_c)?, &cond_bytes)
-            .map_err(|e| ImageGenError::Backend(format!("denoiser cond rows: {e}")))?;
-        drop(cond_bytes);
+        if n_c > 0 {
+            let cond_bytes: Vec<u8> = prepared
+                .stream
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            ops.backend()
+                .copy_h2d(stream(n_x, n_c)?, &cond_bytes)
+                .map_err(|e| ImageGenError::Backend(format!("denoiser cond rows: {e}")))?;
+        }
 
         // The camera token.
         let cam_hidden: Vec<f32> = self.cam[0]
@@ -575,12 +765,24 @@ impl IdolDenoiser {
             .copy_h2d(stream(n_x + n_c, 1)?, &cam_bytes)
             .map_err(|e| ImageGenError::Backend(format!("denoiser camera row: {e}")))?;
 
-        for (repo, block) in self.repo.iter().zip(&self.blocks) {
+        for (index, (repo, block)) in self.repo.iter().zip(&self.blocks).enumerate() {
+            let keys = match (pass, kept) {
+                (Pass::Keep, Some(kept)) => Keys::Keep {
+                    into: &kept.blocks[index],
+                    first: n_x,
+                    rows: kept.rows,
+                },
+                (Pass::Held, Some(kept)) => Keys::Held {
+                    from: &kept.blocks[index],
+                    rows: kept.rows,
+                },
+                _ => Keys::Own,
+            };
             self.block(
                 block,
                 repo,
                 h.view(),
-                Span { rows, heavy },
+                Span { rows, heavy, keys },
                 Some(&t_mod),
                 &mut times,
             )?;
@@ -649,11 +851,11 @@ impl IdolDenoiser {
         block: &Block,
         repo: &Repo,
         x: shiso_core::DeviceView<'_>,
-        span: Span,
+        span: Span<'_>,
         t_mod: Option<&[f32]>,
         times: &mut PassTimes,
     ) -> Result<(), ImageGenError> {
-        let Span { rows, heavy } = span;
+        let Span { rows, heavy, keys } = span;
         let ops = &*self.ops;
         let width = self.args.model_channels;
         let count = rows * width;
@@ -708,8 +910,31 @@ impl IdolDenoiser {
 
         let h = norm("denoiser norm1", 0)?;
         let q = linear(ops, "denoiser qk", &block.q, h.view(), rows)?;
-        let k = linear(ops, "denoiser qk", &block.k, h.view(), rows)?;
-        let v = linear(ops, "denoiser v", &block.v, h.view(), rows)?;
+        // The keys and values this block attends to: its own rows', and
+        // after them the kept ones when the pass holds any. The projections
+        // write the head of each buffer; the kept rows are copied in behind.
+        let key_rows = rows
+            + match keys {
+                Keys::Held { rows, .. } => rows,
+                Keys::Own | Keys::Keep { .. } => 0,
+            };
+        let k = ops.alloc_f32("denoiser qk", key_rows * width)?;
+        let v = ops.alloc_f32("denoiser v", key_rows * width)?;
+        let own = bytes(count);
+        for (step, lin, out) in [
+            ("denoiser qk", &block.k, k.view().cut(0, own)?),
+            ("denoiser v", &block.v, v.view().cut(0, own)?),
+        ] {
+            ops.gemm(&GemmCall {
+                step,
+                out,
+                input: h.view(),
+                weight: lin.weight(),
+                m: rows,
+                n: lin.out_dim,
+                k: lin.in_dim,
+            })?;
+        }
         drop(h);
         times.time(
             ops,
@@ -720,7 +945,7 @@ impl IdolDenoiser {
                     &RopeNormCall {
                         step: "denoiser rope",
                         q: q.view(),
-                        k: k.view(),
+                        k: k.view().cut(0, own)?,
                         offsets: offsets.view(),
                         rates: repo.rates.view(),
                         axis: repo.axis.view(),
@@ -735,6 +960,26 @@ impl IdolDenoiser {
             },
         )?;
         drop(offsets);
+        match keys {
+            Keys::Own => {}
+            Keys::Keep {
+                into,
+                first,
+                rows: kept_rows,
+            } => {
+                let (at, len) = (bytes(first * width), bytes(kept_rows * width));
+                ops.copy("denoiser kept keys", into.k.view(), k.view().cut(at, len)?)?;
+                ops.copy("denoiser kept keys", into.v.view(), v.view().cut(at, len)?)?;
+            }
+            Keys::Held {
+                from,
+                rows: kept_rows,
+            } => {
+                let len = bytes(kept_rows * width);
+                ops.copy("denoiser kept keys", k.view().cut(own, len)?, from.k.view())?;
+                ops.copy("denoiser kept keys", v.view().cut(own, len)?, from.v.view())?;
+            }
+        }
         let attended = times.time(
             ops,
             |t| &mut t.attention,
@@ -749,7 +994,7 @@ impl IdolDenoiser {
                     },
                     AttnShape {
                         queries: rows,
-                        keys: rows,
+                        keys: key_rows,
                         heads: self.args.num_heads,
                         head_dim: self.head_dim,
                         heavy,

@@ -19,17 +19,18 @@ use std::sync::Arc;
 use shiso_core::ids::Seed;
 use shiso_ir::splat::Generate;
 use shiso_vision::splat::{
-    GAUSSIANS_PER_ANCHOR, GeneratedSplat, MAX_GAUSSIANS, MAX_STEPS, MIN_GAUSSIANS, SplatGenError,
-    SplatGenerator, SplatJob, SplatLimits, SplatStepEvent,
+    DEFAULT_REFRESH_EVERY, GAUSSIANS_PER_ANCHOR, GeneratedSplat, MAX_GAUSSIANS, MAX_REFRESH_EVERY,
+    MAX_STEPS, MIN_GAUSSIANS, SplatGenError, SplatGenerator, SplatJob, SplatLimits, SplatStepEvent,
 };
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::AppError;
 
-/// What a splat request that names no step count or Gaussian count gets.
+/// What a splat request that names no step count, Gaussian count or refresh
+/// interval gets.
 ///
-/// The server-side counterpart of the wire's optional `steps` and
-/// `num_gaussians`: the loaded model's [`SplatLimits`] say what it was built
+/// The server-side counterpart of the wire's optional `steps`,
+/// `num_gaussians` and `refresh_every`: the loaded model's [`SplatLimits`] say what it was built
 /// to run at, and the operator may move either value at boot through
 /// [`SplatOverrides`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,15 +39,19 @@ pub struct SplatDefaults {
     pub steps: u32,
     /// How many Gaussians to place.
     pub num_gaussians: u32,
+    /// How often a step runs in full.
+    pub refresh_every: u32,
 }
 
 impl SplatDefaults {
-    /// What the model itself defaults to.
+    /// What the model itself defaults to: its own step and Gaussian counts,
+    /// and the reference's sampler, every step in full.
     #[must_use]
     pub const fn of(limits: &SplatLimits) -> Self {
         Self {
             steps: limits.default_steps,
             num_gaussians: limits.default_num_gaussians,
+            refresh_every: DEFAULT_REFRESH_EVERY,
         }
     }
 }
@@ -58,6 +63,8 @@ pub struct SplatOverrides {
     pub steps: Option<u32>,
     /// `--splat-default-num-gaussians`.
     pub num_gaussians: Option<u32>,
+    /// `--splat-refresh-every`.
+    pub refresh_every: Option<u32>,
 }
 
 /// An operator override the loaded model cannot honour.
@@ -84,6 +91,15 @@ pub enum OverrideError {
         /// The count as configured.
         count: u32,
     },
+    /// The refresh interval is zero or past the family's ceiling.
+    #[error(
+        "--splat-refresh-every {value} is not servable: it must be between 1 and \
+         {MAX_REFRESH_EVERY}"
+    )]
+    Refresh {
+        /// The interval as configured.
+        value: u32,
+    },
 }
 
 impl SplatOverrides {
@@ -107,6 +123,12 @@ impl SplatOverrides {
                 return Err(OverrideError::Gaussians { count });
             }
             defaults.num_gaussians = count;
+        }
+        if let Some(value) = self.refresh_every {
+            if value == 0 || value > MAX_REFRESH_EVERY {
+                return Err(OverrideError::Refresh { value });
+            }
+            defaults.refresh_every = value;
         }
         Ok(defaults)
     }
@@ -155,6 +177,9 @@ pub fn refuse(error: SplatGenError) -> AppError {
         }
         SplatGenError::InvalidCropMargin { .. } => {
             AppError::bad_request(message, Some("crop_margin"), "invalid_request")
+        }
+        SplatGenError::InvalidRefresh { .. } => {
+            AppError::bad_request(message, Some("refresh_every"), "invalid_request")
         }
         SplatGenError::Matting(_)
         | SplatGenError::Backend(_)
@@ -360,7 +385,7 @@ struct GeneratorPanicked;
 #[cfg(test)]
 mod tests {
     use shiso_core::ids::Seed;
-    use shiso_ir::splat::{Generate, Mode};
+    use shiso_ir::splat::{Format, Generate, Mode};
     use shiso_vision::splat::SplatLimits;
 
     use super::{OverrideError, SplatDefaults, SplatOverrides, core};
@@ -376,6 +401,8 @@ mod tests {
             rescale_t: None,
             num_gaussians: None,
             crop_margin: None,
+            format: Format::Ply,
+            refresh_every: None,
         }
     }
 
@@ -419,20 +446,63 @@ mod tests {
     fn an_override_the_model_would_refuse_fails_at_boot() {
         let over = SplatOverrides {
             steps: Some(101),
-            num_gaussians: None,
+            ..SplatOverrides::default()
         };
         assert!(matches!(
             over.resolve(SplatLimits::default()),
             Err(OverrideError::Steps { .. })
         ));
         let over = SplatOverrides {
-            steps: None,
             num_gaussians: Some(32_769),
+            ..SplatOverrides::default()
         };
         assert!(matches!(
             over.resolve(SplatLimits::default()),
             Err(OverrideError::Gaussians { .. })
         ));
+        for value in [0, 5] {
+            let over = SplatOverrides {
+                refresh_every: Some(value),
+                ..SplatOverrides::default()
+            };
+            assert_eq!(
+                over.resolve(SplatLimits::default()),
+                Err(OverrideError::Refresh { value })
+            );
+        }
+    }
+
+    #[test]
+    fn the_refresh_interval_is_the_requests_then_the_operators_then_one() {
+        let limits = SplatLimits::default();
+        let build = |request: Generate, defaults: SplatDefaults| {
+            core::build_job(request, defaults, Seed::new(1))
+                .expect("valid")
+                .refresh_every
+        };
+        assert_eq!(build(request(), SplatDefaults::of(&limits)), 1);
+        let operator = SplatOverrides {
+            refresh_every: Some(2),
+            ..SplatOverrides::default()
+        }
+        .resolve(limits)
+        .expect("servable");
+        assert_eq!(build(request(), operator), 2);
+        let asked = Generate {
+            refresh_every: Some(1),
+            ..request()
+        };
+        assert_eq!(build(asked, operator), 1);
+        let err = core::build_job(
+            Generate {
+                refresh_every: Some(9),
+                ..request()
+            },
+            operator,
+            Seed::new(1),
+        )
+        .expect_err("refused");
+        assert!(err.to_string().contains("refresh_every"), "{err}");
     }
 
     #[test]
@@ -488,8 +558,8 @@ mod service_tests {
 
     use shiso_core::ids::Seed;
     use shiso_vision::splat::{
-        GeneratedSplat, SplatGenError, SplatGenerator, SplatJob, SplatLimits, SplatMode,
-        SplatStepEvent,
+        GeneratedSplat, SplatFormat, SplatGenError, SplatGenerator, SplatJob, SplatLimits,
+        SplatMode, SplatStepEvent,
     };
     use tokio::sync::mpsc;
 
@@ -506,6 +576,8 @@ mod service_tests {
             rescale_t: 3.0,
             num_gaussians: 262_144,
             crop_margin: 1.2,
+            format: SplatFormat::Ply,
+            refresh_every: 1,
         }
     }
 

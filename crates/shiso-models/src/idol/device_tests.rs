@@ -23,6 +23,7 @@ use shiso_core::Backend;
 
 use crate::diffusion::ops::Ops;
 use crate::flux2::vae_encoder::VaeEncoder;
+use crate::idol::generator::Pass;
 use crate::idol::latent::{LatentNorm, VAE_PREFIX_ROWS, tokenize, with_prefix};
 
 pub(super) fn fixture_dir() -> PathBuf {
@@ -275,7 +276,7 @@ fn the_denoiser_matches_the_reference_velocity() {
     let denoiser = IdolDenoiser::load(&dir, ops).expect("the denoiser loads");
     let prepared = denoiser.context(&cond).expect("the conditioning refines");
     let v = denoiser
-        .forward(&latent, &camera, 700.0, &prepared)
+        .forward(&latent, &camera, 700.0, &prepared, Pass::Full)
         .expect("the denoiser runs");
     // Measured: worst 1.3e-4, mean 4.4e-6.
     close_mean(
@@ -291,7 +292,7 @@ fn the_denoiser_matches_the_reference_velocity() {
         .context(&negative)
         .expect("the zero conditioning refines");
     let v = denoiser
-        .forward(&latent, &camera, 700.0, &negative)
+        .forward(&latent, &camera, 700.0, &negative, Pass::Full)
         .expect("the negative pass runs");
     // Zero conditioning gives 4101 identical context rows, which the
     // denoiser holds as one weighted row, and the 24 joint blocks amplify f32
@@ -529,6 +530,7 @@ fn the_flow_integrates_to_the_reference_latent() {
             rescale_t: e2e.rescale_t,
             cfg_strength: e2e.cfg_strength,
             num_gaussians: e2e.num_gaussians,
+            refresh_every: 1,
         },
         &cond,
         &mut replay,
@@ -576,6 +578,7 @@ impl crate::idol::generator::Denoiser for Still {
         sample: &crate::idol::generator::FlowState,
         _timestep: f32,
         _prepared: &crate::idol::generator::Prepared,
+        _pass: Pass,
     ) -> Result<crate::idol::generator::FlowState, String> {
         Ok(crate::idol::generator::FlowState {
             latent: vec![0.0; sample.latent.len()],
@@ -613,6 +616,7 @@ fn the_decode_from_the_reference_latent_replays_the_reference_cloud() {
             rescale_t: e2e.rescale_t,
             cfg_strength: 0.0,
             num_gaussians: e2e.num_gaussians,
+            refresh_every: 1,
         },
         &crate::idol::conditioning::Conditioning::zero(1),
         &mut replay,
@@ -767,13 +771,132 @@ fn a_prepared_stream_is_reusable() {
     let denoiser = IdolDenoiser::load(&dir, ops).expect("the denoiser loads");
     let prepared = denoiser.context(&cond).expect("the conditioning refines");
     let first = denoiser
-        .forward(&latent, &camera, 700.0, &prepared)
+        .forward(&latent, &camera, 700.0, &prepared, Pass::Full)
         .expect("the first pass runs");
     let second = denoiser
-        .forward(&latent, &camera, 700.0, &prepared)
+        .forward(&latent, &camera, 700.0, &prepared, Pass::Full)
         .expect("the second pass runs");
     assert_eq!(first.latent, second.latent, "latent velocity");
     assert_eq!(first.camera, second.camera, "camera velocity");
+}
+
+/// A latent, a camera and a conditioning drawn from a seed: the cases that
+/// compare one pass against another need inputs, not a reference's.
+fn drawn_inputs(
+    config: &crate::idol::config::DenoiserArgs,
+    rows: usize,
+) -> (Vec<f32>, Vec<f32>, crate::idol::conditioning::Conditioning) {
+    use crate::idol::draws::{Draws as _, SeededDraws};
+    let mut draws = SeededDraws::new(shiso_core::ids::Seed::new(7));
+    let latent = draws.normal(config.q_token_length * config.in_channels);
+    let camera = draws.normal(config.cam_channels);
+    let cond = crate::idol::conditioning::Conditioning {
+        dinov3: draws.normal(rows * config.cond_channels),
+        vae: draws.normal(rows * config.cond2_channels),
+        rows,
+    };
+    (latent, camera, cond)
+}
+
+/// A pass that keeps the conditioning rows' keys answers what a full pass
+/// answers, and a held pass straight after it - the same latent, the same
+/// timestep - answers it again: the kept keys are then exactly the ones a
+/// full pass would compute, attended in another order.
+#[test]
+#[ignore = "needs the splat checkpoint (SHISO_TEST_MODEL_IDOL) and a Metal device"]
+fn a_held_pass_at_the_kept_state_repeats_the_full_pass() {
+    use crate::idol::denoiser::IdolDenoiser;
+
+    let case = "held pass";
+    let dir = need!(case, checkpoint("SHISO_TEST_MODEL_IDOL"));
+    let backend = need!(case, device());
+    let args = crate::idol::config::IdolConfig::read(&dir)
+        .expect("the config reads")
+        .denoiser;
+    // Fewer conditioning rows than a picture's, so the case runs in seconds;
+    // the kept buffers and the key layout do not depend on the count.
+    let (latent, camera, cond) = drawn_inputs(&args, 517);
+    let ops = Arc::new(Ops::new(&backend).expect("the diffusion kernel set"));
+    let denoiser = IdolDenoiser::load(&dir, ops).expect("the denoiser loads");
+    let prepared = denoiser.context(&cond).expect("the conditioning refines");
+
+    // Nothing kept yet: a held pass has nothing to attend to.
+    let err = denoiser
+        .forward(&latent, &camera, 700.0, &prepared, Pass::Held)
+        .expect_err("a held pass with nothing kept");
+    assert!(err.to_string().contains("kept"), "{err}");
+
+    let full = denoiser
+        .forward(&latent, &camera, 700.0, &prepared, Pass::Full)
+        .expect("the full pass runs");
+    let keep = denoiser
+        .forward(&latent, &camera, 700.0, &prepared, Pass::Keep)
+        .expect("the keeping pass runs");
+    assert_eq!(full.latent, keep.latent, "keeping changes no latent value");
+    assert_eq!(full.camera, keep.camera, "keeping changes no camera value");
+
+    let held = denoiser
+        .forward(&latent, &camera, 700.0, &prepared, Pass::Held)
+        .expect("the held pass runs");
+    // Measured on an M4: worst 7.8e-5, mean 2.9e-6 of the rms.
+    close_mean(
+        &held.latent,
+        &full.latent,
+        1e-3,
+        5e-5,
+        "held latent velocity",
+    );
+    close(&held.camera, &full.camera, 1e-4, "held camera velocity");
+
+    // At another timestep the held keys are stale, and the pass still runs:
+    // that is the approximation, and it must not be the previous answer.
+    let moved = denoiser
+        .forward(&latent, &camera, 650.0, &prepared, Pass::Held)
+        .expect("the held pass runs at another timestep");
+    assert_ne!(moved.latent, held.latent);
+
+    denoiser.release();
+    let err = denoiser
+        .forward(&latent, &camera, 700.0, &prepared, Pass::Held)
+        .expect_err("a held pass after the release");
+    assert!(err.to_string().contains("kept"), "{err}");
+}
+
+/// The refined latent is carried from a step's first pass to its second, and
+/// from nowhere else: another latent or another timestep refines again.
+#[test]
+#[ignore = "needs the splat checkpoint (SHISO_TEST_MODEL_IDOL) and a Metal device"]
+fn the_refined_latent_is_reused_only_for_the_same_latent_and_timestep() {
+    use crate::idol::denoiser::IdolDenoiser;
+
+    let case = "refined latent";
+    let dir = need!(case, checkpoint("SHISO_TEST_MODEL_IDOL"));
+    let backend = need!(case, device());
+    let args = crate::idol::config::IdolConfig::read(&dir)
+        .expect("the config reads")
+        .denoiser;
+    let (latent, camera, cond) = drawn_inputs(&args, 517);
+    let ops = Arc::new(Ops::new(&backend).expect("the diffusion kernel set"));
+    let denoiser = IdolDenoiser::load(&dir, ops).expect("the denoiser loads");
+    let prepared = denoiser.context(&cond).expect("the conditioning refines");
+    let pass = |latent: &[f32], timestep: f32| {
+        denoiser
+            .forward(latent, &camera, timestep, &prepared, Pass::Full)
+            .expect("the pass runs")
+    };
+    // The first pass refines; the second copies the first's rows.
+    let fresh = pass(&latent, 700.0);
+    let copied = pass(&latent, 700.0);
+    assert_eq!(fresh.latent, copied.latent, "the copy is the refinement");
+    // A pass in between at another timestep and another latent replaces the
+    // carried rows, so the next one at the first state refines afresh and
+    // must answer what it answered before.
+    let mut other = latent.clone();
+    other[0] += 1.0;
+    assert_ne!(pass(&latent, 500.0).latent, fresh.latent);
+    assert_ne!(pass(&other, 700.0).latent, fresh.latent);
+    denoiser.release();
+    assert_eq!(pass(&latent, 700.0).latent, fresh.latent);
 }
 
 /// A conditioning of one repeated row attends as one weighted key: the
@@ -801,10 +924,10 @@ fn a_repeated_conditioning_row_attends_as_one_weighted_key() {
         copies: 1,
     };
     let a = denoiser
-        .forward(&latent, &camera, 700.0, &collapsed)
+        .forward(&latent, &camera, 700.0, &collapsed, Pass::Full)
         .expect("the collapsed pass runs");
     let b = denoiser
-        .forward(&latent, &camera, 700.0, &full)
+        .forward(&latent, &camera, 700.0, &full, Pass::Full)
         .expect("the full pass runs");
     // The same sum in another order, through 24 blocks that amplify rounding
     // on this conditioning (see the reference case's bound).
@@ -845,7 +968,7 @@ fn the_denoiser_pass_profile() {
     .expect("the conditioning refines");
     let pass = || {
         denoiser
-            .forward(&latent, &camera, 700.0, &prepared)
+            .forward(&latent, &camera, 700.0, &prepared, Pass::Full)
             .expect("the pass runs");
     };
     pass();

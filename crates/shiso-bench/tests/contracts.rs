@@ -54,7 +54,7 @@ use shiso_vision::generator::{
     ImageOutputFormat, ImageStepEvent, InputReferenceImage,
 };
 use shiso_vision::splat::{
-    GeneratedSplat, SplatGenError, SplatGenerator, SplatJob, SplatMode, SplatStepEvent,
+    GeneratedSplat, SplatFormat, SplatGenError, SplatGenerator, SplatJob, SplatMode, SplatStepEvent,
 };
 
 use shiso_hub::{HostProfile, HubError, ModelRef, ProgressEvent, Recipe};
@@ -860,10 +860,22 @@ type GenerateSplat = fn(
 const _: GenerateSplat = <dyn SplatGenerator>::generate;
 
 /// A job read apart: the picture's bytes, the mode, the core `Seed` newtype,
-/// the step count, the two sampler knobs, the Gaussian count and the crop
-/// margin. A raw `u64` seed, or a Gaussian count that became a float, stops
-/// here.
-type SplatJobFields = (Vec<u8>, SplatMode, Seed, u32, f32, f32, u32, f32);
+/// the step count, the two sampler knobs, the Gaussian count, the crop
+/// margin, the file format and the refresh interval. A raw `u64` seed, a
+/// Gaussian count that became a float, or a format that became a string,
+/// stops here.
+type SplatJobFields = (
+    Vec<u8>,
+    SplatMode,
+    Seed,
+    u32,
+    f32,
+    f32,
+    u32,
+    f32,
+    SplatFormat,
+    u32,
+);
 fn splat_job_fields(job: SplatJob) -> SplatJobFields {
     (
         job.image,
@@ -874,6 +886,8 @@ fn splat_job_fields(job: SplatJob) -> SplatJobFields {
         job.rescale_t,
         job.num_gaussians,
         job.crop_margin,
+        job.format,
+        job.refresh_every,
     )
 }
 const _: fn(SplatJob) -> SplatJobFields = splat_job_fields;
@@ -949,6 +963,7 @@ fn splat_gen_error_variants(error: &SplatGenError) -> (u8, u32) {
             (10, 0)
         }
         SplatGenError::NoMatte => (11, 0),
+        SplatGenError::InvalidRefresh { value } => (12, *value),
     }
 }
 const _: fn(&SplatGenError) -> (u8, u32) = splat_gen_error_variants;
@@ -1013,6 +1028,8 @@ type SplatRequestFields = (
     Option<f32>,
     Option<u32>,
     Option<f32>,
+    shiso_ir::splat::Format,
+    Option<u32>,
 );
 fn splat_request_fields(request: shiso_ir::splat::Generate) -> SplatRequestFields {
     (
@@ -1024,6 +1041,8 @@ fn splat_request_fields(request: shiso_ir::splat::Generate) -> SplatRequestField
         request.rescale_t,
         request.num_gaussians,
         request.crop_margin,
+        request.format,
+        request.refresh_every,
     )
 }
 const _: fn(shiso_ir::splat::Generate) -> SplatRequestFields = splat_request_fields;
