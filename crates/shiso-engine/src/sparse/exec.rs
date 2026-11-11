@@ -669,7 +669,11 @@ impl<'a> Exec<'a> {
         // n-gram rows depend only on the input tokens, so they land up front
         // (the serial path overlaps that read with the prologue; here the whole
         // pass is one buffer, so there is no prologue to overlap it with).
-        if graphs.is_none() && tap.is_none() && self.backend.supports_segments() {
+        if graphs.is_none()
+            && tap.is_none()
+            && self.backend.supports_segments()
+            && !self.backend.is_profiling()
+        {
             if let Some(land) = land.as_deref_mut() {
                 land()?;
             }

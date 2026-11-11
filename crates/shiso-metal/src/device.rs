@@ -1002,6 +1002,10 @@ impl Backend for MetalBackend {
         true
     }
 
+    fn is_profiling(&self) -> bool {
+        self.inner.lock().profile.is_some()
+    }
+
     fn encode_cut(&self) -> CoreResult<u32> {
         let mut state = self.inner.lock();
         if state.profile.is_some() {

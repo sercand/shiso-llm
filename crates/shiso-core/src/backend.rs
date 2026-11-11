@@ -562,6 +562,13 @@ pub trait Backend: Send + Sync + fmt::Debug {
         false
     }
 
+    /// Whether a profile region is open, so launches are timed one at a time.
+    /// The segmented path runs a whole pass as one buffer and cannot profile
+    /// per launch, so a caller chooses the serial path while this is `true`.
+    fn is_profiling(&self) -> bool {
+        false
+    }
+
     /// Encodes a cut into the open command buffer: the GPU signals that it has
     /// reached this point and then waits for the host to release it. Returns
     /// the cut's index, which [`Backend::wait_cut`] and [`Backend::resume_cut`]
