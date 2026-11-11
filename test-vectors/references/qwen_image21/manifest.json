@@ -6,6 +6,20 @@
   "convrot": {
    "script_sha256": "d74f74fb74e332f7f41c2ecb62ba79ab016e2d1549679b7894d18c078aa6d340"
   },
+  "edit-block": {
+   "environment": {
+    "diffusers": "0.41.0.dev0",
+    "diffusers_commit": "d42ebf9c6e0b46103b74283f5324357a67acaa04",
+    "numpy": "2.5.2",
+    "torch": "2.11.0",
+    "transformers": "5.5.0",
+    "turbo": {
+     "repo": "Qwen/Qwen-Image-2.1-Turbo",
+     "revision": "d65dbc9a7e8f6b5479e33dee6030eaab2a906509"
+    }
+   },
+   "script_sha256": "45284408ab572131df22de524a4b6084d31c89bced5331f40848f69d13c9ca33"
+  },
   "edit-text-encoder-int8": {
    "environment": {
     "diffusers": "0.41.0.dev0",
@@ -556,6 +570,120 @@
    "shape": [
     8,
     4096
+   ]
+  },
+  "edit_block.json": {
+   "description": "One-layer QwenImage21Transformer2DModel (block 0 or 31 of the local INT8 export, f32) over an interleaved prefix of text and two condition images and a 4x4 target: the rotary table, the cached prefix keys and values, and the target output through the full block-causal pass and the prefix-cache pass.",
+   "dtype": "json",
+   "sha256": "e32e441f5a34d642b9c5d027f42575e7eb8d088b1d6392145d420ac26ae2de57",
+   "shape": null
+  },
+  "edit_block00_cached_out.f32": {
+   "description": "Prefix-cache pass, target tokens [16, 64] at sigma 0.704534.",
+   "dtype": "f32le",
+   "sha256": "03852cadc42c8c9706bfa3dbb227e2b6ef8091f6b392f570b837f8e4ff19e5b1",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "edit_block00_prefix_k.f32": {
+   "description": "Cached prefix keys after QK-norm and RoPE [51, 4096] (heads of 128 side by side).",
+   "dtype": "f32le",
+   "sha256": "0146e5f16edccd271dbcd0380aba5daffe398e80e39b2b956e39d9fee8b8f48e",
+   "shape": [
+    51,
+    4096
+   ]
+  },
+  "edit_block00_prefix_v.f32": {
+   "description": "Cached prefix values [51, 4096].",
+   "dtype": "f32le",
+   "sha256": "cbd405005d6b855242ba31466b94faa4cfa6857d31be3bd6f54f967f87a9ec08",
+   "shape": [
+    51,
+    4096
+   ]
+  },
+  "edit_block00_target_out.f32": {
+   "description": "Full block-causal pass, target tokens [16, 64] at sigma 0.704534.",
+   "dtype": "f32le",
+   "sha256": "03852cadc42c8c9706bfa3dbb227e2b6ef8091f6b392f570b837f8e4ff19e5b1",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "edit_block31_cached_out.f32": {
+   "description": "Prefix-cache pass, target tokens [16, 64] at sigma 0.704534.",
+   "dtype": "f32le",
+   "sha256": "6be5741f3aaff000eb705fa3cca7b53742055887e6349130cdda3a0ded0fc417",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "edit_block31_prefix_k.f32": {
+   "description": "Cached prefix keys after QK-norm and RoPE [51, 4096] (heads of 128 side by side).",
+   "dtype": "f32le",
+   "sha256": "769a25436b34d08f2a31750d156fab0abd90a799706c01f57b7fcbf99758a700",
+   "shape": [
+    51,
+    4096
+   ]
+  },
+  "edit_block31_prefix_v.f32": {
+   "description": "Cached prefix values [51, 4096].",
+   "dtype": "f32le",
+   "sha256": "3a8a82a4a4aaa3965ababa02aeb9766d284e421235b06229942452af24bd6fa0",
+   "shape": [
+    51,
+    4096
+   ]
+  },
+  "edit_block31_target_out.f32": {
+   "description": "Full block-causal pass, target tokens [16, 64] at sigma 0.704534.",
+   "dtype": "f32le",
+   "sha256": "6be5741f3aaff000eb705fa3cca7b53742055887e6349130cdda3a0ded0fc417",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "edit_block_in_encoder.f32": {
+   "description": "Seeded randn [30, 4096] (same stream, second): the encoder's rows, image slots included (the transformer never reads those rows).",
+   "dtype": "f32le",
+   "sha256": "dd0cec23193a719b67393b7adb731cc10cfcd676a196e82f7a56e43e2041d930",
+   "shape": [
+    30,
+    4096
+   ]
+  },
+  "edit_block_in_latents.f32": {
+   "description": "Seeded randn [44, 64] (seed 4321 stream, first): the condition images' latent tokens in order, then the target's.",
+   "dtype": "f32le",
+   "sha256": "2b5bba5a6922fdc01a279adbfac3980a0b5ff2de9ca8363d6581761cf2fa3fb4",
+   "shape": [
+    44,
+    64
+   ]
+  },
+  "edit_block_rope_cos.f32": {
+   "description": "Rotary cos [67, 64] over the joint sequence.",
+   "dtype": "f32le",
+   "sha256": "cbf76dc8ebd38a3d848202249f5713aa74d40edeee7f1981e60c3830c4ec22ce",
+   "shape": [
+    67,
+    64
+   ]
+  },
+  "edit_block_rope_sin.f32": {
+   "description": "Rotary sin [67, 64].",
+   "dtype": "f32le",
+   "sha256": "0d804e32db274bc17aabdd714a035c4dd264f451a407a1b959ee37de0ebd50c0",
+   "shape": [
+    67,
+    64
    ]
   },
   "edit_te.json": {
@@ -1154,6 +1282,86 @@
    "shape": [
     4096,
     1
+   ]
+  },
+  "local-dit:transformer_blocks.0.attn.to_k.weight": {
+   "dtype": "I8",
+   "sha256": "8624b722f671ac62f52bfad3f4228d3fc68f7131041b005ae9376029eb279823",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "local-dit:transformer_blocks.0.attn.to_out.0.weight": {
+   "dtype": "I8",
+   "sha256": "473d52378bf72706fe76fcd1af4cba7272aef6ced8d767c2c27f9689e9de76d1",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "local-dit:transformer_blocks.0.attn.to_q.weight": {
+   "dtype": "I8",
+   "sha256": "5562c841b5bedd8ec3c41d3b19c22f1d44b7f3935c08450cd7d88e459f7ac7b9",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "local-dit:transformer_blocks.0.attn.to_v.weight": {
+   "dtype": "I8",
+   "sha256": "b11c2042325fd051155db9cbca36f1bc0b8337e60e548b7001246cf2ae0d47af",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "local-dit:transformer_blocks.0.img_mlp.out.weight": {
+   "dtype": "I8",
+   "sha256": "9abc57e6d46bbed37938ce0547e4f3fb8ea7f818ba3678569c34d35ed0d18a15",
+   "shape": [
+    4096,
+    12288
+   ]
+  },
+  "local-dit:transformer_blocks.31.attn.to_k.weight": {
+   "dtype": "I8",
+   "sha256": "961f5804645e1b355ba07d00619ef90f1dd1cbb02061dc01296c4007f38cb00c",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "local-dit:transformer_blocks.31.attn.to_out.0.weight": {
+   "dtype": "I8",
+   "sha256": "992bb2e1d842b1006177d688c758f7b6465218bb5686f2ebb14928a10b8d2c2a",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "local-dit:transformer_blocks.31.attn.to_q.weight": {
+   "dtype": "I8",
+   "sha256": "7d30b9cea520823a227558ef45aff2a3d09897da3d4b73cebbbe45b943238501",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "local-dit:transformer_blocks.31.attn.to_v.weight": {
+   "dtype": "I8",
+   "sha256": "0f26f9851c27c92a7954fe92d8a5a2bcb49a332edd9b6c9e338bba45f447b230",
+   "shape": [
+    4096,
+    4096
+   ]
+  },
+  "local-dit:transformer_blocks.31.img_mlp.out.weight": {
+   "dtype": "I8",
+   "sha256": "8f7b28955ab2e0643e36c69cf16680cb8d2e2a80ffeeca2339782f4700e61a77",
+   "shape": [
+    4096,
+    12288
    ]
   },
   "local-te:model.visual.deepstack_merger_list.0.norm.weight": {

@@ -185,8 +185,9 @@ extern "C" __global__ void kernel_dit_gqa_f32(
  *
  * Every thread of the block must reach the barriers and shuffles, so rows past
  * the end carry a zero query and are simply not written. CAUSAL masks every key
- * after the query's own joint row (key > t) and stops streaming at the tile's
- * last row; the host sends it no cached rows. Keys past `keys` are masked, so
+ * live key after the query's own joint row (key > t) and, without cached rows,
+ * stops streaming at the tile's last row; cached rows stand for the sequence
+ * before the live ones and are never masked. Keys past `keys` are masked, so
  * ragged lengths need no special case. */
 template <bool CAUSAL, u32 HD>
 static __device__ __forceinline__ void dit_flash_sdpa(
@@ -209,7 +210,8 @@ static __device__ __forceinline__ void dit_flash_sdpa(
     const u32 hd = HD == 0u ? args.head_dim : HD;
     const u32 hd4 = hd / 4u;
     const u32 rows = args.txt_tokens + args.img_tokens;
-    const u32 keys = CAUSAL ? min(rows, q0 + QR) : rows + args.cache_tokens;
+    const u32 keys = CAUSAL && args.cache_tokens == 0u
+            ? min(rows, q0 + QR) : rows + args.cache_tokens;
     const float scale = 1.0f / sqrtf((float)hd);
 
     const u32 part = tid % 4u;
@@ -259,7 +261,7 @@ static __device__ __forceinline__ void dit_flash_sdpa(
             p += __shfl_xor_sync(0xffffffffu, p, 1);
             p += __shfl_xor_sync(0xffffffffu, p, 2);
             const u32 key = s0 + j;
-            if (key >= keys || (CAUSAL && key > qrow)) {
+            if (key >= keys || (CAUSAL && key < rows && key > qrow)) {
                 p = -DIT_INF;
             }
             sc[j] = p;

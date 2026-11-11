@@ -27,6 +27,8 @@ deleting it deliberately is how it is recaptured.
     block       one transformer block (0 and 31) through the real model, with the
                 block-causal full path and the prefix-KV-cache path compared
     vae         AutoencoderKLQwenImage21 decode of a seeded latent
+    edit-block  one block over an interleaved prefix (text, two condition images, text) and a target, on the
+                local INT8 export: rotary table, cached prefix K/V, full and prefix-cache target outputs
     vae-encode  AutoencoderKLQwenImage21 encode of an RGBA picture to normalised mode latents
     text-encoder  Qwen3-VL prompt features (needs ~40 GB of RAM; not run on a laptop)
     text-encoder-streamed  the same features one decoder layer at a time (range-read, evicted after use)
@@ -1107,6 +1109,172 @@ def cmd_block(args):
     out.finish()
 
 
+# ---------------------------------------------------------------- edit block
+
+LOCAL_DIT = ("~/.shiso/models/qwen-image-2.1-viggle-turbo/int8/image/"
+             "Qwen-Image-2.1-viggle-turbo-v0.3-6step-int8_convrot.safetensors")
+# The edit layout: text, a 4x6 condition image, text, a 2x2 condition image, then the 4x4 target.
+EDIT_LAYOUT = {"text": [20, 3], "images": [(4, 6), (2, 2)], "target": (4, 4)}
+
+
+def build_one_layer_model_local(cache: Path, out: Out, dit_file: str, layer: int):
+    """`QwenImage21Transformer2DModel` with num_layers=1 over a local INT8 ConvRot export, in f32.
+
+    The non-block tensors are BF16 as they are. A block linear is `int8 * per-row scale`, un-rotated (the file
+    stores `W . H` per 256-group of the input axis and `H` is its own inverse); the fused `img_mlp.gate_up` is
+    split back into `gate_layer` (its first rows) and `proj`.
+    """
+    import torch
+    from diffusers import QwenImage21Transformer2DModel
+
+    src = Safetensors(cache, "local-dit", path=Path(dit_file).expanduser())
+    h256 = hadamard_256().astype(np.float32)
+
+    def unrotated(name: str) -> np.ndarray:
+        w = src.tensor(name + ".weight").astype(np.float32) * src.tensor(name + ".weight_scale").astype(np.float32)
+        o, i = w.shape
+        return (w.reshape(o, i // 256, 256) @ h256).reshape(o, i)
+
+    cfg = QwenImage21Transformer2DModel.load_config(str(turbo_file(cache, "transformer/config.json").parent))
+    model = QwenImage21Transformer2DModel.from_config(cfg, num_layers=1)
+    sd = {}
+    for name in src.header:
+        if name != "__metadata__" and not name.startswith("transformer_blocks."):
+            sd[name] = torch.from_numpy(src.tensor(name).copy())
+    p = f"transformer_blocks.{layer}."
+    for n in ("attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0", "img_mlp.out"):
+        sd[f"transformer_blocks.0.{n}.weight"] = torch.from_numpy(unrotated(p + n))
+        note_input(out, src, p + n + ".weight")
+    gate_up = unrotated(p + "img_mlp.gate_up")
+    inner = gate_up.shape[0] // 2
+    sd["transformer_blocks.0.img_mlp.gate_layer.weight"] = torch.from_numpy(gate_up[:inner].copy())
+    sd["transformer_blocks.0.img_mlp.proj.weight"] = torch.from_numpy(gate_up[inner:].copy())
+    for n in ("attn.norm_q", "attn.norm_k"):
+        sd[f"transformer_blocks.0.{n}.weight"] = torch.from_numpy(src.tensor(p + n + ".weight").copy())
+    model.load_state_dict({k: v.float() for k, v in sd.items()}, strict=True)
+    for f in src.dir.glob(f"transformer_blocks.{layer}.*"):
+        f.unlink()
+    return model.float().eval(), cfg
+
+
+def cmd_edit_block(args):
+    """One transformer block over an interleaved prefix: text, two condition images, text, then the target.
+
+    The one-layer model's own forward builds the joint sequence, the rotary table, the block-causal attention
+    and the t = 0 modulation of the condition rows. Run three ways over the local INT8 export in f32: the full
+    block-causal pass, the prefix-KV-cache pass (extract at sigma 1, then cached), and the full pass through an
+    independent dense mask; the cached pass and the dense mask must agree with the full pass.
+    """
+    import torch
+    from diffusers.models.transformers.transformer_qwenimage21 import QwenImage21KVCache
+
+    cache = Path(args.cache_dir).expanduser()
+    out = Out("edit-block", own_env=True)
+    texts, images, target = EDIT_LAYOUT["text"], EDIT_LAYOUT["images"], EDIT_LAYOUT["target"]
+    slots = [h * w // 4 for h, w in images]
+    cells = [h * w for h, w in images]
+    n_target = target[0] * target[1]
+    # The encoder's sequence: text run, image slots, text run, image slots; then the target's slots.
+    mask_parts, id_parts = [], []
+    for block, (text, slot, cell) in enumerate(zip(texts, slots, cells)):
+        mask_parts += [torch.zeros(text, dtype=torch.bool), torch.ones(slot, dtype=torch.bool)]
+        id_parts += [torch.full((text,), -1), torch.full((cell,), block)]
+    enc_rows = sum(texts) + sum(slots)
+    img_mask = torch.cat(mask_parts + [torch.ones(n_target // 4, dtype=torch.bool)])[None]
+    image_ids = torch.cat(id_parts + [torch.full((n_target,), len(images))])
+    prefix = sum(texts) + sum(cells)
+    img_shapes = [[(1, h, w) for h, w in images] + [(1, *target)]]
+    sigma_main, sigma_prefill = 0.704534, 1.0
+    g = seeded(4321)
+    latents = torch.randn(1, sum(cells) + n_target, 64, generator=g)
+    enc = torch.randn(1, enc_rows, 4096, generator=g)
+    inputs = {
+        "latents": out.f32("edit_block_in_latents.f32", latents[0],
+                           f"Seeded randn [{sum(cells) + n_target}, 64] (seed 4321 stream, first): the condition "
+                           "images' latent tokens in order, then the target's."),
+        "encoder": out.f32("edit_block_in_encoder.f32", enc[0],
+                           f"Seeded randn [{enc_rows}, 4096] (same stream, second): the encoder's rows, image "
+                           "slots included (the transformer never reads those rows)."),
+    }
+
+    def ts(sigma):
+        return torch.tensor([np.float32(np.float32(sigma) * np.float32(1000)) / np.float32(1000)])
+
+    cases = {}
+    rope_written = False
+    for layer in (0, 31):
+        model, cfg = build_one_layer_model_local(cache, out, args.dit_file, layer)
+        blk = model.transformer_blocks[0]
+        rec = {}
+        hook = blk.register_forward_hook(
+            lambda m, a, kw, o: rec.__setitem__("rotary", kw["rotary_emb"]), with_kwargs=True)
+
+        def run(sigma, cache_obj=None, mode=None):
+            with torch.no_grad():
+                return model(hidden_states=latents, encoder_hidden_states=enc, timestep=ts(sigma),
+                             img_shapes=img_shapes, img_mask=img_mask, encoder_hidden_states_mask=None,
+                             kv_cache=cache_obj, kv_cache_mode=mode, return_dict=False)[0]
+
+        try:
+            full = run(sigma_main)
+            rotary = rec["rotary"]
+            kv = QwenImage21KVCache(1)
+            run(sigma_prefill, kv, "extract")
+            layer_cache = kv.layer_caches[0]
+            cached = run(sigma_main, kv, "cached")
+            default_proc = blk.attn.processor
+            blk.attn.set_processor(DenseBlockCausalProcessor(image_ids))
+            dense = run(sigma_main)
+            blk.attn.set_processor(default_proc)
+        finally:
+            hook.remove()
+        tgt = slice(-n_target, None)
+        diff_cached = float((full[:, tgt] - cached).abs().max())
+        diff_dense = float((full - dense).abs().max())
+        tag = f"edit_block{layer:02d}"
+        k, v = layer_cache.k, layer_cache.v
+        assert k.shape[1] == prefix and v.shape[1] == prefix, (k.shape, v.shape)
+        files = {
+            "prefix_k": out.f32(f"{tag}_prefix_k.f32", k[0].reshape(prefix, -1),
+                                f"Cached prefix keys after QK-norm and RoPE [{prefix}, 4096] (heads of 128 side by side)."),
+            "prefix_v": out.f32(f"{tag}_prefix_v.f32", v[0].reshape(prefix, -1),
+                                f"Cached prefix values [{prefix}, 4096]."),
+            "target_out": out.f32(f"{tag}_target_out.f32", full[0, tgt],
+                                  f"Full block-causal pass, target tokens [{n_target}, 64] at sigma {sigma_main}."),
+            "cached_out": out.f32(f"{tag}_cached_out.f32", cached[0],
+                                  f"Prefix-cache pass, target tokens [{n_target}, 64] at sigma {sigma_main}."),
+        }
+        if not rope_written:
+            inputs["rope_cos"] = out.f32("edit_block_rope_cos.f32", rotary.real,
+                                         f"Rotary cos [{prefix + n_target}, 64] over the joint sequence.")
+            inputs["rope_sin"] = out.f32("edit_block_rope_sin.f32", rotary.imag,
+                                         f"Rotary sin [{prefix + n_target}, 64].")
+            rope_written = True
+        cases[tag] = {
+            "checkpoint_block": layer, "files": files, "output_abs_max": float(full.abs().max()),
+            "max_abs_diff_full_vs_cached": diff_cached,
+            "max_abs_diff_segmented_vs_dense_mask": diff_dense,
+        }
+        print(tag, "full vs cached", diff_cached, "dense", diff_dense, "|y|max", float(full.abs().max()), flush=True)
+        del model
+
+    out.json(
+        "edit_block.json",
+        {
+            "layout": {"text": texts, "images": [list(i) for i in images], "target": list(target),
+                       "order": "text[0], images[0], text[1], images[1], target",
+                       "encoder_rows": enc_rows, "prefix_tokens": prefix},
+            "sigma": sigma_main, "prefill_sigma": sigma_prefill, "seed": 4321, "inputs": inputs,
+            "weights": "local INT8 ConvRot export, dequantized and un-rotated, f32",
+            "cases": cases,
+        },
+        "One-layer QwenImage21Transformer2DModel (block 0 or 31 of the local INT8 export, f32) over an interleaved "
+        "prefix of text and two condition images and a 4x4 target: the rotary table, the cached prefix keys and "
+        "values, and the target output through the full block-causal pass and the prefix-cache pass.",
+    )
+    out.finish()
+
+
 # ---------------------------------------------------------------- vae
 
 def cmd_vae(args):
@@ -1706,6 +1874,9 @@ def main():
                                 "otherwise the tensors are range-read from the hub")
     p = sub.add_parser("edit-tokenizer", help="edit prompt ids, image-slot mask and 3-axis encoder positions")
     p.set_defaults(fn=cmd_edit_tokenizer)
+    p = sub.add_parser("edit-block", help="one block over text + two condition images + target, local INT8 export")
+    p.set_defaults(fn=cmd_edit_block)
+    p.add_argument("--dit-file", default=LOCAL_DIT, help="local INT8 ConvRot transformer safetensors")
     p = sub.add_parser("vision", help="vision tower rows and deepstack rows for one picture (reads ~1.2 GB locally)")
     p.set_defaults(fn=cmd_vision)
     p.add_argument("--te-file", default=LOCAL_TE, help="local text-encoder safetensors holding model.visual.*")

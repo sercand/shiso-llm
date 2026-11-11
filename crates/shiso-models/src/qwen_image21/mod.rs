@@ -52,6 +52,8 @@ pub(crate) const FACTS: FamilyFacts = FamilyFacts {
 #[cfg(test)]
 mod dit_tests;
 #[cfg(test)]
+mod edit_dit_tests;
+#[cfg(test)]
 mod edit_tests;
 #[cfg(test)]
 mod encoder_tests;

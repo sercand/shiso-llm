@@ -114,6 +114,7 @@ cases!(vae:
 
 cases!(prefix:
     flash_sdpa_causal_masks_every_later_key,
+    flash_sdpa_causal_sees_every_cached_row,
     qk_norm_rope_normalizes_then_turns_adjacent_pairs,
     tanh_and_gelu_tanh_match_their_formulas,
     gqa_valid_keys_masks_pad_keys,

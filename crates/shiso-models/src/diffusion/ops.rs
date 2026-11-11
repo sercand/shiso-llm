@@ -610,9 +610,10 @@ pub(crate) struct SdpaCall<'a> {
     /// Elements per token row in the strided q/k/v buffers (a fused qkv row).
     pub txt_stride: usize,
     pub img_stride: usize,
-    /// Mask every key after the query's own joint row (`s > t`): a
-    /// prefix whose rows never see later ones. Refused with cached rows,
-    /// which sit after every live row and would always be masked.
+    /// Mask every live key after the query's own joint row (`s > t`): a
+    /// prefix whose rows never see later ones. Cached rows are never
+    /// masked: they stand for the sequence before the live rows, so a
+    /// later segment of a causal prefix can run on its own.
     pub causal: bool,
 }
 
@@ -1870,10 +1871,10 @@ impl Ops {
         // transformer's 128-wide heads qualify, the VAE's 512-wide one does not.
         let flash = call.head_dim.is_multiple_of(8) && call.head_dim <= FA_MAX_D;
 
-        if call.causal && (call.cache_tokens > 0 || !flash) {
+        if call.causal && !flash {
             return Err(ImageGenError::Backend(format!(
-                "{}: causal attention takes no cached rows and needs a head of at most {FA_MAX_D} in multiples of 8 (got {} cached rows, head {})",
-                call.step, call.cache_tokens, call.head_dim
+                "{}: causal attention needs a head of at most {FA_MAX_D} in multiples of 8 (got {})",
+                call.step, call.head_dim
             )));
         }
         if flash && !call.causal && call.head_dim == 128 && self.half_kv {

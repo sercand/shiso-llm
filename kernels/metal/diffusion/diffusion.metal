@@ -1942,8 +1942,10 @@ kernel void kernel_dit_kv_half_f32(
 /// The causal instantiation (`kernel_dit_flash_sdpa_causal_f32`) masks every
 /// key after the query's own joint row (`s > t`) and stops streaming at the
 /// tile's last row, so a prefix of P rows costs half the score blocks of the
-/// bidirectional pass. The driver sends it no cached rows: a cached key
-/// sits after every live row and would always be masked.
+/// bidirectional pass. Cached rows are never masked: they stand for the
+/// sequence before the live rows (a later segment of a causal prefix run on
+/// its own), whatever their place in the kernel's key order, so with a cache
+/// the stream runs to the end and only live keys are held to `s <= t`.
 #define DIT_FLASH_SDPA_PARAMS \
         constant dit_args_sdpa & args [[buffer(0)]], \
         device float *out_txt            [[buffer(1)]], \
@@ -1982,7 +1984,8 @@ kernel void kernel_dit_flash_sdpa(DIT_FLASH_SDPA_PARAMS) {
     const uint rows = args.txt_tokens + args.img_tokens;
     // A causal tile's last row sees no key past itself, so the stream stops
     // there; rows past the end load zero queries and are never written.
-    const uint keys = CAUSAL ? min(rows, q0 + QR) : rows + args.cache_tokens;
+    const uint keys = CAUSAL && args.cache_tokens == 0u
+            ? min(rows, q0 + QR) : rows + args.cache_tokens;
     if (h >= args.heads) {
         return;
     }
@@ -2100,7 +2103,7 @@ kernel void kernel_dit_flash_sdpa(DIT_FLASH_SDPA_PARAMS) {
             DIT_UNROLL for (uint b = 0; b < NB; ++b) {
                 DIT_UNROLL for (uint c = 0; c < 2u; ++c) {
                     const uint key = s0 + 8u * b + fn + c;
-                    if (key >= keys || (CAUSAL && key > qrow[rb])) {
+                    if (key >= keys || (CAUSAL && key < rows && key > qrow[rb])) {
                         sf[rb][b].thread_elements()[c] = -INFINITY;
                     }
                     block_max = max(block_max, sf[rb][b].thread_elements()[c]);

@@ -720,3 +720,86 @@ pub fn rope_half_table_turns_each_pair_by_its_own_angle(gpu: &Gpu) {
     close(&still, &x, 0.0, 0.0, "rope_half_table at zero angles");
     differs(&turned, &still, 1e-3, "rope_half_table turned vs still");
 }
+
+/// The causal entry with cached rows: the cached keys stand before every
+/// live row, so each live row attends all of them plus the live rows up to
+/// itself. That is a later segment of a causal sequence run on its own - the
+/// rows after a picture in an interleaved prefix - and it must be the same
+/// attention as the whole sequence run causally in one piece. 100 live rows
+/// straddle two query tiles, so the diagonal block and a tile that would
+/// have stopped streaming early both read the cache.
+///
+/// # Panics
+///
+/// When the device answer leaves the half-staging tolerance of the `f64`
+/// oracle, or when it does not differ from the same rows without a cache.
+pub fn flash_sdpa_causal_sees_every_cached_row(gpu: &Gpu) {
+    for (heads, hd, seed, entry) in [
+        (
+            2usize,
+            128usize,
+            51u32,
+            "kernel_dit_flash_sdpa_causal_d128_f32",
+        ),
+        (2, 128, 51, "kernel_dit_flash_sdpa_causal_f32"),
+        (3, 64, 61, "kernel_dit_flash_sdpa_causal_f32"),
+    ] {
+        let (cached, live) = (45usize, 100usize);
+        let rows = cached + live;
+        let width = heads * hd;
+        let scaled = |seed: u32| -> Vec<f32> {
+            signal(rows * width, seed).iter().map(|v| v * 0.4).collect()
+        };
+        let (q, k, v) = (scaled(seed), scaled(seed + 1), scaled(seed + 2));
+        // The whole sequence, causally: the cached rows first.
+        let whole = attention_host(&q, &k, &v, (rows, heads, hd), true);
+        let want = &whole[cached * width..];
+        let split = cached * width;
+        let run = |cache_tokens: usize| -> Vec<f32> {
+            let live_q = upload(gpu, &q[split..]);
+            let live_k = upload(gpu, &k[split..]);
+            let live_v = upload(gpu, &v[split..]);
+            let cache_keys = upload(gpu, &k[..split]);
+            let cache_values = upload(gpu, &v[..split]);
+            let out = upload(gpu, &vec![0f32; live * width]);
+            let dummy = upload(gpu, &[0.0]);
+            let args = SdpaArgs {
+                txt_tokens: live as u32,
+                img_tokens: 0,
+                cache_tokens: cache_tokens as u32,
+                heads: heads as u32,
+                head_dim: hd as u32,
+                txt_stride: width as u32,
+                img_stride: width as u32,
+                cache_stride: width as u32,
+                q_offset: 0,
+                k_offset: 0,
+                v_offset: 0,
+            };
+            launch(
+                gpu,
+                entry,
+                Extent3::new((live as u32).div_ceil(FA_QROWS), heads as u32, 1),
+                Extent3::linear(FA_THREADS),
+                &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(out.view()),
+                    KernelArg::Buffer(dummy.view()),
+                    KernelArg::Buffer(live_q.view()),
+                    KernelArg::Buffer(live_k.view()),
+                    KernelArg::Buffer(live_v.view()),
+                    KernelArg::Buffer(dummy.view()),
+                    KernelArg::Buffer(dummy.view()),
+                    KernelArg::Buffer(dummy.view()),
+                    KernelArg::Buffer(cache_keys.view()),
+                    KernelArg::Buffer(cache_values.view()),
+                ],
+            );
+            drain(gpu);
+            gpu.read_f32(&out)
+        };
+        let got = run(cached);
+        close(&got, want, 3e-3, 0.05, entry);
+        differs(&got, &run(0), 1e-2, "causal with and without the cache");
+    }
+}

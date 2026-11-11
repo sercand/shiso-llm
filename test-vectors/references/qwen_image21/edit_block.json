@@ -1,0 +1,61 @@
+{
+ "layout": {
+  "text": [
+   20,
+   3
+  ],
+  "images": [
+   [
+    4,
+    6
+   ],
+   [
+    2,
+    2
+   ]
+  ],
+  "target": [
+   4,
+   4
+  ],
+  "order": "text[0], images[0], text[1], images[1], target",
+  "encoder_rows": 30,
+  "prefix_tokens": 51
+ },
+ "sigma": 0.704534,
+ "prefill_sigma": 1.0,
+ "seed": 4321,
+ "inputs": {
+  "latents": "edit_block_in_latents.f32",
+  "encoder": "edit_block_in_encoder.f32",
+  "rope_cos": "edit_block_rope_cos.f32",
+  "rope_sin": "edit_block_rope_sin.f32"
+ },
+ "weights": "local INT8 ConvRot export, dequantized and un-rotated, f32",
+ "cases": {
+  "edit_block00": {
+   "checkpoint_block": 0,
+   "files": {
+    "prefix_k": "edit_block00_prefix_k.f32",
+    "prefix_v": "edit_block00_prefix_v.f32",
+    "target_out": "edit_block00_target_out.f32",
+    "cached_out": "edit_block00_cached_out.f32"
+   },
+   "output_abs_max": 6.714728355407715,
+   "max_abs_diff_full_vs_cached": 0.0,
+   "max_abs_diff_segmented_vs_dense_mask": 4.0531158447265625e-06
+  },
+  "edit_block31": {
+   "checkpoint_block": 31,
+   "files": {
+    "prefix_k": "edit_block31_prefix_k.f32",
+    "prefix_v": "edit_block31_prefix_v.f32",
+    "target_out": "edit_block31_target_out.f32",
+    "cached_out": "edit_block31_cached_out.f32"
+   },
+   "output_abs_max": 9.847066879272461,
+   "max_abs_diff_full_vs_cached": 0.0,
+   "max_abs_diff_segmented_vs_dense_mask": 4.76837158203125e-06
+  }
+ }
+}
