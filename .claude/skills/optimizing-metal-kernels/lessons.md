@@ -21,6 +21,16 @@ shapes differ.
 - **8 consecutive weights per lane (16 B loads)** reached 330–410 GB/s against ~150. The 151936-wide vocab head ran at 355 against 175 GB/s (`audio/audio_gemm.metal`).
 - **Matvec re-reads the matrix per row block,** so 64 prompt tokens read every weight 16×. Above `GEMM_MIN_TOKENS` (`projection.rs:~886`) use a GEMM.
 
+- **GGUF block step tier** (`q4e/ggml.metal`, `q4e_g_step_*`; qwen4exp `UD-IQ3_XXS`, M1 Max, 2026-11-11):
+  - Byte-at-a-time loads with a scale multiplied into every weight read 5 GB/s (`IQ4_NL`) and 18 GB/s (`Q6_K`). `packed_uchar4` loads, codes formed four at a time and the block scale applied to the 32-term sum: routed down 1672 -> 377 us, the 248k-row head 2147 -> 1152 us, a plain decode step 3.1 -> 5.3 tok/s.
+  - One simdgroup a row leaves a 640-wide row with 12 idle lanes. Few lanes a row and many rows a threadgroup helped the narrow rows; four rows a lane on the dense projections made a step slower (3.7 ms a layer against 2.9).
+  - What did **not** move a routed launch: decode tables staged in threadgroup memory, several rows sharing one activation read, spinning on the completion event before blocking.
+  - The microbench has a ~100 us floor a launch (`q4_0` 4096x4096 reads 64 GB/s in it, 195 in a model), so it ranks sub-millisecond layouts badly. Rank those on the server's `drain_seconds`.
+- **A streamed model's first bottleneck is memory, not kernels:** the expert pool was sized to the driver's working set (28 GB pool + 13 GB stack on a 64 GB machine with 30 GB in other programs), the pool is wired once read, and the machine swapped: 0.6 tok/s. Held to `Backend::host_available` it is 3.2 tok/s before any kernel changed. Check `sysctl vm.swapusage` before profiling.
+- **Speculation does not pay when a verify row costs a full row:** three verify rows took 0.53 s against 0.18 s for one plain row, for 2.3 tokens a round. Plain decode was faster (5.3 against 4.3 tok/s).
+- **Fusing SwiGLU into the routed gate/up epilogue is bit-identical but SLOWER** (`q4e_g_step_gate_up_act_*`, M1 Max, 2026-11-11, UD-IQ3_XXS decode): 2.52 ms of device time a layer against 2.37 unfused, back to back at 100% pool hits (~6% regression, two fused runs agreed). The unit already holds gate row `o` and up row `o` in one lane, so `silu(g)*u` rides in the store branch — but `precise::exp` there runs only on lane 0 while the other 31 lanes mask off, where the separate `q4e_swiglu_kernel` runs it across all 6400 lanes. The exp stall costs more than the dropped launch + gate/up memory round trip saves. The kernel and its bit-for-bit case (`the_fused_gate_up_activation_matches_the_unfused_chain`) are kept as the regression lock; the decode plan does NOT take it. Do not retry an epilogue activation that calls `precise::exp` from a divergent lane.
+- **The dense `Q6_K` step projections are parallelism-bound, not decode-bound** (M1 Max, 2026-11-11): the packed step kernel reads ~45 GB/s at 160-640 threadgroups (2560x2560 .. 10240x2560) but 118-154 GB/s on the 62080-row head (3880 threadgroups). Raising lanes a row (lpr 8→16→32) makes it WORSE (139→160→204 us at 2560x2560): more fold overhead and less per-lane ILP, not more useful parallelism. The generic `kernel_mul_mv_ext_q6_K_f32_r1_1` is only ~6-10% faster at these shapes (128 vs 139, 445 vs 473, 275 vs 306 us) — the "~150 GB/s" ext reputation does not transfer to narrow projections. `packed_lanes` (8 sub-blocks a lane) is a local optimum; do not route these to ext for the bandwidth.
+
 ## Prefill GEMM (simdgroup matrices)
 
 - **64×64 tile layout** (6357b14, `flux2/flux2.metal:~955`, `audio/audio_gemm.metal`):
@@ -65,6 +75,11 @@ shapes differ.
 - **The KV cache is f16.**
 
 ## Fusion and launch count
+
+- **One command buffer with host-handled fetch cuts beat the per-layer drain by ~1.7x** (qwen4exp UD-IQ3_XXS, M1 Max, 2026-11-11, `--spec-k 0`, full pool): plain decode 7.2 -> **12.1 tok/s** (third request, stable across runs), greedy text bit-identical, and still identical with a 512-slot pool that misses every layer. The serial path drains a command buffer at every layer's `ExpertStream::plan` (~48 commit/drain round trips a step, ~0.29 ms each, plus GPU idle while the host re-encodes). The segmented path (`Exec::run_steps_segmented`, Metal `encode_cut`/`commit_segments`/`wait_cut`/`resume_cut`) encodes the WHOLE step into one buffer with a shared-event signal/wait cut before each layer's experts; the host places the experts at the cut (`fetch_at_cut`, non-draining shared IO) and releases the GPU. Ported from Strata's `mtl_rt.mm::run_graph_seg`. Device time fell 114 -> 76 ms/step: continuous execution keeps the GPU clock up where the per-layer gaps dropped it.
+  - **`wait_cut` must BUSY-SPIN on `signaledValue()`, not block.** A blocking `waitUntilSignaledValue_timeoutMS` wake-up lands on every cut and took decode to 2.8 tok/s; the lock-free spin (Strata does the same) is what makes it fast. Release the backend lock while spinning so read-ahead workers are not blocked.
+  - **Pool size confounds the measurement.** A reference server left running hogged RAM, shrank the pool to 2000 slots (66% hits) and made the segmented path look slow (2.9 tok/s). Check `slots=` and the hit rate in the stream log before judging a decode change; compare at equal pool size.
+  - The n-gram rows land up front in the segmented path (they depend only on the input tokens), losing the prologue overlap the serial path uses; correctness is unchanged.
 
 - **Batching:** every launch goes into one open command buffer and encoder. Only `sync` and host copies flush.
   - Waiting on an `MTLSharedEvent` instead of `waitUntilCompleted` took 145 µs against 210 µs per round trip (4ebe5a0).

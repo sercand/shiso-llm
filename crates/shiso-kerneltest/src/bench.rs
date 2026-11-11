@@ -719,6 +719,130 @@ pub const CASES: &[Case] = &[
         name: "splat_attn_f32_12294x16h64",
         build: crate::splat::bench_attention,
     },
+    Case {
+        name: "q4e_g_step_gate_up_iq2_s_l2",
+        build: crate::qwen4exp::ggml::bench_gate_up_iq2_s_l2,
+    },
+    Case {
+        name: "q4e_g_step_gate_up_iq2_s_l1",
+        build: crate::qwen4exp::ggml::bench_gate_up_iq2_s_l1,
+    },
+    Case {
+        name: "q4e_g_step_gate_up_iq2_s_l4",
+        build: crate::qwen4exp::ggml::bench_gate_up_iq2_s_l4,
+    },
+    Case {
+        name: "q4e_g_step_gate_up_iq3_xxs_l2",
+        build: crate::qwen4exp::ggml::bench_gate_up_iq3_xxs_l2,
+    },
+    Case {
+        name: "q4e_g_step_gate_up_iq3_xxs_l4",
+        build: crate::qwen4exp::ggml::bench_gate_up_iq3_xxs_l4,
+    },
+    Case {
+        name: "q4e_g_step_down_iq4_nl_l2",
+        build: crate::qwen4exp::ggml::bench_down_iq4_nl_l2,
+    },
+    Case {
+        name: "q4e_g_step_down_iq4_nl_l1",
+        build: crate::qwen4exp::ggml::bench_down_iq4_nl_l1,
+    },
+    Case {
+        name: "q4e_g_step_down_iq4_nl_l4",
+        build: crate::qwen4exp::ggml::bench_down_iq4_nl_l4,
+    },
+    Case {
+        name: "q4e_g_step_gate_up_iq2_s_t1_l4",
+        build: crate::qwen4exp::ggml::bench_gate_up_iq2_s_t1_l4,
+    },
+    Case {
+        name: "q4e_g_step_gate_up_iq2_s_t1_l2",
+        build: crate::qwen4exp::ggml::bench_gate_up_iq2_s_t1_l2,
+    },
+    Case {
+        name: "q4e_g_step_gate_up_iq2_s_t1_l1",
+        build: crate::qwen4exp::ggml::bench_gate_up_iq2_s_t1_l1,
+    },
+    Case {
+        name: "q4e_g_step_gate_up_iq3_xxs_t1_l4",
+        build: crate::qwen4exp::ggml::bench_gate_up_iq3_xxs_t1_l4,
+    },
+    Case {
+        name: "q4e_g_step_down_iq4_nl_t1_l2",
+        build: crate::qwen4exp::ggml::bench_down_iq4_nl_t1_l2,
+    },
+    Case {
+        name: "q4e_g_step_down_iq4_nl_t1_l1",
+        build: crate::qwen4exp::ggml::bench_down_iq4_nl_t1_l1,
+    },
+    Case {
+        name: "q4e_g_step_q6_k_2560x2560_r3_l8",
+        build: crate::qwen4exp::ggml::bench_q6_k_2560x2560_r3_l8,
+    },
+    Case {
+        name: "q4e_g_step_q6_k_2560x2560_r1_l8",
+        build: crate::qwen4exp::ggml::bench_q6_k_2560x2560_r1_l8,
+    },
+    Case {
+        name: "q4e_g_step_q6_k_2560x2560_r1_l16",
+        build: crate::qwen4exp::ggml::bench_q6_k_2560x2560_r1_l16,
+    },
+    Case {
+        name: "q4e_g_step_q6_k_2560x2560_r1_l32",
+        build: crate::qwen4exp::ggml::bench_q6_k_2560x2560_r1_l32,
+    },
+    Case {
+        name: "q4e_g_step_q6_k_10240x2560_r1_l8",
+        build: crate::qwen4exp::ggml::bench_q6_k_10240x2560_r1_l8,
+    },
+    Case {
+        name: "q4e_g_step_q6_k_10240x2560_r1_l16",
+        build: crate::qwen4exp::ggml::bench_q6_k_10240x2560_r1_l16,
+    },
+    Case {
+        name: "q4e_g_step_q6_k_10240x2560_r1_l32",
+        build: crate::qwen4exp::ggml::bench_q6_k_10240x2560_r1_l32,
+    },
+    Case {
+        name: "q4e_g_step_q6_k_6144x2560_r1_l8",
+        build: crate::qwen4exp::ggml::bench_q6_k_6144x2560_r1_l8,
+    },
+    Case {
+        name: "q4e_g_step_q6_k_2560x6144_r1_l16",
+        build: crate::qwen4exp::ggml::bench_q6_k_2560x6144_r1_l16,
+    },
+    Case {
+        name: "q4e_ext_q6_k_2560x2560",
+        build: crate::qwen4exp::ggml::bench_ext_q6_k_2560x2560,
+    },
+    Case {
+        name: "q4e_ext_q6_k_10240x2560",
+        build: crate::qwen4exp::ggml::bench_ext_q6_k_10240x2560,
+    },
+    Case {
+        name: "q4e_ext_q6_k_6144x2560",
+        build: crate::qwen4exp::ggml::bench_ext_q6_k_6144x2560,
+    },
+    Case {
+        name: "q4e_ext_q6_k_2560x6144",
+        build: crate::qwen4exp::ggml::bench_ext_q6_k_2560x6144,
+    },
+    Case {
+        name: "q4e_g_step_q8_0_10240x320_r3_l1",
+        build: crate::qwen4exp::ggml::bench_q8_0_10240x320_r3_l1,
+    },
+    Case {
+        name: "q4e_g_step_q8_0_10240x320_r1_l1",
+        build: crate::qwen4exp::ggml::bench_q8_0_10240x320_r1_l1,
+    },
+    Case {
+        name: "q4e_g_step_q8_0_10240x320_r1_l4",
+        build: crate::qwen4exp::ggml::bench_q8_0_10240x320_r1_l4,
+    },
+    Case {
+        name: "q4e_g_step_q6_k_head_r1_l8",
+        build: crate::qwen4exp::ggml::bench_q6_k_head_r1_l8,
+    },
 ];
 
 /// What [`time`] measured.

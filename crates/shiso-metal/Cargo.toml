@@ -39,6 +39,10 @@ name = "kernels"
 path = "tests/kernels.rs"
 
 [[test]]
+name = "segments"
+path = "tests/segments.rs"
+
+[[test]]
 name = "kernel_bench"
 path = "tests/kernel_bench.rs"
 

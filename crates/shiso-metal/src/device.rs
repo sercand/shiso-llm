@@ -156,6 +156,15 @@ pub(crate) struct State {
     /// Samples of the open profile region; `None` when no region is open,
     /// which is the only state in which launches batch.
     profile: Option<Vec<LaunchSample>>,
+    /// The cut handshake's ever-increasing timeline value; each cut takes two
+    /// (a signal and the host's resume), so a reused event never reads a stale
+    /// value from an earlier pass.
+    cut_clock: u64,
+    /// The signal value of each cut encoded into the current segmented pass,
+    /// indexed by the cut's handle; cleared when a new pass starts encoding.
+    seg_cuts: Vec<u64>,
+    /// Whether cuts are being encoded into a pass not yet committed.
+    seg_pending: bool,
 }
 
 /// Driver handles have no `Debug`, so the state reports what it can.
@@ -232,6 +241,10 @@ pub struct MetalBackend {
     /// Signalled at the end of every drained command buffer, which is what a
     /// drain waits on.
     done: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    /// The cut handshake timeline: a segmented command buffer signals it at
+    /// each cut and waits for the host to advance it, so one buffer carries a
+    /// whole pass with the host placing experts between segments.
+    cut_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     inner: Mutex<State>,
 }
 
@@ -289,6 +302,9 @@ impl MetalBackend {
         let done = device
             .newSharedEvent()
             .ok_or_else(|| MetalError::backend("new", "the device refused a shared event"))?;
+        let cut_event = device
+            .newSharedEvent()
+            .ok_or_else(|| MetalError::backend("new", "the device refused a cut event"))?;
         tracing::debug!(
             device = %device.name(),
             max_buffer_bytes = device.maxBufferLength(),
@@ -299,6 +315,7 @@ impl MetalBackend {
             queue,
             library,
             done,
+            cut_event,
             inner: Mutex::new(State {
                 next_id: NonZeroU64::MIN,
                 buffers: HashMap::default(),
@@ -308,6 +325,9 @@ impl MetalBackend {
                 signaled: 0,
                 submitted: Vec::new(),
                 profile: None,
+                cut_clock: 0,
+                seg_cuts: Vec::new(),
+                seg_pending: false,
             }),
         }))
     }
@@ -570,6 +590,47 @@ impl MetalBackend {
         // `entry` cannot outlive it.
         unsafe { entry.buffer.contents().as_ptr().cast::<u8>().add(slack) }
     }
+
+    /// Resolves `dsts` to disjoint host spans and fills them, without draining.
+    /// The caller has ordered the device (a flush, or a cut wait) so the spans
+    /// are safe to write where the GPU reads them.
+    fn write_spans(
+        state: &State,
+        dsts: &[DeviceView<'_>],
+        fill: &mut dyn FnMut(&mut [&mut [u8]]) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(dsts.len());
+        for view in dsts {
+            let entry = state.view(*view)?;
+            let offset = usize::try_from(view.offset()).unwrap_or(usize::MAX);
+            let start = Self::contents(entry) as usize + offset;
+            spans.push((start, usize::try_from(view.len()).unwrap_or(usize::MAX)));
+        }
+        let mut sorted = spans.clone();
+        sorted.sort_unstable();
+        if sorted
+            .windows(2)
+            .any(|pair| pair[0].0.saturating_add(pair[0].1) > pair[1].0)
+        {
+            return Err(CoreError::InvalidValue {
+                key: "write_host views",
+                value: "two of the ranges overlap".to_owned(),
+            });
+        }
+        let mut slices: Vec<&mut [u8]> = spans
+            .iter()
+            .map(|&(start, len)| {
+                // SAFETY: each span lies inside a live buffer the table
+                // retains (checked by `view`), the spans were just shown to be
+                // pairwise disjoint, the lock held for this whole call keeps
+                // every buffer alive and keeps any other call from encoding
+                // work against them, and the caller has ordered the device so
+                // it has finished with them.
+                unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len) }
+            })
+            .collect();
+        fill(&mut slices)
+    }
 }
 
 impl Backend for MetalBackend {
@@ -704,37 +765,7 @@ impl Backend for MetalBackend {
     ) -> CoreResult<()> {
         let mut state = self.inner.lock();
         self.flush(&mut state, "write_host")?;
-        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(dsts.len());
-        for view in dsts {
-            let entry = state.view(*view)?;
-            let offset = usize::try_from(view.offset()).unwrap_or(usize::MAX);
-            let start = Self::contents(entry) as usize + offset;
-            spans.push((start, usize::try_from(view.len()).unwrap_or(usize::MAX)));
-        }
-        let mut sorted = spans.clone();
-        sorted.sort_unstable();
-        if sorted
-            .windows(2)
-            .any(|pair| pair[0].0.saturating_add(pair[0].1) > pair[1].0)
-        {
-            return Err(CoreError::InvalidValue {
-                key: "write_host views",
-                value: "two of the ranges overlap".to_owned(),
-            });
-        }
-        let mut slices: Vec<&mut [u8]> = spans
-            .iter()
-            .map(|&(start, len)| {
-                // SAFETY: each span lies inside a live buffer the table
-                // retains (checked by `view`), the spans were just shown to be
-                // pairwise disjoint, the lock held for this whole call keeps
-                // every buffer alive and keeps any other call from encoding
-                // work against them, and the flush above means the device has
-                // finished with them.
-                unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len) }
-            })
-            .collect();
-        fill(&mut slices)
+        Self::write_spans(&state, dsts, fill)
     }
 
     fn write_host_live(
@@ -920,6 +951,10 @@ impl Backend for MetalBackend {
         })
     }
 
+    fn host_available(&self) -> Option<u64> {
+        host_available()
+    }
+
     /// Every template instantiation the library declares, whatever `module`.
     ///
     /// Metal compiles one flat library, so there is no per-module symbol table
@@ -961,6 +996,147 @@ impl Backend for MetalBackend {
     fn sync(&self) -> CoreResult<()> {
         let mut state = self.inner.lock();
         self.flush(&mut state, "sync")
+    }
+
+    fn supports_segments(&self) -> bool {
+        true
+    }
+
+    fn is_profiling(&self) -> bool {
+        self.inner.lock().profile.is_some()
+    }
+
+    fn encode_cut(&self) -> CoreResult<u32> {
+        let mut state = self.inner.lock();
+        if state.profile.is_some() {
+            return Err(MetalError::backend(
+                "encode_cut",
+                "a cut cannot be encoded while a profile region is open",
+            ));
+        }
+        let command_buffer = self.command_buffer(&mut state)?;
+        {
+            let Batch::Open { encoder, .. } = &mut state.batch else {
+                return Err(MetalError::backend(
+                    "encode_cut",
+                    "no command buffer is open",
+                ));
+            };
+            match encoder {
+                Encoder::Compute(encoder) => encoder.endEncoding(),
+                Encoder::Blit(encoder) => encoder.endEncoding(),
+                Encoder::None => {}
+            }
+            *encoder = Encoder::None;
+        }
+        if !state.seg_pending {
+            state.seg_cuts.clear();
+            state.seg_pending = true;
+        }
+        let base = state.cut_clock;
+        state.cut_clock += 2;
+        let event = ProtocolObject::from_ref(&*self.cut_event);
+        command_buffer.encodeSignalEvent_value(event, base + 1);
+        command_buffer.encodeWaitForEvent_value(event, base + 2);
+        state.seg_cuts.push(base + 1);
+        Ok(u32::try_from(state.seg_cuts.len() - 1).unwrap_or(u32::MAX))
+    }
+
+    fn commit_segments(&self) -> CoreResult<()> {
+        let mut state = self.inner.lock();
+        let Batch::Open {
+            command_buffer,
+            encoder,
+        } = std::mem::take(&mut state.batch)
+        else {
+            return Err(MetalError::backend(
+                "commit_segments",
+                "no command buffer is open",
+            ));
+        };
+        match encoder {
+            Encoder::Compute(encoder) => encoder.endEncoding(),
+            Encoder::Blit(encoder) => encoder.endEncoding(),
+            Encoder::None => {}
+        }
+        state.commits += 1;
+        command_buffer.commit();
+        state.submitted.push(command_buffer);
+        state.seg_pending = false;
+        Ok(())
+    }
+
+    fn wait_cut(&self, cut: u32) -> CoreResult<()> {
+        let value = {
+            let state = self.inner.lock();
+            *state
+                .seg_cuts
+                .get(cut as usize)
+                .ok_or_else(|| MetalError::backend("wait_cut", "no such cut was encoded"))?
+        };
+        // Busy-spin on the timeline value, as Strata's run_graph_seg does: a
+        // blocking wait's wake-up latency lands on every cut, and a decode step
+        // has one per layer. The lock is released while spinning so a read-ahead
+        // worker can still write its slot. Bounded so a GPU that never reaches
+        // the cut (a wrong value, a fault) fails rather than hanging.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self.cut_event.signaledValue() < value {
+            if std::time::Instant::now() > deadline {
+                let state = self.inner.lock();
+                for command_buffer in &state.submitted {
+                    failed(command_buffer, "wait_cut")?;
+                }
+                return Err(MetalError::backend(
+                    "wait_cut",
+                    "the GPU did not reach the cut",
+                ));
+            }
+            std::hint::spin_loop();
+        }
+        let state = self.inner.lock();
+        for command_buffer in &state.submitted {
+            failed(command_buffer, "wait_cut")?;
+        }
+        Ok(())
+    }
+
+    fn resume_cut(&self, cut: u32) -> CoreResult<()> {
+        let state = self.inner.lock();
+        let value = *state
+            .seg_cuts
+            .get(cut as usize)
+            .ok_or_else(|| MetalError::backend("resume_cut", "no such cut was encoded"))?;
+        self.cut_event.setSignaledValue(value + 1);
+        Ok(())
+    }
+
+    fn read_shared(&self, src: DeviceView<'_>, dst: &mut [u8]) -> CoreResult<()> {
+        if dst.len() as u64 != src.len() {
+            return Err(CoreError::OutOfBounds {
+                offset: src.offset(),
+                len: dst.len() as u64,
+                buffer_bytes: src.len(),
+            });
+        }
+        let state = self.inner.lock();
+        let entry = state.view(src)?;
+        let offset = usize::try_from(src.offset()).unwrap_or(0);
+        // SAFETY: bounds proven by `view` and the length check; the caller has
+        // ordered the GPU past the writes (a cut wait), so the bytes are final.
+        unsafe {
+            let source = Self::contents(entry).add(offset);
+            ptr::copy_nonoverlapping(source, dst.as_mut_ptr(), dst.len());
+        }
+        Ok(())
+    }
+
+    fn write_shared(
+        &self,
+        dsts: &[DeviceView<'_>],
+        fill: &mut dyn FnMut(&mut [&mut [u8]]) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        let state = self.inner.lock();
+        Self::write_spans(&state, dsts, fill)
     }
 
     fn as_profiler(&self) -> Option<&dyn Profiler> {
@@ -1125,4 +1301,40 @@ fn failed(
         |err| format!("{status:?}: {}", err.localizedDescription()),
     );
     Err(MetalError::backend(op, detail))
+}
+
+/// Bytes the machine could give a process without swapping: free and
+/// speculative pages, file-backed pages (the file cache, which is dropped
+/// rather than swapped) and purgeable ones.
+fn host_available() -> Option<u64> {
+    let mut raw = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    #[expect(
+        deprecated,
+        reason = "libc points at the mach2 crate for mach_host_self; one call does not warrant a new dependency"
+    )]
+    // SAFETY: `raw` is a zeroed `vm_statistics64` and `count` its length in
+    // `integer_t` words, which is the buffer `HOST_VM_INFO64` writes; the host
+    // port is this task's own send right, valid for the life of the process.
+    let outcome = unsafe {
+        libc::host_statistics64(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO64,
+            raw.as_mut_ptr().cast(),
+            &raw mut count,
+        )
+    };
+    if outcome != libc::KERN_SUCCESS {
+        return None;
+    }
+    // SAFETY: the call succeeded, so the kernel filled the structure; any
+    // field past `count` is still the zero it was initialized to.
+    let pages = unsafe { raw.assume_init() };
+    // SAFETY: `sysconf` reads a constant of the running system.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    let available = u64::from(pages.free_count)
+        + u64::from(pages.speculative_count)
+        + u64::from(pages.external_page_count)
+        + u64::from(pages.purgeable_count);
+    Some(available.saturating_mul(page))
 }

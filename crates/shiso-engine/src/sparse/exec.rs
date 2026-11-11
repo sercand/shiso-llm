@@ -541,6 +541,63 @@ impl<'a> Exec<'a> {
         Ok(report)
     }
 
+    /// Issues a whole pass as ONE command buffer with a host-handled cut at
+    /// each fetch, instead of a drain per fetch: the GPU runs straight through
+    /// the layers, pausing at each cut for the host to place that layer's
+    /// experts, so a decode step's ~48 commit/drain round trips become one
+    /// commit. The cuts are the mechanism Strata's `run_graph_seg` uses.
+    ///
+    /// Falls back to [`Exec::run_steps`] when the backend has no segments or
+    /// the pass carries a step this path does not encode (a branch, a trellis,
+    /// a reservation, a BLAS call) - those keep the serial stream.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Exec::run_step`], the cut handshake, or a fetch reports.
+    pub fn run_steps_segmented(&self, steps: &[Step]) -> CoreResult<PassReport> {
+        let encodable = steps.iter().all(|step| {
+            matches!(
+                step,
+                Step::Kernel { .. }
+                    | Step::Expand { .. }
+                    | Step::Staged { .. }
+                    | Step::Clear { .. }
+                    | Step::Fetch { .. }
+            )
+        });
+        if !encodable || !self.backend.supports_segments() {
+            return self.run_steps(steps);
+        }
+        let mut report = PassReport::default();
+        let mut fetches: Vec<(u32, u32, u32)> = Vec::new();
+        // Phase 1: encode every launch, cutting before each layer's experts.
+        for step in steps {
+            if let Step::Fetch { layer, ids } = step {
+                let cut = self.backend.encode_cut()?;
+                fetches.push((cut, *layer, *ids));
+            } else {
+                self.run_step(step)?;
+                match step {
+                    Step::Kernel { .. } | Step::Expand { .. } | Step::Staged { .. } => {
+                        report.launches = report.launches.saturating_add(1);
+                    }
+                    Step::Clear { .. } => report.cleared = report.cleared.saturating_add(1),
+                    _ => {}
+                }
+            }
+        }
+        // Phase 2: one commit, then place each layer's experts at its cut and
+        // release the GPU into the next segment.
+        self.backend.commit_segments()?;
+        for (cut, layer, ids) in fetches {
+            self.backend.wait_cut(cut)?;
+            self.binder.fetch_experts_at_cut(self.backend, layer, ids)?;
+            self.backend.resume_cut(cut)?;
+        }
+        self.backend.sync()?;
+        Ok(report)
+    }
+
     /// Issues a whole pass, replaying each island's captured graph where the
     /// device has one.
     ///
@@ -608,6 +665,20 @@ impl<'a> Exec<'a> {
     ) -> CoreResult<PassReport> {
         let steps = pass.plan.steps();
         let graphs = graphs.filter(|_| pass.capturable && tap.is_none());
+        // One command buffer with a cut per fetch, where the backend can: the
+        // n-gram rows depend only on the input tokens, so they land up front
+        // (the serial path overlaps that read with the prologue; here the whole
+        // pass is one buffer, so there is no prologue to overlap it with).
+        if graphs.is_none()
+            && tap.is_none()
+            && self.backend.supports_segments()
+            && !self.backend.is_profiling()
+        {
+            if let Some(land) = land.as_deref_mut() {
+                land()?;
+            }
+            return self.run_steps_segmented(steps);
+        }
         if let Some(tap) = tap.as_deref_mut() {
             tap.restart();
         }

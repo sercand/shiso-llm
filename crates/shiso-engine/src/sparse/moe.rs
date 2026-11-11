@@ -1917,8 +1917,8 @@ fn ggml_tier(desc: &ExpertDesc, hidden: u32, inter: u32, groups: u32, device: De
         matmul::ggml_step(desc.down.dtype, ggml::Stage::StepDown, device),
     );
     let lanes = (
-        ggml::step_expert_lanes(hidden),
-        ggml::step_expert_lanes(inter),
+        ggml::step_expert_lanes(hidden, matmul::step_tier(device)),
+        ggml::step_expert_lanes(inter, matmul::step_tier(device)),
     );
     match (prompt, step) {
         ((Some(g), Some(d)), _) => GgmlTier {
@@ -2092,6 +2092,12 @@ pub fn ggml_experts(
         ops.push(Operand::U32(l));
     }
     plan.launch(gate_up, launches[0], Args::of(&ops));
+    // The activation stays a separate launch. Folding it into the gate/up
+    // epilogue (`Stage::StepGateUpAct`) is bit-identical but measured ~6%
+    // slower on an M1 Max (2.52 against 2.37 ms of device time a layer): the
+    // epilogue's `precise::exp` runs in the lane-0 store branch, stalling the
+    // simdgroup, where the separate kernel runs it across every lane. See
+    // `.claude/skills/optimizing-metal-kernels/lessons.md`.
     let mid = ggml_activate(&mut plan, shape, n_tok, half);
     // `out, down_w, mid, sorted, bounds, active, map, in_dim, out_dim,
     //  n_expert, n_used, stride`

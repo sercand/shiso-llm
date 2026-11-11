@@ -206,6 +206,7 @@ enum Stage {
     StepMatvec,
     StepMatvec4,
     StepGateUp,
+    StepGateUpAct,
     StepDown,
 }
 
@@ -224,6 +225,7 @@ fn entry(format: Format, stage: Stage) -> &'static str {
                 Stage::StepMatvec => concat!("q4e_g_step_matvec_", $n, "_kernel"),
                 Stage::StepMatvec4 => concat!("q4e_g_step_matvec4_", $n, "_kernel"),
                 Stage::StepGateUp => concat!("q4e_g_step_gate_up_", $n, "_kernel"),
+                Stage::StepGateUpAct => concat!("q4e_g_step_gate_up_act_", $n, "_kernel"),
                 Stage::StepDown => concat!("q4e_g_step_down_", $n, "_kernel"),
             }
         };
@@ -812,9 +814,9 @@ fn step_matvec(
     gpu.read_f32(&out)
 }
 
-/// The CUDA step entries: every format's dense projection at a half
-/// warp, a warp and a whole block a row, and the routed stages at a half warp
-/// and a warp, match the host; a row's result does not move when it runs
+/// The lanes-a-row step entries: every format's dense projection from two
+/// lanes to a whole block a row, and the routed stages from two lanes to a
+/// warp, match the host; a row's result does not move when it runs
 /// alone, which is what lets a verify reproduce a step.
 pub fn the_lane_step_entries_match_the_host_in_every_block_format(gpu: &Gpu) {
     for (i, format) in FORMATS.into_iter().enumerate() {
@@ -824,7 +826,7 @@ pub fn the_lane_step_entries_match_the_host_in_every_block_format(gpu: &Gpu) {
         let want: Vec<f32> = (0..rows)
             .flat_map(|r| bank.project(0, &x[r * in_dim..(r + 1) * in_dim]))
             .collect();
-        for lpr in [16, 32, 128] {
+        for lpr in [1, 2, 8, 16, 32, 128] {
             let got = step_matvec(gpu, format, &bank, &x, rows, lpr, false);
             assert_close(&format!("{} lpr {lpr}", format.name()), &got, &want, 2e-4);
             let one = step_matvec(gpu, format, &bank, &x, 1, lpr, false);
@@ -845,8 +847,406 @@ pub fn the_lane_step_entries_match_the_host_in_every_block_format(gpu: &Gpu) {
         if format == Format::F32 {
             continue;
         }
-        for (gl, dl) in [(32, 16), (16, 32)] {
+        for (gl, dl) in [(32, 16), (16, 32), (8, 2), (2, 1), (4, 4), (1, 2)] {
             routed(gpu, format, Tier::Lanes(gl, dl), 5, 1500 + 10 * i as u32);
         }
     }
+}
+
+/// The fused gate/up+SwiGLU step entry writes exactly what the unfused gate/up
+/// followed by the device's own `q4e_swiglu_kernel` writes, bit for bit, at
+/// every unit-path lane count and for every block format. The activation rides
+/// in the gate/up epilogue, so this is the check that it rounds the same way
+/// the separate kernel does (`g / (1 + precise::exp(-g)) * u`, not a sigmoid).
+pub fn the_fused_gate_up_activation_matches_the_unfused_chain(gpu: &Gpu) {
+    for (i, format) in FORMATS.into_iter().enumerate() {
+        // Single precision has no routed step entries.
+        if format == Format::F32 {
+            continue;
+        }
+        let (hidden, inter, experts, used) = (512usize, 256usize, 6usize, 2usize);
+        let tokens = 3usize;
+        let gate = Bank::new(format, experts, inter, hidden, 2101 + i as u32);
+        let up = Bank::new(format, experts, inter, hidden, 2102 + i as u32);
+        let x = signal(tokens * hidden, 2103 + i as u32);
+        let ids: Vec<usize> = (0..tokens * used)
+            .map(|c| (c / used + c % used) % experts)
+            .collect();
+        let map: Vec<u32> = (0..experts).map(|e| (experts - 1 - e) as u32).collect();
+        let mut sorted = Vec::new();
+        let mut bounds = vec![0i32; experts + 1];
+        for (e, bound) in bounds.iter_mut().take(experts).enumerate() {
+            *bound = sorted.len() as i32;
+            sorted.extend((0..ids.len()).filter(|&c| ids[c] == e).map(|c| c as i32));
+        }
+        bounds[experts] = sorted.len() as i32;
+        let mut active: Vec<i32> = (0..experts as i32)
+            .filter(|&e| bounds[e as usize + 1] > bounds[e as usize])
+            .collect();
+        let n_active = active.len() as i32;
+        active.resize(experts, 0);
+        active.push(n_active);
+        let cols = ids.len();
+        let i32_le = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let u32_le = |v: &[u32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let (gate_bytes, gate_stride) = gate.padded(experts, 96);
+        let (up_bytes, up_stride) = up.padded(experts, 96);
+        let gw = gpu.upload(&gate_bytes);
+        let uw = gpu.upload(&up_bytes);
+        let xs = gpu.upload(&f32_bytes(&x));
+        let sorted_b = gpu.upload(&i32_le(&sorted));
+        let bounds_b = gpu.upload(&i32_le(&bounds));
+        let active_b = gpu.upload(&i32_le(&active));
+        let map_b = gpu.upload(&u32_le(&map));
+        // The unit path the decode step takes: `lpr * 8 <= 32`.
+        for gl in [1u32, 2, 4] {
+            let out_gate = gpu.upload(&vec![0u8; cols * inter * 4]);
+            let out_up = gpu.upload(&vec![0u8; cols * inter * 4]);
+            let per_block = 4 * 16 / gl as usize;
+            let grid = Extent3::new(inter.div_ceil(per_block) as u32, experts as u32, 1);
+            let routing = [
+                KernelArg::Buffer(gw.view()),
+                KernelArg::Buffer(uw.view()),
+                KernelArg::Buffer(xs.view()),
+                KernelArg::Buffer(sorted_b.view()),
+                KernelArg::Buffer(bounds_b.view()),
+                KernelArg::Buffer(active_b.view()),
+                KernelArg::Buffer(map_b.view()),
+                KernelArg::U32(hidden as u32),
+                KernelArg::U32(inter as u32),
+                KernelArg::U32(experts as u32),
+                KernelArg::U32(used as u32),
+                KernelArg::U32(gate_stride),
+                KernelArg::U32(up_stride),
+                KernelArg::U32(gl),
+            ];
+            let mut unfused = vec![
+                KernelArg::Buffer(out_gate.view()),
+                KernelArg::Buffer(out_up.view()),
+            ];
+            unfused.extend_from_slice(&routing);
+            run(
+                gpu,
+                KernelRef::new(MODULE, entry(format, Stage::StepGateUp)),
+                &LaunchArgs::new(grid, Extent3::linear(128), &unfused),
+            );
+            drain(gpu);
+            // The device's own activation, as the unfused chain runs it.
+            let mid_ref = gpu.upload(&vec![0u8; cols * inter * 4]);
+            let n = (cols * inter) as u64;
+            run(
+                gpu,
+                KernelRef::new("q4e_moe", "q4e_swiglu_kernel"),
+                &LaunchArgs::new(
+                    Extent3::linear(n.div_ceil(256) as u32),
+                    Extent3::linear(256),
+                    &[
+                        KernelArg::Buffer(mid_ref.view()),
+                        KernelArg::Buffer(out_gate.view()),
+                        KernelArg::Buffer(out_up.view()),
+                        KernelArg::U64(n),
+                    ],
+                ),
+            );
+            drain(gpu);
+            // The fused entry: one output, the activation in the epilogue.
+            let mid_fused = gpu.upload(&vec![0u8; cols * inter * 4]);
+            let mut fused = vec![KernelArg::Buffer(mid_fused.view())];
+            fused.extend_from_slice(&routing);
+            run(
+                gpu,
+                KernelRef::new(MODULE, entry(format, Stage::StepGateUpAct)),
+                &LaunchArgs::new(grid, Extent3::linear(128), &fused),
+            );
+            drain(gpu);
+            let want = gpu.read_f32(&mid_ref);
+            let got = gpu.read_f32(&mid_fused);
+            assert!(
+                got == want,
+                "{} gl {gl}: fused activation moved a bit",
+                format.name()
+            );
+        }
+    }
+}
+
+/// Stored bytes of `slots` matrices of `out_dim` rows, with no decoded copy:
+/// a bench shape is too large to decode on the host for nothing.
+fn bench_bytes(format: Format, slots: usize, out_dim: usize, in_dim: usize, seed: u32) -> Vec<u8> {
+    let (per, _) = format.block();
+    let mut rng = seed | 1;
+    let mut bytes = Vec::new();
+    for _ in 0..slots * out_dim * in_dim / per {
+        bytes.extend(format.random_block(&mut rng));
+    }
+    bytes
+}
+
+/// A dense step projection of `rows` activation rows at `lpr` lanes a row,
+/// at the stage the engine picks for that row count, for [`crate::bench`].
+fn bench_step_matvec(
+    gpu: &Gpu,
+    format: Format,
+    (out_dim, in_dim): (usize, usize),
+    rows: usize,
+    lpr: u32,
+) -> crate::bench::Fixture {
+    let bytes = bench_bytes(format, 1, out_dim, in_dim, 0x51ED);
+    let weight_bytes = bytes.len() as u64;
+    let w = gpu.upload(&bytes);
+    let xs = gpu.upload(&f32_bytes(&signal(rows * in_dim, 77)));
+    let out = gpu.upload(&vec![0u8; rows * out_dim * 4]);
+    let four = rows > 2;
+    let per_block = 128 / lpr as usize * if four { 4 } else { 1 };
+    let grid = Extent3::new(
+        out_dim.div_ceil(per_block) as u32,
+        rows.div_ceil(COLS) as u32,
+        1,
+    );
+    let stage = if four {
+        Stage::StepMatvec4
+    } else {
+        Stage::StepMatvec
+    };
+    crate::bench::Fixture::new(
+        weight_bytes,
+        2 * (rows * out_dim * in_dim) as u64,
+        move |gpu| {
+            let args = [
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(w.view()),
+                KernelArg::Buffer(xs.view()),
+                KernelArg::U32(in_dim as u32),
+                KernelArg::U32(out_dim as u32),
+                KernelArg::U32(rows as u32),
+                KernelArg::U32(lpr),
+            ];
+            run(
+                gpu,
+                KernelRef::new(MODULE, entry(format, stage)),
+                &LaunchArgs::new(grid, Extent3::linear(128), &args),
+            );
+        },
+    )
+}
+
+/// The extended `q6_K` matvec's decode specialization: two simdgroups, sixteen
+/// lanes a row (`shiso_engine::launch::ext_consts`, `ext_nxpsg` at one token).
+const EXT_Q6_DECODE: [shiso_core::FnConst; 2] = [
+    shiso_core::FnConst {
+        index: 600,
+        value: shiso_core::FnConstValue::I16(2),
+    },
+    shiso_core::FnConst {
+        index: 601,
+        value: shiso_core::FnConstValue::I16(16),
+    },
+];
+
+/// The extended `q6_K` matvec (`qwen35/gemv_ext_q5k_q6k.metal`) at one
+/// activation row, for an A/B against the packed step entry at the same shape.
+fn bench_ext_q6_k(gpu: &Gpu, (out_dim, in_dim): (usize, usize)) -> crate::bench::Fixture {
+    use crate::generic::product::MulMvExtArgs;
+    let bytes = bench_bytes(Format::Q6K, 1, out_dim, in_dim, 0x51ED);
+    let weight_bytes = bytes.len() as u64;
+    let row_bytes = weight_bytes / out_dim as u64;
+    let w = gpu.upload(&bytes);
+    let xs = gpu.upload(&f32_bytes(&signal(in_dim, 77)));
+    let out = gpu.upload(&vec![0u8; out_dim * 4]);
+    let args = MulMvExtArgs {
+        ne00: in_dim as i32,
+        ne01: out_dim as i32,
+        ne02: 1,
+        pad0: [0; 4],
+        nb00: row_bytes,
+        nb01: row_bytes,
+        nb02: weight_bytes,
+        nb03: weight_bytes,
+        ne10: in_dim as i32,
+        ne11: 1,
+        ne12: 1,
+        pad1: [0; 4],
+        nb10: 4,
+        nb11: (in_dim * 4) as u64,
+        nb12: (in_dim * 4) as u64,
+        nb13: (in_dim * 4) as u64,
+        ne0: out_dim as i32,
+        ne1: 1,
+        r2: 1,
+        r3: 1,
+        pad2: [0; 4],
+    };
+    // Four output rows a threadgroup at sixteen lanes a row and two simdgroups.
+    let grid = Extent3::new(out_dim.div_ceil(4) as u32, 1, 1);
+    crate::bench::Fixture::new(weight_bytes, 2 * (out_dim * in_dim) as u64, move |gpu| {
+        run(
+            gpu,
+            KernelRef::specialized("qwen35", "kernel_mul_mv_ext_q6_K_f32_r1_1", &EXT_Q6_DECODE),
+            &LaunchArgs::new(
+                grid,
+                Extent3::new(32, 2, 1),
+                &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(w.view()),
+                    KernelArg::Buffer(xs.view()),
+                    KernelArg::Buffer(out.view()),
+                ],
+            ),
+        );
+    })
+}
+
+/// The routed tokens, experts a token and bank slots of a bench stage: a
+/// three-row verify of a ten-of-many router, a few experts shared.
+const BENCH_ROUTED: (usize, usize, usize) = (3, 10, 30);
+
+/// A routed step stage - gate and up, or down - over `tokens` rows of
+/// [`BENCH_ROUTED`]'s router at `lpr` lanes a row, for [`crate::bench`].
+fn bench_step_routed(
+    gpu: &Gpu,
+    format: Format,
+    gate_up: bool,
+    (hidden, inter): (usize, usize),
+    lpr: u32,
+    tokens: usize,
+) -> crate::bench::Fixture {
+    let (_, used, experts) = BENCH_ROUTED;
+    // Token t picks experts 8 t .. 8 t + 9, so neighbours share two.
+    let ids: Vec<usize> = (0..tokens * used)
+        .map(|c| (8 * (c / used) + c % used) % experts)
+        .collect();
+    let mut sorted = Vec::new();
+    let mut bounds = vec![0i32; experts + 1];
+    for (e, bound) in bounds.iter_mut().take(experts).enumerate() {
+        *bound = sorted.len() as i32;
+        sorted.extend((0..ids.len()).filter(|&c| ids[c] == e).map(|c| c as i32));
+    }
+    bounds[experts] = sorted.len() as i32;
+    let mut active: Vec<i32> = (0..experts as i32)
+        .filter(|&e| bounds[e as usize + 1] > bounds[e as usize])
+        .collect();
+    let n_active = active.len();
+    active.resize(experts, 0);
+    active.push(n_active as i32);
+    let map: Vec<u32> = (0..experts as u32).collect();
+    let i32_le = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+    let u32_le = |v: &[u32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+    let (out_dim, in_dim) = if gate_up {
+        (inter, hidden)
+    } else {
+        (hidden, inter)
+    };
+    let bank = bench_bytes(format, experts, out_dim, in_dim, 0xBA5E);
+    let stride = (bank.len() / experts) as u32;
+    let matrices = if gate_up { 2 } else { 1 };
+    let read = (bank.len() / experts * n_active * matrices) as u64;
+    let flops = 2 * (ids.len() * out_dim * in_dim * matrices) as u64;
+    let w = gpu.upload(&bank);
+    let w2 = gpu.upload(&bank);
+    let x_rows = if gate_up { tokens } else { ids.len() };
+    let xs = gpu.upload(&f32_bytes(&signal(x_rows * in_dim, 78)));
+    let sorted_b = gpu.upload(&i32_le(&sorted));
+    let bounds_b = gpu.upload(&i32_le(&bounds));
+    let active_b = gpu.upload(&i32_le(&active));
+    let map_b = gpu.upload(&u32_le(&map));
+    let out = gpu.upload(&vec![0u8; ids.len() * out_dim * 4]);
+    let out2 = gpu.upload(&vec![0u8; ids.len() * out_dim * 4]);
+    let per_block = if gate_up { 4 * 16 } else { 4 * 32 } / lpr as usize;
+    let grid = Extent3::new(out_dim.div_ceil(per_block) as u32, experts as u32, 1);
+    crate::bench::Fixture::new(read, flops, move |gpu| {
+        let shape = [
+            KernelArg::U32(in_dim as u32),
+            KernelArg::U32(out_dim as u32),
+            KernelArg::U32(experts as u32),
+            KernelArg::U32(used as u32),
+        ];
+        let routing = [
+            KernelArg::Buffer(xs.view()),
+            KernelArg::Buffer(sorted_b.view()),
+            KernelArg::Buffer(bounds_b.view()),
+            KernelArg::Buffer(active_b.view()),
+            KernelArg::Buffer(map_b.view()),
+        ];
+        let mut args = Vec::with_capacity(16);
+        if gate_up {
+            args.extend([
+                KernelArg::Buffer(out.view()),
+                KernelArg::Buffer(out2.view()),
+                KernelArg::Buffer(w.view()),
+                KernelArg::Buffer(w2.view()),
+            ]);
+            args.extend(routing);
+            args.extend(shape);
+            args.extend([KernelArg::U32(stride), KernelArg::U32(stride)]);
+        } else {
+            args.extend([KernelArg::Buffer(out.view()), KernelArg::Buffer(w.view())]);
+            args.extend(routing);
+            args.extend(shape);
+            args.push(KernelArg::U32(stride));
+        }
+        args.push(KernelArg::U32(lpr));
+        let stage = if gate_up {
+            Stage::StepGateUp
+        } else {
+            Stage::StepDown
+        };
+        run(
+            gpu,
+            KernelRef::new(MODULE, entry(format, stage)),
+            &LaunchArgs::new(grid, Extent3::linear(128), &args),
+        );
+    })
+}
+
+/// The routed and dense widths of the bench shapes: the published sparse
+/// checkpoint's.
+const BENCH_HIDDEN: usize = 2560;
+const BENCH_INTER: usize = 640;
+
+macro_rules! bench_cases {
+    ($($name:ident => $body:expr;)*) => {
+        $(
+            #[doc = concat!("`", stringify!($name), "` for [`crate::bench`].")]
+            pub(crate) fn $name(gpu: &Gpu) -> crate::bench::Fixture {
+                let build: fn(&Gpu) -> crate::bench::Fixture = $body;
+                build(gpu)
+            }
+        )*
+    };
+}
+
+// The lanes a row are the ones the engine picks for these widths
+// (`shiso_engine::sparse::ggml::step_lanes`, `step_expert_lanes`).
+bench_cases! {
+    bench_gate_up_iq2_s_l2 => |g| bench_step_routed(g, Format::Iq2S, true, (BENCH_HIDDEN, BENCH_INTER), 2, 3);
+    bench_gate_up_iq2_s_l1 => |g| bench_step_routed(g, Format::Iq2S, true, (BENCH_HIDDEN, BENCH_INTER), 1, 3);
+    bench_gate_up_iq2_s_l4 => |g| bench_step_routed(g, Format::Iq2S, true, (BENCH_HIDDEN, BENCH_INTER), 4, 3);
+    bench_gate_up_iq3_xxs_l2 => |g| bench_step_routed(g, Format::Iq3Xxs, true, (BENCH_HIDDEN, BENCH_INTER), 2, 3);
+    bench_gate_up_iq3_xxs_l4 => |g| bench_step_routed(g, Format::Iq3Xxs, true, (BENCH_HIDDEN, BENCH_INTER), 4, 3);
+    bench_down_iq4_nl_l2 => |g| bench_step_routed(g, Format::Iq4Nl, false, (BENCH_HIDDEN, BENCH_INTER), 2, 3);
+    bench_down_iq4_nl_l1 => |g| bench_step_routed(g, Format::Iq4Nl, false, (BENCH_HIDDEN, BENCH_INTER), 1, 3);
+    bench_down_iq4_nl_l4 => |g| bench_step_routed(g, Format::Iq4Nl, false, (BENCH_HIDDEN, BENCH_INTER), 4, 3);
+    bench_gate_up_iq2_s_t1_l4 => |g| bench_step_routed(g, Format::Iq2S, true, (BENCH_HIDDEN, BENCH_INTER), 4, 1);
+    bench_gate_up_iq2_s_t1_l2 => |g| bench_step_routed(g, Format::Iq2S, true, (BENCH_HIDDEN, BENCH_INTER), 2, 1);
+    bench_gate_up_iq2_s_t1_l1 => |g| bench_step_routed(g, Format::Iq2S, true, (BENCH_HIDDEN, BENCH_INTER), 1, 1);
+    bench_gate_up_iq3_xxs_t1_l4 => |g| bench_step_routed(g, Format::Iq3Xxs, true, (BENCH_HIDDEN, BENCH_INTER), 4, 1);
+    bench_down_iq4_nl_t1_l2 => |g| bench_step_routed(g, Format::Iq4Nl, false, (BENCH_HIDDEN, BENCH_INTER), 2, 1);
+    bench_down_iq4_nl_t1_l1 => |g| bench_step_routed(g, Format::Iq4Nl, false, (BENCH_HIDDEN, BENCH_INTER), 1, 1);
+    bench_q6_k_2560x2560_r3_l8 => |g| bench_step_matvec(g, Format::Q6K, (2560, 2560), 3, 8);
+    bench_q6_k_2560x2560_r1_l8 => |g| bench_step_matvec(g, Format::Q6K, (2560, 2560), 1, 8);
+    bench_q6_k_2560x2560_r1_l16 => |g| bench_step_matvec(g, Format::Q6K, (2560, 2560), 1, 16);
+    bench_q6_k_2560x2560_r1_l32 => |g| bench_step_matvec(g, Format::Q6K, (2560, 2560), 1, 32);
+    bench_q6_k_10240x2560_r1_l8 => |g| bench_step_matvec(g, Format::Q6K, (10240, 2560), 1, 8);
+    bench_q6_k_10240x2560_r1_l16 => |g| bench_step_matvec(g, Format::Q6K, (10240, 2560), 1, 16);
+    bench_q6_k_10240x2560_r1_l32 => |g| bench_step_matvec(g, Format::Q6K, (10240, 2560), 1, 32);
+    bench_q6_k_6144x2560_r1_l8 => |g| bench_step_matvec(g, Format::Q6K, (6144, 2560), 1, 8);
+    bench_q6_k_2560x6144_r1_l16 => |g| bench_step_matvec(g, Format::Q6K, (2560, 6144), 1, 16);
+    bench_ext_q6_k_2560x2560 => |g| bench_ext_q6_k(g, (2560, 2560));
+    bench_ext_q6_k_10240x2560 => |g| bench_ext_q6_k(g, (10240, 2560));
+    bench_ext_q6_k_6144x2560 => |g| bench_ext_q6_k(g, (6144, 2560));
+    bench_ext_q6_k_2560x6144 => |g| bench_ext_q6_k(g, (2560, 6144));
+    bench_q8_0_10240x320_r3_l1 => |g| bench_step_matvec(g, Format::Q8_0, (10240, 320), 3, 1);
+    bench_q8_0_10240x320_r1_l1 => |g| bench_step_matvec(g, Format::Q8_0, (10240, 320), 1, 1);
+    bench_q8_0_10240x320_r1_l4 => |g| bench_step_matvec(g, Format::Q8_0, (10240, 320), 1, 4);
+    bench_q6_k_head_r1_l8 => |g| bench_step_matvec(g, Format::Q6K, (62080, 2560), 1, 8);
 }

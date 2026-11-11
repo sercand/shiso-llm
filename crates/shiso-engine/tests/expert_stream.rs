@@ -125,6 +125,59 @@ fn stream_with_two_matrices_fetches_and_maps() {
 }
 
 #[test]
+fn a_fetch_at_cut_places_experts_exactly_as_a_serial_fetch() {
+    // The cut path (shared, non-draining IO) must leave the same map and pool
+    // bytes as the serial path, on a miss and on a later hit.
+    let backend = backend();
+    let serial = ExpertStream::open(
+        &backend,
+        Arc::new(FakeSource { failing: None }),
+        4,
+        16,
+        8,
+        6,
+    )
+    .expect("open serial");
+    let cut = ExpertStream::open(
+        &backend,
+        Arc::new(FakeSource { failing: None }),
+        4,
+        16,
+        8,
+        6,
+    )
+    .expect("open cut");
+    for layer in [1u32, 2] {
+        let routed = ids(&backend, &[3, 5, 3, 9]);
+        serial
+            .fetch(backend.as_ref(), layer, routed.view(), 4)
+            .expect("serial fetch");
+        cut.fetch_at_cut(backend.as_ref(), layer, routed.view(), 4)
+            .expect("cut fetch");
+        assert_eq!(
+            map_of(&backend, &serial, layer),
+            map_of(&backend, &cut, layer),
+            "layer {layer} map"
+        );
+        let map = map_of(&backend, &cut, layer);
+        for expert in [3u32, 5, 9] {
+            for (matrix, &bytes) in LAYOUT.iter().enumerate() {
+                let want: Vec<u8> = (0..bytes as usize)
+                    .map(|i| byte(layer, expert, matrix, i))
+                    .collect();
+                assert_eq!(
+                    slot_bytes(&backend, &cut, matrix, map[expert as usize]),
+                    want,
+                    "layer {layer} expert {expert} matrix {matrix}"
+                );
+            }
+        }
+    }
+    assert_eq!(serial.stats().reads, cut.stats().reads);
+    assert_eq!(serial.stats().hits, cut.stats().hits);
+}
+
+#[test]
 fn failed_read_leaves_map_consistent() {
     let backend = backend();
     let stream = ExpertStream::open(

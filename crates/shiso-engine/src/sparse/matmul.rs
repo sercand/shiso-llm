@@ -814,7 +814,7 @@ fn ggml(
         });
     }
     if let Some(entry) = ggml_step(dtype, ggml::step_stage(rows).0, device) {
-        let lanes = ggml::step_lanes(in_dim);
+        let lanes = ggml::step_lanes(in_dim, step_tier(device));
         return Ok(Projection::Ggml {
             entry,
             launch: ggml::step_launch(out_dim, rows, lanes),
@@ -832,17 +832,32 @@ fn ggml(
     })
 }
 
-/// The CUDA step entry `stage` of a GGUF block format, when this pass takes
-/// one: a step or verify pass on a device whose kernel set has the CUDA
-/// block entries ([`PromptMatmul::Tensor`] is that probe, as for
-/// [`ggml_prompt`]). Every step pass takes it whatever its row count, so a
-/// verify row is summed as a single-row step sums it.
+/// The lanes-a-row step entry `stage` of a GGUF block format, when this pass
+/// takes one: a step or verify pass on a device whose kernel set has them.
+/// [`PromptMatmul::Tensor`] is the probe for the CUDA set, as for
+/// [`ggml_prompt`], and [`PromptMatmul::Matrix`] for the Metal one, whose
+/// single-precision rows keep their own split tier. Every step pass takes it
+/// whatever its row count, so a verify row is summed as a single-row step
+/// sums it.
 #[must_use]
 pub fn ggml_step(dtype: DType, stage: ggml::Stage, device: Device) -> Option<Entry> {
-    if !device.row_invariant() && matches!(device.prompt_matmul, PromptMatmul::Tensor) {
-        ggml::entry(dtype, stage)
-    } else {
-        None
+    if device.row_invariant() {
+        return None;
+    }
+    match device.prompt_matmul {
+        PromptMatmul::Tensor => ggml::entry(dtype, stage),
+        PromptMatmul::Matrix if !matches!(dtype, DType::F32) => ggml::entry(dtype, stage),
+        PromptMatmul::Matrix | PromptMatmul::Rows => None,
+    }
+}
+
+/// Which step entries [`ggml_step`] hands out on this device, which decides
+/// the lanes a row takes.
+#[must_use]
+pub const fn step_tier(device: Device) -> ggml::StepTier {
+    match device.prompt_matmul {
+        PromptMatmul::Tensor => ggml::StepTier::Runs,
+        PromptMatmul::Matrix | PromptMatmul::Rows => ggml::StepTier::Packed,
     }
 }
 

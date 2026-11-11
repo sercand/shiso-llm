@@ -42,6 +42,19 @@ pub fn apply_recipe_defaults_unless_set(
         tracing::info!(spec_k = args.spec_k, "applied recipe default for spec_k");
     }
 
+    // A depth of zero asked for outright is plain decode. The draft head is
+    // the recipe's choice, not the operator's, so it is left unloaded rather
+    // than refused as a head with no depth; a head the operator named
+    // themselves is still refused.
+    if args.spec_k == 0 && !check_override("spec_k") && check_override("draft_model") {
+        if args.draft_model.take().is_some() {
+            tracing::info!("--spec-k 0: the recipe's draft head is not loaded");
+        }
+        if check_override("draft_vocab") {
+            args.draft_vocab = None;
+        }
+    }
+
     if let Some(turn_replay_tokens) = defaults.turn_replay_tokens
         && check_override("turn_replay_tokens")
     {

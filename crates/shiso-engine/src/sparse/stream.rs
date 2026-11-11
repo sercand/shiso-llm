@@ -232,6 +232,11 @@ impl fmt::Debug for ExpertStream {
 /// device's queue busy with reads of a few hundred kilobytes each.
 const READERS: usize = 16;
 
+/// Fetches between two info lines of the stream's running totals: a hundred
+/// or so decode steps of a 48-layer stack, so a slow pool shows in the log
+/// without a line per step.
+const STATS_EVERY: u64 = 4096;
+
 /// Threads that read guessed experts while the device computes.
 const PREFETCHERS: usize = 4;
 
@@ -526,6 +531,26 @@ impl ExpertStream {
         })
     }
 
+    /// One info line of the running totals every [`STATS_EVERY`] fetches:
+    /// what a slow pool looks like from the log, without a profile.
+    fn log_totals(&self, clock: u64, totals: &StreamStats) {
+        if !clock.is_multiple_of(STATS_EVERY) {
+            return;
+        }
+        tracing::info!(
+            fetches = totals.fetches,
+            wanted = totals.wanted,
+            hits = totals.hits,
+            prefetched = totals.prefetched,
+            reads = totals.reads,
+            read_gib = totals.read_bytes >> 30,
+            read_seconds = totals.read_seconds,
+            drain_seconds = totals.drain_seconds,
+            slots = self.slots,
+            "routed expert stream, since it opened"
+        );
+    }
+
     /// Slots a batch of `n` new experts may take: never-filled ones first,
     /// then the least recently used, none that the fetch at `clock` wants and
     /// none a read-ahead is writing.
@@ -659,14 +684,22 @@ impl ExpertStream {
     }
 
     /// The distinct experts of the `count` routed ids at `ids`, in order.
+    /// `cut` reads the shared buffer without draining: the caller is paused at
+    /// a fetch cut, so the ids are final and a flush would deadlock.
     fn routed_ids(
         &self,
         backend: &dyn Backend,
         ids: DeviceView<'_>,
         count: u32,
+        cut: bool,
     ) -> CoreResult<Vec<u32>> {
         let mut raw = vec![0u8; count as usize * 4];
-        backend.copy_d2h(ids.slice(0, raw.len() as u64)?, &mut raw)?;
+        let src = ids.slice(0, raw.len() as u64)?;
+        if cut {
+            backend.read_shared(src, &mut raw)?;
+        } else {
+            backend.copy_d2h(src, &mut raw)?;
+        }
         let mut wanted: Vec<u32> = Vec::with_capacity(count as usize);
         for word in raw.as_chunks::<4>().0 {
             let id = i32::from_le_bytes(*word);
@@ -685,13 +718,14 @@ impl ExpertStream {
     }
 
     /// Points `layer`'s map at the slots read-aheads `landed` in, before any
-    /// stage reads them; the device is idle, so a plain write is as cheap as
-    /// any.
+    /// stage reads them; the device is idle (or paused at a cut), so a plain
+    /// write is as cheap as any. `cut` writes without draining.
     fn write_landed(
         &self,
         backend: &dyn Backend,
         layer: u32,
         landed: &[(u32, u32)],
+        cut: bool,
     ) -> CoreResult<()> {
         if landed.is_empty() {
             return Ok(());
@@ -705,12 +739,17 @@ impl ExpertStream {
                 )
             })
             .collect::<CoreResult<Vec<_>>>()?;
-        backend.write_host(&entries, &mut |slices| {
+        let mut fill = |slices: &mut [&mut [u8]]| -> CoreResult<()> {
             for (entry, &(_, slot)) in slices.iter_mut().zip(landed) {
                 entry.copy_from_slice(&slot.to_le_bytes());
             }
             Ok(())
-        })
+        };
+        if cut {
+            backend.write_shared(&entries, &mut fill)
+        } else {
+            backend.write_host(&entries, &mut fill)
+        }
     }
 
     /// Frees the slots of orphaned read-aheads whose reads are over.
@@ -755,6 +794,7 @@ impl ExpertStream {
         layer: u32,
         missing: &[u32],
         victims: &[u32],
+        cut: bool,
     ) -> CoreResult<()> {
         self.unmap_host(
             &mut self.state.lock(),
@@ -762,13 +802,18 @@ impl ExpertStream {
             missing.iter().copied().zip(victims.iter().copied()),
         );
         for &expert in missing {
-            backend.copy_h2d(
-                self.map.slice(
-                    (u64::from(layer) * u64::from(self.experts) + u64::from(expert)) * 4,
-                    4,
-                )?,
-                &EMPTY.to_le_bytes(),
+            let entry = self.map.slice(
+                (u64::from(layer) * u64::from(self.experts) + u64::from(expert)) * 4,
+                4,
             )?;
+            if cut {
+                backend.write_shared(&[entry], &mut |slices| {
+                    slices[0].copy_from_slice(&EMPTY.to_le_bytes());
+                    Ok(())
+                })?;
+            } else {
+                backend.copy_h2d(entry, &EMPTY.to_le_bytes())?;
+            }
         }
         Ok(())
     }
@@ -796,8 +841,9 @@ impl ExpertStream {
         landed: &[(u32, u32)],
         missing: &[u32],
         victims: &[u32],
+        cut: bool,
     ) -> CoreResult<()> {
-        let written = self.write_landed(backend, layer, landed);
+        let written = self.write_landed(backend, layer, landed, cut);
         if written.is_err() {
             let pairs = landed
                 .iter()
@@ -866,6 +912,23 @@ impl ExpertStream {
         self.complete(backend, &plan)
     }
 
+    /// [`ExpertStream::fetch`] at a fetch cut: plan and complete without
+    /// draining, through the shared buffers, for a GPU paused at the cut.
+    ///
+    /// # Errors
+    ///
+    /// As [`ExpertStream::fetch`].
+    pub fn fetch_at_cut(
+        &self,
+        backend: &dyn Backend,
+        layer: u32,
+        ids: DeviceView<'_>,
+        count: u32,
+    ) -> CoreResult<()> {
+        let plan = self.plan_at_cut(backend, layer, ids, count)?;
+        self.complete_at_cut(backend, &plan)
+    }
+
     /// The first half of a fetch: drains the device, reads the routed ids
     /// back, takes what read-aheads landed, and gives every other missing
     /// expert a slot and a map entry - without reading it yet.
@@ -884,6 +947,49 @@ impl ExpertStream {
         ids: DeviceView<'_>,
         count: u32,
     ) -> CoreResult<FetchPlan> {
+        self.plan_inner(backend, layer, ids, count, false)
+    }
+
+    /// [`ExpertStream::plan`] at a fetch cut: the GPU is paused having written
+    /// the routed ids, so this neither drains nor flushes - it reads the ids
+    /// and writes the map through the shared buffers directly. The caller
+    /// releases the GPU ([`Backend::resume_cut`]) only after this and
+    /// [`ExpertStream::complete_at_cut`] return.
+    ///
+    /// # Errors
+    ///
+    /// As [`ExpertStream::fetch`].
+    pub fn plan_at_cut(
+        &self,
+        backend: &dyn Backend,
+        layer: u32,
+        ids: DeviceView<'_>,
+        count: u32,
+    ) -> CoreResult<FetchPlan> {
+        self.plan_inner(backend, layer, ids, count, true)
+    }
+
+    /// The serial path's drain time; a cut is already ordered, so it drains
+    /// nothing and reports zero.
+    fn drain_seconds(backend: &dyn Backend, cut: bool) -> CoreResult<f64> {
+        if cut {
+            return Ok(0.0);
+        }
+        let drained = std::time::Instant::now();
+        backend.sync()?;
+        Ok(drained.elapsed().as_secs_f64())
+    }
+
+    /// The first half of a fetch, `cut` choosing the shared (non-draining) IO
+    /// and skipping the sync the serial path needs.
+    fn plan_inner(
+        &self,
+        backend: &dyn Backend,
+        layer: u32,
+        ids: DeviceView<'_>,
+        count: u32,
+        cut: bool,
+    ) -> CoreResult<FetchPlan> {
         if layer >= self.layers {
             return Err(CoreError::OutOfBounds {
                 offset: u64::from(layer),
@@ -898,10 +1004,8 @@ impl ExpertStream {
         if self.complete.load(Ordering::Acquire) {
             return Ok(plan);
         }
-        let drained = std::time::Instant::now();
-        backend.sync()?;
-        let drain = drained.elapsed().as_secs_f64();
-        let wanted = self.routed_ids(backend, ids, count)?;
+        let drain = Self::drain_seconds(backend, cut)?;
+        let wanted = self.routed_ids(backend, ids, count, cut)?;
         self.release_orphans();
         // Every read-ahead of this layer comes off the books now: the wanted
         // ones are waited for, the others are orphaned.
@@ -921,6 +1025,7 @@ impl ExpertStream {
         state.stats.fetches += 1;
         state.stats.drain_seconds += drain;
         let clock = state.clock;
+        self.log_totals(clock, &state.stats);
         let base = layer as usize * self.experts as usize;
         state.stats.wanted += wanted.len() as u64;
         let mut landing: Vec<(u32, Reading)> = Vec::new();
@@ -973,7 +1078,7 @@ impl ExpertStream {
             // The landed experts are on the host map already; the device map
             // has to agree before the refusal, or a later fetch counts a hit
             // on an entry no stage can read.
-            self.publish_landed(backend, layer, &landed, &[], &[])?;
+            self.publish_landed(backend, layer, &landed, &[], &[], cut)?;
             return Err(CoreError::ShapeMismatch {
                 field: "expert stream slots free for one layer",
                 expected: plan.missing.len() as u64,
@@ -990,7 +1095,7 @@ impl ExpertStream {
             state.host_map[base + expert as usize] = slot;
         }
         drop(state);
-        self.publish_landed(backend, layer, &landed, &plan.missing, &victims)?;
+        self.publish_landed(backend, layer, &landed, &plan.missing, &victims, cut)?;
         plan.victims = victims;
         Ok(plan)
     }
@@ -1004,6 +1109,24 @@ impl ExpertStream {
     /// Whatever the source reports for a read, after which the plan's
     /// missing experts are forgotten on both maps.
     pub fn complete(&self, backend: &dyn Backend, plan: &FetchPlan) -> CoreResult<()> {
+        self.complete_inner(backend, plan, false)
+    }
+
+    /// [`ExpertStream::complete`] at a fetch cut: the missing experts are read
+    /// into their slots through the live (non-draining) write, and a failed
+    /// read forgets them through the shared map write, so nothing flushes the
+    /// paused command buffer.
+    ///
+    /// # Errors
+    ///
+    /// As [`ExpertStream::complete`].
+    pub fn complete_at_cut(&self, backend: &dyn Backend, plan: &FetchPlan) -> CoreResult<()> {
+        self.complete_inner(backend, plan, true)
+    }
+
+    /// The second half of a fetch, `cut` choosing the non-flushing forget on a
+    /// read failure.
+    fn complete_inner(&self, backend: &dyn Backend, plan: &FetchPlan, cut: bool) -> CoreResult<()> {
         if plan.missing.is_empty() {
             return Ok(());
         }
@@ -1014,7 +1137,7 @@ impl ExpertStream {
             // nor the new one, so every expert of this batch is forgotten on
             // both maps: a later fetch reads it again instead of counting a
             // hit on bytes that never arrived.
-            self.forget(backend, plan.layer, &plan.missing, &plan.victims)?;
+            self.forget(backend, plan.layer, &plan.missing, &plan.victims, cut)?;
             return Err(err);
         }
         let mut state = self.state.lock();
