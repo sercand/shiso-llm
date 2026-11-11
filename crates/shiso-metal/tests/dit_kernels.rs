@@ -69,6 +69,7 @@ const ENTRIES: &[&str] = &[
     "kernel_dit_gqa_f32",
     "kernel_dit_rope_4d",
     "kernel_dit_rope_half",
+    "kernel_dit_rope_half_table",
     "kernel_dit_conv2d_f32",
     "kernel_dit_group_norm_stats_f32",
     "kernel_dit_group_norm_apply_f32",
@@ -3453,6 +3454,7 @@ prefix_cases!(
     tanh_and_gelu_tanh_match_their_formulas,
     gqa_valid_keys_masks_pad_keys,
     rope_half_pins_trailing_rows_to_one_position,
+    rope_half_table_turns_each_pair_by_its_own_angle,
 );
 
 #[test]

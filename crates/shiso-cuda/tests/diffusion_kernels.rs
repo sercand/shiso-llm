@@ -117,4 +117,5 @@ cases!(prefix:
     tanh_and_gelu_tanh_match_their_formulas,
     gqa_valid_keys_masks_pad_keys,
     rope_half_pins_trailing_rows_to_one_position,
+    rope_half_table_turns_each_pair_by_its_own_angle,
 );

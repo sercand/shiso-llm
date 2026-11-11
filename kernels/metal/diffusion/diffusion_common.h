@@ -342,6 +342,14 @@ struct dit_args_rope_half {
     uint32_t pinned_pos;
 };
 
+/// Rotate-half RoPE on one packed (tokens, heads, head_dim) tensor from a
+/// per-token angle table: `cos` and `sin` are each (tokens, head_dim / 2).
+struct dit_args_rope_half_table {
+    uint32_t tokens;
+    uint32_t heads;
+    uint32_t head_dim;
+};
+
 /// One NCHW f32 convolution. `has_bias` is the presence contract from
 /// `dit_args_gemm`.
 struct dit_args_conv2d {
@@ -451,6 +459,7 @@ static_assert(sizeof(dit_args_sdpa) == 44, "SdpaArgs");
 static_assert(sizeof(dit_args_gqa) == 20, "GqaArgs");
 static_assert(sizeof(dit_args_rope_4d) == 28, "Rope4dArgs");
 static_assert(sizeof(dit_args_rope_half) == 20, "RopeHalfArgs");
+static_assert(sizeof(dit_args_rope_half_table) == 12, "RopeHalfTableArgs");
 static_assert(sizeof(dit_args_conv2d) == 48, "Conv2dArgs");
 static_assert(sizeof(dit_args_group_norm) == 24, "GroupNormArgs");
 static_assert(sizeof(dit_args_upsample) == 16, "UpsampleArgs");

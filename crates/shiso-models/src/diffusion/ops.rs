@@ -249,6 +249,14 @@ struct RopeHalfArgs {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct RopeHalfTableArgs {
+    tokens: u32,
+    heads: u32,
+    head_dim: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct SdpaArgs {
     txt_tokens: u32,
     img_tokens: u32,
@@ -638,6 +646,20 @@ pub(crate) struct RopeHalfCall<'a> {
     pub pinned_pos: u32,
 }
 
+/// One rotate-half rotation of a (tokens, heads, `head_dim`) tensor by a
+/// per-token angle table.
+pub(crate) struct RopeHalfTableCall<'a> {
+    pub step: &'static str,
+    pub tensor: DeviceView<'a>,
+    /// `(tokens, head_dim / 2)` cosines.
+    pub cos: DeviceView<'a>,
+    /// `(tokens, head_dim / 2)` sines.
+    pub sin: DeviceView<'a>,
+    pub tokens: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+}
+
 /// One 2D convolution of the VAE decoder.
 pub(crate) struct Conv2dCall<'a> {
     pub step: &'static str,
@@ -906,6 +928,7 @@ pub(crate) const REQUIRED_KERNELS: &[&str] = &[
     "kernel_dit_gqa_f32",
     "kernel_dit_rope_4d",
     "kernel_dit_rope_half",
+    "kernel_dit_rope_half_table",
     "kernel_dit_conv2d_f32",
     "kernel_dit_group_norm_stats_f32",
     "kernel_dit_group_norm_apply_f32",
@@ -2175,6 +2198,34 @@ impl Ops {
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
                 KernelArg::Buffer(call.tensor),
                 KernelArg::Buffer(call.freqs),
+            ],
+        )
+    }
+
+    /// Rotate-half `RoPE` on one (tokens, heads, `head_dim`) tensor from a
+    /// per-token angle table: pair `(i, i + head_dim/2)` of token `t` turns
+    /// by the angle at `[t][i]`. A multi-axis decoder's pairs read different
+    /// position axes, which the token index of [`Self::rope_half`] cannot
+    /// express.
+    pub(crate) fn rope_half_table(
+        &self,
+        call: &RopeHalfTableCall<'_>,
+    ) -> Result<(), ImageGenError> {
+        let args = RopeHalfTableArgs {
+            tokens: call.tokens as u32,
+            heads: call.heads as u32,
+            head_dim: call.head_dim as u32,
+        };
+        self.launch(
+            call.step,
+            "kernel_dit_rope_half_table",
+            Extent3::new(call.tokens as u32, call.heads as u32, 1),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(call.tensor),
+                KernelArg::Buffer(call.cos),
+                KernelArg::Buffer(call.sin),
             ],
         )
     }

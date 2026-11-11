@@ -72,6 +72,7 @@ kernel_dit_qk_norm_rope_f32
 kernel_dit_rmsnorm_f32
 kernel_dit_rope_4d
 kernel_dit_rope_half
+kernel_dit_rope_half_table
 kernel_dit_sdpa_f32
 kernel_dit_silu_f32
 kernel_dit_softmax_rows_f32

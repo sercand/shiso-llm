@@ -868,6 +868,39 @@ kernel void kernel_dit_rope_half(
     }
 }
 
+/// Rotate-half RoPE on one packed (tokens, heads, head_dim) tensor from a
+/// per-token angle table: pair `(i, i + head_dim/2)` of token `t` turns by
+/// the angle whose cosine and sine are `cos_table[t * head_dim/2 + i]` and
+/// `sin_table[...]`, the same for every head. For a decoder whose pairs take
+/// their position from different axes: the host builds the angles in f64,
+/// so no pair's position has to be a token index or fit a float exactly.
+kernel void kernel_dit_rope_half_table(
+        constant dit_args_rope_half_table & args [[buffer(0)]],
+        device float *tensor                        [[buffer(1)]],
+        device const float *cos_table               [[buffer(2)]],
+        device const float *sin_table               [[buffer(3)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const uint t = tgpig.x;
+    const uint h = tgpig.y;
+    const uint tid = tpitg.x;
+    if (t >= args.tokens || h >= args.heads) {
+        return;
+    }
+    const uint fold = args.head_dim / 2u;
+    device float *row = tensor + (uint64_t)(t * args.heads + h) * args.head_dim;
+    device const float *c_row = cos_table + (uint64_t)t * fold;
+    device const float *s_row = sin_table + (uint64_t)t * fold;
+    for (uint i = tid; i < fold; i += DIT_BLOCK) {
+        const float c = c_row[i];
+        const float s = s_row[i];
+        const float x0 = row[i];
+        const float x1 = row[i + fold];
+        row[i] = x0 * c - x1 * s;
+        row[i + fold] = x1 * c + x0 * s;
+    }
+}
+
 // --- vae shapes ---------------------------------------------------------------------
 
 /// One NCHW f32 convolution. One threadgroup per output pixel

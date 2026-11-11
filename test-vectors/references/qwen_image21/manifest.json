@@ -6,6 +6,20 @@
   "convrot": {
    "script_sha256": "d74f74fb74e332f7f41c2ecb62ba79ab016e2d1549679b7894d18c078aa6d340"
   },
+  "edit-text-encoder-int8": {
+   "environment": {
+    "diffusers": "0.41.0.dev0",
+    "diffusers_commit": "d42ebf9c6e0b46103b74283f5324357a67acaa04",
+    "numpy": "2.5.2",
+    "torch": "2.11.0",
+    "transformers": "5.5.0",
+    "turbo": {
+     "repo": "Qwen/Qwen-Image-2.1-Turbo",
+     "revision": "d65dbc9a7e8f6b5479e33dee6030eaab2a906509"
+    }
+   },
+   "script_sha256": "55024e52d46f4831ce6a1e55f9c63c36dd67cc04171081c7eacdb025adea371e"
+  },
   "edit-tokenizer": {
    "environment": {
     "diffusers": "0.41.0.dev0",
@@ -527,6 +541,30 @@
    "sha256": "e9e9e3c3e436fe4fc9efdb8d73da29e0997b067b2be55302bb4d229f9f5ba284",
    "shape": [
     8,
+    4096
+   ]
+  },
+  "edit_te.json": {
+   "description": "Vision-language prefill of one edit prompt over one 384x256 picture: reference decoder layers in f32 over the INT8 text encoder's dequantized weights, the reference tower's rows and deepstack rows injected as the model's own forward does.",
+   "dtype": "json",
+   "sha256": "9e77c1aa9b2d2636a37946c555931101098abdd636fdef61fde1d28b0e3c48e0",
+   "shape": null
+  },
+  "edit_te_hidden.f32": {
+   "description": "The last decoder layer's output before the final norm, system turn dropped: (kept, 4096).",
+   "dtype": "f32le",
+   "sha256": "ce3f590dfebf6354211d631208b2419bb23dc3d7513ecae9726e262722e6eb3f",
+   "shape": [
+    117,
+    4096
+   ]
+  },
+  "edit_te_layer02.f32": {
+   "description": "The stream after decoder layer 2 and its deepstack injection, system turn dropped.",
+   "dtype": "f32le",
+   "sha256": "9aa62bbc330cac0be7fe1f6a89ce732ee0d971309fd3d212d826dd8375b36186",
+   "shape": [
+    117,
     4096
    ]
   },

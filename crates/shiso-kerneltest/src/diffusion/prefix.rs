@@ -24,9 +24,10 @@ use crate::harness::{Gpu, drain, f32_bytes, run};
 use crate::oracle::signal;
 
 /// Every entry point this file's cases launch.
-pub const ENTRIES: [&str; 9] = [
+pub const ENTRIES: [&str; 10] = [
     "kernel_dit_gqa_f32",
     "kernel_dit_rope_half",
+    "kernel_dit_rope_half_table",
     "kernel_dit_flash_sdpa_f32",
     "kernel_dit_flash_sdpa_causal_f32",
     "kernel_dit_flash_sdpa_d128_f32",
@@ -639,4 +640,83 @@ pub fn rope_half_pins_trailing_rows_to_one_position(gpu: &Gpu) {
     let plain = run_with(tokens);
     close(&plain, &host(tokens), 1e-5, 1e-3, "rope_half unpinned");
     differs(&pinned, &plain, 1e-3, "rope_half pinned vs unpinned");
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct RopeHalfTableArgs {
+    tokens: u32,
+    heads: u32,
+    head_dim: u32,
+}
+
+/// Rotate-half `RoPE` from a per-token angle table: pair `(i, i + head_dim/2)`
+/// of token `t` turns by the angle whose cosine and sine are `cos[t][i]` and
+/// `sin[t][i]`, for every head. A multi-axis decoder's pairs take their
+/// position from different axes, which a token index cannot express; the
+/// table can.
+///
+/// # Panics
+///
+/// When a row leaves 1e-5 of the `f64` oracle, or a table of all-zero angles
+/// changed the tensor.
+pub fn rope_half_table_turns_each_pair_by_its_own_angle(gpu: &Gpu) {
+    let (tokens, heads, hd) = (5usize, 3usize, 8usize);
+    let fold = hd / 2;
+    let x = signal(tokens * heads * hd, 73);
+    // Three position axes, pairs interleaved over them, as a
+    // vision-language decoder lays them out.
+    let positions = [[0u32, 0, 0], [1, 1, 1], [2, 2, 5], [2, 3, 5], [4, 4, 4]];
+    let angles: Vec<f64> = (0..tokens)
+        .flat_map(|t| {
+            (0..fold).map(move |i| {
+                let freq = 10000f64.powf(-(2.0 * i as f64) / hd as f64);
+                f64::from(positions[t][i % 3]) * freq
+            })
+        })
+        .collect();
+    let run_with = |angles: &[f64]| -> Vec<f32> {
+        let cos: Vec<f32> = angles.iter().map(|a| a.cos() as f32).collect();
+        let sin: Vec<f32> = angles.iter().map(|a| a.sin() as f32).collect();
+        let dx = upload(gpu, &x);
+        let dc = upload(gpu, &cos);
+        let ds = upload(gpu, &sin);
+        let args = RopeHalfTableArgs {
+            tokens: tokens as u32,
+            heads: heads as u32,
+            head_dim: hd as u32,
+        };
+        launch(
+            gpu,
+            "kernel_dit_rope_half_table",
+            Extent3::new(tokens as u32, heads as u32, 1),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(dx.view()),
+                KernelArg::Buffer(dc.view()),
+                KernelArg::Buffer(ds.view()),
+            ],
+        );
+        drain(gpu);
+        gpu.read_f32(&dx)
+    };
+    let mut want = x.clone();
+    for t in 0..tokens {
+        for h in 0..heads {
+            let row = (t * heads + h) * hd;
+            for i in 0..fold {
+                let angle = angles[t * fold + i];
+                let (c, s) = (angle.cos(), angle.sin());
+                let (x0, x1) = (f64::from(x[row + i]), f64::from(x[row + i + fold]));
+                want[row + i] = (x0 * c - x1 * s) as f32;
+                want[row + i + fold] = (x1 * c + x0 * s) as f32;
+            }
+        }
+    }
+    let turned = run_with(&angles);
+    close(&turned, &want, 1e-5, 1e-3, "rope_half_table");
+    let still = run_with(&vec![0.0; angles.len()]);
+    close(&still, &x, 0.0, 0.0, "rope_half_table at zero angles");
+    differs(&turned, &still, 1e-3, "rope_half_table turned vs still");
 }

@@ -183,6 +183,7 @@ struct dit_args_rope_4d {
 /* Rows from pinned_from on turn by position pinned_pos instead of their own
  * index. Added for the padded text prefill; Rust `RopeHalfArgs` fields 4 and 5. */
 struct dit_args_rope_half { u32 tokens, heads, head_dim, pinned_from, pinned_pos; };
+struct dit_args_rope_half_table { u32 tokens, heads, head_dim; };
 struct dit_args_conv2d {
     u32 batch, in_c, in_h, in_w, out_c, out_h, out_w, k_h, k_w, stride, pad, has_bias;
 };
@@ -216,6 +217,7 @@ static_assert(sizeof(dit_args_sdpa) == 44, "SdpaArgs");
 static_assert(sizeof(dit_args_gqa) == 20, "GqaArgs");
 static_assert(sizeof(dit_args_rope_4d) == 28, "Rope4dArgs");
 static_assert(sizeof(dit_args_rope_half) == 20, "RopeHalfArgs");
+static_assert(sizeof(dit_args_rope_half_table) == 12, "RopeHalfTableArgs");
 static_assert(sizeof(dit_args_conv2d) == 48, "Conv2dArgs");
 static_assert(sizeof(dit_args_group_norm) == 24, "GroupNormArgs");
 static_assert(sizeof(dit_args_upsample) == 16, "UpsampleArgs");

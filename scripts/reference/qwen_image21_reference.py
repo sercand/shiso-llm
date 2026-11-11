@@ -17,6 +17,8 @@ deleting it deliberately is how it is recaptured.
 
     tokenizer   prompt -> ids through the pipeline's own template and drop_idx
     vision      Qwen3-VL vision tower: merged rows and the three deepstack row sets for one picture
+    edit-text-encoder-int8  vision-language prefill of an edit prompt: f32 reference layers over the local INT8
+                text encoder, with the tower's rows and deepstack rows injected
     edit-tokenizer  prompt + condition images -> ids, image-slot mask and 3-axis encoder positions
     sigmas      Turbo (fixed sample_sigmas) and base (dynamic exp shift) schedules
     embed       timestep embedding, shared modulation and txt_in on real weights
@@ -1498,6 +1500,113 @@ def cmd_text_encoder_int8_emulation(args):
         del layer
 
 
+def cmd_edit_text_encoder_int8(args):
+    """The vision-language prefill of an edit prompt, over the INT8 text encoder's own weights.
+
+    One picture (the tower case's, 384x256, so 96 image slots) and the edit prompt go through the pipeline's
+    image-conditioned template and the processor. The tower (f32, BF16 weights) gives the image rows and the
+    three deepstack row sets; the decoder layers are transformers' own `Qwen3VLTextDecoderLayer` in f32 over
+    the INT8 weights dequantized and un-rotated, as in `text-encoder-int8-emulation`, so the device case that
+    runs the same INT8 weights is graded on its kernels alone. Positions are the model's own `get_rope_index`
+    and the rotation its `Qwen3VLTextRotaryEmbedding`; the image rows replace the placeholder embeddings and
+    deepstack set `i` is added at the placeholder rows after decoder layer `i`, as `Qwen3VLTextModel.forward`
+    does. Written: the last layer's output before the final norm, after the dropped system turn, and the
+    stream after layer 2 (the last injection) for bisecting.
+    """
+    import torch
+    from transformers import Qwen3VLModel
+    from transformers.masking_utils import create_causal_mask
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextDecoderLayer, Qwen3VLTextRotaryEmbedding
+
+    torch.set_grad_enabled(False)
+    cache = Path(args.cache_dir).expanduser()
+    out = Out("edit-text-encoder-int8", own_env=True)
+    pipe = stub_pipeline(cache)
+    tower, cfg = load_vision_tower(cache, args.te_file, out)
+    tcfg = cfg.text_config
+    tcfg._attn_implementation = "eager"
+    src = Safetensors(cache, "local-te", path=Path(args.te_file).expanduser())
+    h256 = hadamard_256().astype(np.float32)
+
+    def unrotated(name: str) -> np.ndarray:
+        w = src.tensor(name + ".weight").astype(np.float32) * src.tensor(name + ".weight_scale").astype(np.float32)
+        o, i = w.shape
+        return (w.reshape(o, i // 256, 256) @ h256).reshape(o, i)
+
+    width, height = VISION_PICTURE
+    picture = edit_picture(width, height).convert("RGB")
+    text = pipe.prompt_template_ti2i.format(EDIT_PROMPT)
+    inputs = pipe.processor(text=[text], images=[picture], return_tensors="pt")
+    ids, grid = inputs["input_ids"], inputs["image_grid_thw"]
+    image_mask = ids[0] == pipe._img_token_id
+    vision = tower(inputs["pixel_values"].float(), grid_thw=grid)
+    assert int(image_mask.sum()) == vision.pooler_output.shape[0]
+
+    rope_self = type("R", (), {"config": cfg})()
+    rope_self.get_vision_position_ids = lambda *a, **k: Qwen3VLModel.get_vision_position_ids(rope_self, *a, **k)
+    token_types = inputs.get("mm_token_type_ids")
+    if token_types is None:
+        token_types = image_mask.int()[None]
+    position_ids, _ = Qwen3VLModel.get_rope_index(
+        rope_self, ids, token_types, image_grid_thw=grid, video_grid_thw=None,
+        attention_mask=torch.ones_like(ids),
+    )
+
+    id_list = ids[0].tolist()
+    q = src.tensor("model.embed_tokens.weight")
+    scale = src.tensor("model.embed_tokens.weight_scale")
+    rows = q[id_list].astype(np.float32) * scale[id_list]
+    embeds = (rows.reshape(len(id_list), -1, 256) @ h256).reshape(len(id_list), -1)
+    h = torch.from_numpy(np.ascontiguousarray(embeds, dtype=np.float32))[None]
+    h[0, image_mask] = vision.pooler_output
+    t = h.shape[1]
+    pe = Qwen3VLTextRotaryEmbedding(tcfg)(h, position_ids)
+    mask = create_causal_mask(config=tcfg, inputs_embeds=h, attention_mask=torch.ones(1, t, dtype=torch.long),
+                              past_key_values=None, position_ids=position_ids[0])
+    drop_idx = pipe._drop_idx
+    files = {}
+    for l in range(tcfg.num_hidden_layers):
+        p = f"model.layers.{l}."
+        layer = Qwen3VLTextDecoderLayer(tcfg, l).eval()
+        sd = {n + ".weight": torch.from_numpy(unrotated(p + n)) for n in (
+            "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+            "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")}
+        for n in ("input_layernorm.weight", "post_attention_layernorm.weight",
+                  "self_attn.q_norm.weight", "self_attn.k_norm.weight"):
+            sd[n] = torch.from_numpy(src.tensor(p + n).copy())
+        layer.load_state_dict(sd, strict=True)
+        h = layer(h, position_embeddings=pe, attention_mask=mask, position_ids=position_ids[0])
+        if l < len(vision.deepstack_features):
+            h = h.clone()
+            h[0, image_mask] = h[0, image_mask] + vision.deepstack_features[l]
+        if l == 2:
+            files["layer02"] = out.f32("edit_te_layer02.f32", h[0, drop_idx:].numpy(),
+                                       "The stream after decoder layer 2 and its deepstack injection, system turn dropped.")
+        for f in src.dir.glob(f"model.layers.{l}.*"):
+            f.unlink()
+        del layer
+        print(f"layer {l} done", flush=True)
+    files["hidden"] = out.f32("edit_te_hidden.f32", h[0, drop_idx:].numpy(),
+                              "The last decoder layer's output before the final norm, system turn dropped: (kept, 4096).")
+    out.json(
+        "edit_te.json",
+        {
+            "prompt": EDIT_PROMPT,
+            "picture": {"width": width, "height": height, "formula": "v(x, y, c) = (7x + 13y + 29c) mod 256, RGB"},
+            "image_grid_thw": grid.tolist(),
+            "ids": id_list,
+            "drop_idx": drop_idx,
+            "position_ids": position_ids[:, 0].tolist(),
+            "weights": "INT8 ConvRot text encoder, dequantized and un-rotated; BF16 vision tower",
+            "files": files,
+        },
+        "Vision-language prefill of one edit prompt over one 384x256 picture: reference decoder layers in f32 over "
+        "the INT8 text encoder's dequantized weights, the reference tower's rows and deepstack rows injected as "
+        "the model's own forward does.",
+    )
+    out.finish()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cache-dir", default="~/.cache/shiso-ref/qwen-image21",
@@ -1517,6 +1626,10 @@ def main():
     p = sub.add_parser("vision", help="vision tower rows and deepstack rows for one picture (reads ~1.2 GB locally)")
     p.set_defaults(fn=cmd_vision)
     p.add_argument("--te-file", default=LOCAL_TE, help="local text-encoder safetensors holding model.visual.*")
+    p = sub.add_parser("edit-text-encoder-int8",
+                       help="vision-language prefill of an edit prompt over the local INT8 text encoder (f32 layers)")
+    p.set_defaults(fn=cmd_edit_text_encoder_int8)
+    p.add_argument("--te-file", default=LOCAL_TE, help="local INT8 text-encoder safetensors")
     p = sub.add_parser("text-encoder-streamed", help="layer-streamed text encoder (peak ~2 GB disk, ~3 GB RAM)")
     p.set_defaults(fn=cmd_text_encoder_streamed)
     p = sub.add_parser("text-encoder-int8-emulation",

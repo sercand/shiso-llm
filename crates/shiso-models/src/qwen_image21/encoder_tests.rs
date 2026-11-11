@@ -36,11 +36,20 @@ use shiso_core::Backend;
 
 use super::prompt::QwenImagePrompt;
 use crate::diffusion::ops::Ops;
-use crate::diffusion::qwen3_text::{TapSet, TextEncoder, TextEncoderDesc};
+use crate::diffusion::qwen3_text::{
+    ImageRows, TapSet, TextEncoder, TextEncoderDesc, VisionPrefill,
+};
 use crate::diffusion::weights::safetensors_files;
+use crate::qwen35::vision::Qwen35Tower;
+use shiso_vision::{VisionTower, pack_rgb};
 
 /// Lowest per-token cosine the INT8 features may have against BF16.
 const MIN_COSINE: f64 = 0.995;
+
+/// Lowest per-token cosine of the vision-language prefill against the
+/// reference layers run over the same INT8 weights: kernels only, so the bar
+/// is far above the BF16 one.
+const MIN_EDIT_COSINE: f64 = 0.9995;
 
 /// The prompts the reference captured, in the order they run here: the
 /// 60-word one first, so its first prefill is the cold one.
@@ -214,4 +223,140 @@ fn prompt_text(case: &str) -> String {
         .as_str()
         .expect("a prompt")
         .to_string()
+}
+
+/// The capture's picture: `v(x, y, c) = (7x + 13y + 29c) mod 256`, RGB.
+fn capture_picture(width: u32, height: u32) -> Vec<u8> {
+    (0..height)
+        .flat_map(|y| (0..width).map(move |x| (x, y)))
+        .flat_map(|(x, y)| {
+            [0u32, 1, 2].map(|c| u8::try_from((7 * x + 13 * y + 29 * c) % 256).expect("a byte"))
+        })
+        .collect()
+}
+
+/// A list of small non-negative integers out of a fixture.
+fn numbers(value: &serde_json::Value) -> Vec<u32> {
+    value
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|v| u32::try_from(v.as_u64().expect("a number")).expect("fits"))
+        .collect()
+}
+
+/// The vision-language prefill of an edit prompt against
+/// `qwen_image21_reference.py edit-text-encoder-int8`: the reference
+/// decoder layers in f32 over this same INT8 file dequantized, the
+/// reference tower's rows at the image slots and its deepstack sets after
+/// layers 0 to 2, three-axis positions. Both sides read the same weights,
+/// so what is graded is the device path: the tower, the row splice, the
+/// table rotation and the injections.
+#[test]
+#[ignore = "requires a Metal device and SHISO_TEST_MODEL_QWEN_IMAGE21"]
+fn edit_features_match_reference() {
+    let Some((root, backend)) = setup() else {
+        return;
+    };
+    let fixtures = fixture_dir();
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixtures.join("edit_te.json")).expect("the edit fixture"),
+    )
+    .expect("parses");
+    let side =
+        |key: &str| u32::try_from(doc["picture"][key].as_u64().expect("a side")).expect("fits");
+    let (width, height) = (side("width"), side("height"));
+    let slots = (height as usize / 32, width as usize / 32);
+
+    let ops = Ops::new(&backend).expect("the diffusion kernel set");
+    let prompt =
+        QwenImagePrompt::load(&root.join("image_assets/processor")).expect("the prompt loads");
+    let ids = prompt
+        .tokenize_edit(doc["prompt"].as_str().expect("a prompt"), &[slots])
+        .expect("the edit prompt encodes");
+    assert_eq!(ids.ids, numbers(&doc["ids"]), "our ids are the reference's");
+    let positions = ids.positions();
+    for (axis, want) in (0..3).map(|a| (a, numbers(&doc["position_ids"][a]))) {
+        let got: Vec<u32> = positions.iter().map(|p| p[axis]).collect();
+        assert_eq!(got, want, "axis {axis} positions are the reference's");
+    }
+
+    let weights = safetensors_files(&root.join("image/text_encoders")).expect("weights listed");
+    let config = root.join("image_assets/text_encoder/config.json");
+    let began = Instant::now();
+    let tower =
+        Qwen35Tower::open_checkpoint_file(&backend, &weights[0], &config).expect("the tower loads");
+    let rgb = capture_picture(width, height);
+    let item = pack_rgb(&rgb, width, height, tower.preprocess()).expect("the picture packs");
+    let (rows, deep) = tower
+        .encode_deep(&backend, &item)
+        .expect("the tower encodes");
+    eprintln!(
+        "tower load + encode: {:.2} s",
+        began.elapsed().as_secs_f64()
+    );
+
+    let began = Instant::now();
+    let encoder = load(&root, &ops, TapSet::LastPreNorm);
+    let hidden = encoder.context_width();
+    eprintln!(
+        "INT8 text encoder load: {:.2} s",
+        began.elapsed().as_secs_f64()
+    );
+    let (run, _) = &ids.images[0];
+    let images = [ImageRows {
+        at: run.clone(),
+        main: rows.view(),
+        deep: deep
+            .rows
+            .iter()
+            .map(shiso_core::DeviceBuffer::view)
+            .collect(),
+    }];
+    let began = Instant::now();
+    let features = encoder
+        .prefill_vision(
+            &ops,
+            &VisionPrefill {
+                ids: &ids.ids,
+                positions: &positions,
+                images: &images,
+            },
+        )
+        .expect("the vision prefill runs");
+    eprintln!(
+        "vision prefill of {} tokens: {:.3} s",
+        ids.ids.len(),
+        began.elapsed().as_secs_f64()
+    );
+
+    let kept = &features[ids.drop * hidden..];
+    let want = read_f32(&fixtures.join("edit_te_hidden.f32"));
+    let cos = row_cosines(kept, &want, hidden);
+    let (min, mean) = min_mean(&cos);
+    eprintln!("edit: last layer per-token cosine min {min:.7} mean {mean:.7}");
+    assert!(
+        min >= MIN_EDIT_COSINE,
+        "min cosine {min:.7} < {MIN_EDIT_COSINE}; per-token {cos:.5?}"
+    );
+
+    // Without the deepstack sets the features must differ: the injection
+    // is not a no-op the bar above would also pass.
+    let bare = [ImageRows {
+        deep: Vec::new(),
+        ..images[0].clone()
+    }];
+    assert!(
+        encoder
+            .prefill_vision(
+                &ops,
+                &VisionPrefill {
+                    ids: &ids.ids,
+                    positions: &positions,
+                    images: &bare,
+                },
+            )
+            .is_err(),
+        "a picture without its deepstack sets is refused"
+    );
 }
