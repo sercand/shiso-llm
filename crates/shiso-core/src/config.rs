@@ -264,6 +264,27 @@ impl HfConfig {
     /// unusable media token, and [`CoreError::ShapeMismatch`] for a zero
     /// dimension.
     pub fn vision_config(&self) -> CoreResult<Option<VisionConfig>> {
+        self.vision_tower(false)
+    }
+
+    /// [`Self::vision_config`] for a caller that consumes a tower's deepstack
+    /// taps: the taps are returned in `deepstack_visual_indexes` instead of
+    /// being refused.
+    ///
+    /// A tower with taps feeds the language model one extra row set per tap,
+    /// added to its residual stream after its first layers. A caller that
+    /// asks here takes on producing and injecting them; one that cannot must
+    /// use [`Self::vision_config`], whose refusal keeps such a checkpoint
+    /// from answering about a picture it only partly saw.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::vision_config`], without the deepstack refusal.
+    pub fn vision_config_with_deepstack(&self) -> CoreResult<Option<VisionConfig>> {
+        self.vision_tower(true)
+    }
+
+    fn vision_tower(&self, deepstack: bool) -> CoreResult<Option<VisionConfig>> {
         let Some(raw) = self.document.get("vision_config") else {
             return Ok(None);
         };
@@ -281,7 +302,7 @@ impl HfConfig {
             "vision.num_position_embeddings",
             tower.num_position_embeddings,
         )?;
-        if !tower.deepstack_visual_indexes.is_empty() {
+        if !deepstack && !tower.deepstack_visual_indexes.is_empty() {
             return Err(CoreError::Unsupported {
                 what: "deepstack vision towers",
                 backend: "core",

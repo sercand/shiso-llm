@@ -48,6 +48,18 @@ pub enum VisionSource {
     /// dimensions come from the directory's own config. The path is the
     /// tower file.
     TrellisShard(PathBuf),
+    /// One weight file that holds the tower under `model.visual.` beside
+    /// other tensors, with the config document describing it kept elsewhere.
+    ///
+    /// A text encoder exported as a single file carries its tower this way.
+    /// The tower may have deepstack taps: this source is opened only by a
+    /// caller that consumes them.
+    CheckpointFile {
+        /// The weight file.
+        weights: PathBuf,
+        /// The `config.json` whose `vision_config` describes the tower.
+        config: PathBuf,
+    },
 }
 
 impl VisionSource {
@@ -59,6 +71,7 @@ impl VisionSource {
             | Self::SidecarGguf(path)
             | Self::ModeloptDir(path)
             | Self::TrellisShard(path) => path,
+            Self::CheckpointFile { weights, .. } => weights,
         }
     }
 }

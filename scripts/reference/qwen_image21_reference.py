@@ -16,6 +16,7 @@ revisions. It never overwrites a fixture: an existing file stops the run, and
 deleting it deliberately is how it is recaptured.
 
     tokenizer   prompt -> ids through the pipeline's own template and drop_idx
+    vision      Qwen3-VL vision tower: merged rows and the three deepstack row sets for one picture
     edit-tokenizer  prompt + condition images -> ids, image-slot mask and 3-axis encoder positions
     sigmas      Turbo (fixed sample_sigmas) and base (dynamic exp shift) schedules
     embed       timestep embedding, shared modulation and txt_in on real weights
@@ -527,6 +528,78 @@ def cmd_edit_tokenizer(args):
         "Edit prompts through the pipeline's own image-conditioned template and processor: the ids the text encoder "
         "sees, the image-slot mask after the dropped system turn, the processor's image grids and the "
         "vision-language model's 3-axis rotary position ids.",
+    )
+    out.finish()
+
+
+# ---------------------------------------------------------------- vision tower
+
+# The tower picture: already on the processor's 32-pixel grid and above its
+# minimum area, so neither the processor nor the Rust port resamples it.
+VISION_PICTURE = (384, 256)  # width, height
+LOCAL_TE = ("~/.shiso/models/qwen-image-2.1-viggle-turbo/int8/image_text_encoder/text_encoders/"
+            "qwen3vl_8b_int8_convrot.safetensors")
+
+
+def load_vision_tower(cache: Path, te_file: str, out: Out):
+    """The Qwen3-VL vision tower in f32 over the BF16 `model.visual.*` tensors of the local text-encoder file."""
+    import torch
+    from transformers import Qwen3VLConfig
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+
+    config = Qwen3VLConfig.from_pretrained(str(turbo_file(cache, "text_encoder/config.json").parent))
+    src = Safetensors(cache, "local-te", path=Path(te_file).expanduser())
+    prefix = "model.visual."
+    names = [k for k in src.header if k.startswith(prefix)]
+    state = {}
+    for name in names:
+        if src.header[name]["dtype"] != "BF16":
+            sys.exit(f"{name}: expected a BF16 tower tensor, found {src.header[name]['dtype']}")
+        state[name[len(prefix):]] = torch.from_numpy(src.tensor(name).copy())
+    tower = Qwen3VLVisionModel(config.vision_config).float().eval()
+    missing, unexpected = tower.load_state_dict(state, strict=True)
+    assert not missing and not unexpected
+    for name in ("model.visual.patch_embed.proj.weight", "model.visual.merger.linear_fc2.weight",
+                 "model.visual.deepstack_merger_list.0.norm.weight"):
+        note_input(out, src, name)
+    return tower, config
+
+
+def cmd_vision(args):
+    import torch
+
+    cache = Path(args.cache_dir).expanduser()
+    out = Out("vision", own_env=True)
+    pipe = stub_pipeline(cache)
+    tower, config = load_vision_tower(cache, args.te_file, out)
+    width, height = VISION_PICTURE
+    picture = edit_picture(width, height).convert("RGB")
+    inputs = pipe.processor.image_processor(images=[picture], return_tensors="pt")
+    pixel_values, grid = inputs["pixel_values"].float(), inputs["image_grid_thw"]
+    assert grid.tolist() == [[1, height // 16, width // 16]], grid.tolist()
+    with torch.no_grad():
+        result = tower(pixel_values, grid_thw=grid)
+    files = {
+        "pixel_values": out.f32("vision_pixel_values.f32", pixel_values.numpy(),
+                                "The processor's patch rows for the tower picture, (patches, 3 * 2 * 16 * 16)."),
+        "rows": out.f32("vision_rows.f32", result.pooler_output.numpy(),
+                        "The tower's merged output rows, (slots, out_hidden)."),
+    }
+    for i, feature in enumerate(result.deepstack_features):
+        files[f"deepstack{i}"] = out.f32(
+            f"vision_deepstack{i}.f32", feature.numpy(),
+            f"Deepstack rows of tap {i} (after tower block {config.vision_config.deepstack_visual_indexes[i]}), "
+            "(slots, out_hidden).")
+    out.json(
+        "vision.json",
+        {
+            "picture": {"width": width, "height": height, "formula": "v(x, y, c) = (7x + 13y + 29c) mod 256, RGB"},
+            "image_grid_thw": grid.tolist(),
+            "deepstack_visual_indexes": list(config.vision_config.deepstack_visual_indexes),
+            "files": files,
+        },
+        "The Qwen3-VL vision tower (f32, CPU) over one picture: the processor's patch rows in, the merged rows and "
+        "the three deepstack row sets out. Weights: the BF16 `model.visual.*` tensors of the local text-encoder file.",
     )
     out.finish()
 
@@ -1441,6 +1514,9 @@ def main():
                                 "otherwise the tensors are range-read from the hub")
     p = sub.add_parser("edit-tokenizer", help="edit prompt ids, image-slot mask and 3-axis encoder positions")
     p.set_defaults(fn=cmd_edit_tokenizer)
+    p = sub.add_parser("vision", help="vision tower rows and deepstack rows for one picture (reads ~1.2 GB locally)")
+    p.set_defaults(fn=cmd_vision)
+    p.add_argument("--te-file", default=LOCAL_TE, help="local text-encoder safetensors holding model.visual.*")
     p = sub.add_parser("text-encoder-streamed", help="layer-streamed text encoder (peak ~2 GB disk, ~3 GB RAM)")
     p.set_defaults(fn=cmd_text_encoder_streamed)
     p = sub.add_parser("text-encoder-int8-emulation",

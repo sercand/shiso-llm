@@ -51,6 +51,8 @@ mod pipeline_tests;
 #[cfg(test)]
 mod prompt_tests;
 #[cfg(test)]
+mod tower_tests;
+#[cfg(test)]
 mod transformer_tests;
 #[cfg(test)]
 mod vae_tests;

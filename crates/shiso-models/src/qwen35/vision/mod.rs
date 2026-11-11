@@ -29,12 +29,12 @@ mod manifest;
 mod mmproj;
 
 pub use dims::VisionDims;
-pub use encoder::VisionEncoder;
-pub use loader::{TowerTensor, VisionWeights, load_vision_weights};
+pub use encoder::{DeepstackRows, VisionEncoder};
+pub use loader::{DeepstackTap, TowerTensor, VisionWeights, load_vision_weights};
 pub use manifest::{
     Affine, AxisOrder, CHECKPOINT_PREFIX, PUBLISHED_SIDECAR, SIDECAR_PREFIX,
-    SIDECAR_PREFIX_CANONICAL, SidecarContract, TowerBlock, TowerManifest, TowerMerger,
-    TowerTensorSpec, TowerTree,
+    SIDECAR_PREFIX_CANONICAL, SidecarContract, TENSORS_PER_DEEPSTACK_TAP, TowerBlock,
+    TowerManifest, TowerMerger, TowerTensorSpec, TowerTree, deepstack_mergers,
 };
 
 /// The shard index a multi-shard checkpoint carries beside its shards.
@@ -98,7 +98,15 @@ impl Qwen35Tower {
         } else {
             VisionSource::SidecarGguf(path.to_path_buf())
         };
-        let weights = load_vision_weights(backend, &source)?;
+        Self::from_weights(load_vision_weights(backend, &source)?)
+    }
+
+    /// The wrapper over a tower already on the device.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "both doors end here with a `?` on the load; one fallible tail keeps them alike"
+    )]
+    fn from_weights(weights: VisionWeights) -> Result<Self, VisionError> {
         let dims = weights.dims();
         let geometry = dims.geometry();
         let merge = geometry.spatial_merge_size().max(1);
@@ -110,6 +118,48 @@ impl Qwen35Tower {
             merge,
             out_hidden,
         })
+    }
+
+    /// Opens the tower one weight file carries under `model.visual.`, with
+    /// its dimensions and deepstack taps read from `config`.
+    ///
+    /// For a caller that injects the taps itself ([`Self::encode_deep`]):
+    /// the serving path's [`Self::open`] never yields a tower with taps,
+    /// because [`VisionTower::encode`] has nowhere to put their rows.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`load_vision_weights`] refuses the source for.
+    pub fn open_checkpoint_file(
+        backend: &Arc<dyn Backend>,
+        weights: &Path,
+        config: &Path,
+    ) -> Result<Self, VisionError> {
+        let source = VisionSource::CheckpointFile {
+            weights: weights.to_path_buf(),
+            config: config.to_path_buf(),
+        };
+        Self::from_weights(load_vision_weights(backend, &source)?)
+    }
+
+    /// Encodes one item and its deepstack row sets (see
+    /// [`VisionEncoder::encode_deep`]).
+    ///
+    /// # Errors
+    ///
+    /// [`VisionError`] if dimensions mismatch or device operations fail.
+    pub fn encode_deep(
+        &self,
+        backend: &Arc<dyn Backend>,
+        item: &VisionItem,
+    ) -> Result<(DeviceBuffer, DeepstackRows), VisionError> {
+        self.encoder.encode_deep(backend, &self.weights, item)
+    }
+
+    /// How many deepstack taps the tower has.
+    #[must_use]
+    pub fn deepstack_taps(&self) -> usize {
+        self.weights.deepstack().len()
     }
 
     /// Which of the two checkpoint layouts this directory is.

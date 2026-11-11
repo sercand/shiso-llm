@@ -256,6 +256,35 @@ impl<T> Affine<T> {
     }
 }
 
+impl<T> TowerMerger<T> {
+    /// Rewrites the merger's tensors in upload order: normalization, then the
+    /// two projections.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `visit` reports, unchanged and at the first tensor that fails.
+    pub fn try_map<U, E>(
+        self,
+        mut visit: impl FnMut(T) -> Result<U, E>,
+    ) -> Result<TowerMerger<U>, E> {
+        let visit = &mut visit;
+        Ok(TowerMerger {
+            norm: self.norm.try_map(visit)?,
+            fc1: self.fc1.try_map(visit)?,
+            fc2: self.fc2.try_map(visit)?,
+        })
+    }
+
+    /// The merger's tensors, in the order [`TowerMerger::try_map`] visits
+    /// them.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.norm
+            .iter()
+            .chain(self.fc1.iter())
+            .chain(self.fc2.iter())
+    }
+}
+
 impl<T> TowerTree<T> {
     /// Rewrites every tensor in upload order, stopping at the first failure.
     ///
@@ -288,11 +317,7 @@ impl<T> TowerTree<T> {
                     })
                 })
                 .collect::<Result<Vec<_>, E>>()?,
-            merger: TowerMerger {
-                norm: self.merger.norm.try_map(visit)?,
-                fc1: self.merger.fc1.try_map(visit)?,
-                fc2: self.merger.fc2.try_map(visit)?,
-            },
+            merger: self.merger.try_map(visit)?,
         })
     }
 
@@ -311,9 +336,7 @@ impl<T> TowerTree<T> {
                     .chain(block.fc1.iter())
                     .chain(block.fc2.iter())
             }))
-            .chain(self.merger.norm.iter())
-            .chain(self.merger.fc1.iter())
-            .chain(self.merger.fc2.iter())
+            .chain(self.merger.iter())
     }
 
     /// Tensors in the tree.
@@ -443,6 +466,53 @@ impl TowerManifest {
     pub fn names(&self) -> Vec<&str> {
         self.iter().map(TowerTensorSpec::name).collect()
     }
+}
+
+/// Tensors one deepstack merger holds: a normalization and two projections,
+/// each with a bias.
+pub const TENSORS_PER_DEEPSTACK_TAP: usize = 6;
+
+/// The mergers of a tower's deepstack taps, in tap order.
+///
+/// A tap reads the patch stream after one of the tower's blocks and hands
+/// the language model a second set of rows for the same picture. Its merger
+/// is the tower's own in everything but the normalization, which runs over
+/// the folded block (`merge_input` wide) instead of over one patch vector:
+/// the scale and offset are that long, which leaves no other reading.
+#[must_use]
+pub fn deepstack_mergers(
+    prefix: &str,
+    dims: VisionDims,
+    taps: usize,
+) -> Vec<TowerMerger<TowerTensorSpec>> {
+    let merge_in = dim(dims.merge_input());
+    let out = dim(dims.out_hidden());
+    let spec = |name: String, shape: Vec<u64>| TowerTensorSpec {
+        name,
+        accepted: vec![AcceptedShape {
+            dims: shape,
+            rows: PatchRows::AsStored,
+        }],
+    };
+    (0..taps)
+        .map(|tap| {
+            let at = format!("{prefix}.deepstack_merger_list.{tap}");
+            TowerMerger {
+                norm: Affine {
+                    weight: spec(format!("{at}.norm.weight"), vec![merge_in]),
+                    bias: spec(format!("{at}.norm.bias"), vec![merge_in]),
+                },
+                fc1: Affine {
+                    weight: spec(format!("{at}.linear_fc1.weight"), vec![merge_in, merge_in]),
+                    bias: spec(format!("{at}.linear_fc1.bias"), vec![merge_in]),
+                },
+                fc2: Affine {
+                    weight: spec(format!("{at}.linear_fc2.weight"), vec![out, merge_in]),
+                    bias: spec(format!("{at}.linear_fc2.bias"), vec![out]),
+                },
+            }
+        })
+        .collect()
 }
 
 /// Narrows a dimension for comparison against a container's declared shape.

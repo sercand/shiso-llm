@@ -96,7 +96,7 @@ pub use generator::{
     GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageOutputFormat,
     ImageStepEvent, InputReferenceImage,
 };
-pub use image::preprocess_image;
+pub use image::{pack_rgb, preprocess_image};
 pub use item::VisionItem;
 pub use shard::VisionShard;
 /// What this machine's OS video decoder reports, for the boot log.

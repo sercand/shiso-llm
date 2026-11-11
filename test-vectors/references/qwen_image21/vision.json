@@ -1,0 +1,26 @@
+{
+ "picture": {
+  "width": 384,
+  "height": 256,
+  "formula": "v(x, y, c) = (7x + 13y + 29c) mod 256, RGB"
+ },
+ "image_grid_thw": [
+  [
+   1,
+   16,
+   24
+  ]
+ ],
+ "deepstack_visual_indexes": [
+  8,
+  16,
+  24
+ ],
+ "files": {
+  "pixel_values": "vision_pixel_values.f32",
+  "rows": "vision_rows.f32",
+  "deepstack0": "vision_deepstack0.f32",
+  "deepstack1": "vision_deepstack1.f32",
+  "deepstack2": "vision_deepstack2.f32"
+ }
+}

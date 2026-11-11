@@ -37,6 +37,20 @@
   },
   "vae": {
    "script_sha256": "d74f74fb74e332f7f41c2ecb62ba79ab016e2d1549679b7894d18c078aa6d340"
+  },
+  "vision": {
+   "environment": {
+    "diffusers": "0.41.0.dev0",
+    "diffusers_commit": "d42ebf9c6e0b46103b74283f5324357a67acaa04",
+    "numpy": "2.5.2",
+    "torch": "2.11.0",
+    "transformers": "5.5.0",
+    "turbo": {
+     "repo": "Qwen/Qwen-Image-2.1-Turbo",
+     "revision": "d65dbc9a7e8f6b5479e33dee6030eaab2a906509"
+    }
+   },
+   "script_sha256": "2a8da411b2849f4951e55ef5cf4e1d88028f2f01ea184ce7352d7dc7c20baf29"
   }
  },
  "files": {
@@ -909,6 +923,57 @@
     16,
     16
    ]
+  },
+  "vision.json": {
+   "description": "The Qwen3-VL vision tower (f32, CPU) over one picture: the processor's patch rows in, the merged rows and the three deepstack row sets out. Weights: the BF16 `model.visual.*` tensors of the local text-encoder file.",
+   "dtype": "json",
+   "sha256": "045fdc480baba02ca5fb888573aacb0104e424cd0b4999f8d2bc8cee848cfd32",
+   "shape": null
+  },
+  "vision_deepstack0.f32": {
+   "description": "Deepstack rows of tap 0 (after tower block 8), (slots, out_hidden).",
+   "dtype": "f32le",
+   "sha256": "ab44d75582c5f447f910787394a758cf6a73756c390f94791790e9d98b718f5a",
+   "shape": [
+    96,
+    4096
+   ]
+  },
+  "vision_deepstack1.f32": {
+   "description": "Deepstack rows of tap 1 (after tower block 16), (slots, out_hidden).",
+   "dtype": "f32le",
+   "sha256": "e0c131030db4617604278b46f0465f3176c731831186aca4aaa85da7a759bf3c",
+   "shape": [
+    96,
+    4096
+   ]
+  },
+  "vision_deepstack2.f32": {
+   "description": "Deepstack rows of tap 2 (after tower block 24), (slots, out_hidden).",
+   "dtype": "f32le",
+   "sha256": "6c3fbb99d3ff407ec3f55eafd256f0ccf9a73fee410ae4521ad02efefbeeba00",
+   "shape": [
+    96,
+    4096
+   ]
+  },
+  "vision_pixel_values.f32": {
+   "description": "The processor's patch rows for the tower picture, (patches, 3 * 2 * 16 * 16).",
+   "dtype": "f32le",
+   "sha256": "c1842e7c3a5ee1b990815ff3c2871c0227c980ffd16c542f9c1f4ae149579a8d",
+   "shape": [
+    384,
+    1536
+   ]
+  },
+  "vision_rows.f32": {
+   "description": "The tower's merged output rows, (slots, out_hidden).",
+   "dtype": "f32le",
+   "sha256": "b01a558c32c83c85ec37f7a6d7b190221358e857aceecb08e6911c75e0839b1f",
+   "shape": [
+    96,
+    4096
+   ]
   }
  },
  "global": {
@@ -982,6 +1047,32 @@
    "shape": [
     4096,
     1
+   ]
+  },
+  "local-te:model.visual.deepstack_merger_list.0.norm.weight": {
+   "dtype": "BF16",
+   "sha256": "e62b5c81bed60b4ace6e07440d49d2f848f513c93b48c44347b84bbff746ac82",
+   "shape": [
+    4608
+   ]
+  },
+  "local-te:model.visual.merger.linear_fc2.weight": {
+   "dtype": "BF16",
+   "sha256": "31b3a056bef2e9451b7d532d92f413a67745587a3b9222c0973d538be6a67032",
+   "shape": [
+    4096,
+    4608
+   ]
+  },
+  "local-te:model.visual.patch_embed.proj.weight": {
+   "dtype": "BF16",
+   "sha256": "b5ead0bb5217d8409fd91902363c06789d1eaf9570b1fc8bb4cd5e8a75829d24",
+   "shape": [
+    1152,
+    3,
+    2,
+    16,
+    16
    ]
   },
   "text-encoder-embed-rows": {

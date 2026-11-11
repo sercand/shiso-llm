@@ -463,6 +463,24 @@ pub enum VisionError {
         source: shiso_core::CoreError,
     },
 
+    /// A picture handed over at its final size does not sit on the tower's
+    /// grid, or its buffer is not the size its sides say. Packing it would
+    /// crop it or read past it, so it is refused instead.
+    #[error(
+        "a {width}x{height} picture of {bytes} bytes cannot be packed: its sides must be \
+         multiples of {unit} and it must hold three bytes per pixel"
+    )]
+    PictureOffGrid {
+        /// Picture width in pixels.
+        width: u32,
+        /// Picture height in pixels.
+        height: u32,
+        /// Bytes in the buffer handed over.
+        bytes: usize,
+        /// The tower's grid unit in pixels.
+        unit: usize,
+    },
+
     /// The item's patch grid is not a whole number of merge blocks.
     ///
     /// The merger folds a square block of patches into one token, so a grid with

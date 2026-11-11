@@ -7,7 +7,9 @@
 
 use std::num::NonZeroU64;
 
-use super::{ABS_MAX_DIM, DECODE_MAX_SIDE, decode_image, preprocess_image, target_size_for};
+use super::{
+    ABS_MAX_DIM, DECODE_MAX_SIDE, decode_image, pack_rgb, preprocess_image, target_size_for,
+};
 use crate::config::{ImageLimits, PreprocessSpec};
 use crate::error::VisionError;
 use crate::testing::{chain, encoded, png, vision_config};
@@ -693,4 +695,48 @@ fn a_token_range_target_stays_in_its_band() {
 fn a_declared_area_bound_still_caps_the_token_range() {
     let (th, tw) = target_size_for(1024, 1024, &lfm2(), bound(256 * 256));
     assert!(u64::from(th) * u64::from(tw) <= 256 * 256);
+}
+
+/// A picture handed over at its final size is packed as it is: the grid is
+/// the picture's own and every value is the byte through the spec's
+/// statistics, with no resampling in between.
+#[test]
+fn pack_rgb_packs_without_resampling() {
+    let spec = qwen();
+    let (width, height) = (2 * GU, GU);
+    let rgb: Vec<u8> = (0..width * height)
+        .flat_map(|i| {
+            let (x, y) = (i % width, i / width);
+            [0u32, 1, 2].map(|c| u8::try_from((7 * x + 13 * y + 29 * c) % 256).expect("a byte"))
+        })
+        .collect();
+    let item = pack_rgb(&rgb, width, height, &spec).expect("an on-grid picture packs");
+    assert_eq!(item.grid(), (1, 2, 4));
+    // Patch (0, 1) starts at pixel (16, 0); its first value is that pixel's
+    // red channel.
+    let ps = spec.geometry.patch_size();
+    let byte = rgb[ps * 3];
+    let want = (f32::from(byte) / 255.0 - 0.5) / 0.5;
+    let row = item.row(1).expect("a second patch");
+    assert!((row[0] - want).abs() < 1e-6, "{} vs {want}", row[0]);
+    // The same bytes through the decoding door at the same size agree to the
+    // resampler's identity.
+    assert_eq!(item.rows(), 8);
+}
+
+#[test]
+fn pack_rgb_refuses_what_it_would_crop_or_overread() {
+    let spec = qwen();
+    let ok = vec![0u8; (GU * GU * 3) as usize];
+    assert!(pack_rgb(&ok, GU, GU, &spec).is_ok());
+    for (w, h, bytes) in [
+        (GU + 1, GU, ok.len()),
+        (GU, 0, ok.len()),
+        (GU, GU, ok.len() - 3),
+    ] {
+        match pack_rgb(&ok[..bytes.min(ok.len())], w, h, &spec) {
+            Err(VisionError::PictureOffGrid { unit, .. }) => assert_eq!(unit, GU as usize),
+            other => panic!("{w}x{h} over {bytes} bytes: expected a refusal, got {other:?}"),
+        }
+    }
 }
