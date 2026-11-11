@@ -808,6 +808,13 @@ pub struct ServeOptions {
         arg(long, env = "SHISO_IMAGE_DRAFT_STEPS", default_value_t = 0)
     )]
     pub image_draft_steps: u32,
+    /// The most reference images one image edit may carry. Unset, the
+    /// loaded model's own limit applies. Each reference costs memory and
+    /// time for the whole job, so a host that fits two can refuse a third
+    /// before it is queued. Refused at boot when it is above what the model
+    /// takes, or when the model takes none.
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_IMAGE_MAX_REFERENCES"))]
+    pub image_max_references: Option<NonZeroU32>,
     /// Transformer blocks `START:END` (end exclusive) the last denoising
     /// step of every image job skips, adding instead the residual the step
     /// before recorded over the same blocks. Saves `(END - START) / blocks`
@@ -1147,6 +1154,7 @@ impl Default for ServeOptions {
             image_residency: ImageResidencyChoice::Auto,
             image_reserve_gb: 1.5,
             image_draft_steps: 0,
+            image_max_references: None,
             image_final_reuse: None,
             reasoning_parser: ParserChoice::Auto,
             tool_call_parser: ParserChoice::Auto,
@@ -2084,6 +2092,37 @@ mod tests {
         }
         let parsed = Probe::try_parse_from(["probe"]).expect("an empty command line parses");
         assert_eq!(parsed.options, ServeOptions::default());
+    }
+
+    /// `--image-max-references` takes a positive count; zero is not "no
+    /// edits", it is a refused flag.
+    #[cfg(feature = "clap")]
+    #[test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "a test that cannot run says on stderr why it skipped"
+    )]
+    fn image_max_references_is_a_positive_count() {
+        use clap::Parser as _;
+
+        #[derive(Debug, clap::Parser)]
+        struct Probe {
+            #[command(flatten)]
+            options: ServeOptions,
+        }
+        if std::env::vars().any(|(name, _)| name.starts_with("SHISO_")) {
+            eprintln!("SKIP: a SHISO_* variable is set and would override the defaults");
+            return;
+        }
+        assert_eq!(ServeOptions::default().image_max_references, None);
+        let parsed = Probe::try_parse_from(["probe", "--image-max-references", "3"])
+            .expect("a positive count parses");
+        assert_eq!(
+            parsed.options.image_max_references,
+            std::num::NonZeroU32::new(3)
+        );
+        assert!(Probe::try_parse_from(["probe", "--image-max-references", "0"]).is_err());
+        assert!(Probe::try_parse_from(["probe", "--image-max-references", "many"]).is_err());
     }
 
     #[test]

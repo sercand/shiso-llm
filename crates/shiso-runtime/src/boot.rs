@@ -185,7 +185,9 @@ pub fn boot_image(args: &ServeOptions) -> Result<Option<image::ImageService>, Bo
     let service = service
         .with_overrides(args.image_overrides()?)
         .context("--image-default-size / --image-default-steps")?
-        .with_max_upload_bytes(args.image_max_upload_bytes());
+        .with_max_upload_bytes(args.image_max_upload_bytes())
+        .with_max_references(args.image_max_references)
+        .context("--image-max-references")?;
     Ok(Some(service))
 }
 
