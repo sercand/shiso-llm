@@ -516,6 +516,15 @@ pub(crate) struct LinWeight<'a> {
 }
 
 impl<'a> LinWeight<'a> {
+    /// The same weight for an input the caller has already rotated
+    /// ([`Ops::rotate`]) under the weight's own group: the driver multiplies
+    /// it as given. For several weights stored under one rotation that read
+    /// the same rows, so the rows are rotated once instead of once each.
+    pub(crate) fn over_rotated_input(mut self) -> Self {
+        self.rotate = None;
+        self
+    }
+
     /// A raw F32 `(n, k)` operand with no scale, bias or rotation.
     pub(crate) fn f32(w: DeviceView<'a>) -> Self {
         Self {

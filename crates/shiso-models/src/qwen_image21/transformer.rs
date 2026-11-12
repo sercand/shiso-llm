@@ -65,7 +65,7 @@ use super::vae::LatentGrid;
 use crate::diffusion::lin::Lin;
 use crate::diffusion::ops::{
     GemmCall, LayerNormCall, LinearResidualCall, ModulateCall, NarrowKvCall, Ops, QkNormRopeCall,
-    Scratch, SdpaCall, SliceExt, SwigluInput,
+    RotateCall, Scratch, SdpaCall, SliceExt, SwigluInput,
 };
 use crate::diffusion::weights::StStore;
 
@@ -952,8 +952,49 @@ impl QwenDit {
         let normed = ops.alloc_f32("qwen block norm", m * h)?;
         self.norm_scale(ops, run.x, normed.view(), quarter(0)?, m)?;
 
+        // The three attention projections read the same rows, and an INT8
+        // export stores all three under the same rotation: rotate the rows
+        // once here, not once inside each projection. Same rotation, same
+        // products, so the same bits; on an M4 at 1024x1024 it is two
+        // 2 ms launches fewer per block.
+        let group = w.to_q.rotate;
+        let shared = group.filter(|_| w.to_k.rotate == group && w.to_v.rotate == group);
+        let rotated;
+        let attn_in = match shared {
+            Some(group) => {
+                rotated = ops.alloc_f32("qwen qkv rotation", m * h)?;
+                ops.rotate(&RotateCall {
+                    step: "qwen qkv rotation",
+                    out: rotated.view(),
+                    dense: Some(normed.view()),
+                    dense_cols: h,
+                    swiglu: None,
+                    rows: m,
+                    group,
+                })?;
+                rotated.view()
+            }
+            None => normed.view(),
+        };
+        let project = |step, lin: &Lin, out| {
+            let weight = lin.weight();
+            ops.gemm(&GemmCall {
+                step,
+                out,
+                input: attn_in,
+                weight: if shared.is_some() {
+                    weight.over_rotated_input()
+                } else {
+                    weight
+                },
+                m,
+                n: lin.out_dim,
+                k: lin.in_dim,
+            })
+        };
+
         let queries = ops.alloc_f32("qwen q", m * h)?;
-        Self::linear(ops, "qwen to_q", &w.to_q, normed.view(), queries.view(), m)?;
+        project("qwen to_q", &w.to_q, queries.view())?;
         // The keys and values the block attends are f32. A prefix that
         // keeps f32 rows writes them straight into its cache; every other
         // case computes them in scratch.
@@ -970,8 +1011,8 @@ impl QwenDit {
                 (scratch_kv.0.view(), scratch_kv.1.view())
             }
         };
-        Self::linear(ops, "qwen to_k", &w.to_k, normed.view(), keys, m)?;
-        Self::linear(ops, "qwen to_v", &w.to_v, normed.view(), values, m)?;
+        project("qwen to_k", &w.to_k, keys)?;
+        project("qwen to_v", &w.to_v, values)?;
         ops.qk_norm_rope(&QkNormRopeCall {
             step: "qwen qk norm rope",
             q: queries.view(),
