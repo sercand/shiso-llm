@@ -210,6 +210,37 @@ fn rel_l2(got: &[f32], want: &[f32]) -> f64 {
     (num / den.max(f64::MIN_POSITIVE)).sqrt()
 }
 
+/// The capture's layout: its text runs, its condition images' latent grids
+/// (in the order text, image, text, image) and the target's grid.
+fn fixture_layout(doc: &serde_json::Value) -> (Vec<usize>, Vec<LatentGrid>, LatentGrid) {
+    let dims = |v: &serde_json::Value| -> Vec<usize> {
+        v.as_array()
+            .expect("a list")
+            .iter()
+            .map(|d| usize::try_from(d.as_u64().expect("a count")).expect("fits"))
+            .collect()
+    };
+    let texts = dims(&doc["layout"]["text"]);
+    let images = doc["layout"]["images"]
+        .as_array()
+        .expect("images")
+        .iter()
+        .map(|g| {
+            let g = dims(g);
+            LatentGrid { h: g[0], w: g[1] }
+        })
+        .collect();
+    let target = dims(&doc["layout"]["target"]);
+    (
+        texts,
+        images,
+        LatentGrid {
+            h: target[0],
+            w: target[1],
+        },
+    )
+}
+
 /// One block over text, a 4x6 condition image, text, a 2x2 condition image
 /// and a 4x4 target: the cached prefix keys and values, and the target's
 /// output through the prefix-cache pass, against the reference (which
@@ -224,17 +255,26 @@ fn edit_block_matches_reference() {
     let sigma = 0.704_534_f32;
     assert!((doc["sigma"].as_f64().expect("sigma") - f64::from(sigma)).abs() < 1e-6);
     let (hidden, channels) = (4096usize, 64usize);
-    let layout = capture_layout();
-    let grid = LatentGrid { h: 4, w: 4 };
+    let (texts, images, grid) = fixture_layout(&doc);
+    let layout: Vec<Segment> = texts
+        .iter()
+        .zip(&images)
+        .flat_map(|(&text, &image)| [Segment::Text(text), Segment::Image(image)])
+        .collect();
     let encoder = read_f32("edit_block_in_encoder.f32");
     let latents = read_f32("edit_block_in_latents.f32");
-    // The encoder's rows: 20 text, 6 image slots, 3 text, 1 image slot.
-    // The transformer reads the text rows alone.
-    let text_rows: Vec<f32> = [0..20, 26..29]
-        .into_iter()
-        .flat_map(|rows| encoder[rows.start * hidden..rows.end * hidden].to_vec())
-        .collect();
-    let prefix_tokens = 20 + 24 + 3 + 4;
+    // The encoder's rows hold each image's slots (a quarter of its cells)
+    // after its text run; the transformer reads the text rows alone.
+    let mut text_rows = Vec::new();
+    let mut row = 0;
+    for (&text, image) in texts.iter().zip(&images) {
+        text_rows.extend_from_slice(&encoder[row * hidden..(row + text) * hidden]);
+        row += text + image.cells() / 4;
+    }
+    let cells: Vec<usize> = images.iter().map(|g| g.cells()).collect();
+    let condition: usize = cells.iter().sum();
+    let prefix_tokens = texts.iter().sum::<usize>() + condition;
+    let (_, frame) = prefix_positions(&layout);
     for (case, index) in [("edit_block00", 0usize), ("edit_block31", 31)] {
         let Some((ops, dit)) = open(index) else {
             return;
@@ -252,12 +292,12 @@ fn edit_block_matches_reference() {
                 &PrefixInput {
                     layout: &layout,
                     text_feats: feats.view(),
-                    latents: &[cut(0, 24), cut(24, 4)],
+                    latents: &[cut(0, cells[0]), cut(cells[0], cells[1])],
                 },
             )
             .expect("the interleaved prefix");
         assert_eq!(kv.tokens(), prefix_tokens);
-        assert_eq!(kv.target_frame(), 31);
+        assert_eq!(kv.target_frame(), frame);
         // The cache is read back as stored: packed halves on this device,
         // so each value carries half's rounding (2^-11 relative at most).
         for (name, got) in [
@@ -274,8 +314,15 @@ fn edit_block_matches_reference() {
         let out = ops
             .alloc_f32("velocity", grid.cells() * channels)
             .expect("alloc");
-        dit.velocity(&ops, &kv, cut(28, 16), grid, sigma, out.view())
-            .expect("the velocity");
+        dit.velocity(
+            &ops,
+            &kv,
+            cut(condition, grid.cells()),
+            grid,
+            sigma,
+            out.view(),
+        )
+        .expect("the velocity");
         let velocity = ops
             .download("velocity", out.view(), grid.cells() * channels)
             .expect("read");
