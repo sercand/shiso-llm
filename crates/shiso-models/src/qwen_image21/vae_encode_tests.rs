@@ -24,7 +24,9 @@ use shiso_core::Backend;
 use shiso_vision::generator::ImageGenError;
 
 use super::vae::{LatentGrid, QwenVae, QwenVaeDesc};
-use super::vae_encode::{EncodePlan, QwenVaeEncoder, VaeEncodeTap, fold_latent_norm, rgba_field};
+use super::vae_encode::{
+    EncodePlan, QwenVaeEncoder, VaeEncodeTap, fold_latent_norm, pad_in_channels, rgba_field,
+};
 use crate::diffusion::ops::{Ops, avg_down_group};
 use crate::diffusion::weights::StStore;
 
@@ -90,6 +92,34 @@ fn rgba_bytes_become_the_reference_input_field() {
         .map(|(g, w)| (g - w).abs())
         .fold(0f32, f32::max);
     assert!(worst <= 1e-6, "largest difference {worst}");
+}
+
+/// The first convolution is widened to sixteen input channels so its
+/// reduction is one the tiled kernel stages: each output's own taps keep
+/// their values and their `[in][tap]` order, and every added channel's are
+/// zero, so the padded convolution over a zero-padded field is the stored
+/// one.
+#[test]
+fn the_first_convolution_is_padded_with_zero_channels() {
+    // Two outputs, three inputs, two taps.
+    let stored: Vec<f32> = (1..=12).map(|v| v as f32).collect();
+    let padded = pad_in_channels(&stored, 2, 3, 5).expect("the shape fits");
+    assert_eq!(
+        padded,
+        [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0, //
+            7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 0.0, 0.0, 0.0, 0.0,
+        ]
+    );
+    assert_eq!(
+        pad_in_channels(&stored, 2, 3, 3).expect("no padding"),
+        stored
+    );
+    assert!(pad_in_channels(&stored, 2, 3, 2).is_err(), "narrowing");
+    assert!(
+        pad_in_channels(&stored, 5, 3, 4).is_err(),
+        "a ragged weight"
+    );
 }
 
 #[test]

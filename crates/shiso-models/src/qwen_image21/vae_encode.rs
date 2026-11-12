@@ -122,7 +122,7 @@ impl EncodePlan {
     /// downsampled output.
     pub(crate) fn working_set_bytes(&self, grid: LatentGrid) -> u64 {
         let mut spatial = (grid.cells() * SPATIAL_FACTOR * SPATIAL_FACTOR) as u128;
-        let mut elements: u128 = spatial * 4;
+        let mut elements: u128 = spatial * FIRST_CONV_PLANES as u128;
         for &(in_c, out_c, downsamples) in &self.blocks {
             let (in_c, out_c) = (in_c as u128, out_c as u128);
             elements += spatial * (in_c + 3 * out_c + 2);
@@ -155,6 +155,49 @@ pub(crate) struct QwenVaeEncoder {
     /// The quant convolution's mean rows with the latent normalization
     /// folded in.
     quant: Conv,
+}
+
+/// Input planes the first convolution is given: the picture's four and
+/// twelve of zeros.
+///
+/// The tiled convolution stages its reduction sixteen taps at a time, and a
+/// 3x3 kernel over four channels is 36 taps, so the stored convolution ran
+/// on the per-pixel kernel: 714 ms of a 1024x1024 encode on an M4, a third
+/// of the whole encoder. Sixteen channels make it 144 taps, a shape the tile
+/// takes; the added weights and planes are zero, so every added product is
+/// an exact zero.
+pub(crate) const FIRST_CONV_PLANES: usize = 16;
+
+/// A stored `[out_c][in_c][taps]` convolution weight widened to `to` input
+/// channels: each output keeps its own values in place and the channels
+/// past `in_c` are zero.
+///
+/// # Errors
+/// [`ImageGenError::Checkpoint`] when `w` is not a whole number of taps per
+/// `(out_c, in_c)` pair or `to` is narrower than `in_c`.
+pub(crate) fn pad_in_channels(
+    w: &[f32],
+    out_c: usize,
+    in_c: usize,
+    to: usize,
+) -> Result<Vec<f32>, ImageGenError> {
+    let pairs = out_c * in_c;
+    if pairs == 0 || !w.len().is_multiple_of(pairs) || to < in_c {
+        return Err(ImageGenError::Checkpoint(format!(
+            "a convolution weight of {} values cannot be widened from {out_c}x{in_c} to {to} \
+             input channels",
+            w.len()
+        )));
+    }
+    let taps = w.len() / pairs;
+    let mut padded = vec![0f32; out_c * to * taps];
+    for (stored, wide) in w
+        .chunks_exact(in_c * taps)
+        .zip(padded.chunks_exact_mut(to * taps))
+    {
+        wide[..stored.len()].copy_from_slice(stored);
+    }
+    Ok(padded)
 }
 
 /// The picture's interleaved RGBA8 bytes as the channel-first `(4, plane)`
@@ -245,6 +288,19 @@ impl QwenVaeEncoder {
                 conv_in.in_c
             ));
         }
+        let conv_in = Conv {
+            w: ops.upload_f32(
+                "vae conv weight",
+                &pad_in_channels(
+                    &store.f32_vec("encoder.conv1.weight")?,
+                    conv_in.out_c,
+                    conv_in.in_c,
+                    FIRST_CONV_PLANES,
+                )?,
+            )?,
+            in_c: FIRST_CONV_PLANES,
+            ..conv_in
+        };
 
         let depth = store.count_blocks("encoder.downsamples.").ok_or_else(|| {
             ImageGenError::Checkpoint("the VAE encoder has no down blocks".to_owned())
@@ -475,11 +531,16 @@ impl QwenVaeEncoder {
         }
         let (height, width) = grid.image_size();
         let mut field = Field {
-            c: 4,
+            c: FIRST_CONV_PLANES,
             h: height,
             w: width,
         };
-        let pixels = ops.upload_scratch("vae pixels", &rgba_field(rgba, field.spatial())?)?;
+        // The picture's four planes, then the zero planes the widened
+        // first convolution reads beside them.
+        let mut planes = rgba_field(rgba, field.spatial())?;
+        planes.resize(field.len(), 0.0);
+        let pixels = ops.upload_scratch("vae pixels", &planes)?;
+        drop(planes);
         let mut x = QwenVae::conv(ops, &self.conv_in, pixels.view(), field, "vae enc conv_in")?;
         drop(pixels);
         field.c = self.conv_in.out_c;

@@ -200,6 +200,10 @@ struct EditFiles {
     vae_plan: EncodePlan,
     /// The VAE encoder's weights, widened to f32.
     vae_bytes: u64,
+    /// The byte ranges of the VAE file the encoder's import reads.
+    vae_spans: Vec<FileSpan>,
+    /// The byte ranges of the text encoder file the vision tower reads.
+    tower_spans: Vec<FileSpan>,
     /// The vision tower's weights as stored.
     tower_bytes: u64,
     /// The tower's width and feed-forward width, for its activations.
@@ -657,6 +661,7 @@ impl QwenImage21Model {
             .ok_or_else(|| {
                 ImageGenError::Checkpoint("'conv2.weight' has no channel axis".to_string())
             })?;
+        let tower_spans = te.spans(|name| name.starts_with("model.visual."));
         Ok(Some(EditFiles {
             vae: vae_path.to_path_buf(),
             vae_config: assets.join("vae/config.json"),
@@ -667,7 +672,9 @@ impl QwenImage21Model {
                 .filter_map(|n| vae.get(n))
                 .map(|e| e.elements() * 4)
                 .sum(),
-            tower_bytes: total_bytes(&te.spans(|name| name.starts_with("model.visual."))),
+            vae_spans: vae.spans(|n| n.starts_with("encoder.") || n.starts_with("conv1.")),
+            tower_bytes: total_bytes(&tower_spans),
+            tower_spans,
             tower_hidden: axis(1)?,
             tower_intermediate: axis(0)?,
         }))
@@ -1003,6 +1010,11 @@ impl QwenImage21Model {
     ) -> Result<Vec<Vec<f32>>, ImageGenError> {
         let edit = self.edit.as_ref().ok_or_else(no_editing)?;
         let phase = Instant::now();
+        // The encoder is read tensor by tensor out of a mapping whose pages
+        // the swapped components' gigabytes have long since pushed out of
+        // the page cache; faulted in a page at a time that took 1.9 s of
+        // every edit on an M4, read ahead it takes a tenth of that.
+        Prefetch::spawn("vae encoder", edit.vae_spans.clone())?.wait()?;
         let before = device_used(self.ops.backend());
         let vae = QwenVaeEncoder::load(
             &QwenVaeDesc {
@@ -1012,6 +1024,7 @@ impl QwenImage21Model {
             &self.ops,
         )?;
         let loaded = delta(before, device_used(self.ops.backend()));
+        let load_ms = ms(phase);
         state.events.push(ResidencyEvent::Loaded {
             component: Component::VaeEncoder,
             device_bytes: loaded,
@@ -1040,6 +1053,8 @@ impl QwenImage21Model {
         });
         tracing::info!(
             ms = ms(phase),
+            load_ms,
+            device_bytes = loaded,
             references = prepared.len(),
             ok = encoded.is_ok(),
             "qwen image phase vae_encode"
@@ -1059,6 +1074,10 @@ impl QwenImage21Model {
     ) -> Result<Vec<f32>, ImageGenError> {
         let phase = Instant::now();
         let backend = self.ops.backend();
+        let edit = self.edit.as_ref().ok_or_else(no_editing)?;
+        // The tower's tensors are not among the ones the encoder's own
+        // prefetch reads; see `encode_latents`.
+        Prefetch::spawn("vision tower", edit.tower_spans.clone())?.wait()?;
         let before = device_used(backend);
         let [weights] = self.encoder_files.weights.as_slice() else {
             return Err(no_editing());
@@ -1066,6 +1085,7 @@ impl QwenImage21Model {
         let tower = Qwen35Tower::open_checkpoint_file(backend, weights, &self.encoder_files.config)
             .map_err(|e| vision(&e))?;
         let loaded = delta(before, device_used(backend));
+        let load_ms = ms(phase);
         state.events.push(ResidencyEvent::Loaded {
             component: Component::Tower,
             device_bytes: loaded,
@@ -1117,6 +1137,8 @@ impl QwenImage21Model {
         });
         tracing::info!(
             ms = ms(phase),
+            load_ms,
+            device_bytes = loaded,
             references = prepared.len(),
             ok = rows.is_ok(),
             "qwen image phase tower"
