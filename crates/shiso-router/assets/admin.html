@@ -18,6 +18,7 @@
           ink: shiso("text"), "ink-2": shiso("text-2"),
           primary: shiso("primary"), "primary-hover": shiso("primary-hover"), "primary-ink": shiso("primary-text"),
           soft: shiso("soft"), "soft-ink": shiso("soft-text"),
+          "chart-1": shiso("chart-1"), "chart-2": shiso("chart-2"), "chart-3": shiso("chart-3"), "chart-4": shiso("chart-4"), "chart-5": shiso("chart-5"),
           ok: shiso("ok"), "ok-bg": shiso("ok-bg"), warn: shiso("warn"), "warn-bg": shiso("warn-bg"), bad: shiso("bad"), "bad-bg": shiso("bad-bg"),
         },
         fontSize: { xs: ["var(--shiso-text-sm)", "1.4"], sm: ["var(--shiso-text-base)", "1.45"] },
@@ -49,6 +50,11 @@
   --shiso-warn-bg: oklch(0.95 0.05 88);
   --shiso-bad: oklch(0.53 0.2 27);
   --shiso-bad-bg: oklch(0.95 0.03 27);
+  --shiso-chart-1: oklch(0.5 0.12 160);
+  --shiso-chart-2: oklch(0.52 0.16 265);
+  --shiso-chart-3: oklch(0.64 0.13 80);
+  --shiso-chart-4: oklch(0.5 0.16 350);
+  --shiso-chart-5: oklch(0.6 0.11 220);
   --shiso-shadow: 0 1px 2px 0px oklch(0.21 0.025 255 / 0.06), 0 10px 28px -14px oklch(0.21 0.025 255 / 0.16);
 
   --shiso-font-sans: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
@@ -116,6 +122,11 @@
     --shiso-warn-bg: oklch(0.3 0.05 82);
     --shiso-bad: oklch(0.74 0.16 25);
     --shiso-bad-bg: oklch(0.3 0.06 25);
+    --shiso-chart-1: oklch(0.66 0.13 160);
+    --shiso-chart-2: oklch(0.6 0.16 270);
+    --shiso-chart-3: oklch(0.655 0.13 85);
+    --shiso-chart-4: oklch(0.56 0.17 350);
+    --shiso-chart-5: oklch(0.665 0.1 220);
     --shiso-shadow: 0 0 0 1px oklch(1 0 0 / 0.05);
     color-scheme: dark;
   }
@@ -140,6 +151,11 @@
   --shiso-warn-bg: oklch(0.3 0.05 82);
   --shiso-bad: oklch(0.74 0.16 25);
   --shiso-bad-bg: oklch(0.3 0.06 25);
+  --shiso-chart-1: oklch(0.66 0.13 160);
+  --shiso-chart-2: oklch(0.6 0.16 270);
+  --shiso-chart-3: oklch(0.655 0.13 85);
+  --shiso-chart-4: oklch(0.56 0.17 350);
+  --shiso-chart-5: oklch(0.665 0.1 220);
   --shiso-shadow: 0 0 0 1px oklch(1 0 0 / 0.05);
   color-scheme: dark;
 }
@@ -444,15 +460,17 @@ const tierBadge = (r, cls) => r.service_tier
   : "";
 
 // Input and output keep the same two colours everywhere they are split.
-const IN_FILL = "fill-sky-500", OUT_FILL = "fill-violet-400";
-const IN_TEXT = "text-soft-ink", OUT_TEXT = "text-ink";
-const IN_DOT = "bg-sky-500", OUT_DOT = "bg-violet-400";
+// Series colors come from the design system chart palette, in a fixed order:
+// input chart-1, output chart-2, cached input chart-3. Text beside a mark stays in ink.
+const IN_FILL = "fill-chart-1", OUT_FILL = "fill-chart-2";
+const IN_TEXT = "text-ink", OUT_TEXT = "text-ink";
+const IN_DOT = "bg-chart-1", OUT_DOT = "bg-chart-2";
 // Cached input is a third series in the charts only — the tables keep the
 // two-way in/out split. Amber is far enough from both cool hues to stay
 // separable under every colour-vision deficiency (checked: ΔE >= 17).
-const CACHE_FILL = "fill-warn";
-const CACHE_TEXT = "text-warn";
-const CACHE_DOT = "bg-warn";
+const CACHE_FILL = "fill-chart-3";
+const CACHE_TEXT = "text-ink";
+const CACHE_DOT = "bg-chart-3";
 
 let TOKEN = localStorage.getItem("llmr_admin_token") || "";
 // The one live-refresh timer on the page (the Logs tab's active panel).
@@ -2323,9 +2341,9 @@ const fmtElapsed = ms => ms < 60000
 // device lease or a concurrency slot); the other two are the provider's
 // time. Colouring them differently is the whole point of the panel.
 const PHASES = {
-  queued: ["bg-warn", "text-warn", "queued"],
-  upstream: ["bg-sky-500", "text-sky-400", "upstream"],
-  streaming: ["bg-primary", "text-ok", "streaming"],
+  queued: ["bg-chart-3", "text-ink", "queued"],
+  upstream: ["bg-chart-5", "text-ink", "upstream"],
+  streaming: ["bg-chart-1", "text-ink", "streaming"],
 };
 
 /// The Logs filters are applied here rather than on /admin/active: the
