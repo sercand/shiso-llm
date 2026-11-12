@@ -52,6 +52,11 @@ const G64_TILE: u32 = 64;
 /// The simdgroup tile's k slice: a reduction length that is not a multiple
 /// of it goes to the scalar kernels.
 const G64_K: usize = 16;
+/// The smallest projection, in multiply-adds, the host is given a share of.
+/// Sharing costs a wait that orders the device ahead of the host's reads
+/// and wakes the matrix library's threads; below about 6 ms of device work
+/// (2^33 products at the M4's 1.5e12 a second) that is not repaid.
+const HOST_MIN_PRODUCTS: usize = 1 << 33;
 /// Threads per simdgroup-tile threadgroup (four simdgroups).
 const G64_THREADS: u32 = 128;
 /// Query rows per fused-attention threadgroup.
@@ -101,6 +106,38 @@ fn scale_binding<'a>(
         ))),
         (_, None) => Ok(KernelArg::F32(weight.scale)),
     }
+}
+
+/// The host's share of one split projection: columns `device_cols..n` of
+/// `out`, overwritten, or added into it through `gate`.
+struct HostColumns<'a> {
+    step: &'static str,
+    device_cols: usize,
+    /// `(m, n, k)` of the whole projection.
+    shape: (usize, usize, usize),
+    /// The packed `(m, k)` rows both shares read.
+    input: DeviceView<'a>,
+    weight: &'a LinWeight<'a>,
+    gate: Option<DeviceView<'a>>,
+    out: DeviceView<'a>,
+}
+
+/// How many leading columns of an `n`-column, `k`-deep tiled projection the
+/// device keeps when the host is given `per_mille` thousandths of them,
+/// rounded to whole 64-column tiles.
+///
+/// `None` means the projection is not split: no share was asked for, the
+/// shape does not cut into whole tiles (the device share is launched over a
+/// narrower tile grid, which only whole tiles allow), or the rounding leaves
+/// one side with nothing.
+pub(crate) fn split_columns(per_mille: u32, n: usize, k: usize) -> Option<usize> {
+    let tile = G64_TILE as usize;
+    if per_mille == 0 || !k.is_multiple_of(G64_K) || !n.is_multiple_of(tile) {
+        return None;
+    }
+    let tiles = n / tile;
+    let host_tiles = (tiles * per_mille as usize + 500) / 1000;
+    (host_tiles > 0 && host_tiles < tiles).then(|| (tiles - host_tiles) * tile)
 }
 
 /// `DeviceView::slice` answers a core error; the family's drivers speak
@@ -874,6 +911,13 @@ pub(crate) struct Ops {
     /// Whether the module carries [`HALF_KV_KERNELS`], so [`Ops::sdpa`]
     /// narrows K and V once instead of in every query tile.
     half_kv: bool,
+    /// Thousandths of a large per-row INT8 projection's columns the host
+    /// computes while the device computes the rest; 0 keeps every column on
+    /// the device. See [`Ops::with_host_share`].
+    host_share: u32,
+    /// The smallest projection, in multiply-adds, the host is given a share
+    /// of: [`HOST_MIN_PRODUCTS`] outside the tests that split a small one.
+    host_min_products: usize,
 }
 
 /// A pooled working buffer: derefs to the [`DeviceBuffer`] it holds and goes
@@ -1039,6 +1083,8 @@ impl Ops {
             dummy,
             pool: Mutex::default(),
             half_kv,
+            host_share: 0,
+            host_min_products: HOST_MIN_PRODUCTS,
         })
     }
 
@@ -1057,7 +1103,99 @@ impl Ops {
             dummy,
             pool: Mutex::default(),
             half_kv: false,
+            host_share: 0,
+            host_min_products: HOST_MIN_PRODUCTS,
         })
+    }
+
+    /// Splits every large per-row INT8 projection between the device and the
+    /// host's matrix library: `per_mille` thousandths of the columns (rounded
+    /// to whole 64-column tiles) are multiplied on the host, in the device's
+    /// own buffers, while the device multiplies the rest.
+    ///
+    /// The split is a function of the projection's shape and this share
+    /// alone, so a job's answer does not depend on timing; but the host's
+    /// columns are summed in the matrix library's order, not the tile's, so
+    /// a different share is a different (equally valid) rounding of the same
+    /// product. Zero is the device-only path, bit for bit.
+    ///
+    /// # Errors
+    /// [`ImageGenError::Backend`] for a share of 1000 or more, or a nonzero
+    /// share on a device whose buffers the host cannot multiply into.
+    pub(crate) fn with_host_share(mut self, per_mille: u32) -> Result<Self, ImageGenError> {
+        if per_mille >= 1000 {
+            return Err(ImageGenError::Backend(format!(
+                "a host share of {per_mille}/1000 leaves the device nothing to compute"
+            )));
+        }
+        if per_mille > 0 && self.backend.as_host_gemm().is_none() {
+            return Err(ImageGenError::Backend(format!(
+                "the {} backend has no host multiplier, so no share of a projection can be given to the host",
+                self.backend.backend_name()
+            )));
+        }
+        self.host_share = per_mille;
+        Ok(self)
+    }
+
+    /// Shares projections of every size, so a test can split one that is
+    /// small enough to grade against a reference.
+    #[cfg(test)]
+    pub(crate) fn sharing_small_projections(mut self) -> Self {
+        self.host_min_products = 0;
+        self
+    }
+
+    /// How many leading columns the device keeps of an `(m, n, k)` projection
+    /// the host shares, having waited for the device when it is shared: the
+    /// host reads the projection's input, and its own columns of a stream it
+    /// adds into, which the device may still be writing. `None` when the
+    /// device computes all of it.
+    fn device_cols(
+        &self,
+        step: &'static str,
+        kind: WeightKind,
+        (m, n, k): (usize, usize, usize),
+    ) -> Result<Option<usize>, ImageGenError> {
+        if kind != WeightKind::Int8Row
+            || m.saturating_mul(n).saturating_mul(k) < self.host_min_products
+        {
+            return Ok(None);
+        }
+        let split = split_columns(self.host_share, n, k);
+        if split.is_some() {
+            self.backend.sync().map_err(fail(step))?;
+        }
+        Ok(split)
+    }
+
+    /// Runs the host's columns of a split projection whose device share was
+    /// just launched: hands the device its share without waiting, then
+    /// multiplies on this thread.
+    fn host_columns(&self, share: &HostColumns<'_>) -> Result<(), ImageGenError> {
+        let step = share.step;
+        let (m, n, k) = share.shape;
+        let (Some(host), Some(row_scale)) = (self.backend.as_host_gemm(), share.weight.row_scale)
+        else {
+            return Err(ImageGenError::Backend(format!(
+                "{step}: a projection was split without a host multiplier or row scales"
+            )));
+        };
+        self.backend.submit().map_err(fail(step))?;
+        host.gemm_i8_rows(&shiso_core::HostGemmDesc {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            col_start: share.device_cols as u32,
+            col_end: n as u32,
+            input: share.input,
+            weight: share.weight.w,
+            row_scale,
+            bias: share.weight.bias,
+            gate: share.gate,
+            out: share.out,
+        })
+        .map_err(fail(step))
     }
 
     /// Whether a 128-wide-head attention cache can be kept as packed half
@@ -1497,10 +1635,15 @@ impl Ops {
             (WeightKind::F32, false) => "kernel_dit_gemm_f32",
             (WeightKind::Int8Row, false) => "kernel_dit_gemm_i8",
         };
+        // A shared projection launches the device over its leading tiles
+        // only; the entry and its arguments are the whole projection's, so
+        // each device column is the value the unsplit launch computes.
+        let shape = (call.m, call.n, call.k);
+        let split = self.device_cols(call.step, lw.kind, shape)?;
         let (grid, block) = if tiled {
             (
                 Extent3::new(
-                    grid_for(call.n as u32, G64_TILE),
+                    grid_for(split.unwrap_or(call.n) as u32, G64_TILE),
                     grid_for(call.m as u32, G64_TILE),
                     1,
                 ),
@@ -1529,7 +1672,19 @@ impl Ops {
                 scale_arg,
                 KernelArg::Buffer(bias),
             ],
-        )
+        )?;
+        match split {
+            Some(device_cols) => self.host_columns(&HostColumns {
+                step: call.step,
+                device_cols,
+                shape,
+                input,
+                weight: lw,
+                gate: None,
+                out: call.out,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// `residual += gate * linear([dense | swiglu])` in one launch: the
@@ -1605,11 +1760,21 @@ impl Ops {
                 block_gemm_entry(kind, true).ok_or_else(|| no_block_entry(call.step, kind))?
             }
         };
+        // The host has no swiglu reader, so only a projection whose input is
+        // already a packed row - every rotated one - is shared.
+        let shape = (call.m, call.n, k);
+        let shared = match (dense, swiglu) {
+            (Some(input), None) => self
+                .device_cols(call.step, lw.kind, shape)?
+                .map(|device_cols| (device_cols, input)),
+            _ => None,
+        };
+        let split = shared.map(|(device_cols, _)| device_cols);
         self.launch(
             call.step,
             entry,
             Extent3::new(
-                grid_for(call.n as u32, G64_TILE),
+                grid_for(split.unwrap_or(call.n) as u32, G64_TILE),
                 grid_for(call.m as u32, G64_TILE),
                 1,
             ),
@@ -1624,7 +1789,19 @@ impl Ops {
                 KernelArg::Buffer(lw.bias.unwrap_or(self.dummy.view())),
                 KernelArg::Buffer(call.gate),
             ],
-        )
+        )?;
+        match shared {
+            Some((device_cols, input)) => self.host_columns(&HostColumns {
+                step: call.step,
+                device_cols,
+                shape,
+                input,
+                weight: lw,
+                gate: Some(call.gate),
+                out: call.residual,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// [`Ops::linear_residual`] as separate passes, for shapes the fused

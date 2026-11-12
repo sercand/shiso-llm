@@ -149,6 +149,7 @@ pub fn boot_image(args: &ServeOptions) -> Result<Option<image::ImageService>, Bo
         residency: args.image_residency.into(),
         reserve_bytes: args.image_reserve_bytes()?,
         draft_steps: args.image_draft_steps,
+        host_share_per_mille: args.image_host_share.saturating_mul(10),
         final_reuse: args.image_final_reuse.map(|r| (r.start, r.end)),
     };
     let generator = on_device(

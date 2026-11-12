@@ -158,6 +158,7 @@ fn open() -> Option<Arc<dyn ImageGenerator>> {
         residency: ImageResidency::Auto,
         reserve_bytes: DEFAULT_IMAGE_RESERVE_BYTES,
         draft_steps: 0,
+        host_share_per_mille: 0,
         final_reuse: None,
     };
     let generator = shiso_models::image_registry::open_image_generator(&desc, &backend)

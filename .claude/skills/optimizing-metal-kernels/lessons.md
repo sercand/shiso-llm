@@ -53,6 +53,14 @@ shapes differ.
 - **Implicit-GEMM convolution:** gather im2col inside the operand reader and never materialize it. VAE decode went **97 s → 2.8 s**.
 - **Reader and epilogue structs** let one tile body serve linear, convolution and fused variants.
 
+- **The processor is a second multiplier on shared memory** (`shiso-metal/src/host_gemm.rs`, `diffusion/ops.rs` `split_columns`, M4 10-core GPU, 2026-11-12): every Metal buffer is shared storage, so the system matrix library can multiply some of a projection's columns in place while the GPU multiplies the rest.
+  - The GPU's share needs no kernel change: launch the same entry with the same arguments over fewer tile columns. Its columns are bit-identical to the unsplit launch.
+  - The host widens the INT8 codes a 16 MiB piece at a time (`vDSP_vflt8`), multiplies with `cblas_sgemm`, and applies scale/bias/gate as the GPU epilogue does. Order: `sync` (the host reads the input), launch, `submit`, host multiply.
+  - Qwen-Image-2.1 INT8, 1024x1024, 6 steps: a step 22.4 -> 17.0 s at a 34% host share, the job 143 -> 113 s; a one-reference edit 201 -> 162 s. Shares 22/28/34/38/40/46 gave 18.5/17.5/17.0/17.5/18.7/20.4 s a step: below the optimum the GPU is the long side, above it the host.
+  - Effective rates while sharing: GPU 2.9 TFLOPS (3.05 alone), host about 1.5. The split must be a function of shape and the configured share only - a share tuned from timing would make a picture depend on the machine's load.
+  - The widening and epilogue passes ran on one core at first and held the host to a fifth of its time; four threads fixed that (38%: 18.2 -> 17.5 s).
+  - Pictures agree across shares to rounding (58 dB PSNR against the GPU-only picture), not bit for bit: the matrix library sums in its own order.
+
 ## Attention
 
 - **Single-pass flash attention** (`flux2.metal:~1286`):

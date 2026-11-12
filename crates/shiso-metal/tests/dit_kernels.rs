@@ -3520,6 +3520,9 @@ int8_cases!(
     gemm_i8_matches_the_dequantized_product,
     gemm_i8_scales_each_output_row_not_each_input_column,
     fused_i8_is_the_unfused_composition,
+    host_gemm_i8_computes_only_its_columns,
+    host_gemm_i8_gates_into_the_residual,
+    split_gemm_i8_joins_the_device_and_host_shares,
 );
 
 /// One ignored wrapper per shared k-quant case.

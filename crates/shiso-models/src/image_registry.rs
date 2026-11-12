@@ -41,6 +41,11 @@ pub struct ImageModelDesc {
     /// (both steps must run at the image's own size). `None` runs every
     /// block of every step. A family without block reuse refuses it at load.
     pub final_reuse: Option<(u32, u32)>,
+    /// Thousandths of every large per-row INT8 projection's columns the
+    /// host's matrix library multiplies while the device multiplies the rest
+    /// (0: the device computes everything). Refused at load on a device
+    /// whose buffers the host cannot multiply into.
+    pub host_share_per_mille: u32,
 }
 
 /// Which pipeline components stay loaded across jobs.
@@ -171,6 +176,11 @@ pub fn open_image_generator(
                     "--image-draft-steps is not implemented for the flux2 family, \
                      which runs every step at the requested size"
                         .to_owned(),
+                ));
+            }
+            if desc.host_share_per_mille != 0 {
+                return Err(ImageGenError::Checkpoint(
+                    "--image-host-share is not implemented for the flux2 family".to_owned(),
                 ));
             }
             let located = crate::flux2::config::locate_and_inspect(desc)?;

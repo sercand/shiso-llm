@@ -149,6 +149,7 @@ fn open(models: &Models, backend: &Arc<dyn Backend>) -> Arc<dyn ImageGenerator> 
         residency: residency_knob(),
         reserve_bytes: reserve_knob(),
         draft_steps: 0,
+        host_share_per_mille: 0,
         final_reuse: None,
     };
     if std::env::var_os("RUST_LOG").is_some() {

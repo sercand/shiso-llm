@@ -25,7 +25,7 @@ use shiso_core::Backend;
 use shiso_vision::generator::ImageGenError;
 
 use super::lin::Lin;
-use super::ops::{GemmCall, LinWeight, LinearResidualCall, Ops, WeightKind};
+use super::ops::{GemmCall, LinWeight, LinearResidualCall, Ops, WeightKind, split_columns};
 use super::quant::{RotGroup, parse_quant_spec, read_int8_layout, unrotate_row_f32};
 use super::weights::StStore;
 
@@ -489,6 +489,135 @@ fn the_real_int8_linears_match_the_reference_on_the_device() {
             );
             assert!(err <= 1e-4, "{base} {what}: device vs y_int8 {err:e}");
             assert!(min_cos >= 0.9999, "{base} {what}: cosine vs BF16 {cos:?}");
+        }
+    }
+}
+
+/// The host's share is whole 64-column tiles off the end of the projection,
+/// rounded to the nearest tile, and a shape or share that leaves either side
+/// empty - or a projection the tile grid cannot cut - is not split.
+#[test]
+fn the_host_share_is_whole_trailing_tiles() {
+    // 4096 columns are 64 tiles; 30% is 19.2, so the host takes 19.
+    assert_eq!(split_columns(300, 4096, 4096), Some((64 - 19) * 64));
+    // 24576 columns are 384 tiles; 28% is 107.52, so the host takes 108.
+    assert_eq!(split_columns(280, 24576, 4096), Some((384 - 108) * 64));
+    assert_eq!(split_columns(0, 4096, 4096), None, "no share asked for");
+    assert_eq!(split_columns(300, 4100, 4096), None, "a ragged last tile");
+    assert_eq!(
+        split_columns(300, 4096, 4104),
+        None,
+        "a k the tile cannot stage"
+    );
+    assert_eq!(
+        split_columns(300, 64, 4096),
+        None,
+        "one tile cannot be shared"
+    );
+    assert_eq!(
+        split_columns(1, 4096, 4096),
+        None,
+        "a share under half a tile"
+    );
+    assert_eq!(
+        split_columns(999, 128, 4096),
+        None,
+        "the device keeps a tile"
+    );
+}
+
+/// Both linear entries of `ops` over one real layer: the plain product, and
+/// the fused residual entry from a zero stream through a unit gate.
+fn both_entries(ops: &Ops, backend: &Arc<dyn Backend>, lin: &Lin, x: &[f32]) -> [Vec<f32>; 2] {
+    let (out, input) = (lin.out_dim, lin.in_dim);
+    let d_x = ops.upload_f32("x", x).expect("upload x");
+    let d_y = ops.alloc_owned_f32("y", ROWS * out).expect("alloc y");
+    ops.gemm(&GemmCall {
+        step: "int8 shared gemm",
+        out: d_y.view(),
+        input: d_x.view(),
+        weight: lin.weight(),
+        m: ROWS,
+        n: out,
+        k: input,
+    })
+    .expect("gemm");
+    let d_res = ops
+        .upload_f32("res", &vec![0f32; ROWS * out])
+        .expect("zeros");
+    let d_gate = ops.upload_f32("gate", &vec![1f32; out]).expect("ones");
+    ops.linear_residual(&LinearResidualCall {
+        step: "int8 shared fused",
+        residual: d_res.view(),
+        gate: d_gate.view(),
+        dense: Some(d_x.view()),
+        dense_cols: input,
+        swiglu: None,
+        weight: lin.weight(),
+        m: ROWS,
+        n: out,
+    })
+    .expect("linear_residual");
+    backend.sync().expect("sync");
+    [
+        ops.download("y", d_y.view(), ROWS * out).expect("download"),
+        ops.download("y", d_res.view(), ROWS * out)
+            .expect("download"),
+    ]
+}
+
+/// With 30% of every projection's columns multiplied by the host while the
+/// device multiplies the rest, both entries are the same product: the
+/// device's columns are bit for bit the unshared launch's, and the host's
+/// agree with it to rounding. (At these few rows the matrix library happens
+/// to sum in the tile's own order, so the host's bits can match too; that
+/// the host is given columns at all is `split_columns`' own test.)
+#[test]
+#[ignore = "requires a Metal device and SHISO_TEST_MODEL_QWEN_IMAGE21"]
+#[expect(
+    clippy::print_stderr,
+    reason = "the measured agreement is the case's report"
+)]
+fn a_projection_the_host_shares_is_the_device_only_product() {
+    let Some(store) = transformer_store() else {
+        return;
+    };
+    let Some(backend) = device() else { return };
+    let whole = Ops::new(&backend).expect("the diffusion kernel set");
+    let shared = Ops::new(&backend)
+        .expect("the diffusion kernel set")
+        .with_host_share(300)
+        .expect("this device's buffers are shared with the host")
+        .sharing_small_projections();
+    let dir = fixture_dir();
+    for (base, stem) in LAYERS {
+        let lin = Lin::load(&store, &whole, base).expect("the INT8 linear loads");
+        let out = lin.out_dim;
+        let device_cols =
+            split_columns(300, out, lin.in_dim).expect("the fixture layers cut into tiles");
+        let x = read_f32_file(&dir.join(format!("{stem}_x.f32")));
+        let want = both_entries(&whole, &backend, &lin, &x);
+        let got = both_entries(&shared, &backend, &lin, &x);
+        for (what, got, want) in [
+            ("gemm", &got[0], &want[0]),
+            ("linear_residual", &got[1], &want[1]),
+        ] {
+            let err = rel_err(got, want);
+            let (mut device_moved, mut host_moved) = (0usize, 0usize);
+            for (index, (g, w)) in got.iter().zip(want).enumerate() {
+                if g.to_bits() != w.to_bits() {
+                    if index % out < device_cols {
+                        device_moved += 1;
+                    } else {
+                        host_moved += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "shared {what} {base}: max |shared - device| / rms = {err:.2e}, host elements with other bits {host_moved}"
+            );
+            assert!(err <= 1e-5, "{base} {what}: shared vs device {err:e}");
+            assert_eq!(device_moved, 0, "{base} {what}: a device column changed");
         }
     }
 }

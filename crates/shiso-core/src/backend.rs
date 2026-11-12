@@ -712,6 +712,11 @@ pub trait Backend: Send + Sync + fmt::Debug {
         None
     }
 
+    /// A host multiplier over this device's buffers, absent by default.
+    fn as_host_gemm(&self) -> Option<&dyn HostGemm> {
+        None
+    }
+
     /// Cooperative launch support, absent by default.
     fn as_coop(&self) -> Option<&dyn CoopLaunch> {
         None
@@ -1067,6 +1072,66 @@ pub trait BlasBackend: Send + Sync + fmt::Debug {
     fn staging(&self, _bytes: u64) -> CoreResult<Option<DeviceView<'_>>> {
         Ok(None)
     }
+}
+
+/// One host-side share of a row-quantized projection:
+/// `out[r, c] = sum_i input[r, i] * weight[c, i] * row_scale[c] + bias[c]`
+/// for the columns `col_start..col_end` only, or, with a `gate`,
+/// `out[r, c] += gate[c] * (that)`.
+///
+/// The columns outside the range are not read or written, which is the whole
+/// point: the device computes them at the same time, from the same operands,
+/// into the same accumulator.
+#[derive(Debug, Clone, Copy)]
+pub struct HostGemmDesc<'a> {
+    /// Rows of the product.
+    pub m: u32,
+    /// Columns of the whole product: the weight's rows and `out`'s row stride.
+    pub n: u32,
+    /// Shared inner dimension.
+    pub k: u32,
+    /// First column this call computes.
+    pub col_start: u32,
+    /// One past the last column this call computes.
+    pub col_end: u32,
+    /// Left operand, `f32 [m, k]`.
+    pub input: DeviceView<'a>,
+    /// Signed byte codes, `i8 [n, k]`.
+    pub weight: DeviceView<'a>,
+    /// One scale per weight row, `f32 [n]`.
+    pub row_scale: DeviceView<'a>,
+    /// One bias per column, `f32 [n]`, when the projection carries one.
+    pub bias: Option<DeviceView<'a>>,
+    /// One gate per column, `f32 [n]`: with it the product is added into
+    /// `out` scaled by the gate, without it `out` is overwritten.
+    pub gate: Option<DeviceView<'a>>,
+    /// The product, `f32 [m, n]`.
+    pub out: DeviceView<'a>,
+}
+
+/// A device whose buffers the host can multiply into while the device works.
+///
+/// On a machine where the device and the processor share memory, the
+/// processor's matrix library is a second, slower multiplier standing idle
+/// through every large projection. A caller splits a projection's columns
+/// between the two: it launches the device's share, submits it, and runs the
+/// rest here on the calling thread.
+pub trait HostGemm: Send + Sync + fmt::Debug {
+    /// Computes one column range of a per-row INT8 projection on the host,
+    /// reading and writing the device's buffers in place.
+    ///
+    /// The caller has waited ([`Backend::sync`]) past every device write of
+    /// `input` and of the range's columns of `out`; work submitted after that
+    /// wait may run concurrently as long as it touches neither. The result
+    /// for a column depends on the shape and the range, never on what the
+    /// device is doing meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CoreError::OutOfBounds`] when a view is shorter than the
+    /// shape claims or the range does not lie inside `n`, and
+    /// [`crate::CoreError::Backend`] for a view that is not a live allocation.
+    fn gemm_i8_rows(&self, desc: &HostGemmDesc<'_>) -> CoreResult<()>;
 }
 
 /// A device that can run cooperative kernels, where every block must be

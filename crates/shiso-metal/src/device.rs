@@ -246,6 +246,8 @@ pub struct MetalBackend {
     /// whole pass with the host placing experts between segments.
     cut_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     inner: Mutex<State>,
+    /// What the host's share of a split projection widens and multiplies in.
+    host_scratch: crate::host_gemm::HostScratchLock,
 }
 
 /// Probes for a Metal device without building a backend.
@@ -316,6 +318,7 @@ impl MetalBackend {
             library,
             done,
             cut_event,
+            host_scratch: crate::host_gemm::HostScratchLock::default(),
             inner: Mutex::new(State {
                 next_id: NonZeroU64::MIN,
                 buffers: HashMap::default(),
@@ -589,6 +592,19 @@ impl MetalBackend {
         // owns the `Retained` that keeps those bytes mapped, and the borrow of
         // `entry` cannot outlive it.
         unsafe { entry.buffer.contents().as_ptr().cast::<u8>().add(slack) }
+    }
+
+    /// The host address of `view`'s first byte.
+    pub(crate) fn host_address(&self, view: DeviceView<'_>) -> CoreResult<usize> {
+        let state = self.inner.lock();
+        let entry = state.view(view)?;
+        let offset = usize::try_from(view.offset()).unwrap_or(usize::MAX);
+        Ok(Self::contents(entry) as usize + offset)
+    }
+
+    /// The scratch the host's share of a split projection works in.
+    pub(crate) fn host_scratch(&self) -> &crate::host_gemm::HostScratchLock {
+        &self.host_scratch
     }
 
     /// Resolves `dsts` to disjoint host spans and fills them, without draining.
@@ -1140,6 +1156,10 @@ impl Backend for MetalBackend {
     }
 
     fn as_profiler(&self) -> Option<&dyn Profiler> {
+        Some(self)
+    }
+
+    fn as_host_gemm(&self) -> Option<&dyn shiso_core::HostGemm> {
         Some(self)
     }
 }

@@ -808,6 +808,21 @@ pub struct ServeOptions {
         arg(long, env = "SHISO_IMAGE_DRAFT_STEPS", default_value_t = 0)
     )]
     pub image_draft_steps: u32,
+    /// Percent of every large INT8 projection the image model's host
+    /// processor multiplies, through the system matrix library, while the
+    /// GPU multiplies the rest. On a machine whose GPU shares memory with
+    /// the processor the two together are faster than the GPU alone: an M4
+    /// (10-core GPU) is fastest near 34. 0 keeps every projection on the
+    /// GPU. A picture is reproducible at a given share, but a different
+    /// share rounds the same products differently, so it is not the same
+    /// picture bit for bit. Refused at boot on a device without shared
+    /// memory.
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, env = "SHISO_IMAGE_HOST_SHARE", default_value_t = 0)
+    )]
+    #[cfg_attr(feature = "clap", arg(value_parser = clap::value_parser!(u32).range(0..=90)))]
+    pub image_host_share: u32,
     /// The most reference images one image edit may carry. Unset, the
     /// loaded model's own limit applies. Each reference costs memory and
     /// time for the whole job, so a host that fits two can refuse a third
@@ -1154,6 +1169,7 @@ impl Default for ServeOptions {
             image_residency: ImageResidencyChoice::Auto,
             image_reserve_gb: 1.5,
             image_draft_steps: 0,
+            image_host_share: 0,
             image_max_references: None,
             image_final_reuse: None,
             reasoning_parser: ParserChoice::Auto,
@@ -2120,6 +2136,35 @@ mod tests {
         assert_eq!(parsed.options.image_max_references, NonZeroU32::new(3));
         assert!(Probe::try_parse_from(["probe", "--image-max-references", "0"]).is_err());
         assert!(Probe::try_parse_from(["probe", "--image-max-references", "many"]).is_err());
+    }
+
+    /// `--image-host-share` is a percentage that leaves the GPU something:
+    /// off by default, and refused above 90 rather than clamped.
+    #[cfg(feature = "clap")]
+    #[test]
+    #[expect(
+        clippy::print_stderr,
+        reason = "a test that cannot run says on stderr why it skipped"
+    )]
+    fn image_host_share_is_a_bounded_percentage() {
+        use clap::Parser as _;
+
+        #[derive(Debug, clap::Parser)]
+        struct Probe {
+            #[command(flatten)]
+            options: ServeOptions,
+        }
+        if std::env::vars().any(|(name, _)| name.starts_with("SHISO_")) {
+            eprintln!("SKIP: a SHISO_* variable is set and would override the defaults");
+            return;
+        }
+        assert_eq!(ServeOptions::default().image_host_share, 0);
+        let parsed = Probe::try_parse_from(["probe", "--image-host-share", "34"])
+            .expect("a percentage parses");
+        assert_eq!(parsed.options.image_host_share, 34);
+        assert!(Probe::try_parse_from(["probe", "--image-host-share", "91"]).is_err());
+        assert!(Probe::try_parse_from(["probe", "--image-host-share", "-1"]).is_err());
+        assert!(Probe::try_parse_from(["probe", "--image-host-share", "half"]).is_err());
     }
 
     #[test]

@@ -109,6 +109,7 @@ fn qwen_image21_turbo_generates_a_real_rgba_image() {
         residency: ImageResidency::Auto,
         reserve_bytes: DEFAULT_IMAGE_RESERVE_BYTES,
         draft_steps: 0,
+        host_share_per_mille: 0,
         final_reuse: None,
     };
     let began = Instant::now();

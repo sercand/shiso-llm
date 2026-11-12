@@ -401,7 +401,7 @@ impl QwenImage21Model {
         backend: &Arc<dyn Backend>,
     ) -> Result<Self, ImageGenError> {
         let began = Instant::now();
-        let ops = Ops::new(backend)?;
+        let ops = Ops::new(backend)?.with_host_share(desc.host_share_per_mille)?;
         let assets = locate_assets(desc)?;
         let config = QwenImageConfig::read(&assets)?;
         // The checkpoint's documents are its whole schedule: shipped nodes
