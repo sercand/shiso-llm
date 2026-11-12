@@ -5,23 +5,141 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Shiso Model Registry Editor</title>
 <style>
+  /* shiso-design tokens: begin. Vendored from github.com/sercand/shiso-design (packages/css/tokens.css).
+     Do not edit here; change tokens there and paste the new file between these markers. */
   :root {
-    --bg: #0b0d13;
-    --surface: #141721;
-    --surface-elevated: #1c2130;
-    --surface-hover: #23293d;
-    --border: #293046;
-    --border-focus: #3b82f6;
-    --text: #f1f3f9;
-    --text-muted: #8e98b0;
-    --text-dim: #5f6880;
-    --primary: #3b82f6;
-    --primary-hover: #2563eb;
-    --success: #10b981;
-    --danger: #ef4444;
-    --warning: #f59e0b;
-    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --shiso-canvas: oklch(0.962 0.01 255);
+    --shiso-card: oklch(0.995 0.003 255);
+    --shiso-fill: oklch(0.945 0.01 255);
+    --shiso-fill-hover: oklch(0.922 0.012 255);
+    --shiso-line: oklch(0.895 0.01 255);
+    --shiso-text: oklch(0.21 0.025 255);
+    --shiso-text-2: oklch(0.49 0.025 255);
+    --shiso-primary: oklch(0.43 0.085 160);
+    --shiso-primary-hover: oklch(0.38 0.085 160);
+    --shiso-primary-text: oklch(0.99 0 0);
+    --shiso-soft: oklch(0.95 0.026 160);
+    --shiso-soft-text: oklch(0.38 0.085 160);
+    --shiso-live: oklch(0.56 0.13 160);
+    --shiso-ok: oklch(0.48 0.12 152);
+    --shiso-ok-bg: oklch(0.95 0.04 152);
+    --shiso-warn: oklch(0.5 0.11 70);
+    --shiso-warn-bg: oklch(0.95 0.05 88);
+    --shiso-bad: oklch(0.53 0.2 27);
+    --shiso-bad-bg: oklch(0.95 0.03 27);
+    --shiso-shadow: 0 1px 2px 0px oklch(0.21 0.025 255 / 0.06), 0 10px 28px -14px oklch(0.21 0.025 255 / 0.16);
+
+    --shiso-font-sans: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --shiso-font-mono: "JetBrains Mono", ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    --shiso-weight-regular: 400;
+    --shiso-weight-medium: 500;
+    --shiso-weight-semibold: 600;
+    --shiso-weight-bold: 700;
+    --shiso-text-xs: 11px;
+    --shiso-text-sm: 12px;
+    --shiso-text-lg: 16px;
+    --shiso-text-xl: 20px;
+    --shiso-text-2xl: 26px;
+    --shiso-text-3xl: 34px;
+    --shiso-radius-sm: 6px;
+    --shiso-radius-control: 10px;
+    --shiso-radius-inner: 10px;
+    --shiso-radius-card: 16px;
+    --shiso-radius-full: 999px;
+    --shiso-space-1: 4px;
+    --shiso-space-2: 8px;
+    --shiso-space-3: 12px;
+    --shiso-space-4: 16px;
+    --shiso-space-5: 20px;
+    --shiso-space-6: 24px;
+    --shiso-space-8: 32px;
+    --shiso-space-10: 40px;
+    --shiso-control: 30px;
+    --shiso-text-base: 13px;
+    --shiso-pad: 14px;
+    --shiso-gap: 12px;
+    color-scheme: light;
+  }
+  [data-density="comfortable"] {
+    --shiso-control: 40px;
+    --shiso-text-base: 15px;
+    --shiso-pad: 18px;
+    --shiso-gap: 14px;
+  }
+  [data-density="compact"] {
+    --shiso-control: 30px;
+    --shiso-text-base: 13px;
+    --shiso-pad: 14px;
+    --shiso-gap: 12px;
+  }
+  /* Dark: follows the system unless data-theme pins a mode; .dark is the shadcn/next-themes class. */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]):not(.light) {
+      --shiso-canvas: oklch(0.155 0.01 255);
+      --shiso-card: oklch(0.208 0.01 255);
+      --shiso-fill: oklch(0.262 0.01 255);
+      --shiso-fill-hover: oklch(0.295 0.012 255);
+      --shiso-line: oklch(0.31 0.01 255);
+      --shiso-text: oklch(0.955 0.006 255);
+      --shiso-text-2: oklch(0.71 0.01 255);
+      --shiso-primary: oklch(0.76 0.13 160);
+      --shiso-primary-hover: oklch(0.82 0.13 160);
+      --shiso-primary-text: oklch(0.18 0.03 160);
+      --shiso-soft: oklch(0.3 0.058 160);
+      --shiso-soft-text: oklch(0.86 0.09 160);
+      --shiso-live: oklch(0.76 0.13 160);
+      --shiso-ok: oklch(0.78 0.15 152);
+      --shiso-ok-bg: oklch(0.29 0.05 152);
+      --shiso-warn: oklch(0.82 0.13 82);
+      --shiso-warn-bg: oklch(0.3 0.05 82);
+      --shiso-bad: oklch(0.74 0.16 25);
+      --shiso-bad-bg: oklch(0.3 0.06 25);
+      --shiso-shadow: 0 0 0 1px oklch(1 0 0 / 0.05);
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"], .dark {
+    --shiso-canvas: oklch(0.155 0.01 255);
+    --shiso-card: oklch(0.208 0.01 255);
+    --shiso-fill: oklch(0.262 0.01 255);
+    --shiso-fill-hover: oklch(0.295 0.012 255);
+    --shiso-line: oklch(0.31 0.01 255);
+    --shiso-text: oklch(0.955 0.006 255);
+    --shiso-text-2: oklch(0.71 0.01 255);
+    --shiso-primary: oklch(0.76 0.13 160);
+    --shiso-primary-hover: oklch(0.82 0.13 160);
+    --shiso-primary-text: oklch(0.18 0.03 160);
+    --shiso-soft: oklch(0.3 0.058 160);
+    --shiso-soft-text: oklch(0.86 0.09 160);
+    --shiso-live: oklch(0.76 0.13 160);
+    --shiso-ok: oklch(0.78 0.15 152);
+    --shiso-ok-bg: oklch(0.29 0.05 152);
+    --shiso-warn: oklch(0.82 0.13 82);
+    --shiso-warn-bg: oklch(0.3 0.05 82);
+    --shiso-bad: oklch(0.74 0.16 25);
+    --shiso-bad-bg: oklch(0.3 0.06 25);
+    --shiso-shadow: 0 0 0 1px oklch(1 0 0 / 0.05);
+    color-scheme: dark;
+  }
+  /* shiso-design tokens: end */
+  :root {
+    /* This page's own names, pointed at the shared tokens. */
+    --bg: var(--shiso-canvas);
+    --surface: var(--shiso-card);
+    --surface-elevated: var(--shiso-fill);
+    --surface-hover: var(--shiso-fill-hover);
+    --border: var(--shiso-line);
+    --border-focus: var(--shiso-primary);
+    --text: var(--shiso-text);
+    --text-muted: var(--shiso-text-2);
+    --text-dim: var(--shiso-text-2);
+    --primary: var(--shiso-primary);
+    --primary-hover: var(--shiso-primary-hover);
+    --success: var(--shiso-ok);
+    --danger: var(--shiso-bad);
+    --warning: var(--shiso-warn);
+    --font: var(--shiso-font-sans);
+    --mono: var(--shiso-font-mono);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 13px; line-height: 1.5; }
@@ -29,20 +147,20 @@
   .logo-title { display: flex; align-items: center; gap: 12px; }
   .logo-title h1 { font-size: 16px; font-weight: 700; letter-spacing: -0.02em; }
   .badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 500; }
-  .badge-success { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
-  .badge-danger { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
-  .badge-warning { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
-  .badge-primary { background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); }
+  .badge-success { background: color-mix(in oklch, var(--shiso-ok) 15%, transparent); color: var(--shiso-ok); border: 1px solid color-mix(in oklch, var(--shiso-ok) 30%, transparent); }
+  .badge-danger { background: color-mix(in oklch, var(--shiso-bad) 15%, transparent); color: var(--shiso-bad); border: 1px solid color-mix(in oklch, var(--shiso-bad) 30%, transparent); }
+  .badge-warning { background: color-mix(in oklch, var(--shiso-warn) 15%, transparent); color: var(--shiso-warn); border: 1px solid color-mix(in oklch, var(--shiso-warn) 30%, transparent); }
+  .badge-primary { background: color-mix(in oklch, var(--shiso-primary) 15%, transparent); color: var(--shiso-soft-text); border: 1px solid color-mix(in oklch, var(--shiso-primary) 30%, transparent); }
   .badge-muted { background: var(--surface-elevated); color: var(--text-muted); border: 1px solid var(--border); }
   nav { display: flex; gap: 6px; }
   button, .btn { background: var(--surface-elevated); border: 1px solid var(--border); color: var(--text); padding: 7px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; transition: all 0.15s; }
   button:hover, .btn:hover { background: var(--surface-hover); border-color: var(--text-muted); }
-  button.primary, .btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+  button.primary, .btn.primary { background: var(--primary); border-color: var(--primary); color: var(--shiso-primary-text); }
   button.primary:hover, .btn.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
-  button.danger, .btn.danger { background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.3); color: #f87171; }
-  button.danger:hover, .btn.danger:hover { background: rgba(239, 68, 68, 0.25); border-color: var(--danger); }
+  button.danger, .btn.danger { background: color-mix(in oklch, var(--shiso-bad) 15%, transparent); border-color: color-mix(in oklch, var(--shiso-bad) 30%, transparent); color: var(--shiso-bad); }
+  button.danger:hover, .btn.danger:hover { background: color-mix(in oklch, var(--shiso-bad) 25%, transparent); border-color: var(--danger); }
   button.sm, .btn.sm { padding: 4px 8px; font-size: 11px; }
-  nav button.active { background: var(--primary); border-color: var(--primary); color: #fff; }
+  nav button.active { background: var(--primary); border-color: var(--primary); color: var(--shiso-primary-text); }
   main { max-width: 1300px; margin: 24px auto; padding: 0 28px; }
   .tab-content { display: none; }
   .tab-content.active { display: block; }
@@ -56,8 +174,8 @@
   .form-group { margin-bottom: 14px; }
   .form-group.inline { display: flex; align-items: center; gap: 8px; }
   label { display: block; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); margin-bottom: 5px; }
-  input[type="text"], input[type="number"], select, textarea { width: 100%; background: #0e111a; border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-size: 13px; font-family: inherit; }
-  input[type="text"]:focus, input[type="number"]:focus, select:focus, textarea:focus { outline: none; border-color: var(--border-focus); box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2); }
+  input[type="text"], input[type="number"], select, textarea { width: 100%; background: var(--shiso-fill); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-size: 13px; font-family: inherit; }
+  input[type="text"]:focus, input[type="number"]:focus, select:focus, textarea:focus { outline: none; border-color: var(--border-focus); box-shadow: 0 0 0 2px color-mix(in oklch, var(--shiso-primary) 20%, transparent); }
   .row { display: flex; gap: 14px; flex-wrap: wrap; }
   .col { flex: 1; min-width: 200px; }
   .col-2 { flex: 2; min-width: 320px; }
@@ -65,23 +183,23 @@
   .checkbox-group { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; padding: 6px 0; }
   .checkbox-item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; user-select: none; }
   .checkbox-item input { cursor: pointer; accent-color: var(--primary); }
-  .variant-card { background: #11141e; border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .variant-card { background: var(--shiso-fill); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
   .variant-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
   .component-card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px; margin-bottom: 12px; }
   .component-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
   table.file-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }
-  table.file-table th { text-align: left; padding: 8px 10px; background: #0c0e15; border-bottom: 1px solid var(--border); color: var(--text-muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
-  table.file-table td { padding: 8px 10px; border-bottom: 1px solid rgba(41, 48, 70, 0.4); vertical-align: middle; }
-  table.file-table tr:hover { background: rgba(59, 130, 246, 0.04); }
-  table.file-table tr.selected { background: rgba(59, 130, 246, 0.08); }
+  table.file-table th { text-align: left; padding: 8px 10px; background: var(--shiso-fill); border-bottom: 1px solid var(--border); color: var(--text-muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  table.file-table td { padding: 8px 10px; border-bottom: 1px solid var(--shiso-line); vertical-align: middle; }
+  table.file-table tr:hover { background: color-mix(in oklch, var(--shiso-primary) 4%, transparent); }
+  table.file-table tr.selected { background: color-mix(in oklch, var(--shiso-primary) 8%, transparent); }
   .code { font-family: var(--mono); font-size: 12px; }
-  .info-callout { background: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.25); border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; font-size: 12px; display: flex; justify-content: space-between; align-items: center; }
-  .alert-danger { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; color: #fca5a5; font-size: 12px; }
-  .alert-success { background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; color: #6ee7b7; font-size: 12px; }
+  .info-callout { background: color-mix(in oklch, var(--shiso-primary) 8%, transparent); border: 1px solid color-mix(in oklch, var(--shiso-primary) 25%, transparent); border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; font-size: 12px; display: flex; justify-content: space-between; align-items: center; }
+  .alert-danger { background: color-mix(in oklch, var(--shiso-bad) 10%, transparent); border: 1px solid color-mix(in oklch, var(--shiso-bad) 30%, transparent); border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; color: var(--shiso-bad); font-size: 12px; }
+  .alert-success { background: color-mix(in oklch, var(--shiso-ok) 10%, transparent); border: 1px solid color-mix(in oklch, var(--shiso-ok) 30%, transparent); border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; color: var(--shiso-ok); font-size: 12px; }
   details summary { cursor: pointer; font-weight: 600; font-size: 12px; color: var(--text-muted); user-select: none; }
   details summary:hover { color: var(--text); }
-  pre { background: #090b10; border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-family: var(--mono); font-size: 12px; overflow-x: auto; max-height: 400px; }
-  .stat-pill { background: #090b10; border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: var(--mono); font-size: 11px; }
+  pre { background: var(--shiso-fill); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-family: var(--mono); font-size: 12px; overflow-x: auto; max-height: 400px; }
+  .stat-pill { background: var(--shiso-fill); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: var(--mono); font-size: 11px; }
 </style>
 </head>
 <body>
@@ -174,7 +292,7 @@
       </div>
 
       <!-- Tasks, Modalities, Features -->
-      <div class="row" style="background:#10131c; border:1px solid var(--border); border-radius:6px; padding:14px; margin-bottom:16px;">
+      <div class="row" style="background:var(--shiso-fill); border:1px solid var(--border); border-radius:6px; padding:14px; margin-bottom:16px;">
         <div class="col">
           <label>Supported Tasks</label>
           <div class="checkbox-group" id="f-tasks-group">
@@ -208,7 +326,7 @@
       </div>
 
       <!-- Features & Reasoning -->
-      <div class="row" style="background:#10131c; border:1px solid var(--border); border-radius:6px; padding:14px; margin-bottom:20px;">
+      <div class="row" style="background:var(--shiso-fill); border:1px solid var(--border); border-radius:6px; padding:14px; margin-bottom:20px;">
         <div class="col form-group" style="margin-bottom:0;">
           <label>Feature Flags</label>
           <div class="checkbox-group">
@@ -787,7 +905,7 @@ function renderVariantsList() {
       </div>
 
       <!-- Server Defaults Form -->
-      <details style="margin-top:16px; background:#0b0d13; border:1px solid var(--border); border-radius:6px; padding:12px;">
+      <details style="margin-top:16px; background:var(--shiso-fill); border:1px solid var(--border); border-radius:6px; padding:12px;">
         <summary>Server Defaults for ${v.key}</summary>
         <div class="row" style="margin-top:12px;">
           <div class="col form-group">
@@ -1034,14 +1152,14 @@ function renderComponentsList(vIdx) {
 
       ${comp.provider === 'shiso' ? `
       <!-- Hub-hosted file upload -->
-      <div class="row" style="background:#090b10; border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:12px;">
+      <div class="row" style="background:var(--shiso-fill); border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:12px;">
         <div class="col form-group" style="margin-bottom:0;">
           <label>Add a file the hub hosts (next to the model's index.json)</label>
           <input type="file" onchange="uploadHostedFile(${vIdx}, '${role}', this.files[0])">
         </div>
       </div>` : `
       <!-- Hugging Face Inspector Bar -->
-      <div class="row" style="background:#090b10; border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:12px;">
+      <div class="row" style="background:var(--shiso-fill); border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:12px;">
         <div class="col-2 form-group" style="margin-bottom:0;">
           <label>HF Repository</label>
           <input type="text" id="repo-${vIdx}-${role}" value="${comp.repo}" placeholder="owner/repository" onchange="updateCompRepo(${vIdx}, '${role}', this.value)">
@@ -1181,7 +1299,7 @@ function renderComponentInspectorFilePicker(vIdx, role, data) {
   }).join("");
 
   outDiv.innerHTML = `
-    <div style="background:#0b0d13; border:1px solid var(--border); border-radius:6px; padding:12px; margin-top:10px;">
+    <div style="background:var(--shiso-fill); border:1px solid var(--border); border-radius:6px; padding:12px; margin-top:10px;">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
         <div>
           <span style="font-weight:600;">Resolved Commit:</span>
@@ -1488,7 +1606,7 @@ async function runValidation() {
     reports.forEach(r => {
       const color = r.valid ? "var(--success)" : "var(--danger)";
       const status = r.valid ? "OK" : "FAILED";
-      const errList = r.errors.length ? `<div style="margin-top:6px; color:#f87171;">${r.errors.join("<br>")}</div>` : "";
+      const errList = r.errors.length ? `<div style="margin-top:6px; color:var(--shiso-bad);">${r.errors.join("<br>")}</div>` : "";
       html += `<div style="border-bottom:1px solid var(--border); padding:10px 0;">
         <span style="font-weight:600; color:${color};">[${status}]</span> <strong>${r.file}</strong> (${r.name})
         ${errList}

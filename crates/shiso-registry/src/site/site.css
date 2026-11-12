@@ -1,37 +1,138 @@
+/* shiso-design tokens: begin. Vendored from github.com/sercand/shiso-design (packages/css/tokens.css).
+   Do not edit here; change tokens there and paste the new file between these markers. */
 :root {
-  --bg: #fbfaf7;
-  --surface: #ffffff;
-  --surface-2: #f3f1ec;
-  --ink: #1d1f1c;
-  --ink-2: #5b605a;
-  --line: #e4e1da;
-  --accent: #3d7a4a;
-  --accent-ink: #ffffff;
-  --accent-soft: #e5f0e6;
-  --metal: #4b5563;
-  --cuda: #4d7c0f;
-  --warn: #9a5b00;
-  --radius: 12px;
-  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
-  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --shiso-canvas: oklch(0.962 0.01 255);
+  --shiso-card: oklch(0.995 0.003 255);
+  --shiso-fill: oklch(0.945 0.01 255);
+  --shiso-fill-hover: oklch(0.922 0.012 255);
+  --shiso-line: oklch(0.895 0.01 255);
+  --shiso-text: oklch(0.21 0.025 255);
+  --shiso-text-2: oklch(0.49 0.025 255);
+  --shiso-primary: oklch(0.43 0.085 160);
+  --shiso-primary-hover: oklch(0.38 0.085 160);
+  --shiso-primary-text: oklch(0.99 0 0);
+  --shiso-soft: oklch(0.95 0.026 160);
+  --shiso-soft-text: oklch(0.38 0.085 160);
+  --shiso-live: oklch(0.56 0.13 160);
+  --shiso-ok: oklch(0.48 0.12 152);
+  --shiso-ok-bg: oklch(0.95 0.04 152);
+  --shiso-warn: oklch(0.5 0.11 70);
+  --shiso-warn-bg: oklch(0.95 0.05 88);
+  --shiso-bad: oklch(0.53 0.2 27);
+  --shiso-bad-bg: oklch(0.95 0.03 27);
+  --shiso-shadow: 0 1px 2px 0px oklch(0.21 0.025 255 / 0.06), 0 10px 28px -14px oklch(0.21 0.025 255 / 0.16);
+
+  --shiso-font-sans: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --shiso-font-mono: "JetBrains Mono", ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --shiso-weight-regular: 400;
+  --shiso-weight-medium: 500;
+  --shiso-weight-semibold: 600;
+  --shiso-weight-bold: 700;
+  --shiso-text-xs: 11px;
+  --shiso-text-sm: 12px;
+  --shiso-text-lg: 16px;
+  --shiso-text-xl: 20px;
+  --shiso-text-2xl: 26px;
+  --shiso-text-3xl: 34px;
+  --shiso-radius-sm: 6px;
+  --shiso-radius-control: 10px;
+  --shiso-radius-inner: 10px;
+  --shiso-radius-card: 16px;
+  --shiso-radius-full: 999px;
+  --shiso-space-1: 4px;
+  --shiso-space-2: 8px;
+  --shiso-space-3: 12px;
+  --shiso-space-4: 16px;
+  --shiso-space-5: 20px;
+  --shiso-space-6: 24px;
+  --shiso-space-8: 32px;
+  --shiso-space-10: 40px;
+  --shiso-control: 30px;
+  --shiso-text-base: 13px;
+  --shiso-pad: 14px;
+  --shiso-gap: 12px;
   color-scheme: light;
 }
+[data-density="comfortable"] {
+  --shiso-control: 40px;
+  --shiso-text-base: 15px;
+  --shiso-pad: 18px;
+  --shiso-gap: 14px;
+}
+[data-density="compact"] {
+  --shiso-control: 30px;
+  --shiso-text-base: 13px;
+  --shiso-pad: 14px;
+  --shiso-gap: 12px;
+}
+/* Dark: follows the system unless data-theme pins a mode; .dark is the shadcn/next-themes class. */
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #121412;
-    --surface: #1a1d1a;
-    --surface-2: #222622;
-    --ink: #e8eae6;
-    --ink-2: #a2a8a0;
-    --line: #2e332e;
-    --accent: #7cc48a;
-    --accent-ink: #0f1a11;
-    --accent-soft: #1f3424;
-    --metal: #9ca3af;
-    --cuda: #a3d65c;
-    --warn: #e0a84a;
+  :root:not([data-theme="light"]):not(.light) {
+    --shiso-canvas: oklch(0.155 0.01 255);
+    --shiso-card: oklch(0.208 0.01 255);
+    --shiso-fill: oklch(0.262 0.01 255);
+    --shiso-fill-hover: oklch(0.295 0.012 255);
+    --shiso-line: oklch(0.31 0.01 255);
+    --shiso-text: oklch(0.955 0.006 255);
+    --shiso-text-2: oklch(0.71 0.01 255);
+    --shiso-primary: oklch(0.76 0.13 160);
+    --shiso-primary-hover: oklch(0.82 0.13 160);
+    --shiso-primary-text: oklch(0.18 0.03 160);
+    --shiso-soft: oklch(0.3 0.058 160);
+    --shiso-soft-text: oklch(0.86 0.09 160);
+    --shiso-live: oklch(0.76 0.13 160);
+    --shiso-ok: oklch(0.78 0.15 152);
+    --shiso-ok-bg: oklch(0.29 0.05 152);
+    --shiso-warn: oklch(0.82 0.13 82);
+    --shiso-warn-bg: oklch(0.3 0.05 82);
+    --shiso-bad: oklch(0.74 0.16 25);
+    --shiso-bad-bg: oklch(0.3 0.06 25);
+    --shiso-shadow: 0 0 0 1px oklch(1 0 0 / 0.05);
     color-scheme: dark;
   }
+}
+:root[data-theme="dark"], .dark {
+  --shiso-canvas: oklch(0.155 0.01 255);
+  --shiso-card: oklch(0.208 0.01 255);
+  --shiso-fill: oklch(0.262 0.01 255);
+  --shiso-fill-hover: oklch(0.295 0.012 255);
+  --shiso-line: oklch(0.31 0.01 255);
+  --shiso-text: oklch(0.955 0.006 255);
+  --shiso-text-2: oklch(0.71 0.01 255);
+  --shiso-primary: oklch(0.76 0.13 160);
+  --shiso-primary-hover: oklch(0.82 0.13 160);
+  --shiso-primary-text: oklch(0.18 0.03 160);
+  --shiso-soft: oklch(0.3 0.058 160);
+  --shiso-soft-text: oklch(0.86 0.09 160);
+  --shiso-live: oklch(0.76 0.13 160);
+  --shiso-ok: oklch(0.78 0.15 152);
+  --shiso-ok-bg: oklch(0.29 0.05 152);
+  --shiso-warn: oklch(0.82 0.13 82);
+  --shiso-warn-bg: oklch(0.3 0.05 82);
+  --shiso-bad: oklch(0.74 0.16 25);
+  --shiso-bad-bg: oklch(0.3 0.06 25);
+  --shiso-shadow: 0 0 0 1px oklch(1 0 0 / 0.05);
+  color-scheme: dark;
+}
+/* shiso-design tokens: end */
+
+:root {
+  /* The site's own names, pointed at the shared tokens. */
+  --bg: var(--shiso-canvas);
+  --surface: var(--shiso-card);
+  --surface-2: var(--shiso-fill);
+  --ink: var(--shiso-text);
+  --ink-2: var(--shiso-text-2);
+  --line: var(--shiso-line);
+  --accent: var(--shiso-primary);
+  --accent-ink: var(--shiso-primary-text);
+  --accent-soft: var(--shiso-soft);
+  --metal: var(--shiso-text-2);
+  --cuda: var(--shiso-ok);
+  --warn: var(--shiso-warn);
+  --radius: var(--shiso-radius-card);
+  --mono: var(--shiso-font-mono);
+  --sans: var(--shiso-font-sans);
 }
 
 * { box-sizing: border-box; }
