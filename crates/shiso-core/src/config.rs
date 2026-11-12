@@ -277,6 +277,9 @@ impl HfConfig {
     /// use [`Self::vision_config`], whose refusal keeps such a checkpoint
     /// from answering about a picture it only partly saw.
     ///
+    /// `Ok(None)` means what it means there: the document describes a
+    /// text-only model, which is an answer and not a failure.
+    ///
     /// # Errors
     ///
     /// Those of [`Self::vision_config`], without the deepstack refusal.
@@ -284,6 +287,10 @@ impl HfConfig {
         self.vision_tower(true)
     }
 
+    /// The vision block behind both doors; `deepstack` says whether taps
+    /// are returned or refused. `Ok(None)` is a document with no vision
+    /// block at all - a text-only model - and never a tower that failed to
+    /// parse, which is an error.
     fn vision_tower(&self, deepstack: bool) -> CoreResult<Option<VisionConfig>> {
         let Some(raw) = self.document.get("vision_config") else {
             return Ok(None);
