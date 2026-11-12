@@ -822,11 +822,14 @@ impl QwenImage21Model {
         swap: bool,
     ) -> Result<(), ImageGenError> {
         state.encoder_prefetch = None;
-        if state.denoiser.is_some() {
-            return Ok(());
-        }
+        // Before the early return: a job planned to swap must not denoise
+        // beside the encoder either when the transformer is already loaded
+        // (an earlier job planned resident leaves both).
         if swap {
             self.release(state, Component::Encoder);
+        }
+        if state.denoiser.is_some() {
+            return Ok(());
         }
         let phase = Instant::now();
         let (head, rest) = match ahead {
@@ -1026,12 +1029,14 @@ impl QwenImage21Model {
                 )
             })
             .collect();
-        // Dropped whether the encodes worked or not, like the text encoder.
+        // Dropped whether the encodes worked or not, like the text encoder;
+        // the device's own count says what the drop gave back.
+        let held = device_used(self.ops.backend());
         drop(vae);
         self.ops.trim_pool();
         state.events.push(ResidencyEvent::Dropped {
             component: Component::VaeEncoder,
-            device_bytes: loaded,
+            device_bytes: delta(device_used(self.ops.backend()), held),
         });
         tracing::info!(
             ms = ms(phase),
@@ -1103,11 +1108,12 @@ impl QwenImage21Model {
                 },
             )
         })();
+        let held = device_used(backend);
         drop(tower);
         self.ops.trim_pool();
         state.events.push(ResidencyEvent::Dropped {
             component: Component::Tower,
-            device_bytes: loaded,
+            device_bytes: delta(device_used(backend), held),
         });
         tracing::info!(
             ms = ms(phase),
@@ -1116,6 +1122,16 @@ impl QwenImage21Model {
             "qwen image phase tower"
         );
         rows
+    }
+
+    /// Loads the encoder and the transformer together, as a job planned
+    /// resident leaves them: the state a later job planned to swap starts
+    /// from on a host whose plan depends on the job.
+    #[cfg(test)]
+    pub(crate) fn stage_both_loaded(&self) -> Result<(), ImageGenError> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        self.ensure_encoder(&mut state)?;
+        self.ensure_denoiser(&mut state, None, false)
     }
 
     /// Puts the model where a resident job on a larger host leaves a

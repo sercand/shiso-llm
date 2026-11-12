@@ -233,6 +233,30 @@ fn no_path_imports_the_transformer_beside_the_encoder() {
         .expect("the cached job after a failure finishes");
     audit(&model.events(), 0);
 
+    // (c) Both loaded, as a job planned resident leaves them, then a
+    // cached prompt planned to swap: the transformer is already there, so
+    // nothing is imported - and the encoder must still go, or the job
+    // denoises beside the component its plan counted as dropped.
+    model.stage_both_loaded().expect("both load");
+    let before = model.events().len();
+    model
+        .generate(&job_for(&model, cached), None)
+        .expect("the cached job from the resident state finishes");
+    let events = model.events();
+    eprintln!("after both were loaded: {:?}", &events[before..]);
+    assert!(
+        matches!(
+            events[before..],
+            [ResidencyEvent::Dropped {
+                component: Component::Encoder,
+                ..
+            }]
+        ),
+        "a swap-planned job must drop the encoder even when the transformer is already \
+         loaded: {:?}",
+        &events[before..]
+    );
+
     // (a) The encoder loaded and the transformer not, as a resident job on
     // a larger host leaves a model that is then re-planned to swap, then a
     // cached prompt: the encoder must go before the transformer comes.
@@ -327,6 +351,32 @@ fn an_edit_drops_its_picture_readers_before_the_transformer() {
     audit(&events, 0);
     assert_eq!(loads(job_events, Component::VaeEncoder), 1);
     assert_eq!(loads(job_events, Component::Tower), 1);
+    // Each picture reader's drop is measured on the device and gives back
+    // what its load took: the bytes really left before the transformer.
+    for reader in [Component::VaeEncoder, Component::Tower] {
+        let bytes = |loaded: bool| {
+            job_events
+                .iter()
+                .find_map(|e| match *e {
+                    ResidencyEvent::Loaded {
+                        component,
+                        device_bytes,
+                    } if loaded && component == reader => Some(device_bytes),
+                    ResidencyEvent::Dropped {
+                        component,
+                        device_bytes,
+                    } if !loaded && component == reader => Some(device_bytes),
+                    _ => None,
+                })
+                .expect("the reader was loaded and dropped")
+        };
+        let (took, gave) = (bytes(true), bytes(false));
+        eprintln!("{reader:?}: load took {took} bytes, drop released {gave}");
+        assert!(
+            took > 0 && gave * 10 >= took * 9,
+            "{reader:?}: the drop released {gave} of the {took} bytes its load took"
+        );
+    }
     assert_eq!(loads(job_events, Component::Denoiser), 1);
 
     // The same edit again: its conditioning is cached, no component moves.
