@@ -30,7 +30,9 @@ use shiso_vision::generator::ImageGenError;
 use super::quant::RotGroup;
 
 mod vae;
-pub(crate) use vae::{ChannelRmsCall, DupUpCall, VaeConvCall, VaeConvInput, dup_up_map};
+pub(crate) use vae::{
+    AvgDownCall, ChannelRmsCall, DupUpCall, VaeConvCall, VaeConvInput, avg_down_group, dup_up_map,
+};
 
 /// The kernel module every diffusion entry point lives under.
 pub(crate) const MODULE: &str = "diffusion";
@@ -50,6 +52,11 @@ const G64_TILE: u32 = 64;
 /// The simdgroup tile's k slice: a reduction length that is not a multiple
 /// of it goes to the scalar kernels.
 const G64_K: usize = 16;
+/// The smallest projection, in multiply-adds, the host is given a share of.
+/// Sharing costs a wait that orders the device ahead of the host's reads
+/// and wakes the matrix library's threads; below about 6 ms of device work
+/// (2^33 products at the M4's 1.5e12 a second) that is not repaid.
+const HOST_MIN_PRODUCTS: usize = 1 << 33;
 /// Threads per simdgroup-tile threadgroup (four simdgroups).
 const G64_THREADS: u32 = 128;
 /// Query rows per fused-attention threadgroup.
@@ -99,6 +106,38 @@ fn scale_binding<'a>(
         ))),
         (_, None) => Ok(KernelArg::F32(weight.scale)),
     }
+}
+
+/// The host's share of one split projection: columns `device_cols..n` of
+/// `out`, overwritten, or added into it through `gate`.
+struct HostColumns<'a> {
+    step: &'static str,
+    device_cols: usize,
+    /// `(m, n, k)` of the whole projection.
+    shape: (usize, usize, usize),
+    /// The packed `(m, k)` rows both shares read.
+    input: DeviceView<'a>,
+    weight: &'a LinWeight<'a>,
+    gate: Option<DeviceView<'a>>,
+    out: DeviceView<'a>,
+}
+
+/// How many leading columns of an `n`-column, `k`-deep tiled projection the
+/// device keeps when the host is given `per_mille` thousandths of them,
+/// rounded to whole 64-column tiles.
+///
+/// `None` means the projection is not split: no share was asked for, the
+/// shape does not cut into whole tiles (the device share is launched over a
+/// narrower tile grid, which only whole tiles allow), or the rounding leaves
+/// one side with nothing.
+pub(crate) fn split_columns(per_mille: u32, n: usize, k: usize) -> Option<usize> {
+    let tile = G64_TILE as usize;
+    if per_mille == 0 || !k.is_multiple_of(G64_K) || !n.is_multiple_of(tile) {
+        return None;
+    }
+    let tiles = n / tile;
+    let host_tiles = (tiles * per_mille as usize + 500) / 1000;
+    (host_tiles > 0 && host_tiles < tiles).then(|| (tiles - host_tiles) * tile)
 }
 
 /// `DeviceView::slice` answers a core error; the family's drivers speak
@@ -245,6 +284,14 @@ struct RopeHalfArgs {
     head_dim: u32,
     pinned_from: u32,
     pinned_pos: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct RopeHalfTableArgs {
+    tokens: u32,
+    heads: u32,
+    head_dim: u32,
 }
 
 #[repr(C)]
@@ -469,6 +516,15 @@ pub(crate) struct LinWeight<'a> {
 }
 
 impl<'a> LinWeight<'a> {
+    /// The same weight for an input the caller has already rotated
+    /// ([`Ops::rotate`]) under the weight's own group: the driver multiplies
+    /// it as given. For several weights stored under one rotation that read
+    /// the same rows, so the rows are rotated once instead of once each.
+    pub(crate) fn over_rotated_input(mut self) -> Self {
+        self.rotate = None;
+        self
+    }
+
     /// A raw F32 `(n, k)` operand with no scale, bias or rotation.
     pub(crate) fn f32(w: DeviceView<'a>) -> Self {
         Self {
@@ -600,10 +656,25 @@ pub(crate) struct SdpaCall<'a> {
     /// Elements per token row in the strided q/k/v buffers (a fused qkv row).
     pub txt_stride: usize,
     pub img_stride: usize,
-    /// Mask every key after the query's own joint row (`s > t`): a
-    /// prefix whose rows never see later ones. Refused with cached rows,
-    /// which sit after every live row and would always be masked.
+    /// Mask every live key after the query's own joint row (`s > t`): a
+    /// prefix whose rows never see later ones. Cached rows are never
+    /// masked: they stand for the sequence before the live rows, so a
+    /// later segment of a causal prefix can run on its own.
     pub causal: bool,
+}
+
+/// Keys and values narrowed to packed half rows (see [`Ops::narrow_kv`]).
+pub(crate) struct NarrowKvCall<'a> {
+    pub step: &'static str,
+    /// `(rows, heads * head_dim)` halves out.
+    pub k_half: DeviceView<'a>,
+    pub v_half: DeviceView<'a>,
+    /// `(rows, heads * head_dim)` f32 in.
+    pub k: DeviceView<'a>,
+    pub v: DeviceView<'a>,
+    pub rows: usize,
+    pub heads: usize,
+    pub head_dim: usize,
 }
 
 /// Grouped-query causal attention (the text encoder's prefill).
@@ -636,6 +707,20 @@ pub(crate) struct RopeHalfCall<'a> {
     pub pinned_from: usize,
     /// The position the pinned rows turn by.
     pub pinned_pos: u32,
+}
+
+/// One rotate-half rotation of a (tokens, heads, `head_dim`) tensor by a
+/// per-token angle table.
+pub(crate) struct RopeHalfTableCall<'a> {
+    pub step: &'static str,
+    pub tensor: DeviceView<'a>,
+    /// `(tokens, head_dim / 2)` cosines.
+    pub cos: DeviceView<'a>,
+    /// `(tokens, head_dim / 2)` sines.
+    pub sin: DeviceView<'a>,
+    pub tokens: usize,
+    pub heads: usize,
+    pub head_dim: usize,
 }
 
 /// One 2D convolution of the VAE decoder.
@@ -835,6 +920,16 @@ pub(crate) struct Ops {
     /// Whether the module carries [`HALF_KV_KERNELS`], so [`Ops::sdpa`]
     /// narrows K and V once instead of in every query tile.
     half_kv: bool,
+    /// Thousandths of a large per-row INT8 projection's columns the host
+    /// computes while the device computes the rest; 0 keeps every column on
+    /// the device. See [`Ops::with_host_share`].
+    host_share: u32,
+    /// The smallest projection, in multiply-adds, the host is given a share
+    /// of: [`HOST_MIN_PRODUCTS`] outside the tests that split a small one.
+    host_min_products: usize,
+    /// The fewest rows [`Ops::gqa`] sends to the fused tile
+    /// ([`FUSED_GQA_KERNEL`]); `usize::MAX` on a device without it.
+    gqa_fused_min: usize,
 }
 
 /// A pooled working buffer: derefs to the [`DeviceBuffer`] it holds and goes
@@ -878,8 +973,31 @@ impl Drop for Scratch<'_> {
 /// f32 entry stages, so the output is the same bits either way; a module
 /// without them (the CUDA set today) keeps the f32 entry rather than being
 /// refused.
-pub(crate) const HALF_KV_KERNELS: [&str; 2] =
-    ["kernel_dit_kv_half_f32", "kernel_dit_flash_sdpa_d128_kvh"];
+///
+/// The third entry reads a cache that is *stored* as half
+/// ([`Ops::sdpa_half_cache`]): the cached rows are narrowed once, when the
+/// cache is written, instead of on every call.
+pub(crate) const HALF_KV_KERNELS: [&str; 3] = [
+    "kernel_dit_kv_half_f32",
+    "kernel_dit_flash_sdpa_d128_kvh",
+    "kernel_dit_flash_sdpa_d128_kvhc",
+];
+
+/// The fused causal grouped-query tile for 128-wide heads. Optional, like
+/// [`HALF_KV_KERNELS`]: a device without it keeps the per-row kernel.
+pub(crate) const FUSED_GQA_KERNEL: &str = "kernel_dit_flash_gqa_d128_f32";
+/// Query rows per threadgroup of the fused grouped-query tile.
+const FUSED_GQA_ROWS: u32 = 64;
+/// Threads per threadgroup of the fused grouped-query tile.
+const FUSED_GQA_THREADS: u32 = 256;
+/// The head width the fused grouped-query tile is instantiated for.
+const FUSED_GQA_HEAD_DIM: usize = 128;
+/// The fewest rows sent to the fused grouped-query tile. A prompt without a
+/// picture is tens of rows and its attention is not worth moving: below this
+/// the per-row kernel keeps its own summation order, so a text-only prompt's
+/// features - and the picture they condition - stay bit for bit what they
+/// were. A prompt carrying a picture is a thousand rows and up.
+const GQA_FUSED_MIN_TOKENS: usize = 768;
 
 /// Every diffusion kernel entry this driver launches: the module's full
 /// registration in `metal/diffusion/diffusion.metal`. [`Ops::new`] probes the device
@@ -906,6 +1024,7 @@ pub(crate) const REQUIRED_KERNELS: &[&str] = &[
     "kernel_dit_gqa_f32",
     "kernel_dit_rope_4d",
     "kernel_dit_rope_half",
+    "kernel_dit_rope_half_table",
     "kernel_dit_conv2d_f32",
     "kernel_dit_group_norm_stats_f32",
     "kernel_dit_group_norm_apply_f32",
@@ -946,6 +1065,7 @@ pub(crate) const REQUIRED_KERNELS: &[&str] = &[
     "kernel_dit_conv2d_rms_gemm_f32",
     "kernel_dit_conv2d_up2_gemm_f32",
     "kernel_dit_dup_up_add_f32",
+    "kernel_dit_avg_down_add_f32",
 ];
 
 impl Ops {
@@ -982,6 +1102,11 @@ impl Ops {
                 .max_block_threads(KernelRef::new(MODULE, entry))
                 .is_some()
         });
+        // The tile needs its full threadgroup: a pipeline the device caps
+        // below it (the cap follows register use) keeps the per-row kernel.
+        let fused_gqa = backend
+            .max_block_threads(KernelRef::new(MODULE, FUSED_GQA_KERNEL))
+            .is_some_and(|threads| threads >= FUSED_GQA_THREADS);
         let dummy = alloc(backend, 4).map_err(|e| ImageGenError::Backend(e.to_string()))?;
         backend
             .fill_zero(dummy.view())
@@ -991,6 +1116,13 @@ impl Ops {
             dummy,
             pool: Mutex::default(),
             half_kv,
+            host_share: 0,
+            host_min_products: HOST_MIN_PRODUCTS,
+            gqa_fused_min: if fused_gqa {
+                GQA_FUSED_MIN_TOKENS
+            } else {
+                usize::MAX
+            },
         })
     }
 
@@ -1009,7 +1141,127 @@ impl Ops {
             dummy,
             pool: Mutex::default(),
             half_kv: false,
+            host_share: 0,
+            host_min_products: HOST_MIN_PRODUCTS,
+            gqa_fused_min: usize::MAX,
         })
+    }
+
+    /// Splits every large per-row INT8 projection between the device and the
+    /// host's matrix library: `per_mille` thousandths of the columns (rounded
+    /// to whole 64-column tiles) are multiplied on the host, in the device's
+    /// own buffers, while the device multiplies the rest.
+    ///
+    /// The split is a function of the projection's shape and this share
+    /// alone, so a job's answer does not depend on timing; but the host's
+    /// columns are summed in the matrix library's order, not the tile's, so
+    /// a different share is a different (equally valid) rounding of the same
+    /// product. Zero is the device-only path, bit for bit.
+    ///
+    /// # Errors
+    /// [`ImageGenError::Backend`] for a share of 1000 or more, or a nonzero
+    /// share on a device whose buffers the host cannot multiply into.
+    pub(crate) fn with_host_share(mut self, per_mille: u32) -> Result<Self, ImageGenError> {
+        if per_mille >= 1000 {
+            return Err(ImageGenError::Backend(format!(
+                "a host share of {per_mille}/1000 leaves the device nothing to compute"
+            )));
+        }
+        if per_mille > 0 && self.backend.as_host_gemm().is_none() {
+            return Err(ImageGenError::Backend(format!(
+                "the {} backend has no host multiplier, so no share of a projection can be given to the host",
+                self.backend.backend_name()
+            )));
+        }
+        self.host_share = per_mille;
+        Ok(self)
+    }
+
+    /// Sends every grouped-query attention the fused tile can take to it,
+    /// whatever its row count, so a test can grade the tile on a prompt
+    /// short enough to have a reference. A device without the tile keeps
+    /// the per-row kernel.
+    #[cfg(test)]
+    pub(crate) fn fusing_short_prompts(mut self) -> Self {
+        if self.gqa_fused_min != usize::MAX {
+            self.gqa_fused_min = 0;
+        }
+        self
+    }
+
+    /// Whether [`Ops::gqa`] runs `tokens` rows of `head_dim`-wide heads on
+    /// the fused tile.
+    #[cfg(test)]
+    pub(crate) fn fuses_gqa(&self, tokens: usize, head_dim: usize) -> bool {
+        head_dim == FUSED_GQA_HEAD_DIM && tokens >= self.gqa_fused_min
+    }
+
+    /// Shares projections of every size, so a test can split one that is
+    /// small enough to grade against a reference.
+    #[cfg(test)]
+    pub(crate) fn sharing_small_projections(mut self) -> Self {
+        self.host_min_products = 0;
+        self
+    }
+
+    /// How many leading columns the device keeps of an `(m, n, k)` projection
+    /// the host shares, having waited for the device when it is shared: the
+    /// host reads the projection's input, and its own columns of a stream it
+    /// adds into, which the device may still be writing. `None` when the
+    /// device computes all of it.
+    fn device_cols(
+        &self,
+        step: &'static str,
+        kind: WeightKind,
+        (m, n, k): (usize, usize, usize),
+    ) -> Result<Option<usize>, ImageGenError> {
+        if kind != WeightKind::Int8Row
+            || m.saturating_mul(n).saturating_mul(k) < self.host_min_products
+        {
+            return Ok(None);
+        }
+        let split = split_columns(self.host_share, n, k);
+        if split.is_some() {
+            self.backend.sync().map_err(fail(step))?;
+        }
+        Ok(split)
+    }
+
+    /// Runs the host's columns of a split projection whose device share was
+    /// just launched: hands the device its share without waiting, then
+    /// multiplies on this thread.
+    fn host_columns(&self, share: &HostColumns<'_>) -> Result<(), ImageGenError> {
+        let step = share.step;
+        let (m, n, k) = share.shape;
+        let (Some(host), Some(row_scale)) = (self.backend.as_host_gemm(), share.weight.row_scale)
+        else {
+            return Err(ImageGenError::Backend(format!(
+                "{step}: a projection was split without a host multiplier or row scales"
+            )));
+        };
+        self.backend.submit().map_err(fail(step))?;
+        host.gemm_i8_rows(&shiso_core::HostGemmDesc {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            col_start: share.device_cols as u32,
+            col_end: n as u32,
+            input: share.input,
+            weight: share.weight.w,
+            row_scale,
+            bias: share.weight.bias,
+            gate: share.gate,
+            out: share.out,
+        })
+        .map_err(fail(step))
+    }
+
+    /// Whether a 128-wide-head attention cache can be kept as packed half
+    /// rows ([`Ops::narrow_kv`], [`Ops::sdpa_half_cache`]): true when the
+    /// module carries [`HALF_KV_KERNELS`]. A device without them keeps its
+    /// cache in f32 and attends it through [`Ops::sdpa`].
+    pub(crate) fn half_cache(&self) -> bool {
+        self.half_kv
     }
 
     /// The wrapped device, for direct copies and imports.
@@ -1441,10 +1693,15 @@ impl Ops {
             (WeightKind::F32, false) => "kernel_dit_gemm_f32",
             (WeightKind::Int8Row, false) => "kernel_dit_gemm_i8",
         };
+        // A shared projection launches the device over its leading tiles
+        // only; the entry and its arguments are the whole projection's, so
+        // each device column is the value the unsplit launch computes.
+        let shape = (call.m, call.n, call.k);
+        let split = self.device_cols(call.step, lw.kind, shape)?;
         let (grid, block) = if tiled {
             (
                 Extent3::new(
-                    grid_for(call.n as u32, G64_TILE),
+                    grid_for(split.unwrap_or(call.n) as u32, G64_TILE),
                     grid_for(call.m as u32, G64_TILE),
                     1,
                 ),
@@ -1473,7 +1730,19 @@ impl Ops {
                 scale_arg,
                 KernelArg::Buffer(bias),
             ],
-        )
+        )?;
+        match split {
+            Some(device_cols) => self.host_columns(&HostColumns {
+                step: call.step,
+                device_cols,
+                shape,
+                input,
+                weight: lw,
+                gate: None,
+                out: call.out,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// `residual += gate * linear([dense | swiglu])` in one launch: the
@@ -1549,11 +1818,21 @@ impl Ops {
                 block_gemm_entry(kind, true).ok_or_else(|| no_block_entry(call.step, kind))?
             }
         };
+        // The host has no swiglu reader, so only a projection whose input is
+        // already a packed row - every rotated one - is shared.
+        let shape = (call.m, call.n, k);
+        let shared = match (dense, swiglu) {
+            (Some(input), None) => self
+                .device_cols(call.step, lw.kind, shape)?
+                .map(|device_cols| (device_cols, input)),
+            _ => None,
+        };
+        let split = shared.map(|(device_cols, _)| device_cols);
         self.launch(
             call.step,
             entry,
             Extent3::new(
-                grid_for(call.n as u32, G64_TILE),
+                grid_for(split.unwrap_or(call.n) as u32, G64_TILE),
                 grid_for(call.m as u32, G64_TILE),
                 1,
             ),
@@ -1568,7 +1847,19 @@ impl Ops {
                 KernelArg::Buffer(lw.bias.unwrap_or(self.dummy.view())),
                 KernelArg::Buffer(call.gate),
             ],
-        )
+        )?;
+        match shared {
+            Some((device_cols, input)) => self.host_columns(&HostColumns {
+                step: call.step,
+                device_cols,
+                shape,
+                input,
+                weight: lw,
+                gate: Some(call.gate),
+                out: call.residual,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// [`Ops::linear_residual`] as separate passes, for shapes the fused
@@ -1844,10 +2135,10 @@ impl Ops {
         // transformer's 128-wide heads qualify, the VAE's 512-wide one does not.
         let flash = call.head_dim.is_multiple_of(8) && call.head_dim <= FA_MAX_D;
 
-        if call.causal && (call.cache_tokens > 0 || !flash) {
+        if call.causal && !flash {
             return Err(ImageGenError::Backend(format!(
-                "{}: causal attention takes no cached rows and needs a head of at most {FA_MAX_D} in multiples of 8 (got {} cached rows, head {})",
-                call.step, call.cache_tokens, call.head_dim
+                "{}: causal attention needs a head of at most {FA_MAX_D} in multiples of 8 (got {})",
+                call.step, call.head_dim
             )));
         }
         if flash && !call.causal && call.head_dim == 128 && self.half_kv {
@@ -1950,6 +2241,139 @@ impl Ops {
                 KernelArg::Buffer(self.dummy.view()),
                 KernelArg::Buffer(self.dummy.view()),
                 KernelArg::Buffer(self.dummy.view()),
+            ],
+        )
+    }
+
+    /// Narrows `rows` packed `(rows, heads * head_dim)` f32 keys and values
+    /// into packed half rows of the same shape: the conversion the fused
+    /// attention applies to every key and value it stages (saturating), so
+    /// rows stored this way attend exactly as their f32 originals do.
+    ///
+    /// # Errors
+    /// [`ImageGenError::Backend`] on a device without [`HALF_KV_KERNELS`] or
+    /// a failed launch.
+    pub(crate) fn narrow_kv(&self, call: &NarrowKvCall<'_>) -> Result<(), ImageGenError> {
+        if !self.half_kv {
+            return Err(ImageGenError::Backend(format!(
+                "{}: this device's kernel set has no half key/value entries",
+                call.step
+            )));
+        }
+        let width = call.heads * call.head_dim;
+        let args = SdpaArgs {
+            txt_tokens: call.rows as u32,
+            img_tokens: 0,
+            cache_tokens: 0,
+            heads: call.heads as u32,
+            head_dim: call.head_dim as u32,
+            txt_stride: width as u32,
+            img_stride: width as u32,
+            cache_stride: width as u32,
+            q_offset: 0,
+            k_offset: 0,
+            v_offset: 0,
+        };
+        let dummy = self.dummy.view();
+        self.launch(
+            call.step,
+            HALF_KV_KERNELS[0],
+            Extent3::new(grid_for((width / 4) as u32, BLOCK), call.rows as u32, 1),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(call.k_half),
+                KernelArg::Buffer(call.v_half),
+                KernelArg::Buffer(call.k),
+                KernelArg::Buffer(call.v),
+                KernelArg::Buffer(dummy),
+                KernelArg::Buffer(dummy),
+                KernelArg::Buffer(dummy),
+                KernelArg::Buffer(dummy),
+            ],
+        )
+    }
+
+    /// [`Ops::sdpa`] over a cache stored as packed half rows
+    /// ([`Ops::narrow_kv`]): `call.cache_k` and `call.cache_v` are
+    /// `(cache_tokens, heads * head_dim)` halves. The live rows' keys and
+    /// values are narrowed per call, the cached ones are read as they are,
+    /// so a cache kept across the steps of a job is never narrowed again.
+    /// Bit-identical to [`Ops::sdpa`] over the same cache in f32.
+    ///
+    /// # Errors
+    /// [`ImageGenError::Backend`] for a causal call, a head other than 128
+    /// wide, a device without [`HALF_KV_KERNELS`], or a failed launch.
+    pub(crate) fn sdpa_half_cache(&self, call: &SdpaCall<'_>) -> Result<(), ImageGenError> {
+        if call.causal || call.head_dim != 128 || !self.half_kv {
+            return Err(ImageGenError::Backend(format!(
+                "{}: a half cache is attended bidirectionally by 128-wide heads on a device \
+                 with the half key/value entries (causal {}, head {}, entries {})",
+                call.step, call.causal, call.head_dim, self.half_kv
+            )));
+        }
+        let args = SdpaArgs {
+            txt_tokens: call.txt_tokens as u32,
+            img_tokens: call.img_tokens as u32,
+            cache_tokens: call.cache_tokens as u32,
+            heads: call.heads as u32,
+            head_dim: call.head_dim as u32,
+            txt_stride: call.txt_stride as u32,
+            img_stride: call.img_stride as u32,
+            cache_stride: call.cache_stride as u32,
+            q_offset: call.q_offset as u32,
+            k_offset: call.k_offset as u32,
+            v_offset: call.v_offset as u32,
+        };
+        let live_args = SdpaArgs {
+            cache_tokens: 0,
+            ..args
+        };
+        let width = call.heads * call.head_dim;
+        let live = call.txt_tokens + call.img_tokens;
+        // Halves, two per f32 slot; the width is a multiple of eight.
+        let k_half = self.alloc_f32(call.step, live * width / 2)?;
+        let v_half = self.alloc_f32(call.step, live * width / 2)?;
+        let dummy = self.dummy.view();
+        self.launch(
+            call.step,
+            HALF_KV_KERNELS[0],
+            Extent3::new(grid_for((width / 4) as u32, BLOCK), live as u32, 1),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&live_args)),
+                KernelArg::Buffer(k_half.view()),
+                KernelArg::Buffer(v_half.view()),
+                KernelArg::Buffer(call.k_txt),
+                KernelArg::Buffer(call.v_txt),
+                KernelArg::Buffer(call.k_img),
+                KernelArg::Buffer(call.v_img),
+                KernelArg::Buffer(dummy),
+                KernelArg::Buffer(dummy),
+            ],
+        )?;
+        let (cache_k, cache_v) = if call.cache_tokens == 0 {
+            (dummy, dummy)
+        } else {
+            (call.cache_k, call.cache_v)
+        };
+        self.launch(
+            call.step,
+            HALF_KV_KERNELS[2],
+            Extent3::new(grid_for(live as u32, FA_QROWS), call.heads as u32, 1),
+            Extent3::linear(FA_THREADS),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(call.out_txt),
+                KernelArg::Buffer(call.out_img),
+                KernelArg::Buffer(call.q_txt),
+                KernelArg::Buffer(k_half.view()),
+                KernelArg::Buffer(v_half.view()),
+                KernelArg::Buffer(call.q_img),
+                KernelArg::Buffer(dummy),
+                KernelArg::Buffer(dummy),
+                KernelArg::Buffer(cache_k),
+                KernelArg::Buffer(cache_v),
             ],
         )
     }
@@ -2094,11 +2518,31 @@ impl Ops {
             head_dim: call.head_dim as u32,
             valid_keys: call.valid_keys as u32,
         };
+        // The fused tile is the same attention summed in another order, six
+        // to seven times faster on a long prompt; see `GQA_FUSED_MIN_TOKENS`.
+        let fused = call.head_dim == FUSED_GQA_HEAD_DIM && call.tokens >= self.gqa_fused_min;
+        let (entry, grid, block) = if fused {
+            (
+                FUSED_GQA_KERNEL,
+                Extent3::new(
+                    grid_for(call.tokens as u32, FUSED_GQA_ROWS),
+                    call.q_heads as u32,
+                    1,
+                ),
+                Extent3::linear(FUSED_GQA_THREADS),
+            )
+        } else {
+            (
+                "kernel_dit_gqa_f32",
+                Extent3::new(call.tokens as u32, call.q_heads as u32, 1),
+                Extent3::linear(BLOCK),
+            )
+        };
         self.launch(
             call.step,
-            "kernel_dit_gqa_f32",
-            Extent3::new(call.tokens as u32, call.q_heads as u32, 1),
-            Extent3::linear(BLOCK),
+            entry,
+            grid,
+            block,
             &[
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
                 KernelArg::Buffer(call.out),
@@ -2175,6 +2619,34 @@ impl Ops {
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
                 KernelArg::Buffer(call.tensor),
                 KernelArg::Buffer(call.freqs),
+            ],
+        )
+    }
+
+    /// Rotate-half `RoPE` on one (tokens, heads, `head_dim`) tensor from a
+    /// per-token angle table: pair `(i, i + head_dim/2)` of token `t` turns
+    /// by the angle at `[t][i]`. A multi-axis decoder's pairs read different
+    /// position axes, which the token index of [`Self::rope_half`] cannot
+    /// express.
+    pub(crate) fn rope_half_table(
+        &self,
+        call: &RopeHalfTableCall<'_>,
+    ) -> Result<(), ImageGenError> {
+        let args = RopeHalfTableArgs {
+            tokens: call.tokens as u32,
+            heads: call.heads as u32,
+            head_dim: call.head_dim as u32,
+        };
+        self.launch(
+            call.step,
+            "kernel_dit_rope_half_table",
+            Extent3::new(call.tokens as u32, call.heads as u32, 1),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(call.tensor),
+                KernelArg::Buffer(call.cos),
+                KernelArg::Buffer(call.sin),
             ],
         )
     }

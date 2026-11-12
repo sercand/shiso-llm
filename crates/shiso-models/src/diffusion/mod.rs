@@ -38,4 +38,6 @@ pub(crate) mod gguf_forge;
 #[cfg(test)]
 mod quant_tests;
 #[cfg(test)]
+mod qwen3_text_tests;
+#[cfg(test)]
 mod residency_tests;

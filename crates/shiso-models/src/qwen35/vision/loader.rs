@@ -41,7 +41,8 @@ use shiso_vision::{VisionError, VisionShard, VisionSource, open_gguf};
 use super::dims::VisionDims;
 use super::manifest::{
     AxisOrder, CHECKPOINT_PREFIX, PUBLISHED_SIDECAR, PatchRows, SIDECAR_PREFIX,
-    SIDECAR_PREFIX_CANONICAL, SidecarContract, TowerManifest, TowerTensorSpec, TowerTree,
+    SIDECAR_PREFIX_CANONICAL, SidecarContract, TENSORS_PER_DEEPSTACK_TAP, TowerManifest,
+    TowerMerger, TowerTensorSpec, TowerTree, deepstack_mergers,
 };
 use super::mmproj::{self, MmprojTower};
 
@@ -192,6 +193,29 @@ pub struct VisionWeights {
     dims: VisionDims,
     prefix: String,
     tensors: TowerTree<TowerTensor>,
+    /// The deepstack taps, in tap order; empty for a tower without them.
+    deepstack: Vec<DeepstackTap>,
+}
+
+/// One deepstack tap on a device: the block it reads after and its merger.
+#[derive(Debug)]
+pub struct DeepstackTap {
+    block: usize,
+    merger: TowerMerger<TowerTensor>,
+}
+
+impl DeepstackTap {
+    /// The 0-indexed tower block whose output this tap reads.
+    #[must_use]
+    pub fn block(&self) -> usize {
+        self.block
+    }
+
+    /// The tap's merger.
+    #[must_use]
+    pub fn merger(&self) -> &TowerMerger<TowerTensor> {
+        &self.merger
+    }
 }
 
 impl VisionWeights {
@@ -213,10 +237,16 @@ impl VisionWeights {
         &self.tensors
     }
 
+    /// The deepstack taps, in tap order; empty for a tower without them.
+    #[must_use]
+    pub fn deepstack(&self) -> &[DeepstackTap] {
+        &self.deepstack
+    }
+
     /// Tensors resident on the device.
     #[must_use]
     pub fn tensor_count(&self) -> usize {
-        self.tensors.len()
+        self.tensors.len() + self.deepstack.len() * TENSORS_PER_DEEPSTACK_TAP
     }
 
     /// Device bytes the tower occupies.
@@ -224,6 +254,7 @@ impl VisionWeights {
     pub fn device_bytes(&self) -> u64 {
         self.tensors
             .iter()
+            .chain(self.deepstack.iter().flat_map(|tap| tap.merger.iter()))
             .map(|tensor| {
                 tensor.buffer.len()
                     + tensor
@@ -259,12 +290,20 @@ pub fn load_vision_weights(
     let dims = tower.dims();
     let prefix = tower.prefix().to_owned();
     let manifest = TowerManifest::build(&prefix, dims);
+    let taps = tower.deepstack_blocks().to_vec();
+    if taps.iter().any(|&block| block >= dims.depth()) {
+        return Err(VisionError::Unsupported {
+            what: "a deepstack tap after a block the vision tower does not have",
+        });
+    }
+    let mergers = deepstack_mergers(&prefix, dims, taps.len());
 
     let declared = tower.tensor_count();
-    if declared != manifest.len() {
+    let expected = manifest.len() + taps.len() * TENSORS_PER_DEEPSTACK_TAP;
+    if declared != expected {
         return Err(VisionError::TensorCount {
             found: declared,
-            expected: manifest.len(),
+            expected,
         });
     }
 
@@ -278,10 +317,21 @@ pub fn load_vision_weights(
     );
 
     let tensors = manifest.try_map(|spec| tower.upload(backend, &spec))?;
+    let deepstack = taps
+        .into_iter()
+        .zip(mergers)
+        .map(|(block, merger)| {
+            Ok(DeepstackTap {
+                block,
+                merger: merger.try_map(|spec| tower.upload(backend, &spec))?,
+            })
+        })
+        .collect::<Result<Vec<_>, VisionError>>()?;
     let weights = VisionWeights {
         dims,
         prefix,
         tensors,
+        deepstack,
     };
     tracing::info!(
         bytes = weights.device_bytes(),
@@ -306,6 +356,15 @@ enum Tower {
         file: Box<ModeloptFile>,
         /// Dimensions, from the checkpoint's config.
         dims: VisionDims,
+    },
+    /// The tower inside one weight file that also holds other tensors.
+    CheckpointFile {
+        /// The file, opened over the tower's prefix alone.
+        shard: VisionShard,
+        /// Dimensions, from the config document named beside the file.
+        dims: VisionDims,
+        /// The 0-indexed blocks the deepstack taps read after, in tap order.
+        taps: Vec<usize>,
     },
     /// A trellis-quantized tower file beside a checkpoint's config.
     Trellis(Box<TrellisTower>),
@@ -332,6 +391,52 @@ impl Tower {
             VisionSource::TrellisShard(path) => {
                 Ok(Self::Trellis(Box::new(TrellisTower::open(path, backend)?)))
             }
+            VisionSource::CheckpointFile { weights, config } => {
+                Self::open_checkpoint_file(weights, config)
+            }
+        }
+    }
+
+    /// Opens the tower a single weight file carries under `model.visual.`.
+    ///
+    /// The config is read through the door that returns deepstack taps
+    /// instead of refusing them: this source exists for the caller that
+    /// consumes the taps (see [`VisionSource::CheckpointFile`]). The file is
+    /// opened over the tower's prefix only, so the language model's tensors
+    /// beside it - quantized in formats no tower kernel reads - are never
+    /// described.
+    fn open_checkpoint_file(weights: &Path, config_path: &Path) -> Result<Self, VisionError> {
+        let text = std::fs::read_to_string(config_path).map_err(|source| VisionError::TowerIo {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
+        let tower_config = |source| VisionError::TowerConfig {
+            path: config_path.to_path_buf(),
+            source,
+        };
+        let vcfg = shiso_core::HfConfig::from_json_str(&text)
+            .map_err(tower_config)?
+            .vision_config_with_deepstack()
+            .map_err(tower_config)?
+            .ok_or_else(|| VisionError::NoVisionConfig {
+                path: config_path.to_path_buf(),
+            })?;
+        let dims = VisionDims::try_from(&vcfg)?;
+        let taps = vcfg
+            .deepstack_visual_indexes
+            .iter()
+            .map(|&block| usize::try_from(block).unwrap_or(usize::MAX))
+            .collect();
+        let shard = VisionShard::open_under(weights, &format!("{MODELOPT_TOWER_PREFIX}."))?;
+        Ok(Self::CheckpointFile { shard, dims, taps })
+    }
+
+    /// The blocks the tower's deepstack taps read after; empty for every
+    /// container that cannot carry taps.
+    fn deepstack_blocks(&self) -> &[usize] {
+        match self {
+            Self::CheckpointFile { taps, .. } => taps,
+            _ => &[],
         }
     }
 
@@ -422,9 +527,10 @@ impl Tower {
     /// The tower's dimensions.
     fn dims(&self) -> VisionDims {
         match self {
-            Self::Shard { dims, .. } | Self::Modelopt { dims, .. } | Self::Sidecar { dims, .. } => {
-                *dims
-            }
+            Self::Shard { dims, .. }
+            | Self::Modelopt { dims, .. }
+            | Self::CheckpointFile { dims, .. }
+            | Self::Sidecar { dims, .. } => *dims,
             Self::Trellis(tower) => tower.dims,
             Self::Mmproj(tower) => tower.dims(),
         }
@@ -436,7 +542,9 @@ impl Tower {
             Self::Shard { .. } => CHECKPOINT_PREFIX,
             // The same spelling a standalone tower's short prefix uses, which
             // is what this container writes.
-            Self::Modelopt { .. } | Self::Trellis(_) => MODELOPT_TOWER_PREFIX,
+            Self::Modelopt { .. } | Self::CheckpointFile { .. } | Self::Trellis(_) => {
+                MODELOPT_TOWER_PREFIX
+            }
             // Not a spelling this container writes: the manifest is built
             // under the sidecar's names and each lookup is translated.
             Self::Mmproj(_) => SIDECAR_PREFIX,
@@ -447,7 +555,7 @@ impl Tower {
     /// Tensors the container declares under this tower's prefix.
     fn tensor_count(&self) -> usize {
         match self {
-            Self::Shard { shard, .. } => shard.len(),
+            Self::Shard { shard, .. } | Self::CheckpointFile { shard, .. } => shard.len(),
             // Already narrowed to the prefix at open, so this is the tower's
             // own count and not the checkpoint's.
             Self::Modelopt { file, .. } => file.tensors().len(),
@@ -546,7 +654,7 @@ impl Tower {
     /// written in.
     fn describe(&self, name: &str) -> Result<(DType, Vec<u64>, AxisOrder), VisionError> {
         match self {
-            Self::Shard { shard, .. } => {
+            Self::Shard { shard, .. } | Self::CheckpointFile { shard, .. } => {
                 let entry = shard
                     .entry(name)
                     .ok_or_else(|| VisionError::MissingTensor {
@@ -610,7 +718,9 @@ impl Tower {
     /// on the path that did not need to.
     fn bytes(&self, name: &str) -> Result<Cow<'_, [u8]>, VisionError> {
         match self {
-            Self::Shard { shard, .. } => shard.read(name).map(Cow::Owned),
+            Self::Shard { shard, .. } | Self::CheckpointFile { shard, .. } => {
+                shard.read(name).map(Cow::Owned)
+            }
             Self::Modelopt { file, .. } => {
                 let tensor = file.get(name).ok_or_else(|| VisionError::MissingTensor {
                     name: name.to_owned(),

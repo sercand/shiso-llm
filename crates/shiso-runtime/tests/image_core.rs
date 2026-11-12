@@ -332,3 +332,46 @@ async fn an_edit_is_refused_for_what_its_shape_or_model_cannot_take() {
     assert!(bad_request_message(&error).contains("accepts at most 2"));
     assert!(generator.jobs.lock().expect("lock").is_empty());
 }
+
+/// `--image-max-references` lowers what the service accepts below the
+/// model's own limit, and a value the model cannot honour is refused when
+/// the service is built, not on the first edit.
+#[tokio::test]
+async fn an_operator_cap_lowers_the_reference_limit() {
+    use shiso_runtime::image::ReferenceCapError;
+    use std::num::NonZeroU32;
+
+    let service = |cap: Option<u32>| {
+        let generator: Arc<dyn ImageGenerator> = Arc::new(Recording::default());
+        ImageService::start(ImageServiceDesc {
+            generator,
+            model_id: "mock".to_owned(),
+            max_queue: 4,
+            profile: None,
+        })
+        .expect("starts")
+        .with_max_references(cap.and_then(NonZeroU32::new))
+    };
+    // The mock takes two references.
+    assert_eq!(service(None).expect("no cap").max_references(), 2);
+    assert_eq!(service(Some(2)).expect("at the limit").max_references(), 2);
+    let capped = service(Some(1)).expect("below the limit");
+    assert_eq!(capped.max_references(), 1);
+    assert_eq!(
+        service(Some(3)).expect_err("above the model's limit"),
+        ReferenceCapError::AboveModel {
+            requested: 3,
+            model: 2
+        }
+    );
+
+    let state = AppState::without_language_model().with_image(capped);
+    let two = Edit {
+        generate: prompt("x"),
+        references: vec![vec![1], vec![2]],
+    };
+    let error = shiso_runtime::image::edit(&state, two)
+        .await
+        .expect_err("over the cap");
+    assert!(bad_request_message(&error).contains("accepts at most 1"));
+}

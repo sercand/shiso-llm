@@ -219,9 +219,7 @@ fn one_block_matches_the_reference_on_the_cached_path() {
 
         let mut kv = dit.prefix(&ops, feats.view(), p).expect("the prefix");
         assert_eq!(kv.tokens(), p);
-        let keys = ops
-            .download("k", kv.keys(0).expect("layer 0"), p * hidden)
-            .expect("read");
+        let keys = kv.keys(&ops, 0).expect("layer 0");
         let k_head0: Vec<f32> = keys
             .chunks_exact(hidden)
             .flat_map(|row| row[..head_dim].iter().copied())

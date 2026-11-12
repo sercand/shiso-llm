@@ -17,13 +17,18 @@
 #![cfg_attr(not(all(feature = "metal", target_os = "macos")), forbid(unsafe_code))]
 #![cfg_attr(
     all(feature = "metal", target_os = "macos"),
-    expect(unsafe_code, reason = "objc2 message sends into Metal")
+    expect(
+        unsafe_code,
+        reason = "objc2 message sends into Metal, and the system matrix library over shared buffers"
+    )
 )]
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod compile;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod device;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+mod host_gemm;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod pipeline;
 #[cfg(all(feature = "metal", target_os = "macos"))]

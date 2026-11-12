@@ -36,6 +36,24 @@
 //! warms the page cache: nothing is imported to the device while another
 //! component's weights would have to share the working set with it.
 //!
+//! # Edits
+//!
+//! A job with reference pictures conditions on more than its words
+//! ([`super::conditioning`]). Each picture is resized once
+//! ([`super::edit`]) and read twice: by the vision tower that shares the
+//! text encoder's file, whose rows and deepstack rows the encoder takes in
+//! at the picture's slots, and by the VAE encoder, whose latent tokens
+//! stand in the transformer's prefix where the encoder had those slots.
+//! The tower and the VAE encoder are loaded for the encode and dropped
+//! before the transformer is imported, in every residency: they are only
+//! ever needed beside the text encoder. The prefix then holds 4 tokens per
+//! slot - 4,096 for a 1024x1024 reference - and its cached keys and values
+//! are what an edit costs for the whole job, so the planner counts them and
+//! a job that does not fit is refused naming the references, never run
+//! with fewer or smaller ones. An install whose text-encoder file carries
+//! no tower, or whose VAE file no encoder, serves text-to-image only and
+//! says it takes no references.
+//!
 //! # Progress
 //!
 //! A progress event goes out after every step without a partial image: a
@@ -49,24 +67,34 @@ use std::time::Instant;
 use shiso_core::Backend;
 use shiso_vision::generator::{
     GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageLimits, ImageStepEvent,
+    InputReferenceImage,
 };
+use shiso_vision::{VisionTower, pack_rgb};
 
+use super::conditioning::{
+    Conditioning, FeatureCache, JobPrompt, edit_refusal, prepare_references,
+};
 use super::config::QwenImageConfig;
+use super::edit::{MAX_REFERENCES, PreparedReference};
 use super::prompt::QwenImagePrompt;
 use super::scheduler::{ScheduleSource, check_nodes, euler_dt, resolve};
-use super::transformer::{BlockReuse, DitDesc, QwenDit, StepOpts};
+use super::transformer::{BlockReuse, DitDesc, PrefixInput, QwenDit, StepOpts};
 use super::vae::{LatentGrid, QwenVae, QwenVaeDesc, SPATIAL_FACTOR};
+use super::vae_encode::{EncodePlan, QwenVaeEncoder};
 use crate::diffusion::draft::upsample2x_noisy;
 use crate::diffusion::encode::{Channels, encode_image};
 use crate::diffusion::noise::gaussian;
 use crate::diffusion::ops::Ops;
-use crate::diffusion::qwen3_text::{TapSet, TextEncoder, TextEncoderDesc};
+use crate::diffusion::qwen3_text::{
+    ImageRows, TapSet, TextEncoder, TextEncoderDesc, VisionPrefill,
+};
 use crate::diffusion::residency::{
     FileSpan, Footprint, JobPeaks, PlanDesc, Prefetch, Residency, ResidencyMode, plan, split_at,
     total_bytes,
 };
 use crate::diffusion::weights::{StStore, safetensors_files};
 use crate::image_registry::{ImageModelDesc, ImageResidency};
+use crate::qwen35::vision::Qwen35Tower;
 
 /// The text encoder's tensor prefix in the shipped file.
 const TE_PREFIX: &str = "model.";
@@ -123,6 +151,10 @@ pub(crate) enum Component {
     Encoder,
     /// The diffusion transformer.
     Denoiser,
+    /// The vision tower an edit's reference pictures are read by.
+    Tower,
+    /// The VAE encoder an edit's reference pictures become latents through.
+    VaeEncoder,
 }
 
 /// One residency change, in the order it happened.
@@ -157,6 +189,59 @@ struct EncoderFiles {
     intermediate: usize,
 }
 
+/// What an edit needs beyond text-to-image, sized from headers at load.
+#[derive(Debug)]
+struct EditFiles {
+    /// The VAE file, which also holds the encoder.
+    vae: PathBuf,
+    /// The VAE's config document.
+    vae_config: PathBuf,
+    /// The VAE encoder's channel plan, for its working-set estimate.
+    vae_plan: EncodePlan,
+    /// The VAE encoder's weights, widened to f32.
+    vae_bytes: u64,
+    /// The byte ranges of the VAE file the encoder's import reads.
+    vae_spans: Vec<FileSpan>,
+    /// The byte ranges of the text encoder file the vision tower reads.
+    tower_spans: Vec<FileSpan>,
+    /// The vision tower's weights as stored.
+    tower_bytes: u64,
+    /// The tower's width and feed-forward width, for its activations.
+    tower_hidden: usize,
+    tower_intermediate: usize,
+}
+
+/// The shape of one job, as far as the planner cares.
+#[derive(Debug, Clone, Copy)]
+struct JobShape {
+    /// Ids the text encoder reads.
+    encoder_tokens: usize,
+    /// Rows of the transformer's prefix: text and condition-image tokens.
+    prefix_tokens: usize,
+    /// The largest reference picture's latent grid; `None` for a text job.
+    largest_reference: Option<LatentGrid>,
+}
+
+impl JobShape {
+    /// A text job of `tokens` ids.
+    fn text(tokens: usize) -> Self {
+        Self {
+            encoder_tokens: tokens,
+            prefix_tokens: tokens.saturating_sub(super::prompt::DROP_IDX),
+            largest_reference: None,
+        }
+    }
+
+    /// The shape of `prompt`.
+    fn of(prompt: &JobPrompt) -> Self {
+        Self {
+            encoder_tokens: prompt.encoder_ids().len(),
+            prefix_tokens: prompt.prefix_tokens(),
+            largest_reference: prompt.grids().iter().copied().max_by_key(|g| g.cells()),
+        }
+    }
+}
+
 /// What the worker thread changes between jobs.
 #[derive(Debug)]
 struct State {
@@ -165,8 +250,8 @@ struct State {
     decoder: QwenVae,
     /// The encoder's read-ahead started behind the last decode.
     encoder_prefetch: Option<Prefetch>,
-    /// `(kept ids, features)`, most recent first.
-    features: Vec<(Vec<u32>, Vec<f32>)>,
+    /// The last few jobs' conditioning.
+    features: FeatureCache,
     events: Vec<ResidencyEvent>,
 }
 
@@ -181,6 +266,9 @@ pub(crate) struct QwenImage21Model {
     dit_path: PathBuf,
     dit_spans: Vec<FileSpan>,
     encoder_files: EncoderFiles,
+    /// `None` when the install cannot edit: its text-encoder file carries
+    /// no vision tower, or its VAE file no encoder.
+    edit: Option<EditFiles>,
     mode: ResidencyMode,
     working_set: u64,
     reserve: u64,
@@ -192,6 +280,20 @@ pub(crate) struct QwenImage21Model {
     /// ([`super::transformer::BlockReuse`]).
     final_reuse: Option<std::ops::Range<usize>>,
     state: Mutex<State>,
+}
+
+/// The refusal of a reference picture by an install that cannot edit.
+fn no_editing() -> ImageGenError {
+    ImageGenError::ReferenceImage(
+        "reference images are not accepted: this install's text encoder carries no vision \
+         tower, or its VAE no encoder, so it generates from text only"
+            .to_string(),
+    )
+}
+
+/// A vision-tower failure, as the image pipeline reports it.
+fn vision(error: &shiso_vision::VisionError) -> ImageGenError {
+    ImageGenError::Backend(format!("the vision tower: {error}"))
 }
 
 /// Device bytes in use now, when the backend says.
@@ -303,7 +405,7 @@ impl QwenImage21Model {
         backend: &Arc<dyn Backend>,
     ) -> Result<Self, ImageGenError> {
         let began = Instant::now();
-        let ops = Ops::new(backend)?;
+        let ops = Ops::new(backend)?.with_host_share(desc.host_share_per_mille)?;
         let assets = locate_assets(desc)?;
         let config = QwenImageConfig::read(&assets)?;
         // The checkpoint's documents are its whole schedule: shipped nodes
@@ -398,6 +500,13 @@ impl QwenImage21Model {
             let intermediate = shape(&format!("{layers}0.mlp.gate_proj.weight"), 0)?;
             (spans, hidden, intermediate)
         };
+        let edit = Self::edit_files(&te_weights, &vae_path, &assets)?;
+        if edit.is_none() {
+            tracing::info!(
+                "qwen image: this install has no vision tower beside its text encoder or no \
+                 VAE encoder, so it generates from text only"
+            );
+        }
         if te_hidden != config.dit.context_in_dim {
             return Err(ImageGenError::Checkpoint(format!(
                 "the text encoder's rows are {te_hidden} wide but the transformer reads {}",
@@ -460,6 +569,7 @@ impl QwenImage21Model {
                 hidden: te_hidden,
                 intermediate: te_intermediate,
             },
+            edit,
             mode,
             working_set,
             reserve: desc.reserve_bytes,
@@ -473,7 +583,7 @@ impl QwenImage21Model {
                 denoiser: None,
                 decoder,
                 encoder_prefetch: None,
-                features: Vec::new(),
+                features: FeatureCache::new(FEATURE_CACHE),
                 events: Vec::new(),
             }),
         };
@@ -491,7 +601,7 @@ impl QwenImage21Model {
         };
         {
             let mut state = model.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let residency = model.plan_job(&state, grid, PLAN_TOKENS)?;
+            let residency = model.plan_job(&state, grid, JobShape::text(PLAN_TOKENS), 0)?;
             tracing::info!(?residency, "qwen image load-time residency");
             if matches!(residency, Residency::Swap { .. }) {
                 model.ensure_denoiser(&mut state, None, true)?;
@@ -514,47 +624,137 @@ impl QwenImage21Model {
         Ok(model)
     }
 
+    /// What an edit needs, from the files' headers alone; `None` when the
+    /// install cannot edit.
+    ///
+    /// The tower is read out of a single text-encoder file (the layout the
+    /// INT8 export ships); a sharded encoder, one without `model.visual.*`,
+    /// or a VAE file without its encoder half means text-to-image only.
+    fn edit_files(
+        te_weights: &[PathBuf],
+        vae_path: &Path,
+        assets: &Path,
+    ) -> Result<Option<EditFiles>, ImageGenError> {
+        let [te_file] = te_weights else {
+            return Ok(None);
+        };
+        let te = StStore::open(te_file)?;
+        let fc1 = "model.visual.blocks.0.mlp.linear_fc1.weight";
+        let Some(fc1_shape) = te.get(fc1).map(|entry| entry.shape.clone()) else {
+            return Ok(None);
+        };
+        let axis = |i: usize| {
+            fc1_shape
+                .get(i)
+                .and_then(|&d| usize::try_from(d).ok())
+                .ok_or_else(|| ImageGenError::Checkpoint(format!("'{fc1}' has no axis {i}")))
+        };
+        let vae = StStore::open(vae_path)?;
+        if !vae.contains("encoder.conv1.weight") {
+            return Ok(None);
+        }
+        let z_dim = vae
+            .require("conv2.weight")?
+            .shape
+            .first()
+            .and_then(|&d| usize::try_from(d).ok())
+            .ok_or_else(|| {
+                ImageGenError::Checkpoint("'conv2.weight' has no channel axis".to_string())
+            })?;
+        let tower_spans = te.spans(|name| name.starts_with("model.visual."));
+        Ok(Some(EditFiles {
+            vae: vae_path.to_path_buf(),
+            vae_config: assets.join("vae/config.json"),
+            vae_plan: EncodePlan::read(&vae, z_dim)?,
+            vae_bytes: vae
+                .names()
+                .filter(|n| n.starts_with("encoder.") || n.starts_with("conv1."))
+                .filter_map(|n| vae.get(n))
+                .map(|e| e.elements() * 4)
+                .sum(),
+            vae_spans: vae.spans(|n| n.starts_with("encoder.") || n.starts_with("conv1.")),
+            tower_bytes: total_bytes(&tower_spans),
+            tower_spans,
+            tower_hidden: axis(1)?,
+            tower_intermediate: axis(0)?,
+        }))
+    }
+
     /// The job's activation peaks per phase.
-    fn peaks(&self, state: &State, grid: LatentGrid, tokens: usize) -> JobPeaks {
+    ///
+    /// An edit's encode phase also holds whichever is larger of its two
+    /// picture readers - the vision tower with its activations over the
+    /// largest reference, or the VAE encoder with its working set there -
+    /// and its denoise phase holds a prefix as long as the references make
+    /// it.
+    fn peaks(&self, state: &State, grid: LatentGrid, shape: JobShape) -> JobPeaks {
         let (enc_h, enc_i) = (self.encoder_files.hidden, self.encoder_files.intermediate);
         let dit = &self.config.dit;
         let (h, mlp) = (dit.hidden(), dit.mlp_hidden());
-        let kept = tokens.saturating_sub(super::prompt::DROP_IDX);
+        let kept = shape.prefix_tokens;
         let t = grid.cells();
         let row = 7 * h + 2 * mlp + dit.in_channels + dit.out_channels;
         let as_u64 = |v: usize| u64::try_from(v).unwrap_or(u64::MAX);
+        // The prefix cache is packed halves where the device can attend
+        // them, f32 otherwise; a half cache is narrowed from one layer's
+        // f32 keys and values, held while the prefix runs.
+        let (cache_width, narrowing) = if self.ops.half_cache() {
+            (2, 2 * kept * h * 4)
+        } else {
+            (4, 0)
+        };
+        let pictures = match (&self.edit, shape.largest_reference) {
+            (Some(edit), Some(largest)) => {
+                // Four patches per latent cell; per patch the tower holds
+                // its stream twice, the fused projection and its three
+                // parts, the attention output and the feed-forward.
+                let patches = 4 * largest.cells();
+                let tower = edit.tower_bytes
+                    + as_u64(patches * (16 * edit.tower_hidden + 2 * edit.tower_intermediate) * 4);
+                let vae = edit.vae_bytes + edit.vae_plan.working_set_bytes(largest);
+                tower.max(vae)
+            }
+            _ => 0,
+        };
         JobPeaks {
-            encode: as_u64(tokens * (8 * enc_h + 3 * enc_i) * 4),
-            denoise: as_u64(2 * dit.num_layers * kept * h * 4 + (t + kept) * row * 4),
+            encode: as_u64(shape.encoder_tokens * (8 * enc_h + 3 * enc_i) * 4) + pictures,
+            denoise: as_u64(
+                2 * dit.num_layers * kept * h * cache_width + narrowing + (t + kept) * row * 4,
+            ),
             decode: state.decoder.plan().working_set_bytes(grid),
         }
     }
 
-    fn plan_desc(&self, state: &State, grid: LatentGrid, tokens: usize) -> PlanDesc {
+    fn plan_desc(&self, state: &State, grid: LatentGrid, shape: JobShape) -> PlanDesc {
         PlanDesc {
             mode: self.mode,
             working_set: self.working_set,
             reserve: self.reserve,
             footprint: self.footprint,
-            peaks: self.peaks(state, grid, tokens),
+            peaks: self.peaks(state, grid, shape),
         }
     }
 
-    /// The job's residency, or a refusal naming the largest square side
-    /// that fits.
+    /// The job's residency, or a refusal: naming the largest square side
+    /// that fits for a text job, the references for an edit (what moves an
+    /// edit's need is how many pictures it carries).
     fn plan_job(
         &self,
         state: &State,
         grid: LatentGrid,
-        tokens: usize,
+        shape: JobShape,
+        references: usize,
     ) -> Result<Residency, ImageGenError> {
-        plan(&self.plan_desc(state, grid, tokens)).map_err(|short| {
+        plan(&self.plan_desc(state, grid, shape)).map_err(|short| {
+            if references > 0 {
+                return edit_refusal(short, references);
+            }
             let largest = (MIN_SIDE..=MAX_SIDE)
                 .rev()
                 .step_by(SIZE_MULTIPLE as usize)
                 .find(|&side| {
                     let n = side as usize / SPATIAL_FACTOR;
-                    plan(&self.plan_desc(state, LatentGrid { h: n, w: n }, tokens)).is_ok()
+                    plan(&self.plan_desc(state, LatentGrid { h: n, w: n }, shape)).is_ok()
                 })
                 .unwrap_or(0);
             let (h, w) = grid.image_size();
@@ -629,11 +829,14 @@ impl QwenImage21Model {
         swap: bool,
     ) -> Result<(), ImageGenError> {
         state.encoder_prefetch = None;
-        if state.denoiser.is_some() {
-            return Ok(());
-        }
+        // Before the early return: a job planned to swap must not denoise
+        // beside the encoder either when the transformer is already loaded
+        // (an earlier job planned resident leaves both).
         if swap {
             self.release(state, Component::Encoder);
+        }
+        if state.denoiser.is_some() {
+            return Ok(());
         }
         let phase = Instant::now();
         let (head, rest) = match ahead {
@@ -679,6 +882,9 @@ impl QwenImage21Model {
         let dropped = match component {
             Component::Encoder => state.encoder.take().is_some(),
             Component::Denoiser => state.denoiser.take().is_some(),
+            // An edit's picture readers live for one encode and are dropped
+            // where they were loaded ([`Self::encode_pictures`]).
+            Component::Tower | Component::VaeEncoder => false,
         };
         if !dropped {
             return;
@@ -688,6 +894,8 @@ impl QwenImage21Model {
         let label = match component {
             Component::Encoder => "te_drop",
             Component::Denoiser => "dit_drop",
+            Component::Tower => "tower_drop",
+            Component::VaeEncoder => "vae_encoder_drop",
         };
         tracing::info!(
             ms = ms(phase),
@@ -701,22 +909,25 @@ impl QwenImage21Model {
         });
     }
 
-    /// The prompt's transformer-side features `(kept, context)`: from the
-    /// cache, or encoded (loading the encoder, and in swap mode dropping
-    /// the transformer first and the encoder after).
+    /// The job's conditioning: from the cache, or encoded (loading the
+    /// encoder, and in swap mode dropping the transformer first and the
+    /// encoder after). `prepared` is an edit's reference pictures, in the
+    /// prompt's order.
     fn features(
         &self,
         state: &mut State,
-        ids: &super::prompt::PromptIds,
+        prompt: &JobPrompt,
+        prepared: &[PreparedReference],
         residency: Residency,
-    ) -> Result<(Vec<f32>, Option<ReadAhead>), ImageGenError> {
-        let kept = ids.kept().to_vec();
-        if let Some(at) = state.features.iter().position(|(k, _)| *k == kept) {
-            let entry = state.features.remove(at);
-            let features = entry.1.clone();
-            state.features.insert(0, entry);
-            tracing::info!(tokens = kept.len(), "qwen image prompt features cached");
-            return Ok((features, None));
+    ) -> Result<(Conditioning, Option<ReadAhead>), ImageGenError> {
+        let key = prompt.key();
+        if let Some(found) = state.features.get(&key) {
+            tracing::info!(
+                tokens = key.kept.len(),
+                references = prepared.len(),
+                "qwen image prompt features cached"
+            );
+            return Ok((found, None));
         }
         let swap = matches!(residency, Residency::Swap { .. });
         if swap {
@@ -727,7 +938,7 @@ impl QwenImage21Model {
         // fits beside the encoder's phase; the rest waits for the drop.
         let mut ahead = None;
         if swap && state.denoiser.is_none() {
-            let desc = self.plan_desc(state, LatentGrid { h: 1, w: 1 }, ids.ids.len());
+            let desc = self.plan_desc(state, LatentGrid { h: 1, w: 1 }, JobShape::of(prompt));
             let room = desc
                 .working_set
                 .saturating_sub(desc.reserve)
@@ -744,10 +955,11 @@ impl QwenImage21Model {
             }
         }
         let phase = Instant::now();
-        let encoded = self.encode(state, ids);
+        let encoded = self.encode(state, prompt, prepared);
         tracing::info!(
             ms = ms(phase),
-            tokens = ids.ids.len(),
+            tokens = prompt.encoder_ids().len(),
+            references = prepared.len(),
             ok = encoded.is_ok(),
             "qwen image phase encode"
         );
@@ -756,28 +968,192 @@ impl QwenImage21Model {
         if swap {
             self.release(state, Component::Encoder);
         }
-        let features = encoded?;
-        state.features.insert(0, (kept, features.clone()));
-        state.features.truncate(FEATURE_CACHE);
-        Ok((features, ahead))
+        let conditioning = encoded?;
+        state.features.put(key, conditioning.clone());
+        Ok((conditioning, ahead))
     }
 
-    /// The prompt's kept feature rows from the loaded encoder.
+    /// The job's conditioning from the loaded encoder: the prompt's text
+    /// rows, and for an edit each reference picture's latent tokens.
     fn encode(
         &self,
-        state: &State,
-        ids: &super::prompt::PromptIds,
+        state: &mut State,
+        prompt: &JobPrompt,
+        prepared: &[PreparedReference],
+    ) -> Result<Conditioning, ImageGenError> {
+        let unloaded = || ImageGenError::Backend("the text encoder is not loaded".to_string());
+        let short = || ImageGenError::Backend("the encoder returned too few rows".to_string());
+        let width = state.encoder.as_ref().ok_or_else(unloaded)?.context_width();
+        let (all, images) = match prompt {
+            JobPrompt::Text(ids) => {
+                let encoder = state.encoder.as_ref().ok_or_else(unloaded)?;
+                (encoder.prefill(&self.ops, &ids.ids)?, Vec::new())
+            }
+            JobPrompt::Edit { ids, .. } => {
+                let images = self.encode_latents(state, prepared)?;
+                (self.encode_pictures(state, ids, prepared)?, images)
+            }
+        };
+        let kept = all.get(prompt.dropped() * width..).ok_or_else(short)?;
+        Ok(Conditioning {
+            text: prompt.text_features(kept, width)?,
+            images,
+        })
+    }
+
+    /// Each reference picture's normalized latent tokens, through a VAE
+    /// encoder loaded for this call and dropped at its end.
+    fn encode_latents(
+        &self,
+        state: &mut State,
+        prepared: &[PreparedReference],
+    ) -> Result<Vec<Vec<f32>>, ImageGenError> {
+        let edit = self.edit.as_ref().ok_or_else(no_editing)?;
+        let phase = Instant::now();
+        // The encoder is read tensor by tensor out of a mapping whose pages
+        // the swapped components' gigabytes have long since pushed out of
+        // the page cache; faulted in a page at a time that took 1.9 s of
+        // every edit on an M4, read ahead it takes a tenth of that.
+        Prefetch::spawn("vae encoder", edit.vae_spans.clone())?.wait()?;
+        let before = device_used(self.ops.backend());
+        let vae = QwenVaeEncoder::load(
+            &QwenVaeDesc {
+                weights: &edit.vae,
+                config: &edit.vae_config,
+            },
+            &self.ops,
+        )?;
+        let loaded = delta(before, device_used(self.ops.backend()));
+        let load_ms = ms(phase);
+        state.events.push(ResidencyEvent::Loaded {
+            component: Component::VaeEncoder,
+            device_bytes: loaded,
+        });
+        let channels = self.config.dit.in_channels;
+        let encoded: Result<Vec<Vec<f32>>, ImageGenError> = prepared
+            .iter()
+            .map(|picture| {
+                let grid = picture.latent_grid();
+                let tokens = vae.encode(&self.ops, &picture.rgba, grid)?;
+                self.ops.download(
+                    "qwen condition latents",
+                    tokens.view(),
+                    grid.cells() * channels,
+                )
+            })
+            .collect();
+        // Dropped whether the encodes worked or not, like the text encoder;
+        // the device's own count says what the drop gave back.
+        let held = device_used(self.ops.backend());
+        drop(vae);
+        self.ops.trim_pool();
+        state.events.push(ResidencyEvent::Dropped {
+            component: Component::VaeEncoder,
+            device_bytes: delta(device_used(self.ops.backend()), held),
+        });
+        tracing::info!(
+            ms = ms(phase),
+            load_ms,
+            device_bytes = loaded,
+            references = prepared.len(),
+            ok = encoded.is_ok(),
+            "qwen image phase vae_encode"
+        );
+        encoded
+    }
+
+    /// The encoder's rows for an edit prompt, every id's: the vision tower
+    /// (loaded for this call, dropped at its end) reads each picture, and
+    /// the encoder takes its rows and deepstack rows in at the picture's
+    /// slots.
+    fn encode_pictures(
+        &self,
+        state: &mut State,
+        ids: &super::prompt::EditPromptIds,
+        prepared: &[PreparedReference],
     ) -> Result<Vec<f32>, ImageGenError> {
-        let encoder = state
-            .encoder
-            .as_ref()
-            .ok_or_else(|| ImageGenError::Backend("the text encoder is not loaded".to_string()))?;
-        let all = encoder.prefill(&self.ops, &ids.ids)?;
-        let width = encoder.context_width();
-        Ok(all
-            .get(ids.drop * width..)
-            .ok_or_else(|| ImageGenError::Backend("the encoder returned too few rows".to_string()))?
-            .to_vec())
+        let phase = Instant::now();
+        let backend = self.ops.backend();
+        let edit = self.edit.as_ref().ok_or_else(no_editing)?;
+        // The tower's tensors are not among the ones the encoder's own
+        // prefetch reads; see `encode_latents`.
+        Prefetch::spawn("vision tower", edit.tower_spans.clone())?.wait()?;
+        let before = device_used(backend);
+        let [weights] = self.encoder_files.weights.as_slice() else {
+            return Err(no_editing());
+        };
+        let tower = Qwen35Tower::open_checkpoint_file(backend, weights, &self.encoder_files.config)
+            .map_err(|e| vision(&e))?;
+        let loaded = delta(before, device_used(backend));
+        let load_ms = ms(phase);
+        state.events.push(ResidencyEvent::Loaded {
+            component: Component::Tower,
+            device_bytes: loaded,
+        });
+        let rows = (|| {
+            let mut read = Vec::with_capacity(prepared.len());
+            for picture in prepared {
+                let item = pack_rgb(
+                    &picture.rgb,
+                    picture.width,
+                    picture.height,
+                    tower.preprocess(),
+                )
+                .map_err(|e| vision(&e))?;
+                read.push(tower.encode_deep(backend, &item).map_err(|e| vision(&e))?);
+            }
+            let images: Vec<ImageRows<'_>> = ids
+                .images
+                .iter()
+                .zip(&read)
+                .map(|((run, _), (main, deep))| ImageRows {
+                    at: run.clone(),
+                    main: main.view(),
+                    deep: deep
+                        .rows
+                        .iter()
+                        .map(shiso_core::DeviceBuffer::view)
+                        .collect(),
+                })
+                .collect();
+            let encoder = state.encoder.as_ref().ok_or_else(|| {
+                ImageGenError::Backend("the text encoder is not loaded".to_string())
+            })?;
+            encoder.prefill_vision(
+                &self.ops,
+                &VisionPrefill {
+                    ids: &ids.ids,
+                    positions: &ids.positions(),
+                    images: &images,
+                },
+            )
+        })();
+        let held = device_used(backend);
+        drop(tower);
+        self.ops.trim_pool();
+        state.events.push(ResidencyEvent::Dropped {
+            component: Component::Tower,
+            device_bytes: delta(device_used(backend), held),
+        });
+        tracing::info!(
+            ms = ms(phase),
+            load_ms,
+            device_bytes = loaded,
+            references = prepared.len(),
+            ok = rows.is_ok(),
+            "qwen image phase tower"
+        );
+        rows
+    }
+
+    /// Loads the encoder and the transformer together, as a job planned
+    /// resident leaves them: the state a later job planned to swap starts
+    /// from on a host whose plan depends on the job.
+    #[cfg(test)]
+    pub(crate) fn stage_both_loaded(&self) -> Result<(), ImageGenError> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        self.ensure_encoder(&mut state)?;
+        self.ensure_denoiser(&mut state, None, false)
     }
 
     /// Puts the model where a resident job on a larger host leaves a
@@ -801,7 +1177,8 @@ impl QwenImage21Model {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         self.features(
             &mut state,
-            &ids,
+            &JobPrompt::Text(ids),
+            &[],
             Residency::Swap {
                 keep_denoiser: true,
             },
@@ -837,6 +1214,24 @@ impl ImageGenerator for QwenImage21Model {
         }
     }
 
+    fn max_references(&self) -> usize {
+        if self.edit.is_some() {
+            MAX_REFERENCES
+        } else {
+            0
+        }
+    }
+
+    fn default_size_for_references(
+        &self,
+        references: &[InputReferenceImage],
+    ) -> Result<(u32, u32), ImageGenError> {
+        if self.edit.is_none() {
+            return Err(no_editing());
+        }
+        super::edit::default_size(references)
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one generation: plan, encode, prefix, the Euler loop, decode and encode, straight-line by construction"
@@ -847,22 +1242,31 @@ impl ImageGenerator for QwenImage21Model {
         progress: Option<&dyn Fn(ImageStepEvent)>,
     ) -> Result<GeneratedImage, ImageGenError> {
         job.validate(&self.limits())?;
-        if !job.input_references.is_empty() {
-            return Err(ImageGenError::ReferenceImage(
-                "reference images are not accepted: this model generates from text only \
-                 (editing is not supported)"
-                    .to_string(),
-            ));
-        }
         let began = Instant::now();
+        // An edit's pictures are decoded and resized before the model is
+        // touched: a request that can never run costs no device work.
+        let prepared = if job.input_references.is_empty() {
+            Vec::new()
+        } else if self.edit.is_none() {
+            return Err(no_editing());
+        } else {
+            prepare_references(&job.input_references)?
+        };
+        let prompt = if prepared.is_empty() {
+            JobPrompt::Text(self.prompt.tokenize(&job.prompt)?)
+        } else {
+            let slots: Vec<(usize, usize)> =
+                prepared.iter().map(PreparedReference::slots).collect();
+            JobPrompt::edit(self.prompt.tokenize_edit(&job.prompt, &slots)?, &prepared)
+        };
+        let shape = JobShape::of(&prompt);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let _trim = TrimPool(&self.ops);
-        let ids = self.prompt.tokenize(&job.prompt)?;
         let grid = LatentGrid {
             h: job.height as usize / SPATIAL_FACTOR,
             w: job.width as usize / SPATIAL_FACTOR,
         };
-        let residency = self.plan_job(&state, grid, ids.ids.len())?;
+        let residency = self.plan_job(&state, grid, shape, prepared.len())?;
         let steps = job.steps as usize;
         let mut sigmas = resolve(
             self.schedule.source(),
@@ -907,13 +1311,16 @@ impl ImageGenerator for QwenImage21Model {
             width = job.width,
             height = job.height,
             steps,
-            tokens = ids.ids.len(),
+            tokens = shape.encoder_tokens,
+            references = prepared.len(),
+            prefix = shape.prefix_tokens,
             cells = grid.cells(),
             ?residency,
             "qwen image generation started"
         );
 
-        let (features, ahead) = self.features(&mut state, &ids, residency)?;
+        let (conditioning, ahead) = self.features(&mut state, &prompt, &prepared, residency)?;
+        drop(prepared);
         let swap = matches!(residency, Residency::Swap { .. });
         self.ensure_denoiser(&mut state, ahead, swap)?;
         let dit = state
@@ -928,9 +1335,25 @@ impl ImageGenerator for QwenImage21Model {
                 .map_err(|e| ImageGenError::Backend(format!("qwen image sync: {e}")))
         };
         let phase = Instant::now();
-        let kept = ids.ids.len() - ids.drop;
-        let text = ops.upload_scratch("qwen text features", &features)?;
-        let mut kv = dit.prefix(ops, text.view(), kept)?;
+        let kept = prompt.text_rows();
+        let layout = prompt.layout();
+        let text = ops.upload_scratch("qwen text features", &conditioning.text)?;
+        let pictures = conditioning
+            .images
+            .iter()
+            .map(|latents| ops.upload_scratch("qwen condition latents", latents))
+            .collect::<Result<Vec<_>, _>>()?;
+        let picture_views: Vec<_> = pictures.iter().map(|buffer| buffer.view()).collect();
+        let mut kv = dit.prefix_layout(
+            ops,
+            &PrefixInput {
+                layout: &layout,
+                text_feats: text.view(),
+                latents: &picture_views,
+            },
+        )?;
+        drop(picture_views);
+        drop(pictures);
         drop(text);
         if draft > 0 {
             dit.prepare_steps(ops, &mut kv, &draft_sigmas[..draft], draft_grid)?;
@@ -1053,7 +1476,7 @@ impl ImageGenerator for QwenImage21Model {
             // read in behind this decode, but only when they fit beside the
             // decoder and the decode's working set - otherwise the read
             // would evict pages the decode is using.
-            let decode_peak = self.peaks(&state, grid, ids.ids.len()).decode;
+            let decode_peak = self.peaks(&state, grid, shape).decode;
             let budget = self.working_set.saturating_sub(self.reserve);
             if self.footprint.encoder + self.footprint.decoder + decode_peak <= budget {
                 state.encoder_prefetch = Some(Prefetch::spawn(

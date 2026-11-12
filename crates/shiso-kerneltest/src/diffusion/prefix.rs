@@ -24,9 +24,11 @@ use crate::harness::{Gpu, drain, f32_bytes, run};
 use crate::oracle::signal;
 
 /// Every entry point this file's cases launch.
-pub const ENTRIES: [&str; 9] = [
+pub const ENTRIES: [&str; 11] = [
     "kernel_dit_gqa_f32",
+    "kernel_dit_flash_gqa_d128_f32",
     "kernel_dit_rope_half",
+    "kernel_dit_rope_half_table",
     "kernel_dit_flash_sdpa_f32",
     "kernel_dit_flash_sdpa_causal_f32",
     "kernel_dit_flash_sdpa_d128_f32",
@@ -488,8 +490,26 @@ fn gqa_host(
     out
 }
 
+/// Query rows per threadgroup of the fused grouped-query tile.
+const FLASH_GQA_ROWS: u32 = 64;
+/// Threads per threadgroup of the fused grouped-query tile.
+const FLASH_GQA_THREADS: u32 = 256;
+
 fn gqa_device(
     gpu: &Gpu,
+    qkv: (&[f32], &[f32], &[f32]),
+    shape: (usize, usize, usize, usize),
+    valid: usize,
+) -> Vec<f32> {
+    gqa_entry(gpu, "kernel_dit_gqa_f32", qkv, shape, valid)
+}
+
+/// Runs one grouped-query entry, each with its own launch geometry: a
+/// threadgroup per (row, head) for the per-row kernel, per (64 rows, head)
+/// for the fused tile.
+fn gqa_entry(
+    gpu: &Gpu,
+    entry: &'static str,
     qkv: (&[f32], &[f32], &[f32]),
     shape: (usize, usize, usize, usize),
     valid: usize,
@@ -504,11 +524,22 @@ fn gqa_device(
         head_dim: hd as u32,
         valid_keys: valid as u32,
     };
+    let (grid, block) = if entry == "kernel_dit_gqa_f32" {
+        (
+            Extent3::new(rows as u32, q_heads as u32, 1),
+            Extent3::linear(BLOCK),
+        )
+    } else {
+        (
+            Extent3::new((rows as u32).div_ceil(FLASH_GQA_ROWS), q_heads as u32, 1),
+            Extent3::linear(FLASH_GQA_THREADS),
+        )
+    };
     launch(
         gpu,
-        "kernel_dit_gqa_f32",
-        Extent3::new(rows as u32, q_heads as u32, 1),
-        Extent3::linear(BLOCK),
+        entry,
+        grid,
+        block,
         &[
             KernelArg::Bytes(bytemuck::bytes_of(&args)),
             KernelArg::Buffer(out.view()),
@@ -519,6 +550,67 @@ fn gqa_device(
     );
     drain(gpu);
     gpu.read_f32(&out)
+}
+
+/// The fused grouped-query tile is the per-row kernel's attention: against
+/// the `f64` oracle and against the per-row entry on the same device, over
+/// rows that leave a ragged last tile and a ragged last key block, with
+/// query heads sharing kv heads, unpadded and with pad rows that attend only
+/// the real keys.
+///
+/// # Panics
+///
+/// When the fused entry leaves 1e-4 of the oracle or 1e-5 of the values'
+/// size from the per-row entry, or the pad rows' masked answer is the unmasked one.
+pub fn flash_gqa_is_the_per_row_attention(gpu: &Gpu) {
+    let (rows, q_heads, kv_heads, hd) = (150usize, 4usize, 2usize, 128usize);
+    let scaled = |n: usize, seed: u32| -> Vec<f32> {
+        signal(rows * n * hd, seed)
+            .iter()
+            .map(|v| v * 0.3)
+            .collect()
+    };
+    let (q, k, v) = (
+        scaled(q_heads, 71),
+        scaled(kv_heads, 72),
+        scaled(kv_heads, 73),
+    );
+    let shape = (rows, q_heads, kv_heads, hd);
+    let mut answers = Vec::new();
+    for valid in [rows, 97] {
+        let fused = gqa_entry(
+            gpu,
+            "kernel_dit_flash_gqa_d128_f32",
+            (&q, &k, &v),
+            shape,
+            valid,
+        );
+        close(
+            &fused,
+            &gqa_host((&q, &k, &v), shape, valid),
+            1e-4,
+            1e-3,
+            &format!("fused gqa vs f64, valid {valid}"),
+        );
+        close(
+            &fused,
+            &gqa_device(gpu, (&q, &k, &v), shape, valid),
+            // Both are f32 sums in different orders; an output is an average
+            // of values up to 0.3 in size, so one that cancels to near zero
+            // is graded against that size, not its own.
+            1e-5,
+            0.3,
+            &format!("fused gqa vs per-row, valid {valid}"),
+        );
+        answers.push(fused);
+    }
+    let real = 97 * q_heads * hd;
+    differs(
+        &answers[1][real..],
+        &answers[0][real..],
+        1e-3,
+        "fused gqa pad rows masked vs unmasked",
+    );
 }
 
 /// The text encoder's padded prefill: rows at or past `valid_keys` are pad
@@ -639,4 +731,166 @@ pub fn rope_half_pins_trailing_rows_to_one_position(gpu: &Gpu) {
     let plain = run_with(tokens);
     close(&plain, &host(tokens), 1e-5, 1e-3, "rope_half unpinned");
     differs(&pinned, &plain, 1e-3, "rope_half pinned vs unpinned");
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct RopeHalfTableArgs {
+    tokens: u32,
+    heads: u32,
+    head_dim: u32,
+}
+
+/// Rotate-half `RoPE` from a per-token angle table: pair `(i, i + head_dim/2)`
+/// of token `t` turns by the angle whose cosine and sine are `cos[t][i]` and
+/// `sin[t][i]`, for every head. A multi-axis decoder's pairs take their
+/// position from different axes, which a token index cannot express; the
+/// table can.
+///
+/// # Panics
+///
+/// When a row leaves 1e-5 of the `f64` oracle, or a table of all-zero angles
+/// changed the tensor.
+pub fn rope_half_table_turns_each_pair_by_its_own_angle(gpu: &Gpu) {
+    let (tokens, heads, hd) = (5usize, 3usize, 8usize);
+    let fold = hd / 2;
+    let x = signal(tokens * heads * hd, 73);
+    // Three position axes, pairs interleaved over them, as a
+    // vision-language decoder lays them out.
+    let positions = [[0u32, 0, 0], [1, 1, 1], [2, 2, 5], [2, 3, 5], [4, 4, 4]];
+    let angles: Vec<f64> = (0..tokens)
+        .flat_map(|t| {
+            (0..fold).map(move |i| {
+                let freq = 10000f64.powf(-(2.0 * i as f64) / hd as f64);
+                f64::from(positions[t][i % 3]) * freq
+            })
+        })
+        .collect();
+    let run_with = |angles: &[f64]| -> Vec<f32> {
+        let cos: Vec<f32> = angles.iter().map(|a| a.cos() as f32).collect();
+        let sin: Vec<f32> = angles.iter().map(|a| a.sin() as f32).collect();
+        let dx = upload(gpu, &x);
+        let dc = upload(gpu, &cos);
+        let ds = upload(gpu, &sin);
+        let args = RopeHalfTableArgs {
+            tokens: tokens as u32,
+            heads: heads as u32,
+            head_dim: hd as u32,
+        };
+        launch(
+            gpu,
+            "kernel_dit_rope_half_table",
+            Extent3::new(tokens as u32, heads as u32, 1),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(dx.view()),
+                KernelArg::Buffer(dc.view()),
+                KernelArg::Buffer(ds.view()),
+            ],
+        );
+        drain(gpu);
+        gpu.read_f32(&dx)
+    };
+    let mut want = x.clone();
+    for t in 0..tokens {
+        for h in 0..heads {
+            let row = (t * heads + h) * hd;
+            for i in 0..fold {
+                let angle = angles[t * fold + i];
+                let (c, s) = (angle.cos(), angle.sin());
+                let (x0, x1) = (f64::from(x[row + i]), f64::from(x[row + i + fold]));
+                want[row + i] = (x0 * c - x1 * s) as f32;
+                want[row + i + fold] = (x1 * c + x0 * s) as f32;
+            }
+        }
+    }
+    let turned = run_with(&angles);
+    close(&turned, &want, 1e-5, 1e-3, "rope_half_table");
+    let still = run_with(&vec![0.0; angles.len()]);
+    close(&still, &x, 0.0, 0.0, "rope_half_table at zero angles");
+    differs(&turned, &still, 1e-3, "rope_half_table turned vs still");
+}
+
+/// The causal entry with cached rows: the cached keys stand before every
+/// live row, so each live row attends all of them plus the live rows up to
+/// itself. That is a later segment of a causal sequence run on its own - the
+/// rows after a picture in an interleaved prefix - and it must be the same
+/// attention as the whole sequence run causally in one piece. 100 live rows
+/// straddle two query tiles, so the diagonal block and a tile that would
+/// have stopped streaming early both read the cache.
+///
+/// # Panics
+///
+/// When the device answer leaves the half-staging tolerance of the `f64`
+/// oracle, or when it does not differ from the same rows without a cache.
+pub fn flash_sdpa_causal_sees_every_cached_row(gpu: &Gpu) {
+    for (heads, hd, seed, entry) in [
+        (
+            2usize,
+            128usize,
+            51u32,
+            "kernel_dit_flash_sdpa_causal_d128_f32",
+        ),
+        (2, 128, 51, "kernel_dit_flash_sdpa_causal_f32"),
+        (3, 64, 61, "kernel_dit_flash_sdpa_causal_f32"),
+    ] {
+        let (cached, live) = (45usize, 100usize);
+        let rows = cached + live;
+        let width = heads * hd;
+        let scaled = |seed: u32| -> Vec<f32> {
+            signal(rows * width, seed).iter().map(|v| v * 0.4).collect()
+        };
+        let (q, k, v) = (scaled(seed), scaled(seed + 1), scaled(seed + 2));
+        // The whole sequence, causally: the cached rows first.
+        let whole = attention_host(&q, &k, &v, (rows, heads, hd), true);
+        let want = &whole[cached * width..];
+        let split = cached * width;
+        let run = |cache_tokens: usize| -> Vec<f32> {
+            let live_q = upload(gpu, &q[split..]);
+            let live_k = upload(gpu, &k[split..]);
+            let live_v = upload(gpu, &v[split..]);
+            let cache_keys = upload(gpu, &k[..split]);
+            let cache_values = upload(gpu, &v[..split]);
+            let out = upload(gpu, &vec![0f32; live * width]);
+            let dummy = upload(gpu, &[0.0]);
+            let args = SdpaArgs {
+                txt_tokens: live as u32,
+                img_tokens: 0,
+                cache_tokens: cache_tokens as u32,
+                heads: heads as u32,
+                head_dim: hd as u32,
+                txt_stride: width as u32,
+                img_stride: width as u32,
+                cache_stride: width as u32,
+                q_offset: 0,
+                k_offset: 0,
+                v_offset: 0,
+            };
+            launch(
+                gpu,
+                entry,
+                Extent3::new((live as u32).div_ceil(FA_QROWS), heads as u32, 1),
+                Extent3::linear(FA_THREADS),
+                &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(out.view()),
+                    KernelArg::Buffer(dummy.view()),
+                    KernelArg::Buffer(live_q.view()),
+                    KernelArg::Buffer(live_k.view()),
+                    KernelArg::Buffer(live_v.view()),
+                    KernelArg::Buffer(dummy.view()),
+                    KernelArg::Buffer(dummy.view()),
+                    KernelArg::Buffer(dummy.view()),
+                    KernelArg::Buffer(cache_keys.view()),
+                    KernelArg::Buffer(cache_values.view()),
+                ],
+            );
+            drain(gpu);
+            gpu.read_f32(&out)
+        };
+        let got = run(cached);
+        close(&got, want, 3e-3, 0.05, entry);
+        differs(&got, &run(0), 1e-2, "causal with and without the cache");
+    }
 }

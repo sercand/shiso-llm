@@ -233,6 +233,7 @@ pub(super) fn forge_tiny(residency: ImageResidency) -> Tiny {
         residency,
         reserve_bytes: DEFAULT_IMAGE_RESERVE_BYTES,
         draft_steps: 0,
+        host_share_per_mille: 0,
         final_reuse: None,
     };
     Tiny { _dir: dir, desc }
@@ -798,6 +799,7 @@ fn real_files_swap_and_resident_same_bytes_for_one_seed() {
             residency,
             reserve_bytes: DEFAULT_IMAGE_RESERVE_BYTES,
             draft_steps: 0,
+            host_share_per_mille: 0,
             final_reuse: None,
         };
         let generator = open_image_generator(&desc, &backend).expect("opens");

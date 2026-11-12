@@ -88,6 +88,20 @@ impl VisionShard {
     /// [`VisionError::ShardHeader`] for a header this reader cannot trust,
     /// with the reason as a typed fault rather than a message.
     pub fn open(path: &Path) -> Result<Self, VisionError> {
+        Self::open_under(path, "")
+    }
+
+    /// [`Self::open`] over only the tensors whose names start with `prefix`.
+    ///
+    /// For a file that holds a tower beside other tensors: the others are
+    /// never described, so a dtype the tower's kernels do not read fails the
+    /// open only when the tower itself carries it, and [`Self::len`] counts
+    /// the tower alone.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::open`].
+    pub fn open_under(path: &Path, prefix: &str) -> Result<Self, VisionError> {
         let mut file = File::open(path).map_err(|source| VisionError::TowerIo {
             path: path.to_path_buf(),
             source,
@@ -127,7 +141,7 @@ impl VisionShard {
 
         let mut entries = HashMap::with_capacity(table.len());
         for (name, value) in table {
-            if name == METADATA_KEY {
+            if name == METADATA_KEY || !name.starts_with(prefix) {
                 continue;
             }
             let entry = parse_entry(&value, path)?;

@@ -30,6 +30,7 @@ use super::load_vision_weights;
 use crate::qwen35::vision::dims::VisionDims;
 use crate::qwen35::vision::manifest::{
     AxisOrder, PUBLISHED_SIDECAR, SIDECAR_PREFIX, SIDECAR_PREFIX_CANONICAL, TowerManifest,
+    TowerMerger, TowerTensorSpec, deepstack_mergers,
 };
 use shiso_vision::VisionError;
 use shiso_vision::{PatchGeometry, VisionSource};
@@ -853,4 +854,174 @@ fn padded_intermediate_only_widens() {
         4352
     );
     assert!(dims.with_padded_intermediate(4096).is_err());
+}
+
+// -- a tower inside a single weight file -------------------------------------
+
+/// A config document for [`TowerFixture::tiny`] with deepstack taps: the
+/// shape a vision-language text encoder's `config.json` has.
+fn checkpoint_file_config(taps: &[usize]) -> String {
+    let tiny = TowerFixture::tiny();
+    serde_json::json!({
+        "architectures": ["Qwen3VLForConditionalGeneration"],
+        "model_type": "qwen3_vl",
+        "image_token_id": 151_655,
+        "video_token_id": 151_656,
+        "vision_start_token_id": 151_652,
+        "vision_end_token_id": 151_653,
+        "text_config": {
+            "model_type": "qwen3_vl_text",
+            "hidden_size": tiny.out_hidden,
+            "intermediate_size": 24,
+            "num_attention_heads": 2,
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 6,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 5_000_000,
+            "vocab_size": 151_936,
+            "max_position_embeddings": 262_144,
+            "rope_scaling": {
+                "mrope_interleaved": true,
+                "mrope_section": [1, 1, 1],
+                "rope_type": "default"
+            }
+        },
+        "vision_config": {
+            "depth": tiny.depth,
+            "hidden_size": tiny.hidden,
+            "num_heads": tiny.heads,
+            "intermediate_size": tiny.intermediate,
+            "out_hidden_size": tiny.out_hidden,
+            "num_position_embeddings": tiny.positions,
+            "patch_size": tiny.patch,
+            "temporal_patch_size": tiny.temporal,
+            "spatial_merge_size": tiny.merge,
+            "in_channels": 3,
+            "hidden_act": "gelu_pytorch_tanh",
+            "deepstack_visual_indexes": taps,
+        }
+    })
+    .to_string()
+}
+
+/// A safetensors file holding the tiny tower under `model.visual.` with
+/// `taps` deepstack mergers, every tensor f32 and filled with its own index,
+/// beside a language-model tensor in a dtype no tower kernel reads. `omit`
+/// leaves one tower tensor out.
+fn checkpoint_file(taps: usize, omit: Option<&str>) -> NamedTempFile {
+    let dims = TowerFixture::tiny().dims();
+    let manifest = TowerManifest::build(SIDECAR_PREFIX, dims);
+    let mergers = deepstack_mergers(SIDECAR_PREFIX, dims, taps);
+    let specs: Vec<&TowerTensorSpec> = manifest
+        .iter()
+        .chain(mergers.iter().flat_map(TowerMerger::iter))
+        .filter(|spec| Some(spec.name()) != omit)
+        .collect();
+
+    let mut header = serde_json::Map::new();
+    let mut payload: Vec<u8> = Vec::new();
+    for (index, spec) in specs.iter().enumerate() {
+        let start = payload.len();
+        let fill = f32::from(u16::try_from(index).expect("few tensors"));
+        for _ in 0..spec.elements() {
+            payload.extend_from_slice(&fill.to_le_bytes());
+        }
+        header.insert(
+            spec.name().to_owned(),
+            serde_json::json!({
+                "dtype": "F32",
+                "shape": spec.shape(),
+                "data_offsets": [start, payload.len()],
+            }),
+        );
+    }
+    let start = payload.len();
+    payload.extend_from_slice(&[0u8; 8]);
+    header.insert(
+        "model.layers.0.mlp.gate_proj.weight".to_owned(),
+        serde_json::json!({"dtype": "I8", "shape": [2, 4], "data_offsets": [start, payload.len()]}),
+    );
+    let header = serde_json::to_vec(&header).expect("the header serializes");
+
+    let mut file = NamedTempFile::with_suffix(".safetensors").expect("a temporary file");
+    file.write_all(&as_u64(header.len()).to_le_bytes())
+        .expect("writes");
+    file.write_all(&header).expect("writes");
+    file.write_all(&payload).expect("writes");
+    file.flush().expect("flushes");
+    file
+}
+
+fn checkpoint_file_source(
+    weights: &NamedTempFile,
+    taps: &[usize],
+) -> (VisionSource, NamedTempFile) {
+    let mut config = NamedTempFile::with_suffix(".json").expect("a temporary file");
+    config
+        .write_all(checkpoint_file_config(taps).as_bytes())
+        .expect("writes");
+    config.flush().expect("flushes");
+    let source = VisionSource::CheckpointFile {
+        weights: weights.path().to_path_buf(),
+        config: config.path().to_path_buf(),
+    };
+    (source, config)
+}
+
+/// The tower of a single-file text encoder loads from under `model.visual.`
+/// with one merger per deepstack tap, and nothing outside that prefix is
+/// described - the file's other tensors are in formats this loader refuses.
+#[test]
+fn a_checkpoint_file_tower_loads_with_its_deepstack_mergers() {
+    let weights_file = checkpoint_file(2, None);
+    let (source, _config) = checkpoint_file_source(&weights_file, &[0, 1]);
+    let backend = FakeBackend::new();
+    let weights = load_vision_weights(&device(&backend), &source).expect("the tower loads");
+
+    let dims = TowerFixture::tiny().dims();
+    assert_eq!(weights.prefix(), SIDECAR_PREFIX);
+    assert_eq!(weights.dims(), dims);
+    assert_eq!(weights.tensor_count(), dims.tensor_count() + 12);
+    let taps = weights.deepstack();
+    assert_eq!(taps.len(), 2);
+    assert_eq!((taps[0].block(), taps[1].block()), (0, 1));
+    let folded = u64::try_from(dims.merge_input()).expect("fits");
+    assert_eq!(taps[0].merger().norm.weight.elements(), folded);
+    assert_eq!(
+        u64::try_from(backend.live()),
+        Ok(as_u64(dims.tensor_count() + 12))
+    );
+    drop(weights);
+    assert_eq!(backend.live(), 0);
+}
+
+/// A tower with taps and a file without their mergers is not that tower.
+#[test]
+fn a_checkpoint_file_missing_a_deepstack_tensor_is_refused() {
+    let weights_file = checkpoint_file(
+        2,
+        Some("model.visual.deepstack_merger_list.1.linear_fc2.bias"),
+    );
+    let (source, _config) = checkpoint_file_source(&weights_file, &[0, 1]);
+    let backend = FakeBackend::new();
+    match load_vision_weights(&device(&backend), &source) {
+        Err(VisionError::TensorCount { found, expected }) => {
+            assert_eq!(found + 1, expected);
+        }
+        other => panic!("expected a tensor-count refusal, got {other:?}"),
+    }
+    assert_eq!(backend.live(), 0);
+}
+
+/// A tap past the last block names a block that does not exist.
+#[test]
+fn a_deepstack_tap_outside_the_tower_is_refused() {
+    let weights_file = checkpoint_file(2, None);
+    let (source, _config) = checkpoint_file_source(&weights_file, &[0, 2]);
+    let backend = FakeBackend::new();
+    assert!(matches!(
+        load_vision_weights(&device(&backend), &source),
+        Err(VisionError::Unsupported { .. })
+    ));
 }

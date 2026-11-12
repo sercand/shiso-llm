@@ -55,7 +55,7 @@ pub(crate) const SPATIAL_FACTOR: usize = 16;
 
 /// Attention scores formed at once, in f32 elements (256 MiB): a 1024x1024
 /// image's 4096 latent cells score in one block, a 2048x2048 one's in four.
-const ATTN_SCORE_BUDGET: usize = 1 << 26;
+pub(super) const ATTN_SCORE_BUDGET: usize = 1 << 26;
 
 /// Where the decoder's weights and its config document live.
 pub(crate) struct QwenVaeDesc<'a> {
@@ -105,32 +105,70 @@ pub(crate) type Tap<'t> =
     dyn FnMut(VaeTap, DeviceView<'_>, usize) -> Result<(), ImageGenError> + 't;
 
 #[derive(Debug, Deserialize)]
-struct VaeConfig {
-    z_dim: usize,
+pub(super) struct VaeConfig {
+    pub(super) z_dim: usize,
     is_residual: bool,
-    temperal_downsample: Vec<bool>,
-    latents_mean: Vec<f32>,
-    latents_std: Vec<f32>,
+    pub(super) temperal_downsample: Vec<bool>,
+    pub(super) latents_mean: Vec<f32>,
+    pub(super) latents_std: Vec<f32>,
     scale_factor_spatial: Option<usize>,
     patch_size: Option<usize>,
 }
 
+impl VaeConfig {
+    /// Reads the VAE's config document and refuses one neither half of
+    /// this VAE implements: not residual, patchified, or a spatial factor
+    /// other than [`SPATIAL_FACTOR`].
+    pub(super) fn read(path: &Path) -> Result<Self, ImageGenError> {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            ImageGenError::Checkpoint(format!(
+                "vae config {}: {e}; the latent statistics are in no tensor",
+                path.display()
+            ))
+        })?;
+        let config: Self = serde_json::from_str(&text)
+            .map_err(|e| ImageGenError::Checkpoint(format!("parsing {}: {e}", path.display())))?;
+        if !config.is_residual {
+            return Err(ImageGenError::Checkpoint(
+                "vae config is not residual (is_residual: false); only the residual \
+                 VAE with parameter-free block shortcuts is implemented"
+                    .to_owned(),
+            ));
+        }
+        if let Some(p) = config.patch_size {
+            return Err(ImageGenError::Checkpoint(format!(
+                "vae config sets patch_size {p}; a patchified VAE is not implemented"
+            )));
+        }
+        if config
+            .scale_factor_spatial
+            .is_some_and(|f| f != SPATIAL_FACTOR)
+        {
+            return Err(ImageGenError::Checkpoint(format!(
+                "vae config's spatial factor {:?} is not the {SPATIAL_FACTOR} this VAE runs",
+                config.scale_factor_spatial
+            )));
+        }
+        Ok(config)
+    }
+}
+
 /// One convolution, its shape read from the weight tensor.
 #[derive(Debug)]
-struct Conv {
-    w: DeviceBuffer,
-    bias: Option<DeviceBuffer>,
-    out_c: usize,
-    in_c: usize,
-    k: usize,
+pub(super) struct Conv {
+    pub(super) w: DeviceBuffer,
+    pub(super) bias: Option<DeviceBuffer>,
+    pub(super) out_c: usize,
+    pub(super) in_c: usize,
+    pub(super) k: usize,
 }
 
 /// One residual block: norm1 -> silu -> conv1 -> norm2 -> silu -> conv2,
 /// added to the input (or to its 1x1 projection when the width changes).
 #[derive(Debug)]
-struct Resnet {
+pub(super) struct Resnet {
     gamma1: DeviceBuffer,
-    conv1: Conv,
+    pub(super) conv1: Conv,
     gamma2: DeviceBuffer,
     conv2: Conv,
     shortcut: Option<Conv>,
@@ -138,10 +176,10 @@ struct Resnet {
 
 /// The mid block's single-head attention over every latent cell.
 #[derive(Debug)]
-struct Attention {
-    gamma: DeviceBuffer,
-    qkv: Conv,
-    proj: Conv,
+pub(super) struct Attention {
+    pub(super) gamma: DeviceBuffer,
+    pub(super) qkv: Conv,
+    pub(super) proj: Conv,
 }
 
 /// An up block's upsampler: nearest 2x, then a 3x3 convolution; the
@@ -234,18 +272,18 @@ impl DecodePlan {
 
 /// The field the decoder is carrying.
 #[derive(Debug, Clone, Copy)]
-struct Field {
-    c: usize,
-    h: usize,
-    w: usize,
+pub(super) struct Field {
+    pub(super) c: usize,
+    pub(super) h: usize,
+    pub(super) w: usize,
 }
 
 impl Field {
-    fn spatial(self) -> usize {
+    pub(super) fn spatial(self) -> usize {
         self.h * self.w
     }
 
-    fn len(self) -> usize {
+    pub(super) fn len(self) -> usize {
         self.c * self.h * self.w
     }
 }
@@ -266,7 +304,7 @@ struct NormConv<'a> {
 
 /// A resnet's input: consumed (the residual add lands in it) or kept for
 /// the caller (the add lands in a fresh buffer).
-enum Stream<'o, 'b> {
+pub(super) enum Stream<'o, 'b> {
     Owned(Scratch<'o>),
     Kept(&'b DeviceBuffer),
 }
@@ -377,7 +415,7 @@ pub(crate) fn rgba8_from_field(field: &[f32], plane: usize) -> Result<Vec<u8>, I
 
 /// How a convolution's weight is laid out on the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConvLayout {
+pub(super) enum ConvLayout {
     /// The checkpoint's own `[o][i][k][k]`, for the generic convolution.
     Stored,
     /// `[o][k][k][i]`, for the fused VAE convolutions
@@ -392,7 +430,7 @@ enum ConvLayout {
 /// Reads a convolution kernel `[o, i, k, k]` or `[o, i, 1, k, k]` (a
 /// causal kernel with a unit time axis) and its bias, widened to f32 and
 /// laid out as `layout` says.
-fn load_conv(
+pub(super) fn load_conv(
     store: &StStore,
     ops: &Ops,
     name: &str,
@@ -445,7 +483,7 @@ fn load_conv(
 }
 
 /// Reads a channel-norm gain of `channels` elements.
-fn load_gamma(
+pub(super) fn load_gamma(
     store: &StStore,
     ops: &Ops,
     name: &str,
@@ -461,7 +499,7 @@ fn load_gamma(
     store.f32_widen(ops, "vae norm gain", name)
 }
 
-fn load_resnet(store: &StStore, ops: &Ops, base: &str) -> Result<Resnet, ImageGenError> {
+pub(super) fn load_resnet(store: &StStore, ops: &Ops, base: &str) -> Result<Resnet, ImageGenError> {
     let conv1 = load_conv(
         store,
         ops,
@@ -515,38 +553,7 @@ impl QwenVae {
         reason = "one straight pass over the checkpoint's blocks, each check beside the tensor it guards"
     )]
     pub(crate) fn load(desc: &QwenVaeDesc<'_>, ops: &Ops) -> Result<Self, ImageGenError> {
-        let config: VaeConfig = {
-            let text = std::fs::read_to_string(desc.config).map_err(|e| {
-                ImageGenError::Checkpoint(format!(
-                    "vae config {}: {e}; the latent statistics are in no tensor",
-                    desc.config.display()
-                ))
-            })?;
-            serde_json::from_str(&text).map_err(|e| {
-                ImageGenError::Checkpoint(format!("parsing {}: {e}", desc.config.display()))
-            })?
-        };
-        if !config.is_residual {
-            return Err(ImageGenError::Checkpoint(
-                "vae config is not residual (is_residual: false); only the residual \
-                 decoder with dup-up shortcuts is implemented"
-                    .to_owned(),
-            ));
-        }
-        if let Some(p) = config.patch_size {
-            return Err(ImageGenError::Checkpoint(format!(
-                "vae config sets patch_size {p}; a patchified decoder output is not implemented"
-            )));
-        }
-        if config
-            .scale_factor_spatial
-            .is_some_and(|f| f != SPATIAL_FACTOR)
-        {
-            return Err(ImageGenError::Checkpoint(format!(
-                "vae config's spatial factor {:?} is not the {SPATIAL_FACTOR} this decoder runs",
-                config.scale_factor_spatial
-            )));
-        }
+        let config = VaeConfig::read(desc.config)?;
 
         let store = StStore::open(desc.weights)?;
 
@@ -836,7 +843,7 @@ impl QwenVae {
             &mut field,
             "vae mid 0",
         )?;
-        x = self.attention(ops, x, field)?;
+        x = Self::attention(ops, &self.mid_attn, x, field)?;
         x = Self::resnet(
             ops,
             &self.mid_resnets[1],
@@ -962,7 +969,7 @@ impl QwenVae {
     }
 
     /// A plain convolution (no input transform) over `field`, same padding.
-    fn conv<'o>(
+    pub(super) fn conv<'o>(
         ops: &'o Ops,
         conv: &Conv,
         input: DeviceView<'_>,
@@ -1035,7 +1042,7 @@ impl QwenVae {
     /// The residual stream is the 1x1 shortcut's output when the width
     /// changes, else the input itself (consumed) or a copy of it (kept);
     /// conv2 accumulates onto it in its epilogue.
-    fn resnet<'o>(
+    pub(super) fn resnet<'o>(
         ops: &'o Ops,
         r: &Resnet,
         x: Stream<'o, '_>,
@@ -1091,14 +1098,13 @@ impl QwenVae {
         clippy::many_single_char_names,
         reason = "the attention is written in its formula's letters (x, q, k, v, c, s)"
     )]
-    fn attention<'o>(
-        &self,
+    pub(super) fn attention<'o>(
         ops: &'o Ops,
+        attn: &Attention,
         stream: Scratch<'o>,
         field: Field,
     ) -> Result<Scratch<'o>, ImageGenError> {
         let (x, c, s) = (stream, field.c, field.spatial());
-        let attn = &self.mid_attn;
         let step = "vae attn";
         let inv = ops.alloc_f32(step, s)?;
         ops.channel_rms_inv(&ChannelRmsCall {

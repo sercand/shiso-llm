@@ -169,6 +169,7 @@ fn desc_for(
         residency: ImageResidency::Auto,
         reserve_bytes: DEFAULT_IMAGE_RESERVE_BYTES,
         draft_steps: 0,
+        host_share_per_mille: 0,
         final_reuse: None,
     }
 }

@@ -243,7 +243,7 @@ impl Flux3KleinModel {
         backend: &Arc<dyn Backend>,
     ) -> Result<Self, ImageGenError> {
         let began = Instant::now();
-        let ops = Ops::new(backend)?;
+        let ops = Ops::new(backend)?.with_host_share(desc.host_share_per_mille)?;
         let (encoder_spans, encoder_hidden, encoder_inter) =
             read_encoder_facts(&located.text_encoder_files)?;
         if 8 * encoder_hidden != located.params.txt_in {

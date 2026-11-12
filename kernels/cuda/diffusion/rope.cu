@@ -75,3 +75,31 @@ extern "C" __global__ void kernel_dit_rope_half(
         row[i + fold] = x1 * c + x0 * s;
     }
 }
+
+/* Rotate-half RoPE on one packed (tokens, heads, head_dim) tensor from a
+ * per-token angle table: pair (i, i + head_dim/2) of token t turns by the angle
+ * whose cosine and sine are cos_table[t*head_dim/2 + i] and sin_table[...], the
+ * same for every head. The host builds the angles in f64, so a multi-axis
+ * decoder's pairs can each take their own axis. Grid (tokens, heads) x 64. */
+extern "C" __global__ void kernel_dit_rope_half_table(
+        const dit_args_rope_half_table args, float* tensor, const float* cos_table,
+        const float* sin_table) {
+    const u32 t = blockIdx.x;
+    const u32 h = blockIdx.y;
+    const u32 tid = threadIdx.x;
+    if (t >= args.tokens || h >= args.heads) {
+        return;
+    }
+    const u32 fold = args.head_dim / 2u;
+    float* row = tensor + ((u64)t * args.heads + h) * args.head_dim;
+    const float* c_row = cos_table + (u64)t * fold;
+    const float* s_row = sin_table + (u64)t * fold;
+    for (u32 i = tid; i < fold; i += DIT_BLOCK) {
+        const float c = c_row[i];
+        const float s = s_row[i];
+        const float x0 = row[i];
+        const float x1 = row[i + fold];
+        row[i] = x0 * c - x1 * s;
+        row[i + fold] = x1 * c + x0 * s;
+    }
+}

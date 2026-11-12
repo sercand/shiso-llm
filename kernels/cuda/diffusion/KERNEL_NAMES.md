@@ -23,6 +23,7 @@ this with the output of
 ```
 kernel_dit_add_f32
 kernel_dit_add_gated_f32
+kernel_dit_avg_down_add_f32
 kernel_dit_axpy_f32
 kernel_dit_channel_rms_inv_f32
 kernel_dit_concat_rows_f32
@@ -72,6 +73,7 @@ kernel_dit_qk_norm_rope_f32
 kernel_dit_rmsnorm_f32
 kernel_dit_rope_4d
 kernel_dit_rope_half
+kernel_dit_rope_half_table
 kernel_dit_sdpa_f32
 kernel_dit_silu_f32
 kernel_dit_softmax_rows_f32

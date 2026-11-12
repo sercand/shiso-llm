@@ -109,12 +109,15 @@ cases!(vae:
     conv2d_rms_is_the_conv_of_the_normalized_activated_field,
     conv2d_up2_is_the_conv_of_the_upsampled_field,
     dup_up_add_matches_the_reshaped_shortcut,
+    avg_down_add_matches_the_folded_shortcut,
 );
 
 cases!(prefix:
     flash_sdpa_causal_masks_every_later_key,
+    flash_sdpa_causal_sees_every_cached_row,
     qk_norm_rope_normalizes_then_turns_adjacent_pairs,
     tanh_and_gelu_tanh_match_their_formulas,
     gqa_valid_keys_masks_pad_keys,
     rope_half_pins_trailing_rows_to_one_position,
+    rope_half_table_turns_each_pair_by_its_own_angle,
 );

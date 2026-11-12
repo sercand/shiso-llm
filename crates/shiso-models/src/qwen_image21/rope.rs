@@ -13,6 +13,14 @@
 //! positions are just negative angles; the angles are computed directly in
 //! `f64` per (token, pair), so no table indexing by sign is involved.
 //!
+//! An edit's prefix interleaves text with condition images
+//! ([`Segment`]). One position runs through it: a text token takes it on
+//! all three axes and moves it on by one; an image block holds the frame
+//! axis at it for every one of its tokens, lays them on a grid centred like
+//! the target's, and moves it on by the longer of its two sides. The target
+//! is the last such block, at the position the prefix reached - for a
+//! text-only prefix, the text length, as above.
+//!
 //! The device applies the rotation from a per-token cosine/sine table
 //! `(tokens, head_dim / 2)` built here (see `Ops::qk_norm_rope`): the
 //! prefix's table once per job, the target's once per grid.
@@ -26,6 +34,7 @@ pub(crate) const THETA: f64 = 10_000.0;
 pub(crate) type AxisPos = [i64; 3];
 
 /// Text tokens `0..p`: position `i` on every axis.
+#[cfg(test)]
 pub(crate) fn text_positions(p: usize) -> Vec<AxisPos> {
     (0..p)
         .map(|i| {
@@ -43,10 +52,71 @@ fn centred(n: usize) -> impl Iterator<Item = i64> {
 
 /// The target grid's tokens in row-major order, at frame `p` (the text
 /// length) with centred height and width.
+#[cfg(test)]
 pub(crate) fn target_positions(p: usize, grid: LatentGrid) -> Vec<AxisPos> {
-    let frame = i64::try_from(p).unwrap_or(i64::MAX);
+    target_positions_at(i64::try_from(p).unwrap_or(i64::MAX), grid)
+}
+
+/// An image block's tokens in row-major order, all at `frame`, with
+/// centred height and width: the target, or a condition image.
+pub(crate) fn target_positions_at(frame: i64, grid: LatentGrid) -> Vec<AxisPos> {
     centred(grid.h)
         .flat_map(|y| centred(grid.w).map(move |x| [frame, y, x]))
+        .collect()
+}
+
+/// One run of an interleaved prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Segment {
+    /// This many text tokens.
+    Text(usize),
+    /// One condition image's latent grid, a token per cell.
+    Image(LatentGrid),
+}
+
+impl Segment {
+    /// Tokens the segment holds.
+    pub(crate) fn rows(self) -> usize {
+        match self {
+            Self::Text(n) => n,
+            Self::Image(grid) => grid.cells(),
+        }
+    }
+}
+
+/// The positions of an interleaved prefix, and the frame position the
+/// target block after it takes.
+pub(crate) fn prefix_positions(layout: &[Segment]) -> (Vec<AxisPos>, i64) {
+    let mut positions = Vec::with_capacity(layout.iter().map(|s| s.rows()).sum());
+    let mut position = 0i64;
+    for segment in layout {
+        match *segment {
+            Segment::Text(n) => {
+                let n = i64::try_from(n).unwrap_or(i64::MAX);
+                positions.extend((position..position + n).map(|i| [i, i, i]));
+                position += n;
+            }
+            Segment::Image(grid) => {
+                positions.extend(target_positions_at(position, grid));
+                position += i64::try_from(grid.h.max(grid.w)).unwrap_or(i64::MAX);
+            }
+        }
+    }
+    (positions, position)
+}
+
+/// Each segment's rows in the prefix and whether it is an image block, in
+/// order. A block is one segment however its neighbours are laid out: two
+/// images side by side are two entries.
+pub(crate) fn segment_rows(layout: &[Segment]) -> Vec<(std::ops::Range<usize>, bool)> {
+    let mut start = 0;
+    layout
+        .iter()
+        .map(|segment| {
+            let rows = start..start + segment.rows();
+            start = rows.end;
+            (rows, matches!(segment, Segment::Image(_)))
+        })
         .collect()
 }
 

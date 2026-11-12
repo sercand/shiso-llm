@@ -59,6 +59,18 @@ struct DupUpArgs {
     repeats: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct AvgDownArgs {
+    out_c: u32,
+    h: u32,
+    w: u32,
+    factor_s: u32,
+    factor_t: u32,
+    group: u32,
+}
+
+const _: () = assert!(size_of::<AvgDownArgs>() == 24);
 const _: () = assert!(size_of::<ChannelRmsArgs>() == 16);
 const _: () = assert!(size_of::<ConvVaeArgs>() == 48);
 const _: () = assert!(size_of::<DupUpArgs>() == 24);
@@ -158,7 +170,81 @@ pub(crate) fn dup_up_map(
     Ok((factor, (factor_t - 1) * 4, out_c * factor / in_c))
 }
 
+/// The down block's parameter-free shortcut added into the downsampled
+/// field: `out (out_c, h, w) += avg_down(input (in_c, h * factor_s,
+/// w * factor_s))`.
+pub(crate) struct AvgDownCall<'a> {
+    pub step: &'static str,
+    pub out: DeviceView<'a>,
+    pub input: DeviceView<'a>,
+    pub in_c: usize,
+    pub out_c: usize,
+    /// The output field's height and width.
+    pub h: usize,
+    pub w: usize,
+    /// 2 when the block downsamples in space, 1 when it does not.
+    pub factor_s: usize,
+    /// 2 when the block also downsamples in time (a single frame then sits
+    /// behind a zero frame, which halves every mean), 1 when it does not.
+    pub factor_t: usize,
+}
+
+/// How many folded source channels one output channel of the down
+/// shortcut averages.
+///
+/// The reference folds each channel's `(factor_t, factor_s, factor_s)`
+/// neighbourhood into `factor_t * factor_s^2` channels and averages
+/// consecutive groups of them down to `out_c`.
+///
+/// # Errors
+/// [`ImageGenError::Checkpoint`] when `in_c` times the fold is not a whole
+/// multiple of `out_c` (the reference refuses the same shape), or a count is
+/// zero.
+pub(crate) fn avg_down_group(
+    in_c: usize,
+    out_c: usize,
+    factor_s: usize,
+    factor_t: usize,
+) -> Result<usize, ImageGenError> {
+    let folded = in_c * factor_t * factor_s * factor_s;
+    if folded == 0 || out_c == 0 || !folded.is_multiple_of(out_c) {
+        return Err(ImageGenError::Checkpoint(format!(
+            "downsampling shortcut {in_c} -> {out_c} channels with factors {factor_t} (time) and \
+             {factor_s} (space): {folded} folded channels are not a whole multiple of {out_c}"
+        )));
+    }
+    Ok(folded / out_c)
+}
+
 impl Ops {
+    /// The down block's shortcut, added in place (see [`AvgDownCall`]).
+    pub(crate) fn avg_down_add(&self, call: &AvgDownCall<'_>) -> Result<(), ImageGenError> {
+        let group = avg_down_group(call.in_c, call.out_c, call.factor_s, call.factor_t)?;
+        let args = AvgDownArgs {
+            out_c: call.out_c as u32,
+            h: call.h as u32,
+            w: call.w as u32,
+            factor_s: call.factor_s as u32,
+            factor_t: call.factor_t as u32,
+            group: group as u32,
+        };
+        self.launch(
+            call.step,
+            "kernel_dit_avg_down_add_f32",
+            Extent3::new(
+                grid_for((call.h * call.w) as u32, BLOCK),
+                call.out_c as u32,
+                1,
+            ),
+            Extent3::linear(BLOCK),
+            &[
+                KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                KernelArg::Buffer(call.out),
+                KernelArg::Buffer(call.input),
+            ],
+        )
+    }
+
     /// Channel RMS norm, pass 1 (see [`ChannelRmsCall`]).
     pub(crate) fn channel_rms_inv(&self, call: &ChannelRmsCall<'_>) -> Result<(), ImageGenError> {
         #[expect(

@@ -246,6 +246,35 @@ fn a_missing_media_token_names_itself() {
     }
 }
 
+/// A tower with deepstack taps is refused by the serving door, which has
+/// nowhere to put the taps' rows, and returned with its taps to the caller
+/// that asks for them.
+#[test]
+fn deepstack_taps_are_refused_by_one_door_and_returned_by_the_other() {
+    let text = replace(
+        &fixture_text(),
+        "\"deepstack_visual_indexes\": []",
+        "\"deepstack_visual_indexes\": [8, 16, 24]",
+    );
+    let config = HfConfig::from_json_str(&text).expect("edited fixture parses");
+    match config.vision_config() {
+        Err(CoreError::Unsupported { what, .. }) => assert!(what.contains("deepstack")),
+        other => panic!("expected the deepstack refusal, got {other:?}"),
+    }
+    let tower = config
+        .vision_config_with_deepstack()
+        .expect("the taps are accepted")
+        .expect("a vision block");
+    assert_eq!(tower.deepstack_visual_indexes, vec![8, 16, 24]);
+
+    // Without taps the two doors agree.
+    let plain = HfConfig::from_json_str(&fixture_text()).expect("fixture parses");
+    assert_eq!(
+        plain.vision_config_with_deepstack().expect("no error"),
+        plain.vision_config().expect("no error")
+    );
+}
+
 #[test]
 fn an_unknown_activation_is_a_load_error_not_a_string() {
     let text = replace(

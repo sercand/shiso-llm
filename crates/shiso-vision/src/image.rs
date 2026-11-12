@@ -95,6 +95,50 @@ pub fn preprocess_image(
     )
 }
 
+/// Packs an RGB picture that is already at its final size into patch rows.
+///
+/// For a caller that sized the picture itself and needs the tower to read
+/// exactly those pixels: nothing is resampled, so the sides must already be
+/// whole multiples of the tower's grid unit. `rgb` is row-major, three bytes
+/// per pixel. The normalization is the spec's, as in [`preprocess_image`].
+///
+/// # Errors
+///
+/// [`VisionError::PictureOffGrid`] when a side is zero or off the grid, or
+/// the buffer is not `width * height * 3` bytes.
+pub fn pack_rgb(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    spec: &PreprocessSpec,
+) -> Result<VisionItem, VisionError> {
+    let geom = spec.geometry;
+    let unit = geom.grid_unit();
+    let (w, h) = (side_as_usize(width), side_as_usize(height));
+    let off_grid = || VisionError::PictureOffGrid {
+        width,
+        height,
+        bytes: rgb.len(),
+        unit,
+    };
+    if w == 0 || h == 0 || w % unit != 0 || h % unit != 0 || rgb.len() != w * h * 3 {
+        return Err(off_grid());
+    }
+    let picture = RgbImage::from_raw(width, height, rgb.to_vec()).ok_or_else(off_grid)?;
+    let ps = geom.patch_size();
+    let (grid_h, grid_w) = (h / ps, w / ps);
+    let frames: Vec<&RgbImage> =
+        std::iter::repeat_n(&picture, geom.temporal_patch_size()).collect();
+    let pixels = pack_group(&frames, spec, grid_h, grid_w);
+    VisionItem::new(
+        pixels.into_boxed_slice(),
+        geom.patch_dim(),
+        1,
+        grid_h,
+        grid_w,
+    )
+}
+
 /// Decodes bytes into RGB, under the caller's limits and with the orientation
 /// tag applied.
 ///

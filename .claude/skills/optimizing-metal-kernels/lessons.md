@@ -53,6 +53,16 @@ shapes differ.
 - **Implicit-GEMM convolution:** gather im2col inside the operand reader and never materialize it. VAE decode went **97 s → 2.8 s**.
 - **Reader and epilogue structs** let one tile body serve linear, convolution and fused variants.
 
+- **The processor is a second multiplier on shared memory** (`shiso-metal/src/host_gemm.rs`, `diffusion/ops.rs` `split_columns`, M4 10-core GPU, 2026-11-12): every Metal buffer is shared storage, so the system matrix library can multiply some of a projection's columns in place while the GPU multiplies the rest.
+  - The GPU's share needs no kernel change: launch the same entry with the same arguments over fewer tile columns. Its columns are bit-identical to the unsplit launch.
+  - The host widens the INT8 codes a 16 MiB piece at a time (`vDSP_vflt8`), multiplies with `cblas_sgemm`, and applies scale/bias/gate as the GPU epilogue does. Order: `sync` (the host reads the input), launch, `submit`, host multiply.
+  - Qwen-Image-2.1 INT8, 1024x1024, 6 steps: a step 22.4 -> 16.5 s at a 34% host share, the job 143 -> 110 s. With 16 MiB pieces (see below) shares 22/28/34/38/40/46 gave 18.5/17.5/17.0/17.5/18.7/20.4 s a step: below the optimum the GPU is the long side, above it the host.
+  - Effective rates while sharing: GPU 2.9 TFLOPS (3.05 alone), host about 1.5. The split must be a function of shape and the configured share only - a share tuned from timing would make a picture depend on the machine's load.
+  - The widening and epilogue passes ran on one core at first and held the host to a fifth of its time; four threads fixed that (38%: 18.2 -> 17.5 s).
+  - Do not cut the host's range into cache-sized pieces: the library walks the whole left operand (67 MB at 4096 rows x 4096) once per call. A step at 34%: 19.5 s with 4 MiB pieces, 17.0 s with 16 MiB, 16.4 s with the whole range in one call. The picture was bit-identical at every piece size, so the library's sum for a column does not depend on how many columns share the call.
+  - A split measured per shape showed both sides finishing together at 34% for every projection shape of the model, so one share serves all of them.
+  - Pictures agree across shares to rounding (58 dB PSNR against the GPU-only picture), not bit for bit: the matrix library sums in its own order.
+
 ## Attention
 
 - **Single-pass flash attention** (`flux2.metal:~1286`):
@@ -79,6 +89,18 @@ shapes differ.
   - Judge such a change on renders, not on the latent: the same seed at 25 and at 50 exact steps differs by 0.78 of the latent's norm, so a latent distance cannot tell an approximation from a step count.
 - **The KV cache is f16.**
 
+- **Qwen-Image-2.1 on an M4 (10-core GPU, 24 GB) is compute-bound, not kernel-bound** (2026-11-12, 1024x1024, 6-step INT8 checkpoint, per-kernel profile of one job):
+  - `kernel_dit_gemm64_i8` + `kernel_dit_gemm64_fused_i8` are 79% of the job and every launch runs at 3.05 TFLOPS (4096x4096x4096 in 45 ms, 24576x4096 in 271 ms); the fused attention is 12% and also at 3.1 TFLOPS (4096 rows x 4119 keys x 32 heads of 128 in 89 ms). That is about 70% of the part's peak. A step is 22.5 s and nothing in it is cheap to move.
+  - An edit adds one prefix pass over the reference's tokens (4,117 for a 1024x1024 reference: 21.8 s, the same GEMMs) and doubles the keys of every step's attention (25.3 s a step).
+  - Run-to-run thermal drift on this fanless-class load is 21.6 -> 23.0 s a step inside one job: A/B a change with cool-downs and alternating order, or at the kernel level, never from two back-to-back jobs.
+- **The fused attention's half staging is not free for a language model** (same day, Qwen3-VL-8B INT8 text encoder, 1,059-token edit prompt): routing the encoder's grouped-query attention through `kernel_dit_flash_sdpa_causal_d128_f32` (keys and values repeated across the query group) took the prefill from 10.3 s to 5.1 s, but the worst token's features fell to cosine 0.9928 against the per-row f32 kernel (mean 0.99999), under the 0.9995 parity bar. Not adopted. The per-row kernel (`kernel_dit_gqa_f32`) costs 150 ms a layer there, 5.4 s over 36 layers, and grows with the square of the prompt; the fix that keeps parity is a fused entry that stages q, k and v in f32 (16 keys a block to stay under 32 KiB of threadgroup memory), not the half one.
+- **A cache of keys and values can be stored as the halves the fused attention stages** (`kernel_dit_flash_sdpa_d128_kvhc`): bit-identical to attending the f32 cache, half the bytes, and the cached rows are never narrowed again. It is a memory win (2.15 GB instead of 4.3 GB per 1024x1024 reference), not a measurable speed one: the narrowing it removes was 1 ms a layer.
+
+- **A language model's attention wants the fused tile staged in f32** (`kernel_dit_flash_gqa_d128_f32`, M4, 2026-11-12): the text encoder's causal grouped-query prefill ran a threadgroup per (row, head); at 1060 rows x 16 heads of 128 that was 150 ms a layer, 5.4 s of a one-picture edit.
+  - Routing it through the half-staged fused tile was fast (prefill 10.3 -> 5.1 s) and wrong: worst-token cosine against the reference 0.9928. The residual stream is not query-key-normed; half K and V lose it.
+  - The same tile with every operand in f32, 16 keys a block (32 f32 keys are 34816 B of the 32768 B of threadgroup memory), kv heads read natively instead of repeated: tower + prefill 12.8 -> 7.5 s, worst-token cosine 0.9999987 (the per-row kernel: 0.9999978).
+  - Used from 768 rows up, so a text-only prompt keeps the per-row kernel's bits.
+
 ## Fusion and launch count
 
 - **One command buffer with host-handled fetch cuts beat the per-layer drain by ~1.7x** (qwen4exp UD-IQ3_XXS, M1 Max, 2026-11-11, `--spec-k 0`, full pool): plain decode 7.2 -> **12.1 tok/s** (third request, stable across runs), greedy text bit-identical, and still identical with a 512-slot pool that misses every layer. The serial path drains a command buffer at every layer's `ExpertStream::plan` (~48 commit/drain round trips a step, ~0.29 ms each, plus GPU idle while the host re-encodes). The segmented path (`Exec::run_steps_segmented`, Metal `encode_cut`/`commit_segments`/`wait_cut`/`resume_cut`) encodes the WHOLE step into one buffer with a shared-event signal/wait cut before each layer's experts; the host places the experts at the cut (`fetch_at_cut`, non-draining shared IO) and releases the GPU. Ported from Strata's `mtl_rt.mm::run_graph_seg`. Device time fell 114 -> 76 ms/step: continuous execution keeps the GPU clock up where the per-layer gaps dropped it.
@@ -103,6 +125,13 @@ shapes differ.
 - Activations are f32.
   - bf16 rows have 2.0e-3 relative error against 7e-7 for f32. If bf16 ever looks *tighter* than f32, suspect the f32 path.
   - Q8_0 staged through half gave 1.1e-2 error against 2.3e-5 through f32.
+
+## Loading
+
+- **A checkpoint's tensors may all be off the vector boundary, and then every import is a copy** (`shiso-metal` `import_raw_bytes`, `diffusion/weights.rs` `import_bytes`, M4, 2026-11-12): a safetensors header whose length is 8 mod 16 puts every tensor 8 bytes off a 16-byte boundary, and the no-copy wrap refuses those because float kernels load 16-byte vectors. Both Qwen-Image-2.1 INT8 exports are such, so 7 GB of codes were copied at every load.
+  - INT8 codes are read through `packed_char4` loads, which no address misaligns, so they are now wrapped wherever they lie. Transformer load 1.0-1.2 s -> 48 ms, text encoder 0.9 s -> 3-8 ms, server boot 12.4 -> 4.5 s.
+  - The copy also held the weights twice (private buffer plus page cache), which pushed the other swapped component out of the page cache: its prefetch read from the SSD at 3.9 GB/s (1.8 s). Wrapped, both files stay cached and the prefetch runs at 30 GB/s (0.23 s).
+  - Small per-job imports from a file the swap traffic evicts fault in a page at a time: the VAE encoder's 311 MB took 1.9 s to load until its byte ranges were read ahead (0.2 s).
 
 ## Tuning
 

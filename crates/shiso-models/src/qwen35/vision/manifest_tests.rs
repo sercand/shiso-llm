@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use super::{
     AxisOrder, CHECKPOINT_PREFIX, PUBLISHED_SIDECAR, PatchRows, SIDECAR_PREFIX, TowerManifest,
+    TowerMerger, TowerTensorSpec, deepstack_mergers,
 };
 use crate::qwen35::vision::dims::VisionDims;
 use crate::qwen35::vision::testing::{recorded_tower, vision_config};
@@ -344,4 +345,41 @@ fn the_patch_projection_puts_channels_innermost_which_is_what_the_packer_emits()
         u64::try_from(geometry.patch_dim()).expect("fits"),
         "the flattened spelling is one patch row wide"
     );
+}
+
+/// A deepstack tap is one more merger, named by its position in the tap
+/// list, whose normalization runs over the folded block rather than over one
+/// patch vector. The names are the ones the single-file text encoder carries.
+#[test]
+fn deepstack_mergers_name_six_tensors_per_tap() {
+    let dims = VisionDims::try_from(&vision_config()).expect("the recorded tower is valid");
+    let taps = deepstack_mergers(SIDECAR_PREFIX, dims, 3);
+    assert_eq!(taps.len(), 3);
+    let names: Vec<&str> = taps
+        .iter()
+        .flat_map(TowerMerger::iter)
+        .map(TowerTensorSpec::name)
+        .collect();
+    assert_eq!(
+        &names[..6],
+        &[
+            "model.visual.deepstack_merger_list.0.norm.weight",
+            "model.visual.deepstack_merger_list.0.norm.bias",
+            "model.visual.deepstack_merger_list.0.linear_fc1.weight",
+            "model.visual.deepstack_merger_list.0.linear_fc1.bias",
+            "model.visual.deepstack_merger_list.0.linear_fc2.weight",
+            "model.visual.deepstack_merger_list.0.linear_fc2.bias",
+        ]
+    );
+    assert_eq!(names.len(), 18);
+    assert_eq!(
+        names[17],
+        "model.visual.deepstack_merger_list.2.linear_fc2.bias"
+    );
+    let folded = u64::try_from(dims.merge_input()).expect("fits");
+    let out = u64::try_from(dims.out_hidden()).expect("fits");
+    assert_eq!(taps[0].norm.weight.shape(), &[folded]);
+    assert_eq!(taps[0].fc1.weight.shape(), &[folded, folded]);
+    assert_eq!(taps[0].fc2.weight.shape(), &[out, folded]);
+    assert!(deepstack_mergers(SIDECAR_PREFIX, dims, 0).is_empty());
 }

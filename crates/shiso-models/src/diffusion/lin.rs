@@ -74,7 +74,13 @@ impl Lin {
         } else {
             (None, None)
         };
-        let w = store.import(ops.backend(), &weight_name)?;
+        // The INT8 kernels (and the host's share of a split projection) read
+        // the codes through byte loads, so they need no alignment.
+        let w = if kind == WeightKind::Int8Row {
+            store.import_bytes(ops.backend(), &weight_name)?
+        } else {
+            store.import(ops.backend(), &weight_name)?
+        };
         let shape = &entry.shape;
         let (out_dim, in_dim) = (
             usize::try_from(*shape.first().ok_or_else(|| {

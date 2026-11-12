@@ -246,6 +246,8 @@ pub struct MetalBackend {
     /// whole pass with the host placing experts between segments.
     cut_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     inner: Mutex<State>,
+    /// What the host's share of a split projection widens and multiplies in.
+    host_scratch: crate::host_gemm::HostScratchLock,
 }
 
 /// Probes for a Metal device without building a backend.
@@ -316,6 +318,7 @@ impl MetalBackend {
             library,
             done,
             cut_event,
+            host_scratch: crate::host_gemm::HostScratchLock::default(),
             inner: Mutex::new(State {
                 next_id: NonZeroU64::MIN,
                 buffers: HashMap::default(),
@@ -591,6 +594,83 @@ impl MetalBackend {
         unsafe { entry.buffer.contents().as_ptr().cast::<u8>().add(slack) }
     }
 
+    /// Wraps `host[range]` in place when the range lies inside whole pages of
+    /// the mapping and starts on an `align`-byte boundary, and copies it
+    /// otherwise.
+    fn import_aligned(
+        &self,
+        host: &dyn HostBytes,
+        range: Range<usize>,
+        align: usize,
+    ) -> CoreResult<RawBuffer> {
+        let all: &[u8] = host.as_ref();
+        if range.end > all.len() {
+            return Err(CoreError::OutOfBounds {
+                offset: range.start as u64,
+                len: range.end.saturating_sub(range.start) as u64,
+                buffer_bytes: all.len() as u64,
+            });
+        }
+        let len = range.end - range.start;
+        let page = page_size();
+        let base = all.as_ptr() as usize;
+        let start = base + range.start;
+        let aligned = start & !(page - 1);
+        let slack = start - aligned;
+        let want = (slack + len + page - 1) & !(page - 1);
+        let inside = aligned + want <= base + all.len();
+        let fits = self.device.maxBufferLength();
+        // The wrap keeps the range's own address, and unless the caller says
+        // its readers take bytes (`align` of one) the kernels read it as
+        // words and as 16-byte vectors: a payload that does not start on such
+        // a boundary - a container whose header length is not a multiple of
+        // sixteen puts every tensor on an odd address - reads back correctly
+        // through the host and as garbage through the device. Copying is what
+        // puts it on a boundary.
+        let vector_aligned = start.is_multiple_of(align);
+        if inside && want <= fits && vector_aligned {
+            let pointer = ptr::NonNull::new(aligned as *mut c_void).ok_or_else(|| {
+                MetalError::backend("import_raw", "the mapping is at a null address")
+            })?;
+            // SAFETY: `aligned` and `want` stay inside the mapping `host` owns,
+            // and the `Arc` that `import_host` stores inside the returned
+            // `DeviceBuffer` holds those pages mapped for exactly as long as
+            // this handle can be dispatched against.
+            let wrapped = unsafe {
+                self.device
+                    .newBufferWithBytesNoCopy_length_options_deallocator(
+                        pointer,
+                        want,
+                        MTLResourceOptions::StorageModeShared,
+                        None,
+                    )
+            };
+            if let Some(buffer) = wrapped {
+                let mut state = self.inner.lock();
+                return Ok(state.insert(buffer, slack as u64, len as u64));
+            }
+            tracing::debug!(
+                offset = range.start,
+                len,
+                "Metal refused the no-copy wrap; copying instead",
+            );
+        }
+        self.copy_import(host, range)
+    }
+
+    /// The host address of `view`'s first byte.
+    pub(crate) fn host_address(&self, view: DeviceView<'_>) -> CoreResult<usize> {
+        let state = self.inner.lock();
+        let entry = state.view(view)?;
+        let offset = usize::try_from(view.offset()).unwrap_or(usize::MAX);
+        Ok(Self::contents(entry) as usize + offset)
+    }
+
+    /// The scratch the host's share of a split projection works in.
+    pub(crate) fn host_scratch(&self) -> &crate::host_gemm::HostScratchLock {
+        &self.host_scratch
+    }
+
     /// Resolves `dsts` to disjoint host spans and fills them, without draining.
     /// The caller has ordered the device (a flush, or a cut wait) so the spans
     /// are safe to write where the GPU reads them.
@@ -681,58 +761,15 @@ impl Backend for MetalBackend {
     }
 
     fn import_raw(&self, host: &dyn HostBytes, range: Range<usize>) -> CoreResult<RawBuffer> {
-        let all: &[u8] = host.as_ref();
-        if range.end > all.len() {
-            return Err(CoreError::OutOfBounds {
-                offset: range.start as u64,
-                len: range.end.saturating_sub(range.start) as u64,
-                buffer_bytes: all.len() as u64,
-            });
-        }
-        let len = range.end - range.start;
-        let page = page_size();
-        let base = all.as_ptr() as usize;
-        let start = base + range.start;
-        let aligned = start & !(page - 1);
-        let slack = start - aligned;
-        let want = (slack + len + page - 1) & !(page - 1);
-        let inside = aligned + want <= base + all.len();
-        let fits = self.device.maxBufferLength();
-        // The wrap keeps the range's own address, and the kernels read it as
-        // words and as 16-byte vectors: a payload that does not start on such
-        // a boundary - a container whose header length is not a multiple of
-        // sixteen puts every tensor on an odd address - reads back correctly
-        // through the host and as garbage through the device. Copying is what
-        // puts it on a boundary.
-        let vector_aligned = start.is_multiple_of(IMPORT_ALIGN);
-        if inside && want <= fits && vector_aligned {
-            let pointer = ptr::NonNull::new(aligned as *mut c_void).ok_or_else(|| {
-                MetalError::backend("import_raw", "the mapping is at a null address")
-            })?;
-            // SAFETY: `aligned` and `want` stay inside the mapping `host` owns,
-            // and the `Arc` that `import_host` stores inside the returned
-            // `DeviceBuffer` holds those pages mapped for exactly as long as
-            // this handle can be dispatched against.
-            let wrapped = unsafe {
-                self.device
-                    .newBufferWithBytesNoCopy_length_options_deallocator(
-                        pointer,
-                        want,
-                        MTLResourceOptions::StorageModeShared,
-                        None,
-                    )
-            };
-            if let Some(buffer) = wrapped {
-                let mut state = self.inner.lock();
-                return Ok(state.insert(buffer, slack as u64, len as u64));
-            }
-            tracing::debug!(
-                offset = range.start,
-                len,
-                "Metal refused the no-copy wrap; copying instead",
-            );
-        }
-        self.copy_import(host, range)
+        self.import_aligned(host, range, IMPORT_ALIGN)
+    }
+
+    /// A byte payload is wrapped wherever it starts: the kernels that read
+    /// it issue byte loads, which no address can misalign. Measured on an M4
+    /// with the Qwen-Image-2.1 INT8 exports, whose every tensor starts
+    /// eight bytes off a 16-byte boundary and so used to be copied.
+    fn import_raw_bytes(&self, host: &dyn HostBytes, range: Range<usize>) -> CoreResult<RawBuffer> {
+        self.import_aligned(host, range, 1)
     }
 
     fn copy_h2d(&self, dst: DeviceView<'_>, src: &[u8]) -> CoreResult<()> {
@@ -1140,6 +1177,10 @@ impl Backend for MetalBackend {
     }
 
     fn as_profiler(&self) -> Option<&dyn Profiler> {
+        Some(self)
+    }
+
+    fn as_host_gemm(&self) -> Option<&dyn shiso_core::HostGemm> {
         Some(self)
     }
 }

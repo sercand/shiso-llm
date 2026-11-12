@@ -108,6 +108,16 @@ impl Default for VisionEncoder {
     }
 }
 
+/// The rows a tower's deepstack taps produced for one item, in tap order.
+///
+/// Each buffer is `[merged rows, out_hidden]` f32 on the device, the same
+/// shape as the item's main rows.
+#[derive(Debug, Default)]
+pub struct DeepstackRows {
+    /// One row set per tap.
+    pub rows: Vec<DeviceBuffer>,
+}
+
 /// Sink for recording intermediate stages during encoding.
 pub(crate) trait StageSink {
     fn on_pixel_values(&mut self, _buf: &DeviceBuffer) -> Result<(), VisionError> {
@@ -307,7 +317,43 @@ impl VisionEncoder {
         let run = Run::new(backend, *self, &plan, width)?;
         let positions =
             Self::resample_positions(backend, weights, width, plan.grid_h, plan.grid_w)?;
-        Self::forward(&run, &plan, weights, item, &positions, &mut NoopSink)
+        Self::forward(&run, &plan, weights, item, &positions, &mut NoopSink, None)
+    }
+
+    /// [`Self::encode`], plus one row set per deepstack tap of the tower.
+    ///
+    /// Each set has the shape of the main rows - `[merged rows, out_hidden]`
+    /// f32 - and is the patch stream after the tap's block through the tap's
+    /// own merger. They are for the language model's residual stream at the
+    /// item's placeholder rows, one set after each of its first layers, in
+    /// tap order. A tower without taps returns none.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::encode`].
+    pub fn encode_deep(
+        &self,
+        backend: &Arc<dyn Backend>,
+        weights: &VisionWeights,
+        item: &VisionItem,
+    ) -> Result<(DeviceBuffer, DeepstackRows), VisionError> {
+        let dims = weights.dims();
+        let plan = Plan::new(dims, item)?;
+        let width = WeightWidth::of(weights)?;
+        let run = Run::new(backend, *self, &plan, width)?;
+        let positions =
+            Self::resample_positions(backend, weights, width, plan.grid_h, plan.grid_w)?;
+        let mut deep = DeepstackRows::default();
+        let rows = Self::forward(
+            &run,
+            &plan,
+            weights,
+            item,
+            &positions,
+            &mut NoopSink,
+            Some(&mut deep),
+        )?;
+        Ok((rows, deep))
     }
 
     /// Encodes one media item and captures its intermediate stages.
@@ -328,7 +374,7 @@ impl VisionEncoder {
         let positions =
             Self::resample_positions(backend, weights, width, plan.grid_h, plan.grid_w)?;
         let mut sink = CollectorSink::new(backend, weights.dims().depth());
-        let _out = Self::forward(&run, &plan, weights, item, &positions, &mut sink)?;
+        let _out = Self::forward(&run, &plan, weights, item, &positions, &mut sink, None)?;
         sink.finish()
     }
 
@@ -344,6 +390,7 @@ impl VisionEncoder {
         item: &VisionItem,
         positions: &[f32],
         sink: &mut S,
+        mut deep: Option<&mut DeepstackRows>,
     ) -> Result<DeviceBuffer, VisionError> {
         let tree = weights.tensors();
         run.check_quantized(weights)?;
@@ -375,6 +422,12 @@ impl VisionEncoder {
         for (i, block) in tree.blocks.iter().enumerate() {
             Self::block(run, plan, block, &mut buffers)?;
             sink.on_block(i, &buffers.state)?;
+            if let Some(deep) = deep.as_deref_mut() {
+                for tap in weights.deepstack().iter().filter(|tap| tap.block() == i) {
+                    deep.rows
+                        .push(Self::deep_merge(run, plan, tap.merger(), &buffers)?);
+                }
+            }
         }
         let out = Self::merge(run, plan, &tree.merger, &buffers, sink)?;
         run.sync("encode")?;
@@ -576,6 +629,56 @@ impl VisionEncoder {
             Shape::new(plan.merged_rows, plan.out_hidden, plan.merge_input),
         )?;
         sink.on_projected(&out)?;
+        Ok(out)
+    }
+
+    /// A deepstack tap's merger over the running patch stream: fold the
+    /// square block, normalize the folded row, then the two layers with the
+    /// exact activation between them.
+    ///
+    /// The mirror image of [`Self::merge`] in one respect: here the
+    /// normalization runs AFTER the fold, on the folded width. That is again
+    /// not a choice - this merger's scale and offset are one folded row long.
+    /// The stream is only read, so the blocks after the tap see what they
+    /// would have seen without it.
+    fn deep_merge(
+        run: &Run<'_>,
+        plan: &Plan,
+        merger: &TowerMerger<TowerTensor>,
+        buffers: &Buffers,
+    ) -> Result<DeviceBuffer, VisionError> {
+        let folded = run.scratch("deepstack rows", plan.merged_rows * plan.merge_input)?;
+        run.spatial_merge(plan, &folded, &buffers.state)?;
+        let normed = run.scratch("deepstack normed", plan.merged_rows * plan.merge_input)?;
+        run.layer_norm(
+            "deepstack norm",
+            &normed,
+            &folded,
+            &merger.norm,
+            plan.merged_rows,
+            plan.merge_input,
+        )?;
+        run.gemm(
+            "deepstack in",
+            &folded,
+            &normed,
+            &merger.fc1,
+            Shape::new(plan.merged_rows, plan.merge_input, plan.merge_input),
+        )?;
+        run.unary(
+            "deepstack activation",
+            "kernel_vit_gelu_erf",
+            &folded,
+            plan.merged_rows * plan.merge_input,
+        )?;
+        let out = run.scratch("deepstack output", plan.merged_rows * plan.out_hidden)?;
+        run.gemm(
+            "deepstack out",
+            &out,
+            &folded,
+            &merger.fc2,
+            Shape::new(plan.merged_rows, plan.out_hidden, plan.merge_input),
+        )?;
         Ok(out)
     }
 

@@ -37,11 +37,12 @@ pub mod profile;
 
 pub use backend::{
     Backend, BlasBackend, CoopLaunch, DEVICE_POINTER_BYTES, Extent3, FnConst, FnConstValue,
-    GemmDType, GemmDesc, GemmOp, GemmReduction, GraphBackend, GraphCapture, GraphKey, KernelArg,
-    KernelRef, LaunchArgs, MemoryInfo, PointerPack,
+    GemmDType, GemmDesc, GemmOp, GemmReduction, GraphBackend, GraphCapture, GraphKey, HostGemm,
+    HostGemmDesc, KernelArg, KernelRef, LaunchArgs, MemoryInfo, PointerPack,
 };
 pub use buffer::{
     DeviceBuffer, DeviceView, HostBytes, RawBuffer, alloc, alloc_tagged, import_host,
+    import_host_bytes,
 };
 pub use config::{HfConfig, HiddenAct, VisionConfig};
 pub use decision::{

@@ -119,6 +119,34 @@ pub enum OverrideError {
     },
 }
 
+/// Why `--image-max-references` cannot be honoured by the loaded model.
+///
+/// Refused at boot, like the other image flags: a limit the model cannot
+/// meet would otherwise read as accepted and change nothing.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ReferenceCapError {
+    /// The loaded model generates from text alone.
+    #[error(
+        "--image-max-references {requested} was given, but the loaded image model takes no \
+         reference images"
+    )]
+    NoReferences {
+        /// The count as configured.
+        requested: u32,
+    },
+    /// The flag names more references than the model reads.
+    #[error(
+        "--image-max-references {requested} is above the {model} reference images the loaded \
+         image model takes"
+    )]
+    AboveModel {
+        /// The count as configured.
+        requested: u32,
+        /// The model's own limit.
+        model: usize,
+    },
+}
+
 impl ImageOverrides {
     /// The model's defaults with these overrides applied.
     ///
@@ -201,6 +229,9 @@ pub struct ImageService {
     /// The generator, kept for the questions that need no queue slot: how
     /// many references it takes and what size they imply.
     generator: Arc<dyn ImageGenerator>,
+    /// The most references one job may carry: the model's limit, or the
+    /// operator's lower one.
+    max_references: usize,
     max_upload_bytes: usize,
 }
 
@@ -226,6 +257,7 @@ impl ImageService {
             model_id: desc.model_id.clone(),
             limits,
             defaults: ImageDefaults::of(&limits),
+            max_references: desc.generator.max_references(),
             generator: Arc::clone(&desc.generator),
             max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
         };
@@ -259,11 +291,39 @@ impl ImageService {
         self.max_upload_bytes
     }
 
-    /// The most reference images one job may carry; zero when the loaded
-    /// model generates from text alone.
+    /// The same service with the operator's reference limit applied under
+    /// the model's own; `None` keeps the model's.
+    ///
+    /// # Errors
+    ///
+    /// [`ReferenceCapError`] for a limit above the model's, or any limit on
+    /// a model that takes no references.
+    pub fn with_max_references(
+        mut self,
+        cap: Option<std::num::NonZeroU32>,
+    ) -> Result<Self, ReferenceCapError> {
+        let Some(cap) = cap else {
+            return Ok(self);
+        };
+        let requested = cap.get();
+        let model = self.generator.max_references();
+        if model == 0 {
+            return Err(ReferenceCapError::NoReferences { requested });
+        }
+        let wanted = usize::try_from(requested).unwrap_or(usize::MAX);
+        if wanted > model {
+            return Err(ReferenceCapError::AboveModel { requested, model });
+        }
+        self.max_references = wanted;
+        Ok(self)
+    }
+
+    /// The most reference images one job may carry: the loaded model's
+    /// limit, or the operator's lower one. Zero when the model generates
+    /// from text alone.
     #[must_use]
-    pub fn max_references(&self) -> usize {
-        self.generator.max_references()
+    pub const fn max_references(&self) -> usize {
+        self.max_references
     }
 
     /// The size an edit takes when its caller names none.

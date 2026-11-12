@@ -15,7 +15,11 @@
 //!   plain `f64` product over the dequantized weight, with and without a bias,
 //!   on shapes that leave ragged tiles and cross many k slices - and against
 //!   the wrong reading of the scale (by input column), which must fail;
-//! - `kernel_dit_gemm64_fused_i8` against the separate passes it replaces.
+//! - `kernel_dit_gemm64_fused_i8` against the separate passes it replaces;
+//! - the host's share of a projection split between the device and the
+//!   processor ([`shiso_core::HostGemm`]) against the same `f64` product, on
+//!   its own columns only, and joined with a device share launched over fewer
+//!   tiles.
 #![expect(
     clippy::cast_possible_truncation,
     reason = "fixture dimensions are small literals marshalled as the kernels' u32 argument fields"
@@ -30,7 +34,9 @@
 )]
 
 use bytemuck::{Pod, Zeroable};
-use shiso_core::{DeviceBuffer, DeviceView, Extent3, KernelArg, KernelRef, LaunchArgs};
+use shiso_core::{
+    DeviceBuffer, DeviceView, Extent3, HostGemmDesc, KernelArg, KernelRef, LaunchArgs,
+};
 
 use crate::harness::{Gpu, drain, f32_bytes, run};
 use crate::oracle::signal;
@@ -817,4 +823,246 @@ fn unfused_device(gpu: &Gpu, c: &FusedCase, o: &Operands<'_>, residual: &[f32]) 
     );
     drain(gpu);
     gpu.read_f32(&d_unfused)
+}
+
+// --- the host's share of a split projection ---------------------------------
+
+/// The value every output starts at, so a column the host was not asked for
+/// shows whether it was written.
+const UNTOUCHED: f32 = 7.5;
+
+/// One host-share fixture, uploaded.
+struct HostCase {
+    shape: (usize, usize, usize),
+    x: Vec<f32>,
+    q: Vec<i8>,
+    s: Vec<f32>,
+    bias: Vec<f32>,
+    d_x: DeviceBuffer,
+    d_q: DeviceBuffer,
+    d_s: DeviceBuffer,
+    d_bias: DeviceBuffer,
+}
+
+impl HostCase {
+    fn new(gpu: &Gpu, shape: (usize, usize, usize), seed: u32) -> Self {
+        let (m, n, k) = shape;
+        let x = signal(m * k, 0x6000 + seed);
+        let q = codes(n * k, 0x6100 + seed);
+        let s = row_scales(n);
+        let bias = signal(n, 0x6200 + seed);
+        Self {
+            shape,
+            d_x: gpu.upload(&f32_bytes(&x)),
+            d_q: gpu.upload(&i8_bytes(&q)),
+            d_s: gpu.upload(&f32_bytes(&s)),
+            d_bias: gpu.upload(&f32_bytes(&bias)),
+            x,
+            q,
+            s,
+            bias,
+        }
+    }
+
+    /// Runs the host share over `cols` into `out`.
+    fn host(
+        &self,
+        gpu: &Gpu,
+        out: &DeviceBuffer,
+        cols: std::ops::Range<usize>,
+        with_bias: bool,
+        gate: Option<&DeviceBuffer>,
+    ) {
+        let (m, n, k) = self.shape;
+        let host = gpu
+            .device()
+            .as_host_gemm()
+            .expect("the split projection needs a device with a host multiplier");
+        host.gemm_i8_rows(&HostGemmDesc {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            col_start: cols.start as u32,
+            col_end: cols.end as u32,
+            input: self.d_x.view(),
+            weight: self.d_q.view(),
+            row_scale: self.d_s.view(),
+            bias: with_bias.then(|| self.d_bias.view()),
+            gate: gate.map(DeviceBuffer::view),
+            out: out.view(),
+        })
+        .expect("the host share runs");
+    }
+}
+
+/// Asserts `got` equals `want` inside `cols` and still holds `before`
+/// everywhere else.
+fn only_columns(
+    got: &[f32],
+    want: &[f32],
+    before: &[f32],
+    n: usize,
+    cols: &std::ops::Range<usize>,
+    what: &str,
+) {
+    let floor = rms(want).max(f32::MIN_POSITIVE);
+    for (index, (&g, &w)) in got.iter().zip(want).enumerate() {
+        let col = index % n;
+        if cols.contains(&col) {
+            let bound = 1e-5 * w.abs().max(floor);
+            assert!(
+                (g - w).abs() <= bound,
+                "{what}: element {index} (column {col}) is {g}, expected {w}",
+            );
+        } else {
+            assert!(
+                g.to_bits() == before[index].to_bits(),
+                "{what}: element {index} (column {col}) is outside the range and was written",
+            );
+        }
+    }
+}
+
+/// The host share equals the dequantized `f64` product on exactly the columns
+/// it was given - with and without a bias, on a range that starts mid-matrix,
+/// ends at the edge, and is long enough to be multiplied in several pieces -
+/// and writes no other column.
+pub fn host_gemm_i8_computes_only_its_columns(gpu: &Gpu) {
+    let cases: [((usize, usize, usize), std::ops::Range<usize>); 3] = [
+        ((5, 192, 256), 64..192),
+        ((9, 320, 512), 128..256),
+        // 16448 rows of 4096 codes are past the 64 Mi elements the host
+        // widens at once, so this range is multiplied in two pieces.
+        ((2, 16512, 4096), 64..16512),
+    ];
+    for (index, (shape, cols)) in cases.iter().enumerate() {
+        let (m, n, _) = *shape;
+        let case = HostCase::new(gpu, *shape, u32::try_from(index).unwrap_or(0));
+        let before = vec![UNTOUCHED; m * n];
+        for with_bias in [false, true] {
+            let want = product_host(
+                &case.x,
+                &case.q,
+                &case.s,
+                with_bias.then_some(case.bias.as_slice()),
+                *shape,
+            );
+            let out = gpu.upload(&f32_bytes(&before));
+            drain(gpu);
+            case.host(gpu, &out, cols.clone(), with_bias, None);
+            only_columns(
+                &gpu.read_f32(&out),
+                &want,
+                &before,
+                n,
+                cols,
+                &format!("host share {shape:?} {cols:?} bias={with_bias}"),
+            );
+        }
+    }
+}
+
+/// With a gate the host share adds `gate[c] * linear` into the stream it is
+/// given, on its columns only.
+pub fn host_gemm_i8_gates_into_the_residual(gpu: &Gpu) {
+    let shape = (6, 256, 768);
+    let (m, n, _) = shape;
+    let cols = 64..256;
+    let case = HostCase::new(gpu, shape, 0x40);
+    let residual = signal(m * n, 0x6300);
+    let gate = signal(n, 0x6301);
+    let d_gate = gpu.upload(&f32_bytes(&gate));
+    for with_bias in [false, true] {
+        let linear = product_host(
+            &case.x,
+            &case.q,
+            &case.s,
+            with_bias.then_some(case.bias.as_slice()),
+            shape,
+        );
+        let want: Vec<f32> = residual
+            .iter()
+            .zip(&linear)
+            .enumerate()
+            .map(|(i, (&r, &l))| r + gate[i % n] * l)
+            .collect();
+        let out = gpu.upload(&f32_bytes(&residual));
+        drain(gpu);
+        case.host(gpu, &out, cols.clone(), with_bias, Some(&d_gate));
+        only_columns(
+            &gpu.read_f32(&out),
+            &want,
+            &residual,
+            n,
+            &cols,
+            &format!("gated host share bias={with_bias}"),
+        );
+    }
+}
+
+/// A projection split between the device and the host is the whole
+/// projection: the device computes the first columns by being launched over
+/// fewer tiles, the host the rest while the device runs, and the device's
+/// columns are bit for bit what it computes when it has the whole matrix.
+///
+/// # Panics
+///
+/// When the device refuses the submission, or the joined product is wrong.
+pub fn split_gemm_i8_joins_the_device_and_host_shares(gpu: &Gpu) {
+    let shape = (130, 448, 1024);
+    let (m, n, k) = shape;
+    let device_cols = 256;
+    let case = HostCase::new(gpu, shape, 0x50);
+    let want = product_host(&case.x, &case.q, &case.s, Some(&case.bias), shape);
+    let whole = gemm_device(
+        gpu,
+        "kernel_dit_gemm64_i8",
+        &case.x,
+        &case.q,
+        &case.s,
+        Some(&case.bias),
+        shape,
+    );
+    let out = gpu.upload(&f32_bytes(&vec![UNTOUCHED; m * n]));
+    drain(gpu);
+    let args = GemmArgs {
+        m: m as u32,
+        n: n as u32,
+        k: k as u32,
+        has_bias: 1,
+    };
+    launch(
+        gpu,
+        "kernel_dit_gemm64_i8",
+        Extent3::new(
+            (device_cols as u32) / G64_TILE,
+            (m as u32).div_ceil(G64_TILE),
+            1,
+        ),
+        Extent3::linear(G64_THREADS),
+        &[
+            KernelArg::Bytes(bytemuck::bytes_of(&args)),
+            KernelArg::Buffer(out.view()),
+            KernelArg::Buffer(case.d_x.view()),
+            KernelArg::Buffer(case.d_q.view()),
+            KernelArg::Buffer(case.d_s.view()),
+            KernelArg::Buffer(case.d_bias.view()),
+        ],
+    );
+    gpu.device()
+        .submit()
+        .expect("the device share is submitted");
+    case.host(gpu, &out, device_cols..n, true, None);
+    drain(gpu);
+    let got = gpu.read_f32(&out);
+    close(&got, &want, 1e-5, "split projection vs the f64 product");
+    for (index, (&g, &w)) in got.iter().zip(&whole).enumerate() {
+        if index % n < device_cols {
+            assert!(
+                g.to_bits() == w.to_bits(),
+                "the device's column {} changed when it was given fewer tiles",
+                index % n
+            );
+        }
+    }
 }
