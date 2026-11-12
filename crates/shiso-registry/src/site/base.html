@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-density="comfortable">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -7,15 +7,13 @@
 <meta name="description" content="{% block description %}Models packaged for the shiso inference server: pinned weights, hardware requirements and measured throughput.{% endblock %}">
 <link rel="stylesheet" href="{{ root }}assets/site.css">
 </head>
-<body>
-<header class="top">
-  <div class="wrap top-row">
-    <a class="brand" href="{{ root or './' }}"><span class="leaf" aria-hidden="true"></span>shiso <span class="muted">hub</span></a>
-    <nav class="top-nav">
-      <a href="{{ root or './' }}">Models</a>
-      <a href="{{ root }}registry/v1/index.json">Index JSON</a>
-    </nav>
-  </div>
+<body class="shiso">
+<header class="s-topbar wrap">
+  <a class="brand" href="{{ root or './' }}"><span class="leaf" aria-hidden="true"></span>shiso <span class="s-muted">hub</span></a>
+  <nav class="s-row">
+    <a class="s-btn s-btn--ghost" href="{{ root or './' }}">Models</a>
+    <a class="s-btn s-btn--ghost" href="{{ root }}registry/v1/index.json">Index JSON</a>
+  </nav>
 </header>
 <main class="wrap">
 {% block main %}{% endblock %}

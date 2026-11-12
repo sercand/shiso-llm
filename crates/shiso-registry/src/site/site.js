@@ -71,7 +71,7 @@
     history.replaceState(null, "", url);
   }
 
-  document.querySelectorAll(".chip[data-filter]").forEach(function (chip) {
+  document.querySelectorAll("[data-filter]").forEach(function (chip) {
     chip.addEventListener("click", function () {
       var set = active[chip.dataset.filter];
       var on = chip.getAttribute("aria-pressed") !== "true";

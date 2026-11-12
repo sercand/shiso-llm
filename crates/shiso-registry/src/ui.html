@@ -5,95 +5,425 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Shiso Model Registry Editor</title>
 <style>
-  :root {
-    --bg: #0b0d13;
-    --surface: #141721;
-    --surface-elevated: #1c2130;
-    --surface-hover: #23293d;
-    --border: #293046;
-    --border-focus: #3b82f6;
-    --text: #f1f3f9;
-    --text-muted: #8e98b0;
-    --text-dim: #5f6880;
-    --primary: #3b82f6;
-    --primary-hover: #2563eb;
-    --success: #10b981;
-    --danger: #ef4444;
-    --warning: #f59e0b;
-    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+/* shiso-design: begin. Vendored from github.com/sercand/shiso-design (packages/css/shiso.css): tokens and components.
+   Do not edit here; change it there and paste the new file between these markers. */
+:root {
+  --shiso-canvas: oklch(0.962 0.01 255);
+  --shiso-card: oklch(0.995 0.003 255);
+  --shiso-fill: oklch(0.945 0.01 255);
+  --shiso-fill-hover: oklch(0.922 0.012 255);
+  --shiso-line: oklch(0.895 0.01 255);
+  --shiso-text: oklch(0.21 0.025 255);
+  --shiso-text-2: oklch(0.49 0.025 255);
+  --shiso-primary: oklch(0.43 0.085 160);
+  --shiso-primary-hover: oklch(0.38 0.085 160);
+  --shiso-primary-text: oklch(0.99 0 0);
+  --shiso-soft: oklch(0.95 0.026 160);
+  --shiso-soft-text: oklch(0.38 0.085 160);
+  --shiso-live: oklch(0.56 0.13 160);
+  --shiso-ok: oklch(0.48 0.12 152);
+  --shiso-ok-bg: oklch(0.95 0.04 152);
+  --shiso-warn: oklch(0.5 0.11 70);
+  --shiso-warn-bg: oklch(0.95 0.05 88);
+  --shiso-bad: oklch(0.53 0.2 27);
+  --shiso-bad-bg: oklch(0.95 0.03 27);
+  --shiso-chart-1: oklch(0.5 0.12 160);
+  --shiso-chart-2: oklch(0.52 0.16 265);
+  --shiso-chart-3: oklch(0.64 0.13 80);
+  --shiso-chart-4: oklch(0.5 0.16 350);
+  --shiso-chart-5: oklch(0.6 0.11 220);
+  --shiso-shadow: 0 1px 2px 0px oklch(0.21 0.025 255 / 0.06), 0 10px 28px -14px oklch(0.21 0.025 255 / 0.16);
+
+  --shiso-font-sans: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --shiso-font-mono: "JetBrains Mono", ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --shiso-weight-regular: 400;
+  --shiso-weight-medium: 500;
+  --shiso-weight-semibold: 600;
+  --shiso-weight-bold: 700;
+  --shiso-text-xs: 11px;
+  --shiso-text-sm: 12px;
+  --shiso-text-lg: 16px;
+  --shiso-text-xl: 20px;
+  --shiso-text-2xl: 26px;
+  --shiso-text-3xl: 34px;
+  --shiso-radius-sm: 6px;
+  --shiso-radius-control: 10px;
+  --shiso-radius-inner: 10px;
+  --shiso-radius-card: 16px;
+  --shiso-radius-full: 999px;
+  --shiso-space-1: 4px;
+  --shiso-space-2: 8px;
+  --shiso-space-3: 12px;
+  --shiso-space-4: 16px;
+  --shiso-space-5: 20px;
+  --shiso-space-6: 24px;
+  --shiso-space-8: 32px;
+  --shiso-space-10: 40px;
+  --shiso-control: 30px;
+  --shiso-text-base: 13px;
+  --shiso-pad: 14px;
+  --shiso-gap: 12px;
+  color-scheme: light;
+}
+[data-density="comfortable"] {
+  --shiso-control: 40px;
+  --shiso-text-base: 15px;
+  --shiso-pad: 18px;
+  --shiso-gap: 14px;
+}
+[data-density="compact"] {
+  --shiso-control: 30px;
+  --shiso-text-base: 13px;
+  --shiso-pad: 14px;
+  --shiso-gap: 12px;
+}
+/* Dark: follows the system unless data-theme pins a mode; .dark is the shadcn/next-themes class. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not(.light) {
+    --shiso-canvas: oklch(0.155 0.01 255);
+    --shiso-card: oklch(0.208 0.01 255);
+    --shiso-fill: oklch(0.262 0.01 255);
+    --shiso-fill-hover: oklch(0.295 0.012 255);
+    --shiso-line: oklch(0.31 0.01 255);
+    --shiso-text: oklch(0.955 0.006 255);
+    --shiso-text-2: oklch(0.71 0.01 255);
+    --shiso-primary: oklch(0.76 0.13 160);
+    --shiso-primary-hover: oklch(0.82 0.13 160);
+    --shiso-primary-text: oklch(0.18 0.03 160);
+    --shiso-soft: oklch(0.3 0.058 160);
+    --shiso-soft-text: oklch(0.86 0.09 160);
+    --shiso-live: oklch(0.76 0.13 160);
+    --shiso-ok: oklch(0.78 0.15 152);
+    --shiso-ok-bg: oklch(0.29 0.05 152);
+    --shiso-warn: oklch(0.82 0.13 82);
+    --shiso-warn-bg: oklch(0.3 0.05 82);
+    --shiso-bad: oklch(0.74 0.16 25);
+    --shiso-bad-bg: oklch(0.3 0.06 25);
+    --shiso-chart-1: oklch(0.66 0.13 160);
+    --shiso-chart-2: oklch(0.6 0.16 270);
+    --shiso-chart-3: oklch(0.655 0.13 85);
+    --shiso-chart-4: oklch(0.56 0.17 350);
+    --shiso-chart-5: oklch(0.665 0.1 220);
+    --shiso-shadow: 0 0 0 1px oklch(1 0 0 / 0.05);
+    color-scheme: dark;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 13px; line-height: 1.5; }
-  header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 28px; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 50; }
-  .logo-title { display: flex; align-items: center; gap: 12px; }
-  .logo-title h1 { font-size: 16px; font-weight: 700; letter-spacing: -0.02em; }
-  .badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 500; }
-  .badge-success { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
-  .badge-danger { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
-  .badge-warning { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
-  .badge-primary { background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); }
-  .badge-muted { background: var(--surface-elevated); color: var(--text-muted); border: 1px solid var(--border); }
-  nav { display: flex; gap: 6px; }
-  button, .btn { background: var(--surface-elevated); border: 1px solid var(--border); color: var(--text); padding: 7px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; transition: all 0.15s; }
-  button:hover, .btn:hover { background: var(--surface-hover); border-color: var(--text-muted); }
-  button.primary, .btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
-  button.primary:hover, .btn.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
-  button.danger, .btn.danger { background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.3); color: #f87171; }
-  button.danger:hover, .btn.danger:hover { background: rgba(239, 68, 68, 0.25); border-color: var(--danger); }
-  button.sm, .btn.sm { padding: 4px 8px; font-size: 11px; }
-  nav button.active { background: var(--primary); border-color: var(--primary); color: #fff; }
-  main { max-width: 1300px; margin: 24px auto; padding: 0 28px; }
-  .tab-content { display: none; }
-  .tab-content.active { display: block; }
-  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 20px; }
-  .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
-  .card-title { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
-  .recipe-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 18px; display: flex; flex-direction: column; justify-content: space-between; transition: border-color 0.15s; }
-  .recipe-card:hover { border-color: var(--primary); }
-  .recipe-card-title { font-size: 15px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-  .form-group { margin-bottom: 14px; }
-  .form-group.inline { display: flex; align-items: center; gap: 8px; }
-  label { display: block; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); margin-bottom: 5px; }
-  input[type="text"], input[type="number"], select, textarea { width: 100%; background: #0e111a; border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-size: 13px; font-family: inherit; }
-  input[type="text"]:focus, input[type="number"]:focus, select:focus, textarea:focus { outline: none; border-color: var(--border-focus); box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2); }
-  .row { display: flex; gap: 14px; flex-wrap: wrap; }
-  .col { flex: 1; min-width: 200px; }
-  .col-2 { flex: 2; min-width: 320px; }
-  .col-3 { flex: 3; min-width: 440px; }
-  .checkbox-group { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; padding: 6px 0; }
-  .checkbox-item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; user-select: none; }
-  .checkbox-item input { cursor: pointer; accent-color: var(--primary); }
-  .variant-card { background: #11141e; border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-  .variant-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
-  .component-card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 14px; margin-bottom: 12px; }
-  .component-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-  table.file-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }
-  table.file-table th { text-align: left; padding: 8px 10px; background: #0c0e15; border-bottom: 1px solid var(--border); color: var(--text-muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
-  table.file-table td { padding: 8px 10px; border-bottom: 1px solid rgba(41, 48, 70, 0.4); vertical-align: middle; }
-  table.file-table tr:hover { background: rgba(59, 130, 246, 0.04); }
-  table.file-table tr.selected { background: rgba(59, 130, 246, 0.08); }
-  .code { font-family: var(--mono); font-size: 12px; }
-  .info-callout { background: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.25); border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; font-size: 12px; display: flex; justify-content: space-between; align-items: center; }
-  .alert-danger { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; color: #fca5a5; font-size: 12px; }
-  .alert-success { background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; color: #6ee7b7; font-size: 12px; }
-  details summary { cursor: pointer; font-weight: 600; font-size: 12px; color: var(--text-muted); user-select: none; }
-  details summary:hover { color: var(--text); }
-  pre { background: #090b10; border: 1px solid var(--border); border-radius: 6px; padding: 12px; font-family: var(--mono); font-size: 12px; overflow-x: auto; max-height: 400px; }
-  .stat-pill { background: #090b10; border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: var(--mono); font-size: 11px; }
+}
+:root[data-theme="dark"], .dark {
+  --shiso-canvas: oklch(0.155 0.01 255);
+  --shiso-card: oklch(0.208 0.01 255);
+  --shiso-fill: oklch(0.262 0.01 255);
+  --shiso-fill-hover: oklch(0.295 0.012 255);
+  --shiso-line: oklch(0.31 0.01 255);
+  --shiso-text: oklch(0.955 0.006 255);
+  --shiso-text-2: oklch(0.71 0.01 255);
+  --shiso-primary: oklch(0.76 0.13 160);
+  --shiso-primary-hover: oklch(0.82 0.13 160);
+  --shiso-primary-text: oklch(0.18 0.03 160);
+  --shiso-soft: oklch(0.3 0.058 160);
+  --shiso-soft-text: oklch(0.86 0.09 160);
+  --shiso-live: oklch(0.76 0.13 160);
+  --shiso-ok: oklch(0.78 0.15 152);
+  --shiso-ok-bg: oklch(0.29 0.05 152);
+  --shiso-warn: oklch(0.82 0.13 82);
+  --shiso-warn-bg: oklch(0.3 0.05 82);
+  --shiso-bad: oklch(0.74 0.16 25);
+  --shiso-bad-bg: oklch(0.3 0.06 25);
+  --shiso-chart-1: oklch(0.66 0.13 160);
+  --shiso-chart-2: oklch(0.6 0.16 270);
+  --shiso-chart-3: oklch(0.655 0.13 85);
+  --shiso-chart-4: oklch(0.56 0.17 350);
+  --shiso-chart-5: oklch(0.665 0.1 220);
+  --shiso-shadow: 0 0 0 1px oklch(1 0 0 / 0.05);
+  color-scheme: dark;
+}
+
+/* Shiso components for plain HTML. Every rule reads tokens only; no literal colors.
+   Put class="shiso" on <body> (or any container) for base typography. */
+.shiso, .shiso *, .shiso *::before, .shiso *::after { box-sizing: border-box; }
+.shiso {
+  margin: 0;
+  background: var(--shiso-canvas);
+  color: var(--shiso-text);
+  font: var(--shiso-weight-regular) var(--shiso-text-base)/1.45 var(--shiso-font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+/* Components set display, which would otherwise beat the hidden attribute. */
+.shiso [hidden] { display: none !important; }
+.shiso :focus-visible { outline: 2px solid var(--shiso-primary); outline-offset: 2px; }
+/* Plain links only: anything with a class (buttons, cards, nav items) styles itself. */
+.shiso a:not([class]) { color: var(--shiso-primary); text-decoration: none; }
+.shiso a:not([class]):hover { text-decoration: underline; }
+
+/* Type */
+.s-h1, .s-h2, .s-h3 { margin: 0; font-weight: var(--shiso-weight-semibold); letter-spacing: -0.012em; text-wrap: balance; }
+.s-h1 { font-size: var(--shiso-text-2xl); line-height: 1.15; letter-spacing: -0.02em; }
+.s-h2 { font-size: var(--shiso-text-xl); line-height: 1.2; }
+.s-h3 { font-size: var(--shiso-text-lg); line-height: 1.3; }
+.s-muted { color: var(--shiso-text-2); }
+.s-small { font-size: var(--shiso-text-sm); }
+.s-num { font-variant-numeric: tabular-nums; }
+.s-mono { font-family: var(--shiso-font-mono); font-size: 0.92em; }
+
+/* Layout helpers */
+.s-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--shiso-space-2); }
+.s-stack { display: grid; gap: var(--shiso-gap); align-content: start; }
+.s-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: var(--shiso-gap); }
+.s-spacer { flex: 1; }
+
+/* Card: the one lifted surface. Do not nest cards; use .s-inset inside a card. */
+.s-card {
+  background: var(--shiso-card);
+  border-radius: var(--shiso-radius-card);
+  padding: var(--shiso-pad);
+  box-shadow: var(--shiso-shadow);
+  display: grid;
+  gap: var(--shiso-gap);
+  align-content: start;
+  min-width: 0;
+}
+.s-inset { background: var(--shiso-fill); border-radius: var(--shiso-radius-inner); padding: var(--shiso-space-1) var(--shiso-space-3); }
+/* Fields inside an inset sit on the fill, so they take the card color to stay visible. */
+.s-inset .s-input, .s-inset .s-select, .s-inset .s-textarea { background: var(--shiso-card); }
+
+/* Button */
+.s-btn {
+  font: inherit;
+  font-weight: var(--shiso-weight-medium);
+  height: var(--shiso-control);
+  padding: 0 calc(var(--shiso-control) * 0.45);
+  border-radius: var(--shiso-radius-control);
+  border: 1px solid transparent;
+  background: var(--shiso-fill);
+  color: var(--shiso-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+  cursor: pointer;
+  text-decoration: none;
+}
+.s-btn:hover { background: var(--shiso-fill-hover); text-decoration: none; }
+.s-btn--primary { background: var(--shiso-primary); color: var(--shiso-primary-text); }
+.s-btn--primary:hover { background: var(--shiso-primary-hover); }
+.s-btn--outline { background: transparent; border-color: var(--shiso-line); }
+.s-btn--ghost { background: transparent; color: var(--shiso-text-2); }
+.s-btn--danger { background: var(--shiso-bad-bg); color: var(--shiso-bad); }
+.s-btn--outline:hover, .s-btn--ghost:hover { background: var(--shiso-fill); }
+.s-btn--icon { width: var(--shiso-control); padding: 0; }
+.s-btn:disabled, .s-btn[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; }
+.s-btn svg, .s-nav svg, .s-input svg { width: 1.15em; height: 1.15em; flex: none; }
+
+/* Fields: filled, no border at rest */
+.s-field { display: grid; gap: 6px; }
+.s-label { font-weight: var(--shiso-weight-medium); font-size: 0.93em; }
+.s-hint { color: var(--shiso-text-2); font-size: var(--shiso-text-sm); }
+.s-input, .s-select, .s-textarea {
+  font: inherit;
+  color: var(--shiso-text);
+  background: var(--shiso-fill);
+  border: 1px solid transparent;
+  border-radius: var(--shiso-radius-control);
+  height: var(--shiso-control);
+  padding: 0 calc(var(--shiso-control) * 0.35);
+  width: 100%;
+  min-width: 0;
+}
+.s-textarea { height: auto; min-height: calc(var(--shiso-control) * 2.4); padding-block: 8px; resize: vertical; line-height: 1.45; }
+.s-input::placeholder, .s-textarea::placeholder { color: var(--shiso-text-2); }
+.s-input:hover, .s-select:hover, .s-textarea:hover { background: var(--shiso-fill-hover); }
+.s-input:focus-visible, .s-select:focus-visible, .s-textarea:focus-visible { outline: 2px solid var(--shiso-primary); outline-offset: 0; background: var(--shiso-card); }
+.s-input[aria-invalid="true"] { outline: 2px solid var(--shiso-bad); outline-offset: 0; }
+
+/* Checkbox and switch: native inputs, so they work without JavaScript */
+.s-check { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.s-check input { width: 16px; height: 16px; margin: 0; accent-color: var(--shiso-primary); }
+.s-switch { display: inline-flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer; }
+.s-switch input {
+  appearance: none; -webkit-appearance: none; margin: 0; flex: none; cursor: pointer;
+  width: 34px; height: 20px; border-radius: var(--shiso-radius-full);
+  background: var(--shiso-line); position: relative; transition: background 0.15s;
+}
+.s-switch input::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+  background: var(--shiso-card); transition: translate 0.15s;
+}
+.s-switch input:checked { background: var(--shiso-primary); }
+.s-switch input:checked::after { translate: 14px 0; background: var(--shiso-primary-text); }
+
+/* Pill: status always pairs a dot with a word */
+.s-pill {
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  border-radius: var(--shiso-radius-full); padding: 2px 9px;
+  font-size: 0.88em; font-weight: var(--shiso-weight-medium);
+  background: var(--shiso-fill); color: var(--shiso-text-2);
+}
+.s-pill--dot::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.s-pill--ok { background: var(--shiso-ok-bg); color: var(--shiso-ok); }
+.s-pill--warn { background: var(--shiso-warn-bg); color: var(--shiso-warn); }
+.s-pill--bad { background: var(--shiso-bad-bg); color: var(--shiso-bad); }
+.s-pill--soft { background: var(--shiso-soft); color: var(--shiso-soft-text); }
+/* Live: an agent is working right now. The only place the live color appears. */
+.s-pill--live { color: var(--shiso-text); }
+.s-pill--live::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--shiso-live); box-shadow: 0 0 0 3px color-mix(in oklch, var(--shiso-live) 25%, transparent); }
+
+/* Segmented control: buttons for in-page views, links for routed tabs */
+.s-seg { display: inline-flex; gap: 2px; padding: 3px; max-width: 100%; background: var(--shiso-fill); border-radius: var(--shiso-radius-control); }
+.s-seg button, .s-seg a {
+  font: inherit; font-weight: var(--shiso-weight-medium); border: 0; background: transparent; cursor: pointer; white-space: nowrap;
+  color: var(--shiso-text-2); height: calc(var(--shiso-control) - 8px); padding: 0 12px;
+  display: inline-flex; align-items: center; text-decoration: none;
+  border-radius: calc(var(--shiso-radius-control) - 3px);
+}
+.s-seg button:hover, .s-seg a:hover { color: var(--shiso-text); text-decoration: none; }
+.s-seg button[aria-pressed="true"], .s-seg button[aria-selected="true"], .s-seg a[aria-current] { background: var(--shiso-card); color: var(--shiso-text); box-shadow: var(--shiso-shadow); }
+
+/* Table */
+.s-table-wrap { overflow-x: auto; }
+.s-table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+.s-table th { text-align: left; font-weight: var(--shiso-weight-medium); color: var(--shiso-text-2); font-size: 0.92em; }
+.s-table th, .s-table td { padding: calc(var(--shiso-pad) * 0.45) var(--shiso-space-3) calc(var(--shiso-pad) * 0.45) 0; border-bottom: 1px solid var(--shiso-line); white-space: nowrap; }
+.s-table tr:last-child td, .s-table td[rowspan] { border-bottom: 0; }
+.s-table .s-right { text-align: right; padding-right: 0; }
+.s-table .s-wrap { white-space: normal; min-width: 200px; font-weight: var(--shiso-weight-medium); }
+
+/* Key/value rows, diff rows, meter, avatar */
+.s-kv { display: grid; gap: 6px; }
+.s-kv > div { display: flex; justify-content: space-between; gap: 12px; }
+.s-diff > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; padding: 7px 0; font-variant-numeric: tabular-nums; }
+.s-diff > div + div { border-top: 1px solid var(--shiso-line); }
+.s-diff del { color: var(--shiso-text-2); margin-right: 6px; }
+.s-diff ins { text-decoration: none; font-weight: var(--shiso-weight-semibold); }
+.s-meter { height: 8px; border-radius: var(--shiso-radius-full); background: var(--shiso-fill); overflow: hidden; }
+.s-meter > span { display: block; height: 100%; border-radius: inherit; background: var(--shiso-primary); }
+.s-avatar { width: 36px; height: 36px; flex: none; border-radius: 50%; display: grid; place-items: center; background: var(--shiso-soft); color: var(--shiso-soft-text); font-weight: var(--shiso-weight-semibold); }
+
+/* Small button: table rows and dense toolbars */
+.s-btn--sm { height: calc(var(--shiso-control) - 6px); padding: 0 10px; font-size: var(--shiso-text-sm); border-radius: calc(var(--shiso-radius-control) - 2px); }
+
+/* A whole card that is a link */
+a.s-card, a.s-card:hover { color: inherit; text-decoration: none; }
+a.s-card { transition: box-shadow 0.15s; }
+a.s-card:hover, a.s-card:focus-visible { box-shadow: var(--shiso-shadow), 0 0 0 2px var(--shiso-soft); }
+
+/* Chip: a filter you switch on and off (aria-pressed). Not a status; use a pill for that. */
+.s-chip {
+  font: inherit; font-size: 0.92em; font-weight: var(--shiso-weight-medium); cursor: pointer; white-space: nowrap;
+  display: inline-flex; align-items: center; gap: 6px;
+  height: calc(var(--shiso-control) - 4px); padding: 0 12px;
+  border: 0; border-radius: var(--shiso-radius-full);
+  background: var(--shiso-card); color: var(--shiso-text); box-shadow: var(--shiso-shadow);
+}
+.s-chip:hover { background: var(--shiso-fill); }
+.s-chip > span { color: var(--shiso-text-2); font-variant-numeric: tabular-nums; }
+.s-chip[aria-pressed="true"] { background: var(--shiso-primary); color: var(--shiso-primary-text); box-shadow: none; }
+.s-chip[aria-pressed="true"] > span { color: inherit; opacity: 0.8; }
+
+/* Alert: a message inside the page. Default is informational. */
+.s-alert {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px;
+  padding: 10px 14px; border-radius: var(--shiso-radius-inner);
+  background: var(--shiso-soft); color: var(--shiso-soft-text);
+}
+.s-alert--ok { background: var(--shiso-ok-bg); color: var(--shiso-ok); }
+.s-alert--warn { background: var(--shiso-warn-bg); color: var(--shiso-warn); }
+.s-alert--bad { background: var(--shiso-bad-bg); color: var(--shiso-bad); }
+
+/* Code: inline and block */
+.shiso code { font-family: var(--shiso-font-mono); font-size: 0.92em; }
+.s-code {
+  margin: 0; padding: var(--shiso-space-3); overflow-x: auto;
+  background: var(--shiso-fill); border-radius: var(--shiso-radius-inner);
+  font-family: var(--shiso-font-mono); font-size: 0.92em; line-height: 1.5;
+}
+
+/* Facts: a small label over its value, laid out in columns */
+.s-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px 16px; margin: 0; }
+.s-facts > div { min-width: 0; }
+.s-facts dt { font-size: var(--shiso-text-sm); color: var(--shiso-text-2); }
+.s-facts dd { margin: 0; font-weight: var(--shiso-weight-medium); overflow-wrap: anywhere; }
+
+/* Top bar for pages without a sidebar */
+.s-topbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--shiso-space-2) var(--shiso-space-4); padding: var(--shiso-space-3) var(--shiso-pad); }
+
+/* App shell: sidebar sits on the canvas, content cards float above it */
+.s-shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100%; }
+.s-side { padding: var(--shiso-space-3) var(--shiso-space-2); display: flex; flex-direction: column; gap: var(--shiso-space-3); border-right: 1px solid var(--shiso-line); }
+.s-main { padding: var(--shiso-pad); display: grid; gap: var(--shiso-gap); align-content: start; min-width: 0; }
+.s-nav { display: grid; gap: 2px; }
+.s-nav a {
+  display: flex; align-items: center; gap: 10px; height: var(--shiso-control); padding: 0 10px;
+  border-radius: var(--shiso-radius-control); color: var(--shiso-text-2); font-weight: var(--shiso-weight-medium); text-decoration: none;
+}
+.s-nav a:hover { background: var(--shiso-fill); text-decoration: none; }
+.s-nav a[aria-current] { background: var(--shiso-card); color: var(--shiso-text); box-shadow: var(--shiso-shadow); }
+.s-count { margin-left: auto; font-size: 0.82em; line-height: 1.6; padding: 0 7px; border-radius: var(--shiso-radius-full); background: var(--shiso-primary); color: var(--shiso-primary-text); font-variant-numeric: tabular-nums; }
+@media (max-width: 760px) {
+  .s-shell { grid-template-columns: minmax(0, 1fr); }
+  .s-side { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { .shiso * { transition: none !important; } }
+/* shiso-design: end */
+
+/* Page layout. Everything visual comes from the design system above; these rules only place things.
+   Use tokens for any value; never a literal color. */
+:root {
+  /* Short names used by inline styles in the markup below. */
+  --border: var(--shiso-line);
+  --text: var(--shiso-text);
+  --text-muted: var(--shiso-text-2);
+  --text-dim: var(--shiso-text-2);
+  --primary: var(--shiso-primary);
+  --success: var(--shiso-ok);
+  --danger: var(--shiso-bad);
+  --warning: var(--shiso-warn);
+  --mono: var(--shiso-font-mono);
+  --surface: var(--shiso-card);
+  --surface-elevated: var(--shiso-fill);
+  --bg: var(--shiso-canvas);
+}
+h1, h2, h3, h4, p { margin: 0; }
+header.s-topbar { position: sticky; top: 0; z-index: 50; background: var(--shiso-canvas); padding-inline: 28px; }
+.logo-title { display: flex; align-items: center; gap: 12px; }
+main { max-width: 1300px; margin: 12px auto 40px; padding: 0 28px; }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+.s-card { margin-bottom: var(--shiso-space-4); }
+.card-header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; }
+.card-title { display: flex; align-items: center; gap: 8px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: var(--shiso-space-4); }
+.grid > .s-card { margin-bottom: 0; }
+.recipe-card-title { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.form-group { margin-bottom: 14px; }
+.form-group.inline { display: flex; align-items: center; gap: 8px; }
+.row { display: flex; gap: 14px; flex-wrap: wrap; }
+.col { flex: 1; min-width: 200px; }
+.col-2 { flex: 2; min-width: 320px; }
+.col-3 { flex: 3; min-width: 440px; }
+.checkbox-group { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; padding: 6px 0; }
+/* A variant is a filled group inside the editor card; its components are raised rows inside it. */
+.variant-card { background: var(--shiso-fill); border-radius: var(--shiso-radius-inner); padding: 16px; margin-bottom: 16px; }
+.variant-card .s-input, .variant-card .s-select { background: var(--shiso-card); }
+.variant-card-header, .component-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 12px; }
+.component-card { background: var(--shiso-card); border-radius: var(--shiso-radius-inner); padding: 14px; margin-bottom: 12px; }
+.component-card .s-input, .component-card .s-select { background: var(--shiso-fill); }
+.s-table tr.selected td { background: var(--shiso-soft); }
+.s-inset.row { padding: 12px; }
+details summary { cursor: pointer; font-weight: var(--shiso-weight-medium); color: var(--shiso-text-2); user-select: none; }
+details summary:hover { color: var(--shiso-text); }
+.s-code { max-height: 400px; }
 </style>
 </head>
-<body>
+<body class="shiso">
 
-<header>
+<header class="s-topbar">
   <div class="logo-title">
-    <h1>Shiso Model Registry</h1>
-    <span id="git-branch" class="badge badge-muted">branch: ...</span>
-    <span id="git-status-badge" class="badge badge-success">clean</span>
+    <h1 class="s-h3">Shiso Model Registry</h1>
+    <span id="git-branch" class="s-pill">branch: ...</span>
+    <span id="git-status-badge" class="s-pill s-pill--ok s-pill--dot">clean</span>
   </div>
-  <nav>
-    <button id="nav-dashboard" class="active" onclick="showTab('dashboard')">Dashboard</button>
+  <nav class="s-seg">
+    <button id="nav-dashboard" aria-pressed="true" onclick="showTab('dashboard')">Dashboard</button>
     <button id="nav-editor" onclick="startNewRecipe()">+ New Recipe</button>
     <button id="nav-inspect" onclick="showTab('inspect')">HF Explorer</button>
     <button id="nav-validation" onclick="showTab('validation')">Validation Suite</button>
@@ -108,13 +438,13 @@
   <section id="tab-dashboard" class="tab-content active">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
       <div>
-        <h2 style="font-size:18px; font-weight:700;">Model Recipes</h2>
-        <p style="color:var(--text-muted); font-size:12px;">Authored models available in this repository under <code>recipes/</code></p>
+        <h2 class="s-h2">Model Recipes</h2>
+        <p class="s-muted s-small">Authored models available in this repository under <code>recipes/</code></p>
       </div>
       <div style="display:flex; gap:10px;">
-        <input type="text" id="recipe-search" placeholder="Filter by name, task, or tag..." oninput="filterRecipes()" style="width:280px;">
-        <button class="primary" onclick="startNewRecipe()">+ Create Recipe</button>
-        <button onclick="loadRecipes()">Refresh</button>
+        <input class="s-input" type="text" id="recipe-search" placeholder="Filter by name, task, or tag..." oninput="filterRecipes()" style="width:280px;">
+        <button class="s-btn s-btn--primary" onclick="startNewRecipe()">+ Create Recipe</button>
+        <button class="s-btn" onclick="loadRecipes()">Refresh</button>
       </div>
     </div>
     <div id="recipe-grid" class="grid"></div>
@@ -122,15 +452,15 @@
 
   <!-- TAB 2: RECIPE EDITOR (VISUAL WIZARD, NO MANUAL JSON!) -->
   <section id="tab-editor" class="tab-content">
-    <div class="card">
+    <div class="s-card">
       <div class="card-header">
         <div>
-          <div class="card-title" id="editor-title">Author Model Recipe</div>
+          <div class="card-title s-h3" id="editor-title">Author Model Recipe</div>
           <p style="color:var(--text-muted); font-size:12px; margin-top:2px;">Configure metadata, select checkpoints from Hugging Face, and preview variants.</p>
         </div>
         <div style="display:flex; gap:8px;">
-          <button onclick="toggleJsonPreview()">Preview JSON</button>
-          <button class="primary" onclick="submitRecipeForm()">Save Recipe Manifest</button>
+          <button class="s-btn" onclick="toggleJsonPreview()">Preview JSON</button>
+          <button class="s-btn s-btn--primary" onclick="submitRecipeForm()">Save Recipe Manifest</button>
         </div>
       </div>
 
@@ -140,98 +470,98 @@
       <!-- 1. General Metadata -->
       <div class="row">
         <div class="col form-group">
-          <label>Model Family (shiso-models)</label>
-          <select id="f-family" onchange="onFamilySelected()"></select>
+          <label class="s-label">Model Family (shiso-models)</label>
+          <select class="s-select" id="f-family" onchange="onFamilySelected()"></select>
         </div>
         <div class="col form-group">
-          <label>Canonical Model Name (ID)</label>
-          <input type="text" id="f-name" placeholder="e.g. qwen3.5-9b" oninput="liveValidateForm()">
+          <label class="s-label">Canonical Model Name (ID)</label>
+          <input class="s-input" type="text" id="f-name" placeholder="e.g. qwen3.5-9b" oninput="liveValidateForm()">
         </div>
         <div class="col form-group">
-          <label>Aliases (comma-separated)</label>
-          <input type="text" id="f-aliases" placeholder="e.g. qwen3.5, qwen3.5-instruct">
+          <label class="s-label">Aliases (comma-separated)</label>
+          <input class="s-input" type="text" id="f-aliases" placeholder="e.g. qwen3.5, qwen3.5-instruct">
         </div>
       </div>
 
       <!-- Family Capabilities Pill -->
-      <div id="family-info-pill" class="info-callout" style="display:none;">
+      <div id="family-info-pill" class="s-alert" style="display:none;">
         <div id="family-info-content"></div>
       </div>
 
       <div class="row">
         <div class="col-2 form-group">
-          <label>Description</label>
-          <input type="text" id="f-description" placeholder="One-line summary of architecture, parameters, and roles">
+          <label class="s-label">Description</label>
+          <input class="s-input" type="text" id="f-description" placeholder="One-line summary of architecture, parameters, and roles">
         </div>
         <div class="col form-group" style="max-width:200px;">
-          <label>Min Shiso Version</label>
-          <input type="text" id="f-min-shiso-version" value="0.1.0">
+          <label class="s-label">Min Shiso Version</label>
+          <input class="s-input" type="text" id="f-min-shiso-version" value="0.1.0">
         </div>
         <div class="col form-group">
-          <label>Tags (comma-separated)</label>
-          <input type="text" id="f-tags" placeholder="e.g. vision, tools, speculative">
+          <label class="s-label">Tags (comma-separated)</label>
+          <input class="s-input" type="text" id="f-tags" placeholder="e.g. vision, tools, speculative">
         </div>
       </div>
 
       <!-- Tasks, Modalities, Features -->
-      <div class="row" style="background:#10131c; border:1px solid var(--border); border-radius:6px; padding:14px; margin-bottom:16px;">
+      <div class="row s-inset" style="margin-bottom:16px;">
         <div class="col">
-          <label>Supported Tasks</label>
+          <label class="s-label">Supported Tasks</label>
           <div class="checkbox-group" id="f-tasks-group">
-            <label class="checkbox-item"><input type="checkbox" value="chat" checked> Chat</label>
-            <label class="checkbox-item"><input type="checkbox" value="transcription"> Transcription</label>
-            <label class="checkbox-item"><input type="checkbox" value="diarization"> Diarization</label>
-            <label class="checkbox-item"><input type="checkbox" value="image_generation"> Image Generation</label>
-            <label class="checkbox-item"><input type="checkbox" value="splat_generation"> Splat Generation</label>
-            <label class="checkbox-item"><input type="checkbox" value="embedding"> Embedding</label>
-            <label class="checkbox-item"><input type="checkbox" value="decision"> Decision</label>
+            <label class="s-check"><input type="checkbox" value="chat" checked> Chat</label>
+            <label class="s-check"><input type="checkbox" value="transcription"> Transcription</label>
+            <label class="s-check"><input type="checkbox" value="diarization"> Diarization</label>
+            <label class="s-check"><input type="checkbox" value="image_generation"> Image Generation</label>
+            <label class="s-check"><input type="checkbox" value="splat_generation"> Splat Generation</label>
+            <label class="s-check"><input type="checkbox" value="embedding"> Embedding</label>
+            <label class="s-check"><input type="checkbox" value="decision"> Decision</label>
           </div>
         </div>
         <div class="col">
-          <label>Input Modalities</label>
+          <label class="s-label">Input Modalities</label>
           <div class="checkbox-group" id="f-inputs-group">
-            <label class="checkbox-item"><input type="checkbox" value="text" checked> Text</label>
-            <label class="checkbox-item"><input type="checkbox" value="image"> Image</label>
-            <label class="checkbox-item"><input type="checkbox" value="video"> Video</label>
-            <label class="checkbox-item"><input type="checkbox" value="audio"> Audio</label>
+            <label class="s-check"><input type="checkbox" value="text" checked> Text</label>
+            <label class="s-check"><input type="checkbox" value="image"> Image</label>
+            <label class="s-check"><input type="checkbox" value="video"> Video</label>
+            <label class="s-check"><input type="checkbox" value="audio"> Audio</label>
           </div>
         </div>
         <div class="col">
-          <label>Output Modalities</label>
+          <label class="s-label">Output Modalities</label>
           <div class="checkbox-group" id="f-outputs-group">
-            <label class="checkbox-item"><input type="checkbox" value="text" checked> Text</label>
-            <label class="checkbox-item"><input type="checkbox" value="audio"> Audio</label>
-            <label class="checkbox-item"><input type="checkbox" value="image"> Image</label>
-            <label class="checkbox-item"><input type="checkbox" value="3d"> 3D</label>
+            <label class="s-check"><input type="checkbox" value="text" checked> Text</label>
+            <label class="s-check"><input type="checkbox" value="audio"> Audio</label>
+            <label class="s-check"><input type="checkbox" value="image"> Image</label>
+            <label class="s-check"><input type="checkbox" value="3d"> 3D</label>
           </div>
         </div>
       </div>
 
       <!-- Features & Reasoning -->
-      <div class="row" style="background:#10131c; border:1px solid var(--border); border-radius:6px; padding:14px; margin-bottom:20px;">
+      <div class="row s-inset" style="margin-bottom:20px;">
         <div class="col form-group" style="margin-bottom:0;">
-          <label>Feature Flags</label>
+          <label class="s-label">Feature Flags</label>
           <div class="checkbox-group">
-            <label class="checkbox-item"><input type="checkbox" id="f-feat-tools" checked> Tools enabled</label>
-            <label class="checkbox-item"><input type="checkbox" id="f-feat-struct" checked> Structured output (JSON schema)</label>
-            <label class="checkbox-item"><input type="checkbox" id="f-feat-reasoning" onchange="toggleReasoningFields()" checked> Reasoning trace support</label>
+            <label class="s-check"><input type="checkbox" id="f-feat-tools" checked> Tools enabled</label>
+            <label class="s-check"><input type="checkbox" id="f-feat-struct" checked> Structured output (JSON schema)</label>
+            <label class="s-check"><input type="checkbox" id="f-feat-reasoning" onchange="toggleReasoningFields()" checked> Reasoning trace support</label>
           </div>
         </div>
         <div class="col" id="reasoning-fields" style="display:flex; gap:12px;">
-          <div class="form-group" style="flex:1; margin-bottom:0;">
-            <label>Reasoning Efforts</label>
+          <div class="form-group s-field" style="flex:1; margin-bottom:0;">
+            <label class="s-label">Reasoning Efforts</label>
             <div class="checkbox-group" id="f-reasoning-efforts">
-              <label class="checkbox-item"><input type="checkbox" value="none" checked> none</label>
-              <label class="checkbox-item"><input type="checkbox" value="low" checked> low</label>
-              <label class="checkbox-item"><input type="checkbox" value="medium" checked> medium</label>
-              <label class="checkbox-item"><input type="checkbox" value="high" checked> high</label>
-              <label class="checkbox-item"><input type="checkbox" value="xhigh" checked> xhigh</label>
-              <label class="checkbox-item"><input type="checkbox" value="max" checked> max</label>
+              <label class="s-check"><input type="checkbox" value="none" checked> none</label>
+              <label class="s-check"><input type="checkbox" value="low" checked> low</label>
+              <label class="s-check"><input type="checkbox" value="medium" checked> medium</label>
+              <label class="s-check"><input type="checkbox" value="high" checked> high</label>
+              <label class="s-check"><input type="checkbox" value="xhigh" checked> xhigh</label>
+              <label class="s-check"><input type="checkbox" value="max" checked> max</label>
             </div>
           </div>
-          <div class="form-group" style="width:140px; margin-bottom:0;">
-            <label>Default Effort</label>
-            <select id="f-default-effort">
+          <div class="form-group s-field" style="width:140px; margin-bottom:0;">
+            <label class="s-label">Default Effort</label>
+            <select class="s-select" id="f-default-effort">
               <option value="medium">medium</option>
               <option value="none">none</option>
               <option value="low">low</option>
@@ -246,10 +576,10 @@
       <!-- 2. Variants List -->
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
         <div>
-          <h3 style="font-size:15px; font-weight:600;">Model Variants</h3>
-          <p style="color:var(--text-muted); font-size:12px;">Each backend/quantization offering. Files are selected through the embedded HF Inspector.</p>
+          <h3 class="s-h3">Model Variants</h3>
+          <p class="s-muted s-small">Each backend/quantization offering. Files are selected through the embedded HF Inspector.</p>
         </div>
-        <button class="primary sm" onclick="addVariant()">+ Add Variant</button>
+        <button class="s-btn s-btn--sm" onclick="addVariant()">+ Add Variant</button>
       </div>
 
       <div id="variants-container"></div>
@@ -257,33 +587,33 @@
       <!-- JSON Preview Accordion -->
       <details id="json-preview-details" style="margin-top:20px;">
         <summary style="padding:10px 0;">Preview Generated Recipe JSON</summary>
-        <pre id="json-preview" style="margin-top:8px;"></pre>
+        <pre class="s-code" id="json-preview" style="margin-top:8px;"></pre>
       </details>
 
       <div style="display:flex; justify-content:space-between; align-items:center; margin-top:24px; border-top:1px solid var(--border); padding-top:16px;">
-        <button onclick="showTab('dashboard')">Cancel</button>
-        <button class="primary" onclick="submitRecipeForm()">Save Recipe Manifest</button>
+        <button class="s-btn" onclick="showTab('dashboard')">Cancel</button>
+        <button class="s-btn" onclick="submitRecipeForm()">Save Recipe Manifest</button>
       </div>
     </div>
   </section>
 
   <!-- TAB 3: HF EXPLORER (STANDALONE INSPECTION) -->
   <section id="tab-inspect" class="tab-content">
-    <div class="card">
+    <div class="s-card">
       <div class="card-header">
-        <div class="card-title">Hugging Face Repository Explorer</div>
+        <div class="card-title s-h3">Hugging Face Repository Explorer</div>
       </div>
       <div class="row">
         <div class="col-3 form-group">
-          <label>Hugging Face Repository (owner/name)</label>
-          <input type="text" id="exp-repo" placeholder="e.g. shiso-community/qwen3.5-9b-mlx-4bit">
+          <label class="s-label">Hugging Face Repository (owner/name)</label>
+          <input class="s-input" type="text" id="exp-repo" placeholder="e.g. shiso-community/qwen3.5-9b-mlx-4bit">
         </div>
         <div class="col form-group">
-          <label>Revision / Tag / Branch</label>
-          <input type="text" id="exp-rev" value="main">
+          <label class="s-label">Revision / Tag / Branch</label>
+          <input class="s-input" type="text" id="exp-rev" value="main">
         </div>
         <div class="col form-group" style="flex:0; align-self:flex-end;">
-          <button class="primary" onclick="runStandaloneInspect()" style="height:36px; padding:0 20px;">Inspect</button>
+          <button class="s-btn s-btn--primary" onclick="runStandaloneInspect()">Inspect</button>
         </div>
       </div>
       <div id="exp-result" style="margin-top:16px;"></div>
@@ -292,10 +622,10 @@
 
   <!-- TAB 4: VALIDATION -->
   <section id="tab-validation" class="tab-content">
-    <div class="card">
+    <div class="s-card">
       <div class="card-header">
-        <div class="card-title">Strict Recipe Validation Suite</div>
-        <button class="primary" onclick="runValidation()">Run Full Validation</button>
+        <div class="card-title s-h3">Strict Recipe Validation Suite</div>
+        <button class="s-btn s-btn--primary" onclick="runValidation()">Run Full Validation</button>
       </div>
       <p style="color:var(--text-muted); font-size:12px; margin-bottom:16px;">Strictly validates all recipe files under <code>recipes/</code> against the current engine catalog and structural schema rules (§3).</p>
       <div id="validation-results"></div>
@@ -304,22 +634,22 @@
 
   <!-- TAB 5: BUILD & PUBLISH -->
   <section id="tab-build" class="tab-content">
-    <div class="card">
+    <div class="s-card">
       <div class="card-header">
-        <div class="card-title">Compile and Build Static Registry</div>
+        <div class="card-title s-h3">Compile and Build Static Registry</div>
       </div>
       <div class="row">
         <div class="col form-group">
-          <label>Site Root (relative to the registry repository; empty = the repository, which the host and Hub Preview serve)</label>
-          <input type="text" id="build-out" value="" placeholder="(repository root)">
+          <label class="s-label">Site Root (relative to the registry repository; empty = the repository, which the host and Hub Preview serve)</label>
+          <input class="s-input" type="text" id="build-out" value="" placeholder="(repository root)">
         </div>
       </div>
-      <div class="form-group">
-        <label class="checkbox-item"><input type="checkbox" id="build-allow-dirty"> Allow uncommitted recipe changes (skips strict git timestamp check)</label>
-        <label class="checkbox-item"><input type="checkbox" id="build-offline"> Offline: use cached model cards only, fetch no README</label>
+      <div class="form-group s-field">
+        <label class="s-check"><input type="checkbox" id="build-allow-dirty"> Allow uncommitted recipe changes (skips strict git timestamp check)</label>
+        <label class="s-check"><input type="checkbox" id="build-offline"> Offline: use cached model cards only, fetch no README</label>
       </div>
       <div style="display:flex; gap:10px; margin-bottom:16px;">
-        <button class="primary" onclick="runBuild()">Run Build</button>
+        <button class="s-btn s-btn--primary" onclick="runBuild()">Run Build</button>
       </div>
       <div id="build-result"></div>
     </div>
@@ -327,9 +657,9 @@
 
   <!-- TAB 6: BENCHMARKS -->
   <section id="tab-bench" class="tab-content">
-    <div class="card">
+    <div class="s-card">
       <div class="card-header">
-        <div class="card-title">Measure Throughput on This Device</div>
+        <div class="card-title s-h3">Measure Throughput on This Device</div>
       </div>
       <p style="color:var(--text-muted); font-size:13px; margin:0 0 14px;">
         Start <code>shiso serve &lt;name&gt;:&lt;variant&gt;</code> (release build) for an installed variant, then run the bench here.
@@ -338,22 +668,22 @@
       </p>
       <div class="row">
         <div class="col form-group">
-          <label>Installed Variant</label>
-          <select id="bench-model"></select>
+          <label class="s-label">Installed Variant</label>
+          <select class="s-select" id="bench-model"></select>
         </div>
         <div class="col form-group">
-          <label>Server URL</label>
-          <input type="text" id="bench-url" value="http://127.0.0.1:8090">
+          <label class="s-label">Server URL</label>
+          <input class="s-input" type="text" id="bench-url" value="http://127.0.0.1:8090">
         </div>
         <div class="col form-group">
-          <label>Device (empty = derived from the chip)</label>
-          <input type="text" id="bench-device" placeholder="e.g. m1-max, gb10">
+          <label class="s-label">Device (empty = derived from the chip)</label>
+          <input class="s-input" type="text" id="bench-device" placeholder="e.g. m1-max, gb10">
         </div>
       </div>
       <div class="row">
         <div class="col form-group">
-          <label>Task</label>
-          <select id="bench-task" onchange="toggleBenchFields()">
+          <label class="s-label">Task</label>
+          <select class="s-select" id="bench-task" onchange="toggleBenchFields()">
             <option value="">From the recipe</option>
             <option value="chat">chat</option>
             <option value="decision">decision</option>
@@ -362,49 +692,49 @@
           </select>
         </div>
         <div class="col form-group bench-tokens">
-          <label>Prompt Tokens (comma separated)</label>
-          <input type="text" id="bench-prompts" value="512,4096">
+          <label class="s-label">Prompt Tokens (comma separated)</label>
+          <input class="s-input" type="text" id="bench-prompts" value="512,4096">
         </div>
         <div class="col form-group bench-chat">
-          <label>Decode Tokens</label>
-          <input type="number" id="bench-decode" value="128" min="2">
+          <label class="s-label">Decode Tokens</label>
+          <input class="s-input" type="number" id="bench-decode" value="128" min="2">
         </div>
         <div class="col form-group">
-          <label>Runs (after one warm-up)</label>
-          <input type="number" id="bench-runs" value="3" min="1">
+          <label class="s-label">Runs (after one warm-up)</label>
+          <input class="s-input" type="number" id="bench-runs" value="3" min="1">
         </div>
       </div>
       <div class="row">
         <div class="col form-group bench-image">
-          <label>Image Sizes (WxH, comma separated; empty = server default)</label>
-          <input type="text" id="bench-image-sizes" placeholder="e.g. 1024x1024,512x512">
+          <label class="s-label">Image Sizes (WxH, comma separated; empty = server default)</label>
+          <input class="s-input" type="text" id="bench-image-sizes" placeholder="e.g. 1024x1024,512x512">
         </div>
         <div class="col form-group bench-audio">
-          <label>Audio Clip (WAV path; empty = synthesized speech on macOS)</label>
-          <input type="text" id="bench-audio" placeholder="/path/to/clip.wav">
+          <label class="s-label">Audio Clip (WAV path; empty = synthesized speech on macOS)</label>
+          <input class="s-input" type="text" id="bench-audio" placeholder="/path/to/clip.wav">
         </div>
       </div>
       <div class="row">
         <div class="col form-group">
-          <label>shiso Version (empty = <code>shiso --version</code>)</label>
-          <input type="text" id="bench-version" placeholder="e.g. 0.1.0">
+          <label class="s-label">shiso Version (empty = <code>shiso --version</code>)</label>
+          <input class="s-input" type="text" id="bench-version" placeholder="e.g. 0.1.0">
         </div>
         <div class="col form-group" style="flex:2;">
-          <label>Notes</label>
-          <input type="text" id="bench-notes" placeholder="e.g. on battery, --spec-k 0">
+          <label class="s-label">Notes</label>
+          <input class="s-input" type="text" id="bench-notes" placeholder="e.g. on battery, --spec-k 0">
         </div>
       </div>
       <div style="display:flex; gap:10px; margin-bottom:16px;">
-        <button class="primary" id="bench-start" onclick="startBench()">Run Benchmark</button>
-        <button onclick="loadInstalled()">Refresh Installed</button>
+        <button class="s-btn s-btn--primary" id="bench-start" onclick="startBench()">Run Benchmark</button>
+        <button class="s-btn" onclick="loadInstalled()">Refresh Installed</button>
       </div>
       <div id="bench-state"></div>
-      <pre id="bench-log" style="display:none; max-height:320px; overflow:auto;"></pre>
+      <pre class="s-code" id="bench-log" style="display:none; max-height:320px; overflow:auto;"></pre>
     </div>
-    <div class="card">
+    <div class="s-card">
       <div class="card-header">
-        <div class="card-title">Recorded Benchmarks</div>
-        <button class="sm" onclick="loadBenchRecords()">Refresh</button>
+        <div class="card-title s-h3">Recorded Benchmarks</div>
+        <button class="s-btn s-btn--sm" onclick="loadBenchRecords()">Refresh</button>
       </div>
       <div id="bench-records"></div>
     </div>
@@ -448,11 +778,11 @@ async function api(path, opts = {}) {
 
 function showTab(name) {
   document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-  document.querySelectorAll('nav button').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(el => el.setAttribute('aria-pressed', 'false'));
   const target = document.getElementById('tab-' + name);
   const btn = document.getElementById('nav-' + name);
   if (target) target.classList.add('active');
-  if (btn) btn.classList.add('active');
+  if (btn) btn.setAttribute('aria-pressed', 'true');
   if (name === 'dashboard') loadRecipes();
   if (name === 'validation') runValidation();
   if (name === 'bench') { loadInstalled(); loadBenchRecords(); pollBench(); }
@@ -465,10 +795,10 @@ async function loadGitStatus() {
     document.getElementById('git-branch').innerText = "branch: " + data.branch;
     const badge = document.getElementById('git-status-badge');
     if (data.is_dirty) {
-      badge.className = "badge badge-warning";
+      badge.className = "s-pill s-pill--warn s-pill--dot";
       badge.innerText = `${data.changed_recipes.length} modified`;
     } else {
-      badge.className = "badge badge-success";
+      badge.className = "s-pill s-pill--ok s-pill--dot";
       badge.innerText = "clean";
     }
   } catch (e) { console.error(e); }
@@ -531,25 +861,22 @@ function renderRecipes(recipes) {
   }
   recipes.forEach(r => {
     const card = document.createElement('div');
-    card.className = "recipe-card";
+    card.className = "s-card";
     const statusBadge = r.valid
-      ? '<span class="badge badge-success">Valid</span>'
-      : `<span class="badge badge-danger">Errors (${r.errors.length})</span>`;
+      ? '<span class="s-pill s-pill--ok s-pill--dot">Valid</span>'
+      : `<span class="s-pill s-pill--bad s-pill--dot">Errors (${r.errors.length})</span>`;
 
     card.innerHTML = `
-      <div>
-        <div class="recipe-card-title">
-          <span>${r.name}</span>
-          ${statusBadge}
-        </div>
-        <div style="font-size:12px; color:var(--text-muted); margin-bottom:8px;">${r.file}</div>
-        <div style="font-size:11px; margin-bottom:12px;">
-          <span class="stat-pill">family: ${r.name.includes("qwen") ? "qwen" : "model"}</span>
-        </div>
+      <div class="recipe-card-title">
+        <span class="s-h3">${r.name}</span>
+        ${statusBadge}
       </div>
-      <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
-        <button class="sm" onclick="editRecipe('${r.name}')">Edit Recipe</button>
-        <button class="sm danger" onclick="deleteRecipe('${r.name}')">Delete</button>
+      <div class="s-mono s-muted s-small">${r.file}</div>
+      <div class="s-row">
+        <span class="s-pill">${r.name.includes("qwen") ? "qwen" : "model"} family</span>
+        <span class="s-spacer"></span>
+        <button class="s-btn s-btn--sm" onclick="editRecipe('${r.name}')">Edit</button>
+        <button class="s-btn s-btn--sm s-btn--ghost" onclick="deleteRecipe('${r.name}')">Delete</button>
       </div>
     `;
     container.appendChild(card);
@@ -692,46 +1019,46 @@ function renderVariantsList() {
     card.innerHTML = `
       <div class="variant-card-header">
         <div style="display:flex; align-items:center; gap:8px;">
-          <span style="font-weight:700; font-size:14px;">Variant #${vIdx + 1}:</span>
-          <input type="text" value="${v.key}" onchange="updateVariantField(${vIdx}, 'key', this.value)" style="width:180px; font-weight:600;">
-          <span class="badge ${isCuda ? 'badge-warning' : 'badge-primary'}">${(v.backends || []).join(' / ') || 'no backend'}</span>
-          <span class="stat-pill">Disk: ${formatBytes(diskBytes)}</span>
+          <span class="s-h3">Variant #${vIdx + 1}:</span>
+          <input class="s-input" type="text" value="${v.key}" onchange="updateVariantField(${vIdx}, 'key', this.value)" style="width:180px; font-weight:600;">
+          <span class="s-pill ${isCuda ? 's-pill--warn' : 's-pill--soft'}">${(v.backends || []).join(' / ') || 'no backend'}</span>
+          <span class="s-pill s-mono">Disk: ${formatBytes(diskBytes)}</span>
         </div>
-        <button class="sm danger" onclick="deleteVariant(${vIdx})">Delete Variant</button>
+        <button class="s-btn s-btn--sm s-btn--danger" onclick="deleteVariant(${vIdx})">Delete Variant</button>
       </div>
 
       <!-- Variant basic specs -->
       <div class="row">
         <div class="col form-group">
-          <label>Backends (same files, preference order)</label>
+          <label class="s-label">Backends (same files, preference order)</label>
           <div style="display:flex; gap:12px; align-items:center; padding:6px 0;">
-            <label style="margin:0; font-weight:400;"><input type="checkbox" ${(v.backends || []).includes('metal') ? 'checked' : ''} onchange="toggleVariantBackend(${vIdx}, 'metal', this.checked)"> Apple Metal</label>
-            <label style="margin:0; font-weight:400;"><input type="checkbox" ${(v.backends || []).includes('cuda') ? 'checked' : ''} onchange="toggleVariantBackend(${vIdx}, 'cuda', this.checked)"> NVIDIA CUDA</label>
+            <label class="s-label" style="margin:0; font-weight:400;"><input type="checkbox" ${(v.backends || []).includes('metal') ? 'checked' : ''} onchange="toggleVariantBackend(${vIdx}, 'metal', this.checked)"> Apple Metal</label>
+            <label class="s-label" style="margin:0; font-weight:400;"><input type="checkbox" ${(v.backends || []).includes('cuda') ? 'checked' : ''} onchange="toggleVariantBackend(${vIdx}, 'cuda', this.checked)"> NVIDIA CUDA</label>
           </div>
         </div>
         <div class="col form-group">
-          <label>Quantization Label</label>
-          <input type="text" value="${v.quant}" placeholder="e.g. mlx-4bit, fp8, q4_k_m" onchange="updateVariantField(${vIdx}, 'quant', this.value)">
+          <label class="s-label">Quantization Label</label>
+          <input class="s-input" type="text" value="${v.quant}" placeholder="e.g. mlx-4bit, fp8, q4_k_m" onchange="updateVariantField(${vIdx}, 'quant', this.value)">
         </div>
         <div class="col form-group">
-          <label>Min Host RAM (GB)</label>
-          <input type="number" step="0.5" value="${(v.requirements.min_ram_bytes / 1073741824).toFixed(1)}" onchange="updateVariantRam(${vIdx}, 'min_ram_bytes', this.value)">
+          <label class="s-label">Min Host RAM (GB)</label>
+          <input class="s-input" type="number" step="0.5" value="${(v.requirements.min_ram_bytes / 1073741824).toFixed(1)}" onchange="updateVariantRam(${vIdx}, 'min_ram_bytes', this.value)">
         </div>
         <div class="col form-group">
-          <label>Recommended RAM (GB)</label>
-          <input type="number" step="0.5" value="${(v.requirements.recommended_ram_bytes / 1073741824).toFixed(1)}" onchange="updateVariantRam(${vIdx}, 'recommended_ram_bytes', this.value)">
+          <label class="s-label">Recommended RAM (GB)</label>
+          <input class="s-input" type="number" step="0.5" value="${(v.requirements.recommended_ram_bytes / 1073741824).toFixed(1)}" onchange="updateVariantRam(${vIdx}, 'recommended_ram_bytes', this.value)">
         </div>
       </div>
 
       ${isCuda ? `
       <div class="row">
         <div class="col form-group">
-          <label>Min CUDA Compute Capability (SM)</label>
-          <input type="number" value="${v.requires?.min_cuda_sm || 89}" onchange="updateVariantField(${vIdx}, 'min_cuda_sm', this.value)">
+          <label class="s-label">Min CUDA Compute Capability (SM)</label>
+          <input class="s-input" type="number" value="${v.requires?.min_cuda_sm || 89}" onchange="updateVariantField(${vIdx}, 'min_cuda_sm', this.value)">
         </div>
         <div class="col form-group">
-          <label>Min VRAM (GB)</label>
-          <input type="number" step="0.5" value="${((v.requirements.min_vram_bytes || 0) / 1073741824).toFixed(1)}" onchange="updateVariantRam(${vIdx}, 'min_vram_bytes', this.value)">
+          <label class="s-label">Min VRAM (GB)</label>
+          <input class="s-input" type="number" step="0.5" value="${((v.requirements.min_vram_bytes || 0) / 1073741824).toFixed(1)}" onchange="updateVariantRam(${vIdx}, 'min_vram_bytes', this.value)">
         </div>
       </div>
       ` : ''}
@@ -739,8 +1066,8 @@ function renderVariantsList() {
       ${(v.backends || []).includes('metal') ? `
       <div class="row">
         <div class="col form-group">
-          <label>Min Apple GPU Family (Metal)</label>
-          <select onchange="updateVariantField(${vIdx}, 'min_metal_family', this.value)">
+          <label class="s-label">Min Apple GPU Family (Metal)</label>
+          <select class="s-select" onchange="updateVariantField(${vIdx}, 'min_metal_family', this.value)">
             <option value="" ${!v.requires?.min_metal_family ? 'selected' : ''}>any Apple silicon</option>
             <option value="7" ${v.requires?.min_metal_family === 7 ? 'selected' : ''}>7 - M1 and newer</option>
             <option value="8" ${v.requires?.min_metal_family === 8 ? 'selected' : ''}>8 - M2 and newer</option>
@@ -749,8 +1076,8 @@ function renderVariantsList() {
           </select>
         </div>
         <div class="col form-group">
-          <label>Min GPU Working Set (GB) - Metal, shared with CUDA min VRAM</label>
-          <input type="number" step="0.5" value="${((v.requirements.min_vram_bytes || 0) / 1073741824).toFixed(1)}" onchange="updateVariantRam(${vIdx}, 'min_vram_bytes', this.value)">
+          <label class="s-label">Min GPU Working Set (GB) - Metal, shared with CUDA min VRAM</label>
+          <input class="s-input" type="number" step="0.5" value="${((v.requirements.min_vram_bytes || 0) / 1073741824).toFixed(1)}" onchange="updateVariantRam(${vIdx}, 'min_vram_bytes', this.value)">
         </div>
       </div>
       ` : ''}
@@ -758,9 +1085,9 @@ function renderVariantsList() {
       <!-- Components Section with Embedded HF Inspector -->
       <div style="margin-top:16px;">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-          <label style="margin-bottom:0;">Components (${Object.keys(v.components).length})</label>
+          <label class="s-label" style="margin-bottom:0;">Components (${Object.keys(v.components).length})</label>
           <div style="display:flex; gap:6px;">
-            <select id="add-role-select-${vIdx}" style="width:130px; padding:4px 8px; font-size:11px;">
+            <select class="s-select" id="add-role-select-${vIdx}" style="width:130px;">
               <option value="draft">draft</option>
               <option value="vision">vision</option>
               <option value="asr">asr</option>
@@ -779,7 +1106,7 @@ function renderVariantsList() {
               <option value="ngram">ngram</option>
               <option value="generation_config">generation_config</option>
             </select>
-            <button class="sm primary" onclick="addComponentToVariant(${vIdx})">+ Add Role</button>
+            <button class="s-btn s-btn--sm " onclick="addComponentToVariant(${vIdx})">+ Add Role</button>
           </div>
         </div>
 
@@ -787,62 +1114,62 @@ function renderVariantsList() {
       </div>
 
       <!-- Server Defaults Form -->
-      <details style="margin-top:16px; background:#0b0d13; border:1px solid var(--border); border-radius:6px; padding:12px;">
+      <details class="s-inset" style="margin-top:16px; padding:12px;">
         <summary>Server Defaults for ${v.key}</summary>
         <div class="row" style="margin-top:12px;">
           <div class="col form-group">
-            <label>Context Window (--ctx)</label>
-            <input type="number" value="${v.server_defaults?.ctx || ''}" placeholder="32768" onchange="updateServerDefault(${vIdx}, 'ctx', this.value)">
+            <label class="s-label">Context Window (--ctx)</label>
+            <input class="s-input" type="number" value="${v.server_defaults?.ctx || ''}" placeholder="32768" onchange="updateServerDefault(${vIdx}, 'ctx', this.value)">
           </div>
           <div class="col form-group">
-            <label>Speculation Depth (--spec-k)</label>
-            <input type="number" value="${v.server_defaults?.spec_k || ''}" placeholder="3 (required if draft head is present)" onchange="updateServerDefault(${vIdx}, 'spec_k', this.value)">
+            <label class="s-label">Speculation Depth (--spec-k)</label>
+            <input class="s-input" type="number" value="${v.server_defaults?.spec_k || ''}" placeholder="3 (required if draft head is present)" onchange="updateServerDefault(${vIdx}, 'spec_k', this.value)">
           </div>
           <div class="col form-group">
-            <label>Vision Max Pixels (--vision-max-pixels)</label>
-            <input type="number" value="${v.server_defaults?.vision_max_pixels || ''}" placeholder="1638400" onchange="updateServerDefault(${vIdx}, 'vision_max_pixels', this.value)">
-          </div>
-        </div>
-        <div class="row">
-          <div class="col form-group">
-            <label>Max Concurrent Sequences (--max-num-seqs)</label>
-            <input type="number" value="${v.server_defaults?.max_num_seqs || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'max_num_seqs', this.value)">
-          </div>
-          <div class="col form-group">
-            <label>Turn Replay Tokens (--turn-replay-tokens)</label>
-            <input type="number" value="${v.server_defaults?.turn_replay_tokens || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'turn_replay_tokens', this.value)">
-          </div>
-          <div class="col form-group">
-            <label>Video Max Frames (--video-max-frames)</label>
-            <input type="number" value="${v.server_defaults?.video_max_frames || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'video_max_frames', this.value)">
+            <label class="s-label">Vision Max Pixels (--vision-max-pixels)</label>
+            <input class="s-input" type="number" value="${v.server_defaults?.vision_max_pixels || ''}" placeholder="1638400" onchange="updateServerDefault(${vIdx}, 'vision_max_pixels', this.value)">
           </div>
         </div>
         <div class="row">
           <div class="col form-group">
-            <label>Video FPS (--video-fps)</label>
-            <input type="number" step="0.1" value="${v.server_defaults?.video_fps ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'video_fps', this.value)">
+            <label class="s-label">Max Concurrent Sequences (--max-num-seqs)</label>
+            <input class="s-input" type="number" value="${v.server_defaults?.max_num_seqs || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'max_num_seqs', this.value)">
           </div>
           <div class="col form-group">
-            <label>ASR Lookahead Frames (--asr-lookahead)</label>
-            <input type="number" value="${v.server_defaults?.asr_lookahead || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'asr_lookahead', this.value)">
+            <label class="s-label">Turn Replay Tokens (--turn-replay-tokens)</label>
+            <input class="s-input" type="number" value="${v.server_defaults?.turn_replay_tokens || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'turn_replay_tokens', this.value)">
           </div>
           <div class="col form-group">
-            <label>ASR Batch Size (--asr-batch)</label>
-            <input type="number" value="${v.server_defaults?.asr_batch || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'asr_batch', this.value)">
-          </div>
-          <div class="col form-group">
-            <label>Splat Default Steps (--splat-default-steps)</label>
-            <input type="number" value="${v.server_defaults?.splat_default_steps || ''}" placeholder="model default" onchange="updateServerDefault(${vIdx}, 'splat_default_steps', this.value)">
-          </div>
-          <div class="col form-group">
-            <label>Splat Refresh Every (--splat-refresh-every)</label>
-            <input type="number" min="1" max="4" value="${v.server_defaults?.splat_refresh_every || ''}" placeholder="1 = every step in full" onchange="updateServerDefault(${vIdx}, 'splat_refresh_every', this.value)">
+            <label class="s-label">Video Max Frames (--video-max-frames)</label>
+            <input class="s-input" type="number" value="${v.server_defaults?.video_max_frames || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'video_max_frames', this.value)">
           </div>
         </div>
         <div class="row">
           <div class="col form-group">
-            <label>Expert Residency (--expert-residency)</label>
-            <select onchange="updateServerDefault(${vIdx}, 'expert_residency', this.value)">
+            <label class="s-label">Video FPS (--video-fps)</label>
+            <input class="s-input" type="number" step="0.1" value="${v.server_defaults?.video_fps ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'video_fps', this.value)">
+          </div>
+          <div class="col form-group">
+            <label class="s-label">ASR Lookahead Frames (--asr-lookahead)</label>
+            <input class="s-input" type="number" value="${v.server_defaults?.asr_lookahead || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'asr_lookahead', this.value)">
+          </div>
+          <div class="col form-group">
+            <label class="s-label">ASR Batch Size (--asr-batch)</label>
+            <input class="s-input" type="number" value="${v.server_defaults?.asr_batch || ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'asr_batch', this.value)">
+          </div>
+          <div class="col form-group">
+            <label class="s-label">Splat Default Steps (--splat-default-steps)</label>
+            <input class="s-input" type="number" value="${v.server_defaults?.splat_default_steps || ''}" placeholder="model default" onchange="updateServerDefault(${vIdx}, 'splat_default_steps', this.value)">
+          </div>
+          <div class="col form-group">
+            <label class="s-label">Splat Refresh Every (--splat-refresh-every)</label>
+            <input class="s-input" type="number" min="1" max="4" value="${v.server_defaults?.splat_refresh_every || ''}" placeholder="1 = every step in full" onchange="updateServerDefault(${vIdx}, 'splat_refresh_every', this.value)">
+          </div>
+        </div>
+        <div class="row">
+          <div class="col form-group">
+            <label class="s-label">Expert Residency (--expert-residency)</label>
+            <select class="s-select" onchange="updateServerDefault(${vIdx}, 'expert_residency', this.value)">
               <option value="" ${!v.server_defaults?.expert_residency ? 'selected' : ''}>server default</option>
               <option value="auto" ${v.server_defaults?.expert_residency === 'auto' ? 'selected' : ''}>auto (resident when they fit, streamed when they do not)</option>
               <option value="resident" ${v.server_defaults?.expert_residency === 'resident' ? 'selected' : ''}>resident (imported beside the other weights)</option>
@@ -852,40 +1179,40 @@ function renderVariantsList() {
         </div>
         <div class="row">
           <div class="col form-group">
-            <label>Expert Reserve GB (--expert-reserve-gb)</label>
-            <input type="number" value="${v.server_defaults?.expert_reserve_gb ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'expert_reserve_gb', this.value)">
+            <label class="s-label">Expert Reserve GB (--expert-reserve-gb)</label>
+            <input class="s-input" type="number" value="${v.server_defaults?.expert_reserve_gb ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'expert_reserve_gb', this.value)">
           </div>
           <div class="col form-group">
-            <label>Expert Slots (--expert-slots)</label>
-            <input type="number" value="${v.server_defaults?.expert_slots ?? ''}" placeholder="0 = sized from working set" onchange="updateServerDefault(${vIdx}, 'expert_slots', this.value)">
+            <label class="s-label">Expert Slots (--expert-slots)</label>
+            <input class="s-input" type="number" value="${v.server_defaults?.expert_slots ?? ''}" placeholder="0 = sized from working set" onchange="updateServerDefault(${vIdx}, 'expert_slots', this.value)">
           </div>
           <div class="col form-group">
-            <label>Prompt Lookup Depth (--spec-lookup)</label>
-            <input type="number" value="${v.server_defaults?.spec_lookup ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'spec_lookup', this.value)">
+            <label class="s-label">Prompt Lookup Depth (--spec-lookup)</label>
+            <input class="s-input" type="number" value="${v.server_defaults?.spec_lookup ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'spec_lookup', this.value)">
           </div>
           <div class="col form-group">
-            <label>Draft Confidence (--spec-confidence)</label>
-            <input type="number" step="0.05" min="0" max="1" value="${v.server_defaults?.spec_confidence ?? ''}" placeholder="0 = never stops" onchange="updateServerDefault(${vIdx}, 'spec_confidence', this.value)">
+            <label class="s-label">Draft Confidence (--spec-confidence)</label>
+            <input class="s-input" type="number" step="0.05" min="0" max="1" value="${v.server_defaults?.spec_confidence ?? ''}" placeholder="0 = never stops" onchange="updateServerDefault(${vIdx}, 'spec_confidence', this.value)">
           </div>
         </div>
         <div class="row">
           <div class="col form-group">
-            <label>GPU Memory Utilization (--gpu-memory-utilization)</label>
-            <input type="number" step="0.01" value="${v.server_defaults?.gpu_memory_utilization ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'gpu_memory_utilization', this.value)">
+            <label class="s-label">GPU Memory Utilization (--gpu-memory-utilization)</label>
+            <input class="s-input" type="number" step="0.01" value="${v.server_defaults?.gpu_memory_utilization ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'gpu_memory_utilization', this.value)">
           </div>
           <div class="col form-group">
-            <label>KV Cache Tokens (--kv-cache-tokens)</label>
-            <input type="number" value="${v.server_defaults?.kv_cache_tokens ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'kv_cache_tokens', this.value)">
+            <label class="s-label">KV Cache Tokens (--kv-cache-tokens)</label>
+            <input class="s-input" type="number" value="${v.server_defaults?.kv_cache_tokens ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'kv_cache_tokens', this.value)">
           </div>
           <div class="col form-group">
-            <label>Solo Prefill Chunk (--solo-prefill-chunk)</label>
-            <input type="number" value="${v.server_defaults?.solo_prefill_chunk ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'solo_prefill_chunk', this.value)">
+            <label class="s-label">Solo Prefill Chunk (--solo-prefill-chunk)</label>
+            <input class="s-input" type="number" value="${v.server_defaults?.solo_prefill_chunk ?? ''}" placeholder="server default" onchange="updateServerDefault(${vIdx}, 'solo_prefill_chunk', this.value)">
           </div>
           <div class="col form-group">
-            <label>Capture Graphs</label>
+            <label class="s-label">Capture Graphs</label>
             <div style="display:flex; gap:12px; padding:6px 0;">
-              <label style="margin:0; font-weight:400;"><input type="checkbox" ${v.server_defaults?.capture_verify ? 'checked' : ''} onchange="updateServerDefault(${vIdx}, 'capture_verify', this.checked ? 'true' : '')"> --capture-verify</label>
-              <label style="margin:0; font-weight:400;"><input type="checkbox" ${v.server_defaults?.capture_batch ? 'checked' : ''} onchange="updateServerDefault(${vIdx}, 'capture_batch', this.checked ? 'true' : '')"> --capture-batch</label>
+              <label class="s-label" style="margin:0; font-weight:400;"><input type="checkbox" ${v.server_defaults?.capture_verify ? 'checked' : ''} onchange="updateServerDefault(${vIdx}, 'capture_verify', this.checked ? 'true' : '')"> --capture-verify</label>
+              <label class="s-label" style="margin:0; font-weight:400;"><input type="checkbox" ${v.server_defaults?.capture_batch ? 'checked' : ''} onchange="updateServerDefault(${vIdx}, 'capture_batch', this.checked ? 'true' : '')"> --capture-batch</label>
             </div>
           </div>
         </div>
@@ -1017,16 +1344,16 @@ function renderComponentsList(vIdx) {
     card.innerHTML = `
       <div class="component-header">
         <div style="display:flex; align-items:center; gap:8px;">
-          <span class="badge badge-primary">${role.toUpperCase()}</span>
-          <span class="stat-pill">${comp.files.length} files selected</span>
-          ${comp.entry ? `<span class="stat-pill">entry: ${comp.entry}</span>` : ''}
+          <span class="s-pill s-pill--soft">${role.toUpperCase()}</span>
+          <span class="s-pill s-mono">${comp.files.length} files selected</span>
+          ${comp.entry ? `<span class="s-pill s-mono">entry: ${comp.entry}</span>` : ''}
         </div>
-        ${role !== 'base' ? `<button class="sm danger" onclick="removeComponentFromVariant(${vIdx}, '${role}')">Remove Role</button>` : ''}
+        ${role !== 'base' ? `<button class="s-btn s-btn--sm s-btn--danger" onclick="removeComponentFromVariant(${vIdx}, '${role}')">Remove Role</button>` : ''}
       </div>
 
-      <div class="form-group" style="max-width:240px;">
-        <label>Source</label>
-        <select onchange="setCompProvider(${vIdx}, '${role}', this.value)">
+      <div class="form-group s-field" style="max-width:240px;">
+        <label class="s-label">Source</label>
+        <select class="s-select" onchange="setCompProvider(${vIdx}, '${role}', this.value)">
           <option value="huggingface" ${comp.provider === 'huggingface' ? 'selected' : ''}>Hugging Face</option>
           <option value="shiso" ${comp.provider === 'shiso' ? 'selected' : ''}>shiso hub (files up to 1 MiB)</option>
         </select>
@@ -1034,24 +1361,24 @@ function renderComponentsList(vIdx) {
 
       ${comp.provider === 'shiso' ? `
       <!-- Hub-hosted file upload -->
-      <div class="row" style="background:#090b10; border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:12px;">
+      <div class="row s-inset" style="margin-bottom:12px;">
         <div class="col form-group" style="margin-bottom:0;">
-          <label>Add a file the hub hosts (next to the model's index.json)</label>
+          <label class="s-label">Add a file the hub hosts (next to the model's index.json)</label>
           <input type="file" onchange="uploadHostedFile(${vIdx}, '${role}', this.files[0])">
         </div>
       </div>` : `
       <!-- Hugging Face Inspector Bar -->
-      <div class="row" style="background:#090b10; border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:12px;">
+      <div class="row s-inset" style="margin-bottom:12px;">
         <div class="col-2 form-group" style="margin-bottom:0;">
-          <label>HF Repository</label>
-          <input type="text" id="repo-${vIdx}-${role}" value="${comp.repo}" placeholder="owner/repository" onchange="updateCompRepo(${vIdx}, '${role}', this.value)">
+          <label class="s-label">HF Repository</label>
+          <input class="s-input" type="text" id="repo-${vIdx}-${role}" value="${comp.repo}" placeholder="owner/repository" onchange="updateCompRepo(${vIdx}, '${role}', this.value)">
         </div>
         <div class="col form-group" style="max-width:140px; margin-bottom:0;">
-          <label>Revision / Branch</label>
-          <input type="text" id="rev-${vIdx}-${role}" value="${comp.revision}" onchange="updateCompRev(${vIdx}, '${role}', this.value)">
+          <label class="s-label">Revision / Branch</label>
+          <input class="s-input" type="text" id="rev-${vIdx}-${role}" value="${comp.revision}" onchange="updateCompRev(${vIdx}, '${role}', this.value)">
         </div>
         <div class="col form-group" style="flex:0; margin-bottom:0; align-self:flex-end;">
-          <button class="primary sm" onclick="inspectComponentRepo(${vIdx}, '${role}')" style="height:35px; white-space:nowrap;">
+          <button class="s-btn s-btn--sm" onclick="inspectComponentRepo(${vIdx}, '${role}')">
             🔍 Inspect HF Files
           </button>
         </div>
@@ -1091,7 +1418,7 @@ const BINDABLE_ROLES = ['base', 'draft', 'draft_vocab', 'vision', 'asr', 'asr_mm
 // written to the recipe.
 function bindsSelect(vIdx, role, name, current, disabled) {
   return `
-    <select style="padding:2px 6px; font-size:11px;" ${disabled ? 'disabled' : ''} onchange="setFileBinds(${vIdx}, '${role}', '${name}', this.value)">
+    <select class="s-select" ${disabled ? 'disabled' : ''} onchange="setFileBinds(${vIdx}, '${role}', '${name}', this.value)">
       <option value="" ${!current ? 'selected' : ''}>-</option>
       ${BINDABLE_ROLES.filter(r => r !== role).map(r => `<option value="${r}" ${current === r ? 'selected' : ''}>${r}</option>`).join('')}
     </select>`;
@@ -1102,8 +1429,8 @@ function renderComponentSelectedFilesSummary(vIdx, role, comp) {
     return `<div style="color:var(--text-dim); font-size:12px; font-style:italic;">No files selected yet. Click "Inspect HF Files" to browse and select files for this role.</div>`;
   }
   return `
-    <div style="font-size:12px; color:var(--text-muted); margin-bottom:6px;">Selected Files:</div>
-    <table class="file-table">
+    <div class="s-muted s-small" style="margin-bottom:6px;">Selected Files:</div>
+    <div class="s-table-wrap"><table class="s-table">
       <thead>
         <tr><th>File Name</th><th>Size</th><th>SHA-256 Digest</th><th>Entry</th><th>Binds (passed to another role's flag)</th></tr>
       </thead>
@@ -1113,12 +1440,12 @@ function renderComponentSelectedFilesSummary(vIdx, role, comp) {
             <td><code>${f.name}</code></td>
             <td>${formatBytes(f.size)}</td>
             <td><code title="${f.sha256}">${f.sha256.substring(0, 16)}...${f.sha256.substring(56)}</code></td>
-            <td>${comp.entry === f.name ? '<span class="badge badge-success">entry</span>' : ''}</td>
+            <td>${comp.entry === f.name ? '<span class="s-pill s-pill--ok s-pill--dot">entry</span>' : ''}</td>
             <td>${bindsSelect(vIdx, role, f.name, f.binds, false)}</td>
           </tr>
         `).join("")}
       </tbody>
-    </table>
+    </table></div>
   `;
 }
 
@@ -1132,7 +1459,7 @@ async function inspectComponentRepo(vIdx, role) {
     return;
   }
 
-  outDiv.innerHTML = `<div style="color:var(--text-muted); padding:8px 0;"><span class="badge badge-warning">Loading...</span> Inspecting repository and computing SHA-256 digests...</div>`;
+  outDiv.innerHTML = `<div style="color:var(--text-muted); padding:8px 0;"><span class="s-pill s-pill--warn s-pill--dot">Loading...</span> Inspecting repository and computing SHA-256 digests...</div>`;
 
   try {
     const res = await api('/api/hf/inspect', {
@@ -1141,7 +1468,7 @@ async function inspectComponentRepo(vIdx, role) {
       body: JSON.stringify({ repo, revision })
     });
     if (!res.ok) {
-      outDiv.innerHTML = `<div class="alert-danger">Hugging Face error: ${await res.text()}</div>`;
+      outDiv.innerHTML = `<div class="s-alert s-alert--bad">Hugging Face error: ${await res.text()}</div>`;
       return;
     }
     const data = await res.json();
@@ -1151,7 +1478,7 @@ async function inspectComponentRepo(vIdx, role) {
 
     renderComponentInspectorFilePicker(vIdx, role, data);
   } catch (e) {
-    outDiv.innerHTML = `<div class="alert-danger">Inspection failed: ${e.message}</div>`;
+    outDiv.innerHTML = `<div class="s-alert s-alert--bad">Inspection failed: ${e.message}</div>`;
   }
 }
 
@@ -1170,8 +1497,8 @@ function renderComponentInspectorFilePicker(vIdx, role, data) {
         </td>
         <td><strong>${f.name}</strong></td>
         <td>${formatBytes(f.size)}</td>
-        <td><code style="font-size:11px;" title="${f.sha256}">${f.sha256.substring(0, 14)}...</code></td>
-        <td><span class="badge ${f.lfs ? 'badge-primary' : 'badge-muted'}">${f.lfs ? 'LFS' : 'raw'}</span></td>
+        <td><code class="s-small" title="${f.sha256}">${f.sha256.substring(0, 14)}...</code></td>
+        <td><span class="s-pill ${f.lfs ? 's-pill--soft' : ''}">${f.lfs ? 'LFS' : 'raw'}</span></td>
         <td style="text-align:center;">
           <input type="radio" name="entry-${vIdx}-${role}" value="${f.name}" ${comp.entry === f.name ? 'checked' : ''} onchange="setComponentEntry(${vIdx}, '${role}', '${f.name}')">
         </td>
@@ -1181,19 +1508,19 @@ function renderComponentInspectorFilePicker(vIdx, role, data) {
   }).join("");
 
   outDiv.innerHTML = `
-    <div style="background:#0b0d13; border:1px solid var(--border); border-radius:6px; padding:12px; margin-top:10px;">
+    <div class="s-inset" style="padding:12px; margin-top:10px;">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
         <div>
-          <span style="font-weight:600;">Resolved Commit:</span>
-          <code class="stat-pill">${data.commit}</code>
+          <span class="s-label">Resolved Commit:</span>
+          <code class="s-pill s-mono">${data.commit}</code>
         </div>
         <div style="display:flex; gap:6px;">
-          <button class="sm" onclick="selectAllComponentFiles(${vIdx}, '${role}', true)">Select All</button>
-          <button class="sm" onclick="selectAllComponentFiles(${vIdx}, '${role}', false)">Clear Selection</button>
+          <button class="s-btn s-btn--sm" onclick="selectAllComponentFiles(${vIdx}, '${role}', true)">Select All</button>
+          <button class="s-btn s-btn--sm" onclick="selectAllComponentFiles(${vIdx}, '${role}', false)">Clear Selection</button>
         </div>
       </div>
 
-      <table class="file-table">
+      <div class="s-table-wrap"><table class="s-table">
         <thead>
           <tr>
             <th></th>
@@ -1208,7 +1535,7 @@ function renderComponentInspectorFilePicker(vIdx, role, data) {
         <tbody>
           ${rows}
         </tbody>
-      </table>
+      </table></div>
     </div>
   `;
 
@@ -1379,11 +1706,11 @@ function liveValidateForm() {
 
   if (errors.length > 0) {
     box.style.display = 'block';
-    box.className = 'alert-danger';
+    box.className = 's-alert s-alert--bad';
     box.innerHTML = `<strong>Validation Issues (${errors.length}):</strong><br>` + errors.join("<br>");
   } else {
     box.style.display = 'block';
-    box.className = 'alert-success';
+    box.className = 's-alert s-alert--ok';
     box.innerHTML = `<strong>All checks passed!</strong> This recipe meets all strict validation rules.`;
   }
 }
@@ -1449,7 +1776,7 @@ async function runStandaloneInspect() {
       body: JSON.stringify({ repo, revision })
     });
     if (!res.ok) {
-      out.innerHTML = `<div class="alert-danger">${await res.text()}</div>`;
+      out.innerHTML = `<div class="s-alert s-alert--bad">${await res.text()}</div>`;
       return;
     }
     const data = await res.json();
@@ -1458,19 +1785,19 @@ async function runStandaloneInspect() {
         <td><code>${f.name}</code></td>
         <td>${formatBytes(f.size)}</td>
         <td><code title="${f.sha256}">${f.sha256}</code></td>
-        <td><span class="badge ${f.lfs ? 'badge-primary' : 'badge-muted'}">${f.lfs ? 'LFS' : 'raw'}</span></td>
+        <td><span class="s-pill ${f.lfs ? 's-pill--soft' : ''}">${f.lfs ? 'LFS' : 'raw'}</span></td>
       </tr>
     `).join("");
 
     out.innerHTML = `
       <div style="margin-bottom:12px;"><strong>Commit SHA:</strong> <code>${data.commit}</code> &bull; ${data.files.length} files</div>
-      <table class="file-table">
+      <div class="s-table-wrap"><table class="s-table">
         <thead><tr><th>Name</th><th>Size</th><th>SHA-256 Digest</th><th>Storage</th></tr></thead>
         <tbody>${rows}</tbody>
-      </table>
+      </table></div>
     `;
   } catch (e) {
-    out.innerHTML = `<div class="alert-danger">${e.message}</div>`;
+    out.innerHTML = `<div class="s-alert s-alert--bad">${e.message}</div>`;
   }
 }
 
@@ -1488,7 +1815,7 @@ async function runValidation() {
     reports.forEach(r => {
       const color = r.valid ? "var(--success)" : "var(--danger)";
       const status = r.valid ? "OK" : "FAILED";
-      const errList = r.errors.length ? `<div style="margin-top:6px; color:#f87171;">${r.errors.join("<br>")}</div>` : "";
+      const errList = r.errors.length ? `<div class="s-small" style="margin-top:6px; color:var(--shiso-bad);">${r.errors.join("<br>")}</div>` : "";
       html += `<div style="border-bottom:1px solid var(--border); padding:10px 0;">
         <span style="font-weight:600; color:${color};">[${status}]</span> <strong>${r.file}</strong> (${r.name})
         ${errList}
@@ -1512,11 +1839,11 @@ async function runBuild() {
       body: JSON.stringify({ out, allow_dirty: allowDirty, offline })
     });
     if (!res.ok) {
-      resDiv.innerHTML = `<div class="alert-danger">Build failed:<br>${await res.text()}</div>`;
+      resDiv.innerHTML = `<div class="s-alert s-alert--bad">Build failed:<br>${await res.text()}</div>`;
     } else {
       const data = await res.json();
       resDiv.innerHTML = `
-        <div class="alert-success">
+        <div class="s-alert s-alert--ok">
           <strong>Build Complete!</strong><br>${esc(data.diff)}
           ${data.missing_cards.length ? `<br>No model card for: ${esc(data.missing_cards.join(', '))}` : ''}
           ${data.pruned.length ? `<br>Removed stale: ${esc(data.pruned.join(', '))}` : ''}
@@ -1524,7 +1851,7 @@ async function runBuild() {
         </div>
       `;
     }
-  } catch (e) { resDiv.innerHTML = `<div class="alert-danger">${e.message}</div>`; }
+  } catch (e) { resDiv.innerHTML = `<div class="s-alert s-alert--bad">${e.message}</div>`; }
 }
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1572,9 +1899,9 @@ function renderBench(job) {
   log.style.display = 'block';
   log.textContent = (job.log || []).join('\n');
   log.scrollTop = log.scrollHeight;
-  if (job.running) state.innerHTML = `<div class="info-callout">Measuring <strong>${esc(job.model)}</strong>…</div>`;
-  else if (job.error) state.innerHTML = `<div class="alert-danger">Benchmark failed: ${esc(job.error)}</div>`;
-  else if (job.record) state.innerHTML = `<div class="alert-success">Wrote <code>${esc(job.record)}</code>. Commit it, then rebuild to publish.</div>`;
+  if (job.running) state.innerHTML = `<div class="s-alert">Measuring <strong>${esc(job.model)}</strong>…</div>`;
+  else if (job.error) state.innerHTML = `<div class="s-alert s-alert--bad">Benchmark failed: ${esc(job.error)}</div>`;
+  else if (job.record) state.innerHTML = `<div class="s-alert s-alert--ok">Wrote <code>${esc(job.record)}</code>. Commit it, then rebuild to publish.</div>`;
 }
 
 async function pollBench() {
@@ -1612,7 +1939,7 @@ async function startBench() {
     body: JSON.stringify(body)
   });
   if (!res.ok) {
-    document.getElementById('bench-state').innerHTML = `<div class="alert-danger">${esc(await res.text())}</div>`;
+    document.getElementById('bench-state').innerHTML = `<div class="s-alert s-alert--bad">${esc(await res.text())}</div>`;
     return;
   }
   pollBench();
@@ -1622,19 +1949,19 @@ async function loadBenchRecords() {
   const div = document.getElementById('bench-records');
   try {
     const res = await api('/api/bench/records');
-    if (!res.ok) { div.innerHTML = `<div class="alert-danger">${esc(await res.text())}</div>`; return; }
+    if (!res.ok) { div.innerHTML = `<div class="s-alert s-alert--bad">${esc(await res.text())}</div>`; return; }
     const records = await res.json();
-    if (!records.length) { div.innerHTML = '<span style="color:var(--text-muted)">No records yet.</span>'; return; }
+    if (!records.length) { div.innerHTML = '<span class="s-muted">No records yet.</span>'; return; }
     let rows = '';
     records.forEach(r => r.results.forEach(x => {
       rows += `<tr${r.stale ? ' style="opacity:.55" title="measured on older weights"' : ''}>
         <td>${esc(r.model)}:${esc(r.variant)}</td><td>${esc(x.kind)}</td>
-        <td>${esc(r.device)}<br><span style="color:var(--text-muted)">${esc(r.chip)}</span></td>
+        <td>${esc(r.device)}<br><span class="s-muted">${esc(r.chip)}</span></td>
         <td>${benchSummary(x)}</td>
         <td>${esc(r.measured_at.slice(0, 10))}${r.stale ? ' (stale)' : ''}</td></tr>`;
     }));
-    div.innerHTML = `<table class="file-table"><thead><tr><th>Variant</th><th>Kind</th><th>Device</th><th>Result</th><th>Measured</th></tr></thead><tbody>${rows}</tbody></table>`;
-  } catch (e) { div.innerHTML = `<div class="alert-danger">${esc(e.message)}</div>`; }
+    div.innerHTML = `<div class="s-table-wrap"><table class="s-table"><thead><tr><th>Variant</th><th>Kind</th><th>Device</th><th>Result</th><th>Measured</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  } catch (e) { div.innerHTML = `<div class="s-alert s-alert--bad">${esc(e.message)}</div>`; }
 }
 
 function formatBytes(bytes) {

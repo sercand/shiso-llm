@@ -1,29 +1,415 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>llm-router admin</title>
 <script src="https://cdn.tailwindcss.com"></script>
+<script>
+  // Shiso design tokens as Tailwind colors. Opacity modifiers (bg-card/60) mix toward transparent.
+  const shiso = (name) => ({ opacityValue }) => opacityValue === undefined
+    ? `var(--shiso-${name})`
+    : `color-mix(in oklch, var(--shiso-${name}) calc(${opacityValue} * 100%), transparent)`;
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          canvas: shiso("canvas"), card: shiso("card"), fill: shiso("fill"), "fill-hover": shiso("fill-hover"), line: shiso("line"),
+          ink: shiso("text"), "ink-2": shiso("text-2"),
+          primary: shiso("primary"), "primary-hover": shiso("primary-hover"), "primary-ink": shiso("primary-text"),
+          soft: shiso("soft"), "soft-ink": shiso("soft-text"),
+          "chart-1": shiso("chart-1"), "chart-2": shiso("chart-2"), "chart-3": shiso("chart-3"), "chart-4": shiso("chart-4"), "chart-5": shiso("chart-5"),
+          ok: shiso("ok"), "ok-bg": shiso("ok-bg"), warn: shiso("warn"), "warn-bg": shiso("warn-bg"), bad: shiso("bad"), "bad-bg": shiso("bad-bg"),
+        },
+        fontSize: { xs: ["var(--shiso-text-sm)", "1.4"], sm: ["var(--shiso-text-base)", "1.45"] },
+        fontFamily: { sans: ["var(--shiso-font-sans)"], mono: ["var(--shiso-font-mono)"] },
+      },
+    },
+  };
+</script>
 <style>
+/* shiso-design: begin. Vendored from github.com/sercand/shiso-design (packages/css/shiso.css): tokens and components.
+   Do not edit here; change it there and paste the new file between these markers. */
+:root {
+  --shiso-canvas: oklch(0.962 0.01 255);
+  --shiso-card: oklch(0.995 0.003 255);
+  --shiso-fill: oklch(0.945 0.01 255);
+  --shiso-fill-hover: oklch(0.922 0.012 255);
+  --shiso-line: oklch(0.895 0.01 255);
+  --shiso-text: oklch(0.21 0.025 255);
+  --shiso-text-2: oklch(0.49 0.025 255);
+  --shiso-primary: oklch(0.43 0.085 160);
+  --shiso-primary-hover: oklch(0.38 0.085 160);
+  --shiso-primary-text: oklch(0.99 0 0);
+  --shiso-soft: oklch(0.95 0.026 160);
+  --shiso-soft-text: oklch(0.38 0.085 160);
+  --shiso-live: oklch(0.56 0.13 160);
+  --shiso-ok: oklch(0.48 0.12 152);
+  --shiso-ok-bg: oklch(0.95 0.04 152);
+  --shiso-warn: oklch(0.5 0.11 70);
+  --shiso-warn-bg: oklch(0.95 0.05 88);
+  --shiso-bad: oklch(0.53 0.2 27);
+  --shiso-bad-bg: oklch(0.95 0.03 27);
+  --shiso-chart-1: oklch(0.5 0.12 160);
+  --shiso-chart-2: oklch(0.52 0.16 265);
+  --shiso-chart-3: oklch(0.64 0.13 80);
+  --shiso-chart-4: oklch(0.5 0.16 350);
+  --shiso-chart-5: oklch(0.6 0.11 220);
+  --shiso-shadow: 0 1px 2px 0px oklch(0.21 0.025 255 / 0.06), 0 10px 28px -14px oklch(0.21 0.025 255 / 0.16);
+
+  --shiso-font-sans: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --shiso-font-mono: "JetBrains Mono", ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --shiso-weight-regular: 400;
+  --shiso-weight-medium: 500;
+  --shiso-weight-semibold: 600;
+  --shiso-weight-bold: 700;
+  --shiso-text-xs: 11px;
+  --shiso-text-sm: 12px;
+  --shiso-text-lg: 16px;
+  --shiso-text-xl: 20px;
+  --shiso-text-2xl: 26px;
+  --shiso-text-3xl: 34px;
+  --shiso-radius-sm: 6px;
+  --shiso-radius-control: 10px;
+  --shiso-radius-inner: 10px;
+  --shiso-radius-card: 16px;
+  --shiso-radius-full: 999px;
+  --shiso-space-1: 4px;
+  --shiso-space-2: 8px;
+  --shiso-space-3: 12px;
+  --shiso-space-4: 16px;
+  --shiso-space-5: 20px;
+  --shiso-space-6: 24px;
+  --shiso-space-8: 32px;
+  --shiso-space-10: 40px;
+  --shiso-control: 30px;
+  --shiso-text-base: 13px;
+  --shiso-pad: 14px;
+  --shiso-gap: 12px;
+  color-scheme: light;
+}
+[data-density="comfortable"] {
+  --shiso-control: 40px;
+  --shiso-text-base: 15px;
+  --shiso-pad: 18px;
+  --shiso-gap: 14px;
+}
+[data-density="compact"] {
+  --shiso-control: 30px;
+  --shiso-text-base: 13px;
+  --shiso-pad: 14px;
+  --shiso-gap: 12px;
+}
+/* Dark: follows the system unless data-theme pins a mode; .dark is the shadcn/next-themes class. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not(.light) {
+    --shiso-canvas: oklch(0.155 0.01 255);
+    --shiso-card: oklch(0.208 0.01 255);
+    --shiso-fill: oklch(0.262 0.01 255);
+    --shiso-fill-hover: oklch(0.295 0.012 255);
+    --shiso-line: oklch(0.31 0.01 255);
+    --shiso-text: oklch(0.955 0.006 255);
+    --shiso-text-2: oklch(0.71 0.01 255);
+    --shiso-primary: oklch(0.76 0.13 160);
+    --shiso-primary-hover: oklch(0.82 0.13 160);
+    --shiso-primary-text: oklch(0.18 0.03 160);
+    --shiso-soft: oklch(0.3 0.058 160);
+    --shiso-soft-text: oklch(0.86 0.09 160);
+    --shiso-live: oklch(0.76 0.13 160);
+    --shiso-ok: oklch(0.78 0.15 152);
+    --shiso-ok-bg: oklch(0.29 0.05 152);
+    --shiso-warn: oklch(0.82 0.13 82);
+    --shiso-warn-bg: oklch(0.3 0.05 82);
+    --shiso-bad: oklch(0.74 0.16 25);
+    --shiso-bad-bg: oklch(0.3 0.06 25);
+    --shiso-chart-1: oklch(0.66 0.13 160);
+    --shiso-chart-2: oklch(0.6 0.16 270);
+    --shiso-chart-3: oklch(0.655 0.13 85);
+    --shiso-chart-4: oklch(0.56 0.17 350);
+    --shiso-chart-5: oklch(0.665 0.1 220);
+    --shiso-shadow: 0 0 0 1px oklch(1 0 0 / 0.05);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"], .dark {
+  --shiso-canvas: oklch(0.155 0.01 255);
+  --shiso-card: oklch(0.208 0.01 255);
+  --shiso-fill: oklch(0.262 0.01 255);
+  --shiso-fill-hover: oklch(0.295 0.012 255);
+  --shiso-line: oklch(0.31 0.01 255);
+  --shiso-text: oklch(0.955 0.006 255);
+  --shiso-text-2: oklch(0.71 0.01 255);
+  --shiso-primary: oklch(0.76 0.13 160);
+  --shiso-primary-hover: oklch(0.82 0.13 160);
+  --shiso-primary-text: oklch(0.18 0.03 160);
+  --shiso-soft: oklch(0.3 0.058 160);
+  --shiso-soft-text: oklch(0.86 0.09 160);
+  --shiso-live: oklch(0.76 0.13 160);
+  --shiso-ok: oklch(0.78 0.15 152);
+  --shiso-ok-bg: oklch(0.29 0.05 152);
+  --shiso-warn: oklch(0.82 0.13 82);
+  --shiso-warn-bg: oklch(0.3 0.05 82);
+  --shiso-bad: oklch(0.74 0.16 25);
+  --shiso-bad-bg: oklch(0.3 0.06 25);
+  --shiso-chart-1: oklch(0.66 0.13 160);
+  --shiso-chart-2: oklch(0.6 0.16 270);
+  --shiso-chart-3: oklch(0.655 0.13 85);
+  --shiso-chart-4: oklch(0.56 0.17 350);
+  --shiso-chart-5: oklch(0.665 0.1 220);
+  --shiso-shadow: 0 0 0 1px oklch(1 0 0 / 0.05);
+  color-scheme: dark;
+}
+
+/* Shiso components for plain HTML. Every rule reads tokens only; no literal colors.
+   Put class="shiso" on <body> (or any container) for base typography. */
+.shiso, .shiso *, .shiso *::before, .shiso *::after { box-sizing: border-box; }
+.shiso {
+  margin: 0;
+  background: var(--shiso-canvas);
+  color: var(--shiso-text);
+  font: var(--shiso-weight-regular) var(--shiso-text-base)/1.45 var(--shiso-font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+/* Components set display, which would otherwise beat the hidden attribute. */
+.shiso [hidden] { display: none !important; }
+.shiso :focus-visible { outline: 2px solid var(--shiso-primary); outline-offset: 2px; }
+/* Plain links only: anything with a class (buttons, cards, nav items) styles itself. */
+.shiso a:not([class]) { color: var(--shiso-primary); text-decoration: none; }
+.shiso a:not([class]):hover { text-decoration: underline; }
+
+/* Type */
+.s-h1, .s-h2, .s-h3 { margin: 0; font-weight: var(--shiso-weight-semibold); letter-spacing: -0.012em; text-wrap: balance; }
+.s-h1 { font-size: var(--shiso-text-2xl); line-height: 1.15; letter-spacing: -0.02em; }
+.s-h2 { font-size: var(--shiso-text-xl); line-height: 1.2; }
+.s-h3 { font-size: var(--shiso-text-lg); line-height: 1.3; }
+.s-muted { color: var(--shiso-text-2); }
+.s-small { font-size: var(--shiso-text-sm); }
+.s-num { font-variant-numeric: tabular-nums; }
+.s-mono { font-family: var(--shiso-font-mono); font-size: 0.92em; }
+
+/* Layout helpers */
+.s-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--shiso-space-2); }
+.s-stack { display: grid; gap: var(--shiso-gap); align-content: start; }
+.s-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: var(--shiso-gap); }
+.s-spacer { flex: 1; }
+
+/* Card: the one lifted surface. Do not nest cards; use .s-inset inside a card. */
+.s-card {
+  background: var(--shiso-card);
+  border-radius: var(--shiso-radius-card);
+  padding: var(--shiso-pad);
+  box-shadow: var(--shiso-shadow);
+  display: grid;
+  gap: var(--shiso-gap);
+  align-content: start;
+  min-width: 0;
+}
+.s-inset { background: var(--shiso-fill); border-radius: var(--shiso-radius-inner); padding: var(--shiso-space-1) var(--shiso-space-3); }
+/* Fields inside an inset sit on the fill, so they take the card color to stay visible. */
+.s-inset .s-input, .s-inset .s-select, .s-inset .s-textarea { background: var(--shiso-card); }
+
+/* Button */
+.s-btn {
+  font: inherit;
+  font-weight: var(--shiso-weight-medium);
+  height: var(--shiso-control);
+  padding: 0 calc(var(--shiso-control) * 0.45);
+  border-radius: var(--shiso-radius-control);
+  border: 1px solid transparent;
+  background: var(--shiso-fill);
+  color: var(--shiso-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+  cursor: pointer;
+  text-decoration: none;
+}
+.s-btn:hover { background: var(--shiso-fill-hover); text-decoration: none; }
+.s-btn--primary { background: var(--shiso-primary); color: var(--shiso-primary-text); }
+.s-btn--primary:hover { background: var(--shiso-primary-hover); }
+.s-btn--outline { background: transparent; border-color: var(--shiso-line); }
+.s-btn--ghost { background: transparent; color: var(--shiso-text-2); }
+.s-btn--danger { background: var(--shiso-bad-bg); color: var(--shiso-bad); }
+.s-btn--outline:hover, .s-btn--ghost:hover { background: var(--shiso-fill); }
+.s-btn--icon { width: var(--shiso-control); padding: 0; }
+.s-btn:disabled, .s-btn[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; }
+.s-btn svg, .s-nav svg, .s-input svg { width: 1.15em; height: 1.15em; flex: none; }
+
+/* Fields: filled, no border at rest */
+.s-field { display: grid; gap: 6px; }
+.s-label { font-weight: var(--shiso-weight-medium); font-size: 0.93em; }
+.s-hint { color: var(--shiso-text-2); font-size: var(--shiso-text-sm); }
+.s-input, .s-select, .s-textarea {
+  font: inherit;
+  color: var(--shiso-text);
+  background: var(--shiso-fill);
+  border: 1px solid transparent;
+  border-radius: var(--shiso-radius-control);
+  height: var(--shiso-control);
+  padding: 0 calc(var(--shiso-control) * 0.35);
+  width: 100%;
+  min-width: 0;
+}
+.s-textarea { height: auto; min-height: calc(var(--shiso-control) * 2.4); padding-block: 8px; resize: vertical; line-height: 1.45; }
+.s-input::placeholder, .s-textarea::placeholder { color: var(--shiso-text-2); }
+.s-input:hover, .s-select:hover, .s-textarea:hover { background: var(--shiso-fill-hover); }
+.s-input:focus-visible, .s-select:focus-visible, .s-textarea:focus-visible { outline: 2px solid var(--shiso-primary); outline-offset: 0; background: var(--shiso-card); }
+.s-input[aria-invalid="true"] { outline: 2px solid var(--shiso-bad); outline-offset: 0; }
+
+/* Checkbox and switch: native inputs, so they work without JavaScript */
+.s-check { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.s-check input { width: 16px; height: 16px; margin: 0; accent-color: var(--shiso-primary); }
+.s-switch { display: inline-flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer; }
+.s-switch input {
+  appearance: none; -webkit-appearance: none; margin: 0; flex: none; cursor: pointer;
+  width: 34px; height: 20px; border-radius: var(--shiso-radius-full);
+  background: var(--shiso-line); position: relative; transition: background 0.15s;
+}
+.s-switch input::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+  background: var(--shiso-card); transition: translate 0.15s;
+}
+.s-switch input:checked { background: var(--shiso-primary); }
+.s-switch input:checked::after { translate: 14px 0; background: var(--shiso-primary-text); }
+
+/* Pill: status always pairs a dot with a word */
+.s-pill {
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  border-radius: var(--shiso-radius-full); padding: 2px 9px;
+  font-size: 0.88em; font-weight: var(--shiso-weight-medium);
+  background: var(--shiso-fill); color: var(--shiso-text-2);
+}
+.s-pill--dot::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.s-pill--ok { background: var(--shiso-ok-bg); color: var(--shiso-ok); }
+.s-pill--warn { background: var(--shiso-warn-bg); color: var(--shiso-warn); }
+.s-pill--bad { background: var(--shiso-bad-bg); color: var(--shiso-bad); }
+.s-pill--soft { background: var(--shiso-soft); color: var(--shiso-soft-text); }
+/* Live: an agent is working right now. The only place the live color appears. */
+.s-pill--live { color: var(--shiso-text); }
+.s-pill--live::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--shiso-live); box-shadow: 0 0 0 3px color-mix(in oklch, var(--shiso-live) 25%, transparent); }
+
+/* Segmented control: buttons for in-page views, links for routed tabs */
+.s-seg { display: inline-flex; gap: 2px; padding: 3px; max-width: 100%; background: var(--shiso-fill); border-radius: var(--shiso-radius-control); }
+.s-seg button, .s-seg a {
+  font: inherit; font-weight: var(--shiso-weight-medium); border: 0; background: transparent; cursor: pointer; white-space: nowrap;
+  color: var(--shiso-text-2); height: calc(var(--shiso-control) - 8px); padding: 0 12px;
+  display: inline-flex; align-items: center; text-decoration: none;
+  border-radius: calc(var(--shiso-radius-control) - 3px);
+}
+.s-seg button:hover, .s-seg a:hover { color: var(--shiso-text); text-decoration: none; }
+.s-seg button[aria-pressed="true"], .s-seg button[aria-selected="true"], .s-seg a[aria-current] { background: var(--shiso-card); color: var(--shiso-text); box-shadow: var(--shiso-shadow); }
+
+/* Table */
+.s-table-wrap { overflow-x: auto; }
+.s-table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+.s-table th { text-align: left; font-weight: var(--shiso-weight-medium); color: var(--shiso-text-2); font-size: 0.92em; }
+.s-table th, .s-table td { padding: calc(var(--shiso-pad) * 0.45) var(--shiso-space-3) calc(var(--shiso-pad) * 0.45) 0; border-bottom: 1px solid var(--shiso-line); white-space: nowrap; }
+.s-table tr:last-child td, .s-table td[rowspan] { border-bottom: 0; }
+.s-table .s-right { text-align: right; padding-right: 0; }
+.s-table .s-wrap { white-space: normal; min-width: 200px; font-weight: var(--shiso-weight-medium); }
+
+/* Key/value rows, diff rows, meter, avatar */
+.s-kv { display: grid; gap: 6px; }
+.s-kv > div { display: flex; justify-content: space-between; gap: 12px; }
+.s-diff > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; padding: 7px 0; font-variant-numeric: tabular-nums; }
+.s-diff > div + div { border-top: 1px solid var(--shiso-line); }
+.s-diff del { color: var(--shiso-text-2); margin-right: 6px; }
+.s-diff ins { text-decoration: none; font-weight: var(--shiso-weight-semibold); }
+.s-meter { height: 8px; border-radius: var(--shiso-radius-full); background: var(--shiso-fill); overflow: hidden; }
+.s-meter > span { display: block; height: 100%; border-radius: inherit; background: var(--shiso-primary); }
+.s-avatar { width: 36px; height: 36px; flex: none; border-radius: 50%; display: grid; place-items: center; background: var(--shiso-soft); color: var(--shiso-soft-text); font-weight: var(--shiso-weight-semibold); }
+
+/* Small button: table rows and dense toolbars */
+.s-btn--sm { height: calc(var(--shiso-control) - 6px); padding: 0 10px; font-size: var(--shiso-text-sm); border-radius: calc(var(--shiso-radius-control) - 2px); }
+
+/* A whole card that is a link */
+a.s-card, a.s-card:hover { color: inherit; text-decoration: none; }
+a.s-card { transition: box-shadow 0.15s; }
+a.s-card:hover, a.s-card:focus-visible { box-shadow: var(--shiso-shadow), 0 0 0 2px var(--shiso-soft); }
+
+/* Chip: a filter you switch on and off (aria-pressed). Not a status; use a pill for that. */
+.s-chip {
+  font: inherit; font-size: 0.92em; font-weight: var(--shiso-weight-medium); cursor: pointer; white-space: nowrap;
+  display: inline-flex; align-items: center; gap: 6px;
+  height: calc(var(--shiso-control) - 4px); padding: 0 12px;
+  border: 0; border-radius: var(--shiso-radius-full);
+  background: var(--shiso-card); color: var(--shiso-text); box-shadow: var(--shiso-shadow);
+}
+.s-chip:hover { background: var(--shiso-fill); }
+.s-chip > span { color: var(--shiso-text-2); font-variant-numeric: tabular-nums; }
+.s-chip[aria-pressed="true"] { background: var(--shiso-primary); color: var(--shiso-primary-text); box-shadow: none; }
+.s-chip[aria-pressed="true"] > span { color: inherit; opacity: 0.8; }
+
+/* Alert: a message inside the page. Default is informational. */
+.s-alert {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px;
+  padding: 10px 14px; border-radius: var(--shiso-radius-inner);
+  background: var(--shiso-soft); color: var(--shiso-soft-text);
+}
+.s-alert--ok { background: var(--shiso-ok-bg); color: var(--shiso-ok); }
+.s-alert--warn { background: var(--shiso-warn-bg); color: var(--shiso-warn); }
+.s-alert--bad { background: var(--shiso-bad-bg); color: var(--shiso-bad); }
+
+/* Code: inline and block */
+.shiso code { font-family: var(--shiso-font-mono); font-size: 0.92em; }
+.s-code {
+  margin: 0; padding: var(--shiso-space-3); overflow-x: auto;
+  background: var(--shiso-fill); border-radius: var(--shiso-radius-inner);
+  font-family: var(--shiso-font-mono); font-size: 0.92em; line-height: 1.5;
+}
+
+/* Facts: a small label over its value, laid out in columns */
+.s-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px 16px; margin: 0; }
+.s-facts > div { min-width: 0; }
+.s-facts dt { font-size: var(--shiso-text-sm); color: var(--shiso-text-2); }
+.s-facts dd { margin: 0; font-weight: var(--shiso-weight-medium); overflow-wrap: anywhere; }
+
+/* Top bar for pages without a sidebar */
+.s-topbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--shiso-space-2) var(--shiso-space-4); padding: var(--shiso-space-3) var(--shiso-pad); }
+
+/* App shell: sidebar sits on the canvas, content cards float above it */
+.s-shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100%; }
+.s-side { padding: var(--shiso-space-3) var(--shiso-space-2); display: flex; flex-direction: column; gap: var(--shiso-space-3); border-right: 1px solid var(--shiso-line); }
+.s-main { padding: var(--shiso-pad); display: grid; gap: var(--shiso-gap); align-content: start; min-width: 0; }
+.s-nav { display: grid; gap: 2px; }
+.s-nav a {
+  display: flex; align-items: center; gap: 10px; height: var(--shiso-control); padding: 0 10px;
+  border-radius: var(--shiso-radius-control); color: var(--shiso-text-2); font-weight: var(--shiso-weight-medium); text-decoration: none;
+}
+.s-nav a:hover { background: var(--shiso-fill); text-decoration: none; }
+.s-nav a[aria-current] { background: var(--shiso-card); color: var(--shiso-text); box-shadow: var(--shiso-shadow); }
+.s-count { margin-left: auto; font-size: 0.82em; line-height: 1.6; padding: 0 7px; border-radius: var(--shiso-radius-full); background: var(--shiso-primary); color: var(--shiso-primary-text); font-variant-numeric: tabular-nums; }
+@media (max-width: 760px) {
+  .s-shell { grid-template-columns: minmax(0, 1fr); }
+  .s-side { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { .shiso * { transition: none !important; } }
+/* shiso-design: end */
+  /* Page rules. Components come from the design system; Tailwind is used for layout utilities only. */
+  .hidden { display: none !important; }
+  .s-card { display: block; }
+  .s-table th, .s-table td { padding-left: 0; }
+  h1, h2, h3, p { margin: 0; }
   /* Keep show/hide working even if the Tailwind CDN is unreachable. */
   .hidden { display: none; }
-  body { background: #0a0a0a; }
+  body { background: var(--shiso-canvas); }
   ::-webkit-scrollbar { width: 8px; height: 8px; }
-  ::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb { background: var(--shiso-line); border-radius: 4px; }
 </style>
 </head>
-<body class="text-neutral-200 min-h-screen font-sans antialiased">
+<body class="shiso min-h-screen">
 
 <!-- Login overlay -->
-<div id="login" class="hidden fixed inset-0 z-50 bg-neutral-950 flex items-center justify-center">
-  <form id="login-form" class="w-80 space-y-4 rounded-xl border border-neutral-800 bg-neutral-900 p-6">
-    <h1 class="text-lg font-semibold">llm-router admin</h1>
-    <p class="text-sm text-neutral-400">Enter the admin token from your router config.</p>
+<div id="login" class="hidden fixed inset-0 z-50 bg-canvas flex items-center justify-center">
+  <form id="login-form" class="s-card w-80 space-y-4">
+    <h1 class="s-h3">llm-router admin</h1>
+    <p class="text-sm text-ink-2">Enter the admin token from your router config.</p>
     <input id="login-token" type="password" placeholder="admin token" autocomplete="current-password"
-      class="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm outline-none focus:border-emerald-500">
-    <p id="login-err" class="hidden text-sm text-red-400">Invalid token.</p>
-    <button class="w-full rounded-lg bg-emerald-600 py-2 text-sm font-medium text-white hover:bg-emerald-500">Sign in</button>
+      class="s-input w-full">
+    <p id="login-err" class="hidden text-sm text-bad">Invalid token.</p>
+    <button class="s-btn s-btn--primary w-full">Sign in</button>
   </form>
 </div>
 
@@ -31,25 +417,25 @@
 <div id="app" class="hidden mx-auto max-w-6xl px-4 pb-16">
   <nav class="flex items-center justify-between py-5">
     <div class="flex items-center gap-8">
-      <span class="text-lg font-semibold text-white">llm-router</span>
-      <div class="flex gap-1 text-sm">
-        <a href="#/keys" data-tab="keys" class="tab rounded-lg px-3 py-1.5 hover:bg-neutral-800">API Keys</a>
-        <a href="#/analytics" data-tab="analytics" class="tab rounded-lg px-3 py-1.5 hover:bg-neutral-800">Analytics</a>
-        <a href="#/chat" data-tab="chat" class="tab rounded-lg px-3 py-1.5 hover:bg-neutral-800">Chat</a>
-        <a href="#/logs" data-tab="logs" class="tab rounded-lg px-3 py-1.5 hover:bg-neutral-800">Logs</a>
-        <a href="#/models" data-tab="models" class="tab rounded-lg px-3 py-1.5 hover:bg-neutral-800">Models</a>
-        <a href="#/backends" data-tab="backends" class="tab rounded-lg px-3 py-1.5 hover:bg-neutral-800">Backends</a>
-        <a href="#/groups" data-tab="groups" class="tab rounded-lg px-3 py-1.5 hover:bg-neutral-800">Groups</a>
+      <span class="s-h3">llm-router</span>
+      <div class="s-seg">
+        <a href="#/keys" data-tab="keys" class="tab">API Keys</a>
+        <a href="#/analytics" data-tab="analytics" class="tab">Analytics</a>
+        <a href="#/chat" data-tab="chat" class="tab">Chat</a>
+        <a href="#/logs" data-tab="logs" class="tab">Logs</a>
+        <a href="#/models" data-tab="models" class="tab">Models</a>
+        <a href="#/backends" data-tab="backends" class="tab">Backends</a>
+        <a href="#/groups" data-tab="groups" class="tab">Groups</a>
       </div>
     </div>
-    <button onclick="logout()" class="text-sm text-neutral-400 hover:text-white">Sign out</button>
+    <button onclick="logout()" class="text-sm text-ink-2 hover:text-ink">Sign out</button>
   </nav>
   <main id="view"></main>
 </div>
 
 <!-- Modal + drawer mount points -->
 <div id="modal-root"></div>
-<div id="toast" class="hidden fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-lg bg-red-600 px-4 py-2 text-sm text-white shadow-lg"></div>
+<div id="toast" class="hidden s-alert s-alert--bad fixed bottom-6 left-1/2 z-50 -translate-x-1/2 shadow-lg"></div>
 
 <script>
 "use strict";
@@ -70,19 +456,21 @@ const sumBy = (rows, f) => rows.reduce((a, r) => a + (f(r) || 0), 0);
 // detail drawer; the caller supplies only the sizing, since a table cell
 // and a drawer tag want different metrics.
 const tierBadge = (r, cls) => r.service_tier
-  ? `<span class="rounded bg-amber-500/15 text-amber-400 ${cls}">${esc(r.service_tier)}</span>`
+  ? `<span class="s-pill s-pill--warn ${cls}">${esc(r.service_tier)}</span>`
   : "";
 
 // Input and output keep the same two colours everywhere they are split.
-const IN_FILL = "fill-sky-500", OUT_FILL = "fill-violet-400";
-const IN_TEXT = "text-sky-400", OUT_TEXT = "text-violet-300";
-const IN_DOT = "bg-sky-500", OUT_DOT = "bg-violet-400";
+// Series colors come from the design system chart palette, in a fixed order:
+// input chart-1, output chart-2, cached input chart-3. Text beside a mark stays in ink.
+const IN_FILL = "fill-chart-1", OUT_FILL = "fill-chart-2";
+const IN_TEXT = "text-ink", OUT_TEXT = "text-ink";
+const IN_DOT = "bg-chart-1", OUT_DOT = "bg-chart-2";
 // Cached input is a third series in the charts only — the tables keep the
 // two-way in/out split. Amber is far enough from both cool hues to stay
 // separable under every colour-vision deficiency (checked: ΔE >= 17).
-const CACHE_FILL = "fill-amber-400";
-const CACHE_TEXT = "text-amber-400";
-const CACHE_DOT = "bg-amber-400";
+const CACHE_FILL = "fill-chart-3";
+const CACHE_TEXT = "text-ink";
+const CACHE_DOT = "bg-chart-3";
 
 let TOKEN = localStorage.getItem("llmr_admin_token") || "";
 // The one live-refresh timer on the page (the Logs tab's active panel).
@@ -183,7 +571,7 @@ async function route() {
   const hash = location.hash || "#/keys";
   const tab = TABS.find(t => hash.startsWith("#/" + t)) || "keys";
   document.querySelectorAll(".tab").forEach(a =>
-    a.classList.toggle("bg-neutral-800", a.dataset.tab === tab));
+    a.toggleAttribute("aria-current", a.dataset.tab === tab));
   const detail = ROUTES.map(([re, render]) => [hash.match(re), render]).find(([m]) => m);
   try {
     if (detail) await detail[1](decodeURIComponent(detail[0][1]));
@@ -218,16 +606,16 @@ if (TOKEN) boot(); else showLogin();
 // ---- shared bits -----------------------------------------------------
 
 function card(inner, cls = "") {
-  return `<div class="rounded-xl border border-neutral-800 bg-neutral-900 ${cls}">${inner}</div>`;
+  return `<div class="s-card ${cls}">${inner}</div>`;
 }
 
 function progressBar(used, limit) {
-  if (limit == null) return `<span class="text-neutral-500 text-xs">no limit</span>`;
+  if (limit == null) return `<span class="text-ink-2 text-xs">no limit</span>`;
   const pct = limit > 0 ? Math.min(100, used / limit * 100) : 100;
-  const color = pct >= 100 ? "bg-red-500" : pct >= 75 ? "bg-amber-500" : "bg-emerald-500";
+  const color = pct >= 100 ? "bg-bad" : pct >= 75 ? "bg-warn" : "bg-primary";
   return `<div class="w-28">
-    <div class="h-1.5 rounded bg-neutral-800"><div class="h-1.5 rounded ${color}" style="width:${pct}%"></div></div>
-    <div class="mt-1 text-[11px] text-neutral-500">${pct.toFixed(0)}%</div>
+    <div class="h-1.5 rounded bg-fill"><div class="h-1.5 rounded ${color}" style="width:${pct}%"></div></div>
+    <div class="mt-1 text-[11px] text-ink-2">${pct.toFixed(0)}%</div>
   </div>`;
 }
 
@@ -262,7 +650,7 @@ const stackTotal = p => SEGMENTS.reduce((n, s) => n + p[s.key], 0);
 function stackedBarChart(points) {
   const max = Math.max(...points.map(stackTotal));
   if (!points.length || max <= 0) {
-    return `<div class="flex h-40 items-center justify-center text-sm text-neutral-600">no usage yet</div>`;
+    return `<div class="flex h-40 items-center justify-center text-sm text-ink-2">no usage yet</div>`;
   }
   const W = 900, H = 160, PAD = 4, GAP = 2;
   const bw = Math.max(4, Math.floor(W / points.length) - 3);
@@ -290,7 +678,7 @@ function stackedBarChart(points) {
     const tip = SEGMENTS.map(seg => `${seg.name}: ${fmtInt(p[seg.key])}`
       + (seg.key === "cached" && input > 0 ? ` (${pct(p.cached, input).toFixed(0)}% of input)` : "")).join("\n");
     return `<g><title>${esc(`${p.label}\n${tip}\nTotal: ${fmtInt(stackTotal(p))} tok\nCost: ${fmtCost(p.cost)}`)}</title>
-      <rect x="${x}" y="0" width="${bw}" height="${H}" class="fill-transparent hover:fill-neutral-800/40"></rect>
+      <rect x="${x}" y="0" width="${bw}" height="${H}" class="fill-transparent hover:fill-fill/40"></rect>
       ${rects}
     </g>`;
   }).join("");
@@ -310,9 +698,8 @@ function rangeDayBuckets(rows) {
 }
 
 function rangePicker() {
-  return `<div class="flex gap-1 rounded-lg border border-neutral-800 p-0.5 text-xs">
-    ${RANGES.map(d => `<button onclick="setRange(${d})"
-      class="rounded px-2 py-0.5 ${d === RANGE_DAYS ? "bg-neutral-700 text-white" : "text-neutral-400 hover:text-white"}">${d}d</button>`).join("")}
+  return `<div class="s-seg">
+    ${RANGES.map(d => `<button onclick="setRange(${d})" aria-pressed="${d === RANGE_DAYS}">${d}d</button>`).join("")}
   </div>`;
 }
 
@@ -340,13 +727,13 @@ function usageChart(rows) {
   return card(`<div class="p-5">
     <div class="flex flex-wrap items-baseline justify-between gap-2">
       <div class="flex items-center gap-3">
-        <h2 class="text-sm font-medium text-neutral-400">Tokens · last ${RANGE_DAYS} days</h2>
+        <h2 class="text-sm font-medium text-ink-2">Tokens · last ${RANGE_DAYS} days</h2>
         ${rangePicker()}
       </div>
       <div class="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-xs">
         ${SEGMENTS.map(s => `<span class="flex items-center gap-1.5 ${s.text}">${dot(s.dot)} ${s.name} ${fmtInt(totals[s.key])}</span>`).join("")}
-        <span class="text-xl font-semibold text-white">${fmtInt(total)} tok</span>
-        ${cost > 0 ? `<span class="text-neutral-400">${fmtCost(cost)}</span>` : ""}
+        <span class="s-h2">${fmtInt(total)} tok</span>
+        ${cost > 0 ? `<span class="text-ink-2">${fmtCost(cost)}</span>` : ""}
       </div>
     </div>
     <div class="mt-4">${stackedBarChart(points)}</div>
@@ -359,31 +746,31 @@ function shareBar(r, whole) {
   const w = pct(r.total_tokens, whole);
   const split = r.prompt_tokens + r.completion_tokens;
   return `<div class="w-32">
-    <div class="h-1.5 rounded bg-neutral-800">
+    <div class="h-1.5 rounded bg-fill">
       <div class="flex h-1.5 overflow-hidden rounded" style="width:${w.toFixed(1)}%">
         <div class="${IN_DOT}" style="width:${pct(r.prompt_tokens, split)}%"></div>
         <div class="${OUT_DOT}" style="width:${pct(r.completion_tokens, split)}%"></div>
       </div>
     </div>
-    <div class="mt-1 text-[11px] text-neutral-500">${w.toFixed(1)}%</div>
+    <div class="mt-1 text-[11px] text-ink-2">${w.toFixed(1)}%</div>
   </div>`;
 }
 
 function statCard(title, s) {
   return card(`<div class="p-4">
-    <div class="text-xs uppercase tracking-wide text-neutral-500">${title}</div>
-    <div class="mt-1 text-xl font-semibold text-white">${fmtCost(s.cost)}</div>
-    <div class="mt-1 text-xs text-neutral-400">${fmtInt(s.requests)} reqs${
-      s.errors ? ` · <span class="text-red-400">${fmtInt(s.errors)} err</span>` : ""}</div>
+    <div class="text-xs text-ink-2">${title}</div>
+    <div class="s-h2 mt-1">${fmtCost(s.cost)}</div>
+    <div class="mt-1 text-xs text-ink-2">${fmtInt(s.requests)} reqs${
+      s.errors ? ` · <span class="text-bad">${fmtInt(s.errors)} err</span>` : ""}</div>
     ${inOutLine(s.prompt_tokens, s.completion_tokens)}
-    ${s.avg_ttfb_ms != null ? `<div class="mt-0.5 text-[11px] text-neutral-500">${fmtMs(s.avg_ttfb_ms)} ttfb</div>` : ""}
+    ${s.avg_ttfb_ms != null ? `<div class="mt-0.5 text-[11px] text-ink-2">${fmtMs(s.avg_ttfb_ms)} ttfb</div>` : ""}
   </div>`);
 }
 
 function inOutLine(input, output) {
   return `<div class="mt-0.5 text-[11px]">
     <span class="${IN_TEXT}">${fmtInt(input)} in</span>
-    <span class="text-neutral-600"> · </span>
+    <span class="text-ink-2"> · </span>
     <span class="${OUT_TEXT}">${fmtInt(output)} out</span>
   </div>`;
 }
@@ -394,31 +781,31 @@ function modelOptions(selected) {
 }
 
 function resetSelect(name, value) {
-  return `<select name="${name}" class="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm">
+  return `<select name="${name}" class="s-select w-full">
     ${["never", "daily", "weekly", "monthly"].map(v =>
       `<option value="${v}" ${v === value ? "selected" : ""}>${v}</option>`).join("")}
   </select>`;
 }
 
 function modelChecks(name, selected) {
-  return `<div class="grid grid-cols-2 gap-1 rounded-lg border border-neutral-800 p-2 max-h-40 overflow-y-auto">
-    ${CATALOG.map(m => `<label class="flex items-center gap-2 text-sm text-neutral-300">
+  return `<div class="s-inset grid grid-cols-2 gap-1 p-2 max-h-40 overflow-y-auto">
+    ${CATALOG.map(m => `<label class="flex items-center gap-2 text-sm text-ink">
       <input type="checkbox" name="${name}" value="${esc(m.name)}"
         ${selected && selected.includes(m.name) ? "checked" : ""}
-        class="accent-emerald-500"> ${esc(m.name)}${
-          m.private ? ' <span class="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-400">private</span>' : ""
+        class="accent-primary"> ${esc(m.name)}${
+          m.private ? ' <span class="s-pill s-pill--warn">private</span>' : ""
         }</label>`).join("")}
   </div>`;
 }
 
 function allowlistChecks(allowed) {
   return `${modelChecks("allowed_models", allowed)}
-  <p class="mt-1 text-xs text-neutral-500">None checked = all public models. Private models always need to be checked.</p>`;
+  <p class="mt-1 text-xs text-ink-2">None checked = all public models. Private models always need to be checked.</p>`;
 }
 
 function flexChecks(flex) {
   return `${modelChecks("flex_models", flex)}
-  <p class="mt-1 text-xs text-neutral-500">Requests for these models are forced to the <code>flex</code> service tier, overriding the client's choice.</p>`;
+  <p class="mt-1 text-xs text-ink-2">Requests for these models are forced to the <code>flex</code> service tier, overriding the client's choice.</p>`;
 }
 
 function readKeyForm(form) {
@@ -439,19 +826,19 @@ function readKeyForm(form) {
 
 function keyFormFields(k = {}) {
   return `
-    <label class="block text-sm">Name
+    <label class="s-label block">Name
       <input name="name" required value="${esc(k.name || "")}"
-        class="mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-1.5 text-sm"></label>
+        class="s-input mt-1 w-full"></label>
     <div class="grid grid-cols-2 gap-3">
-      <label class="block text-sm">Credit limit (USD)
+      <label class="s-label block">Credit limit (USD)
         <input name="credit_limit" type="number" step="any" min="0" value="${k.credit_limit ?? ""}"
-          placeholder="unlimited" class="mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-1.5 text-sm"></label>
-      <label class="block text-sm">Reset
+          placeholder="unlimited" class="s-input mt-1 w-full"></label>
+      <label class="s-label block">Reset
         <div class="mt-1">${resetSelect("credit_limit_reset", k.credit_limit_reset || "never")}</div></label>
-      <label class="block text-sm">Token limit
+      <label class="s-label block">Token limit
         <input name="token_limit" type="number" step="1" min="0" value="${k.token_limit ?? ""}"
-          placeholder="unlimited" class="mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-1.5 text-sm"></label>
-      <label class="block text-sm">Reset
+          placeholder="unlimited" class="s-input mt-1 w-full"></label>
+      <label class="s-label block">Reset
         <div class="mt-1">${resetSelect("token_limit_reset", k.token_limit_reset || "never")}</div></label>
     </div>
     <div class="text-sm">Allowed models${allowlistChecks(k.allowed_models)}</div>
@@ -463,13 +850,13 @@ function closeModal() { $("#modal-root").innerHTML = ""; }
 function openModal(inner, width = "max-w-md") {
   $("#modal-root").innerHTML = `
     <div class="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4" onclick="if(event.target===this)closeModal()">
-      <div class="max-h-[90vh] w-full ${width} overflow-y-auto rounded-xl border border-neutral-800 bg-neutral-900 p-5">${inner}</div>
+      <div class="s-card max-h-[90vh] w-full ${width} overflow-y-auto">${inner}</div>
     </div>`;
 }
 
 const input = (name, attrs = "", value = "") =>
   `<input name="${name}" ${attrs} value="${esc(value)}"
-     class="mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-1.5 text-sm">`;
+     class="s-input mt-1 w-full">`;
 
 // ---- analytics -------------------------------------------------------
 
@@ -502,42 +889,42 @@ function leaderboard(title, rows, dim, note = "") {
   const body = rows.map(r => {
     const name = dim.nameOf(r), href = dim.hrefOf(r);
     const cell = name == null
-      ? `<span class="text-neutral-500">${dim.nullLabel}</span>`
+      ? `<span class="text-ink-2">${dim.nullLabel}</span>`
       : href
-        ? `<a class="font-medium text-sky-400 hover:underline" href="${href}">${esc(name)}</a>`
-        : `<span class="font-medium text-white">${esc(name)}</span>`;
-    return `<tr class="border-t border-neutral-800">
+        ? `<a class="" href="${href}">${esc(name)}</a>`
+        : `<span class="font-medium text-ink">${esc(name)}</span>`;
+    return `<tr class="border-t border-line">
       <td class="px-4 py-3 text-sm">${cell}</td>
-      <td class="px-4 py-3 text-sm text-neutral-300">${fmtInt(r.requests)}
-        ${r.errors ? `<div class="text-[11px] text-red-400">${fmtInt(r.errors)} failed</div>` : ""}</td>
-      <td class="px-4 py-3 text-sm text-white">${fmtInt(r.total_tokens)}
+      <td class="px-4 py-3 text-sm text-ink">${fmtInt(r.requests)}
+        ${r.errors ? `<div class="text-[11px] text-bad">${fmtInt(r.errors)} failed</div>` : ""}</td>
+      <td class="px-4 py-3 text-sm text-ink">${fmtInt(r.total_tokens)}
         ${inOutLine(r.prompt_tokens, r.completion_tokens)}</td>
-      <td class="px-4 py-3 text-sm text-neutral-300">${fmtCost(r.cost)}</td>
-      <td class="px-4 py-3 text-sm text-neutral-400">${fmtMs(r.avg_ttfb_ms)}
-        <div class="text-[11px] text-neutral-500">${fmtMs(r.avg_duration_ms)} total</div></td>
+      <td class="px-4 py-3 text-sm text-ink">${fmtCost(r.cost)}</td>
+      <td class="px-4 py-3 text-sm text-ink-2">${fmtMs(r.avg_ttfb_ms)}
+        <div class="text-[11px] text-ink-2">${fmtMs(r.avg_duration_ms)} total</div></td>
       <td class="px-4 py-3">${shareBar(r, whole)}</td>
     </tr>`;
   }).join("");
 
   return `<div class="flex items-baseline justify-between">
-      <h3 class="text-sm font-semibold text-white">${title}</h3>
-      ${note ? `<span class="text-xs text-neutral-500">${note}</span>` : ""}
+      <h3 class="text-sm font-semibold text-ink">${title}</h3>
+      ${note ? `<span class="text-xs text-ink-2">${note}</span>` : ""}
     </div>
-    ${card(`<table class="w-full text-left">
-      <thead><tr class="text-xs uppercase tracking-wide text-neutral-500">
+    ${card(`<table class="s-table w-full text-left">
+      <thead><tr class="text-xs text-ink-2">
         <th class="px-4 py-3">Name</th><th class="px-4 py-3">Requests</th>
         <th class="px-4 py-3">Tokens</th><th class="px-4 py-3">Cost</th>
         <th class="px-4 py-3">Avg TTFB</th><th class="px-4 py-3">Share</th>
       </tr></thead>
-      <tbody>${body || '<tr><td colspan="6" class="px-4 py-8 text-center text-neutral-600">Nothing in this range.</td></tr>'}</tbody>
+      <tbody>${body || '<tr><td colspan="6" class="px-4 py-8 text-center text-ink-2">Nothing in this range.</td></tr>'}</tbody>
     </table>`, "mt-2 overflow-x-auto")}`;
 }
 
 function totalTile(title, value, sub = "") {
   return card(`<div class="p-4">
-    <div class="text-xs uppercase tracking-wide text-neutral-500">${title}</div>
-    <div class="mt-1 text-xl font-semibold text-white">${value}</div>
-    <div class="mt-1 text-xs text-neutral-400">${sub || "&nbsp;"}</div>
+    <div class="text-xs text-ink-2">${title}</div>
+    <div class="s-h2 mt-1">${value}</div>
+    <div class="mt-1 text-xs text-ink-2">${sub || "&nbsp;"}</div>
   </div>`);
 }
 
@@ -555,8 +942,8 @@ async function renderAnalytics() {
   $("#view").innerHTML = `
     <div class="flex items-center justify-between">
       <div>
-        <h2 class="text-base font-semibold text-white">Analytics</h2>
-        <p class="mt-1 text-sm text-neutral-400">Traffic over the last ${RANGE_DAYS} days, by model, provider and key.</p>
+        <h2 class="s-h3">Analytics</h2>
+        <p class="mt-1 text-sm text-ink-2">Traffic over the last ${RANGE_DAYS} days, by model, provider and key.</p>
       </div>
     </div>
     <div class="mt-4 grid grid-cols-2 gap-3 md:grid-cols-4">
@@ -564,7 +951,7 @@ async function renderAnalytics() {
       ${totalTile("Tokens", fmtInt(total(r => r.total_tokens)),
         `${fmtInt(total(r => r.prompt_tokens))} in · ${fmtInt(total(r => r.completion_tokens))} out`)}
       ${totalTile("Requests", fmtInt(requests),
-        errors ? `<span class="text-red-400">${fmtInt(errors)} failed (${pct(errors, requests).toFixed(1)}%)</span>` : "all succeeded")}
+        errors ? `<span class="text-bad">${fmtInt(errors)} failed (${pct(errors, requests).toFixed(1)}%)</span>` : "all succeeded")}
       ${totalTile("Cached input", fmtInt(total(r => r.cached_tokens)),
         `${pct(total(r => r.cached_tokens), total(r => r.prompt_tokens)).toFixed(1)}% of input`)}
     </div>
@@ -593,15 +980,15 @@ async function renderDimensionDetail(dim, name) {
     : BACKENDS.some(b => b.name === name);
 
   $("#view").innerHTML = `
-    <a href="#/analytics" class="text-sm text-neutral-500 hover:text-white">&larr; Analytics</a>
+    <a href="#/analytics" class="text-sm text-ink-2 hover:text-ink">&larr; Analytics</a>
     <div class="mt-2 flex flex-wrap items-center gap-3">
-      <h2 class="text-xl font-semibold text-white">${esc(name)}</h2>
-      <span class="rounded bg-neutral-800 px-2 py-0.5 text-xs text-neutral-300">${isModel ? "model" : "provider"}</span>
-      ${known ? "" : '<span class="rounded bg-amber-500/15 px-2 py-0.5 text-xs text-amber-400">not in catalog</span>'}
-      <a class="ml-auto text-sm text-sky-400 hover:underline" href="#/logs"
+      <h2 class="s-h2">${esc(name)}</h2>
+      <span class="s-pill">${isModel ? "model" : "provider"}</span>
+      ${known ? "" : '<span class="s-pill s-pill--warn">not in catalog</span>'}
+      <a class="ml-auto text-sm" href="#/logs"
         onclick='setLogFilter(${esc(JSON.stringify(isModel ? { model: name } : { backend: name }))})'>View logs</a>
     </div>
-    ${known ? "" : `<p class="mt-1 text-xs text-neutral-500">
+    ${known ? "" : `<p class="mt-1 text-xs text-ink-2">
       No ${isModel ? "model" : "backend"} by this name is configured — these are historical logs.</p>`}
 
     <div class="mt-5 grid grid-cols-2 gap-3 md:grid-cols-4">
@@ -685,7 +1072,7 @@ function ensureChatSelection() {
 const options = (items, selected) => items.map(([value, label]) =>
   `<option value="${esc(value)}" ${value === selected ? "selected" : ""}>${esc(label)}</option>`).join("");
 
-const SELECT_CLS = "mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm text-neutral-200";
+const SELECT_CLS = "s-select mt-1 w-full";
 
 function chatModelOptions() {
   return options(modelsOn(CHAT.backend).map(m => [m.name, m.name]), CHAT.model);
@@ -699,12 +1086,12 @@ function chatPathOptions() {
 /// provider does not serve) are visible in this one line.
 function chatPreview() {
   const b = backendNamed(CHAT.backend);
-  if (!b || !CHAT.model || !CHAT.path) return `<span class="text-amber-400">Pick a provider, model and API type.</span>`;
+  if (!b || !CHAT.model || !CHAT.path) return `<span class="text-warn">Pick a provider, model and API type.</span>`;
   const upstream = upstreamModelFor(CHAT.model, CHAT.backend);
-  return `POST <span class="text-neutral-300">${esc(b.base_url.replace(/\/$/, ""))}${esc(CHAT.path)}</span>
-    · model <span class="text-neutral-300">${esc(upstream)}</span>
-    ${upstream !== CHAT.model ? `<span class="text-neutral-600">(renamed from ${esc(CHAT.model)})</span>` : ""}
-    · billed to <span class="text-neutral-300">admin console</span>`;
+  return `POST <span class="text-ink">${esc(b.base_url.replace(/\/$/, ""))}${esc(CHAT.path)}</span>
+    · model <span class="text-ink">${esc(upstream)}</span>
+    ${upstream !== CHAT.model ? `<span class="text-ink-2">(renamed from ${esc(CHAT.model)})</span>` : ""}
+    · billed to <span class="text-ink">admin console</span>`;
 }
 
 function paintChatSelects() {
@@ -736,17 +1123,17 @@ function qSubList(q, i) {
   const items = choice ? q.options : q.levels;
   const key = choice ? "opt" : "lvl";
   return `<div class="mt-2">
-    <span class="text-xs text-neutral-500">${choice ? "Options" : "Levels"}</span>
+    <span class="text-xs text-ink-2">${choice ? "Options" : "Levels"}</span>
     <div class="mt-1 space-y-1">
       ${items.map((v, j) => `<div class="flex items-center gap-2">
         <input data-${key}="${i}:${j}" value="${esc(v)}" placeholder="${choice ? "option text" : "level label"}"
-          class="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-1 text-sm">
+          class="s-input w-full">
         <button data-${key}del="${i}:${j}" title="Remove"
-          class="rounded-lg bg-neutral-800 px-2 py-1 text-[11px] text-neutral-500 hover:bg-red-900/60 hover:text-red-200">&#10005;</button>
+          class="s-btn s-btn--sm">&#10005;</button>
       </div>`).join("")}
     </div>
     <button data-${key}add="${i}"
-      class="mt-1 rounded-lg bg-neutral-800 px-2 py-1 text-[11px] text-neutral-400 hover:bg-neutral-700">+ ${choice ? "Option" : "Level"}</button>
+      class="s-btn s-btn--sm mt-1">+ ${choice ? "Option" : "Level"}</button>
   </div>`;
 }
 
@@ -758,23 +1145,23 @@ function paintQuestions() {
   const box = $("#chat-qs");
   if (!box) return;
   box.innerHTML = CHAT.questions.map((q, i) => `
-    <div class="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3">
+    <div class="s-inset p-3">
       <div class="grid items-end gap-2 md:grid-cols-[7rem_9rem_1fr_auto]">
-        <label class="block text-xs text-neutral-500">Name
+        <label class="s-label block">Name
           ${input("qid", `data-q="${i}" data-f="id" placeholder="q${i + 1}"`, q.id)}</label>
-        <label class="block text-xs text-neutral-500">Type
-          <select data-q="${i}" data-f="type" class="mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm text-neutral-200">${options(Q_TYPES, q.type)}</select></label>
-        <label class="block text-xs text-neutral-500">Question
+        <label class="s-label block">Type
+          <select data-q="${i}" data-f="type" class="s-select mt-1 w-full">${options(Q_TYPES, q.type)}</select></label>
+        <label class="s-label block">Question
           ${input("qq", `data-q="${i}" data-f="question" placeholder="Is this about billing?"`, q.question)}</label>
         <button data-del="${i}" title="Remove question"
-          class="mb-1 rounded-lg bg-neutral-800 px-2.5 py-1.5 text-xs text-neutral-400 hover:bg-red-900/60 hover:text-red-200">&#10005;</button>
+          class="s-btn s-btn--sm mb-1">&#10005;</button>
       </div>
       ${q.type === "yes_no"
-        ? `<p class="mt-2 text-[11px] text-neutral-600">Answered with the probability that the statement is true.</p>`
+        ? `<p class="mt-2 text-[11px] text-ink-2">Answered with the probability that the statement is true.</p>`
         : qSubList(q, i)}
     </div>`).join("")
     + `<button id="chat-qadd"
-        class="w-full rounded-lg border border-dashed border-neutral-700 px-3 py-1.5 text-xs text-neutral-400 hover:border-neutral-500 hover:text-neutral-200">+ Add question</button>`;
+        class="s-btn s-btn--outline s-btn--sm w-full border-dashed">+ Add question</button>`;
 
   box.querySelectorAll("[data-q][data-f]").forEach(el => {
     const q = CHAT.questions[+el.dataset.q];
@@ -824,24 +1211,24 @@ function questionsPayload() {
 function paintComposer() {
   const box = $("#chat-composer");
   if (!box) return;
-  const sendBtn = label => `<button id="chat-send" class="rounded-lg bg-emerald-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40">${label}</button>`;
+  const sendBtn = label => `<button id="chat-send" class="s-btn s-btn--primary disabled:opacity-40">${label}</button>`;
   if (CHAT.path === TRANSCRIPTIONS) {
     box.innerHTML = `<div class="p-3">
       <div class="grid gap-3 md:grid-cols-4">
-        <label class="col-span-2 block text-xs text-neutral-500">Audio file
+        <label class="s-label col-span-2 block">Audio file
           <input id="chat-audio" type="file" accept="audio/*,video/mp4,video/webm"
-            class="mt-1 block w-full text-sm text-neutral-300 file:mr-3 file:rounded-lg file:border-0 file:bg-neutral-800 file:px-3 file:py-1.5 file:text-sm file:text-neutral-200 hover:file:bg-neutral-700">
-          <span id="chat-audio-name" class="mt-1 block text-neutral-400">${CHAT.audio ? `${esc(CHAT.audio.name)} · ${fmtBytes(CHAT.audio.size)}` : "mp3, mp4, mpeg, mpga, m4a, wav or webm"}</span></label>
-        <label class="block text-xs text-neutral-500">Language
+            class="mt-1 block w-full text-sm text-ink file:mr-3 file:rounded-lg file:border-0 file:bg-fill file:px-3 file:py-1.5 file:text-sm file:text-ink hover:file:bg-fill-hover">
+          <span id="chat-audio-name" class="mt-1 block text-ink-2">${CHAT.audio ? `${esc(CHAT.audio.name)} · ${fmtBytes(CHAT.audio.size)}` : "mp3, mp4, mpeg, mpga, m4a, wav or webm"}</span></label>
+        <label class="s-label block">Language
           ${input("chat-lang", 'id="chat-lang" list="chat-langs" placeholder="auto-detect"', CHAT.language)}
           <datalist id="chat-langs">${["en", "tr", "de", "fr", "es", "it", "pt", "nl", "ru", "ar", "ja", "zh"].map(l => `<option value="${l}">`).join("")}</datalist></label>
-        <label class="block text-xs text-neutral-500">Response format
+        <label class="s-label block">Response format
           <select id="chat-format" class="${SELECT_CLS}">${options(TRANSCRIPTION_FORMATS, CHAT.response_format)}</select></label>
-        <label class="block text-xs text-neutral-500 md:col-span-2">Keywords
+        <label class="s-label block md:col-span-2">Keywords
           ${input("chat-keywords", 'id="chat-keywords" placeholder="word bias, comma-separated"', CHAT.keywords)}</label>
       </div>
       <div class="mt-2 flex items-center justify-between">
-        <span class="text-xs text-neutral-500">The system prompt, if set, is sent as the transcription <code>prompt</code>; keywords go as a <code>keywords</code> form field — the wire form of the SDK's <code>extra_body={"keywords": [...]}</code>, and support varies by provider.
+        <span class="text-xs text-ink-2">The system prompt, if set, is sent as the transcription <code>prompt</code>; keywords go as a <code>keywords</code> form field — the wire form of the SDK's <code>extra_body={"keywords": [...]}</code>, and support varies by provider.
           diarized_json needs a diarizing model (e.g. gpt-4o-transcribe-diarize).</span>
         ${sendBtn("Transcribe")}
       </div>
@@ -857,19 +1244,19 @@ function paintComposer() {
   } else {
     const scoring = isScoring(CHAT.path);
     box.innerHTML = `<div class="p-3">
-      ${scoring ? `<div class="text-xs font-medium text-neutral-400">Questions</div>
+      ${scoring ? `<div class="text-xs font-medium text-ink-2">Questions</div>
       <div id="chat-qs" class="mt-2 space-y-2"></div>
       <div class="mt-3">
-        <div class="text-xs font-medium text-neutral-400">Images</div>
+        <div class="text-xs font-medium text-ink-2">Images</div>
         <input id="chat-images" type="file" accept="image/*" multiple
-          class="mt-1 block w-full text-sm text-neutral-300 file:mr-3 file:rounded-lg file:border-0 file:bg-neutral-800 file:px-3 file:py-1.5 file:text-sm file:text-neutral-200 hover:file:bg-neutral-700">
+          class="mt-1 block w-full text-sm text-ink file:mr-3 file:rounded-lg file:border-0 file:bg-fill file:px-3 file:py-1.5 file:text-sm file:text-ink hover:file:bg-fill-hover">
         <div id="chat-img-chips" class="mt-2"></div>
       </div>
-      <p class="mt-2 text-xs text-neutral-500">Your newest message is sent as <code>input</code> (decisions) and the system prompt as <code>state</code> (System One). Picked images ride with the input as <code>input_image</code> parts of one user message (decisions) and as <code>images</code> items (System One). The token cap is ignored; temperature applies to decisions only — System One refuses it.</p>` : ""}
+      <p class="mt-2 text-xs text-ink-2">Your newest message is sent as <code>input</code> (decisions) and the system prompt as <code>state</code> (System One). Picked images ride with the input as <code>input_image</code> parts of one user message (decisions) and as <code>images</code> items (System One). The token cap is ignored; temperature applies to decisions only — System One refuses it.</p>` : ""}
       <textarea id="chat-input" rows="3" placeholder="${scoring ? "Text to score… (Enter to send)" : "Message… (Enter to send, Shift+Enter for a newline)"}"
-        class="${scoring ? "mt-3 " : ""}w-full resize-y rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm outline-none focus:border-emerald-500"></textarea>
+        class="${scoring ? "mt-3 " : ""}w-full resize-y rounded-lg border border-line bg-canvas px-3 py-2 text-sm outline-none focus:border-primary"></textarea>
       <div class="mt-2 flex items-center justify-between">
-        <span class="text-xs text-neutral-500">${scoring
+        <span class="text-xs text-ink-2">${scoring
           ? "Scored, not generated: a decision model reads every question in one pass, any other model takes one prefill per question."
           : "Non-streaming. The whole transcript is re-sent each turn."}</span>
         ${sendBtn(scoring ? "Score" : "Send")}
@@ -900,36 +1287,36 @@ async function renderChat() {
   $("#view").innerHTML = `
     <div class="flex items-center justify-between">
       <div>
-        <h2 class="text-base font-semibold text-white">Chat</h2>
-        <p class="mt-1 text-sm text-neutral-400">Send a message through the router to one provider, to check a model is wired up.
-          Requests run as the <span class="text-neutral-300">admin console</span> key and appear in the logs.</p>
+        <h2 class="s-h3">Chat</h2>
+        <p class="mt-1 text-sm text-ink-2">Send a message through the router to one provider, to check a model is wired up.
+          Requests run as the <span class="text-ink">admin console</span> key and appear in the logs.</p>
       </div>
-      <button id="chat-clear" class="rounded-lg bg-neutral-800 px-3 py-1.5 text-sm hover:bg-neutral-700">Clear</button>
+      <button id="chat-clear" class="s-btn">Clear</button>
     </div>
-    ${BACKENDS.length ? "" : '<p class="mt-3 text-sm text-amber-400">Add a backend and a model first.</p>'}
+    ${BACKENDS.length ? "" : '<p class="mt-3 text-sm text-warn">Add a backend and a model first.</p>'}
     ${card(`<div class="p-4">
       <div class="grid gap-3 md:grid-cols-3">
-        <label class="block text-xs text-neutral-500">Provider
+        <label class="s-label block">Provider
           <select id="chat-backend" class="${SELECT_CLS}">${options(BACKENDS.map(b => [b.name, b.name]), CHAT.backend)}</select></label>
-        <label class="block text-xs text-neutral-500">Model
+        <label class="s-label block">Model
           <select id="chat-model" class="${SELECT_CLS}">${chatModelOptions()}</select></label>
-        <label class="block text-xs text-neutral-500">API type
+        <label class="s-label block">API type
           <select id="chat-path" class="${SELECT_CLS}">${chatPathOptions()}</select></label>
       </div>
       <details class="mt-3">
-        <summary class="cursor-pointer text-xs text-neutral-500">Options</summary>
+        <summary class="cursor-pointer text-xs text-ink-2">Options</summary>
         <div class="mt-2 grid gap-3 md:grid-cols-4">
-          <label class="col-span-2 block text-xs text-neutral-500">System prompt
+          <label class="s-label col-span-2 block">System prompt
             ${input("chat-system", 'id="chat-system" placeholder="optional"', CHAT.system)}</label>
-          <label class="block text-xs text-neutral-500">Max tokens
+          <label class="s-label block">Max tokens
             ${input("chat-max", 'id="chat-max" type="number" min="1" step="1" placeholder="provider default"', CHAT.max_tokens)}</label>
-          <label class="block text-xs text-neutral-500">Temperature
+          <label class="s-label block">Temperature
             ${input("chat-temp", 'id="chat-temp" type="number" min="0" step="any" placeholder="provider default"', CHAT.temperature)}</label>
         </div>
-        <p class="mt-1 text-xs text-neutral-500">Anthropic requires a token cap; without one the console sends 1024.
+        <p class="mt-1 text-xs text-ink-2">Anthropic requires a token cap; without one the console sends 1024.
           Embeddings ignore both and send your newest message as the input. Transcription and the scoring endpoints ignore the token cap.</p>
       </details>
-      <div id="chat-preview" class="mt-3 border-t border-neutral-800 pt-3 font-mono text-xs text-neutral-500">${chatPreview()}</div>
+      <div id="chat-preview" class="mt-3 border-t border-line pt-3 font-mono text-xs text-ink-2">${chatPreview()}</div>
     </div>`, "mt-4")}
     <div id="chat-log" class="mt-4 space-y-3"></div>
     ${card(`<div id="chat-composer"></div>`, "mt-4")}
@@ -1009,9 +1396,9 @@ function paintImageChips() {
   const box = $("#chat-img-chips");
   if (!box) return;
   box.innerHTML = CHAT.images.map((f, i) =>
-    `<span class="mr-1 mb-1 inline-block rounded bg-neutral-800 px-2 py-0.5 text-xs">${esc(f.name)} · ${fmtBytes(f.size)}` +
-    `<button data-i="${i}" class="ml-1 text-red-400 hover:underline" aria-label="remove ${esc(f.name)}">×</button></span>`
-  ).join("") || '<span class="text-xs text-neutral-600">png, jpg, webp… sent with your message</span>';
+    `<span class="s-pill mr-1 mb-1 inline-block">${esc(f.name)} · ${fmtBytes(f.size)}` +
+    `<button data-i="${i}" class="s-btn s-btn--ghost s-btn--sm ml-1 text-bad" aria-label="remove ${esc(f.name)}">×</button></span>`
+  ).join("") || '<span class="text-xs text-ink-2">png, jpg, webp… sent with your message</span>';
   box.querySelectorAll("button[data-i]").forEach(b =>
     b.addEventListener("click", () => { CHAT.images.splice(Number(b.dataset.i), 1); paintImageChips(); }));
 }
@@ -1115,10 +1502,9 @@ async function fetchLogRow(id, tries = 8) {
 }
 
 function statusPill(status) {
-  if (status == null) return '<span class="rounded bg-red-500/15 px-1.5 py-0.5 text-red-400">failed</span>';
-  const cls = status < 300 ? "bg-emerald-500/15 text-emerald-400"
-    : status < 500 ? "bg-amber-500/15 text-amber-400" : "bg-red-500/15 text-red-400";
-  return `<span class="rounded ${cls} px-1.5 py-0.5">${status}</span>`;
+  if (status == null) return '<span class="s-pill s-pill--bad">failed</span>';
+  const cls = status < 300 ? "s-pill--ok" : status < 500 ? "s-pill--warn" : "s-pill--bad";
+  return `<span class="s-pill ${cls}">${status}</span>`;
 }
 
 /// The line under a reply: what the router did with it. Everything after
@@ -1136,33 +1522,33 @@ function replyMeta(m) {
     }
     if (l.cost != null) bits.push(fmtCost(l.cost));
     if (l.finish_reason) bits.push(esc(l.finish_reason));
-    bits.push(`<a class="text-sky-400 hover:underline" onclick='openLog(${esc(JSON.stringify(l.id))})'>log</a>`);
+    bits.push(`<a class="" onclick='openLog(${esc(JSON.stringify(l.id))})'>log</a>`);
   }
-  return `<div class="mt-2 flex flex-wrap items-center gap-2 border-t border-neutral-800 pt-2 text-[11px] text-neutral-500">${bits.join('<span class="text-neutral-700">·</span>')}</div>`;
+  return `<div class="mt-2 flex flex-wrap items-center gap-2 border-t border-line pt-2 text-[11px] text-ink-2">${bits.join('<span class="text-ink-2/60">·</span>')}</div>`;
 }
 
 function chatBubble(m) {
   if (m.role === "user") {
     return `<div class="flex justify-end">
-      <div class="max-w-[80%] whitespace-pre-wrap rounded-xl bg-neutral-800 px-3 py-2 text-sm text-neutral-100">${esc(m.content)}</div>
+      <div class="max-w-[80%] whitespace-pre-wrap rounded-xl bg-fill px-3 py-2 text-sm text-ink">${esc(m.content)}</div>
     </div>`;
   }
-  const tone = m.ok ? "border-neutral-800 bg-neutral-900" : "border-red-900/70 bg-red-950/30";
+  const tone = m.ok ? "border-line bg-card" : "border-bad/40 bg-bad-bg";
   const thought = m.reasoning && m.reasoning.text
     ? `<details class="mb-2">
-        <summary class="cursor-pointer text-[11px] text-neutral-500">reasoning</summary>
-        <div class="mt-1 max-h-64 overflow-auto whitespace-pre-wrap text-xs text-neutral-400">${esc(m.reasoning.text)}</div>
+        <summary class="cursor-pointer text-[11px] text-ink-2">reasoning</summary>
+        <div class="mt-1 max-h-64 overflow-auto whitespace-pre-wrap text-xs text-ink-2">${esc(m.reasoning.text)}</div>
       </details>`
     : "";
   const body = thought + (m.content
-    ? `<div class="whitespace-pre-wrap text-sm ${m.ok ? "text-neutral-200" : "text-red-300"}">${esc(m.content)}</div>`
-    : `<div class="text-sm text-neutral-500">No text in the response — see the raw body.</div>`);
+    ? `<div class="whitespace-pre-wrap text-sm ${m.ok ? "text-ink" : "text-bad"}">${esc(m.content)}</div>`
+    : `<div class="text-sm text-ink-2">No text in the response — see the raw body.</div>`);
   return `<div class="flex justify-start">
     <div class="max-w-[85%] rounded-xl border ${tone} px-3 py-2">
       ${body}
       ${m.body !== undefined ? `<details class="mt-2">
-        <summary class="cursor-pointer text-[11px] text-neutral-500">raw response</summary>
-        <pre class="mt-1 max-h-64 overflow-auto rounded-lg bg-neutral-950 p-2 text-[11px] text-neutral-400">${esc(JSON.stringify(m.body, null, 2))}</pre>
+        <summary class="cursor-pointer text-[11px] text-ink-2">raw response</summary>
+        <pre class="s-code mt-1 max-h-64 text-ink-2">${esc(JSON.stringify(m.body, null, 2))}</pre>
       </details>` : ""}
       ${replyMeta(m)}
     </div>
@@ -1173,7 +1559,7 @@ function paintTranscript() {
   const log = $("#chat-log");
   if (!log) return;
   log.innerHTML = CHAT.messages.map(chatBubble).join("")
-    + (CHAT.busy ? `<div class="flex justify-start"><div class="rounded-xl border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-500">…</div></div>` : "");
+    + (CHAT.busy ? `<div class="flex justify-start"><div class="s-card px-3 py-2 text-sm text-ink-2">…</div></div>` : "");
   const send = $("#chat-send");
   if (send) send.disabled = CHAT.busy;
   log.lastElementChild?.scrollIntoView?.({ block: "nearest" });
@@ -1187,51 +1573,51 @@ async function renderKeys() {
     api("/admin/usage?group_by=day&since=" + encodeURIComponent(sinceParam())),
   ]);
   const rows = keys.map(k => `
-    <tr class="cursor-pointer border-t border-neutral-800 hover:bg-neutral-800/50" onclick="location.hash='#/keys/${esc(k.id)}'">
+    <tr class="cursor-pointer border-t border-line hover:bg-fill/50" onclick="location.hash='#/keys/${esc(k.id)}'">
       <td class="px-4 py-3">
-        <div class="font-medium text-white">${esc(k.name)}</div>
-        <div class="text-xs text-neutral-500">${fmtDate(k.created_at)}</div>
+        <div class="font-medium text-ink">${esc(k.name)}</div>
+        <div class="text-xs text-ink-2">${fmtDate(k.created_at)}</div>
       </td>
       <td class="px-4 py-3">${k.disabled
-        ? '<span class="rounded bg-red-500/15 px-2 py-0.5 text-xs text-red-400">Disabled</span>'
-        : '<span class="rounded bg-emerald-500/15 px-2 py-0.5 text-xs text-emerald-400">Enabled</span>'}</td>
+        ? '<span class="s-pill s-pill--bad">Disabled</span>'
+        : '<span class="s-pill s-pill--ok">Enabled</span>'}</td>
       <td class="px-4 py-3 text-sm">
-        <div>${fmtCost(k.usage.window_cost)}${k.credit_limit != null ? ` <span class="text-neutral-500">/ ${fmtCost(k.credit_limit)}</span>` : ""}</div>
+        <div>${fmtCost(k.usage.window_cost)}${k.credit_limit != null ? ` <span class="text-ink-2">/ ${fmtCost(k.credit_limit)}</span>` : ""}</div>
         ${progressBar(k.usage.window_cost, k.credit_limit)}
       </td>
       <td class="px-4 py-3 text-sm">
-        <div>${fmtInt(k.usage.window_tokens)}${k.token_limit != null ? ` <span class="text-neutral-500">/ ${fmtInt(k.token_limit)}</span>` : ""}</div>
+        <div>${fmtInt(k.usage.window_tokens)}${k.token_limit != null ? ` <span class="text-ink-2">/ ${fmtInt(k.token_limit)}</span>` : ""}</div>
         ${inOutLine(k.usage.window_prompt_tokens, k.usage.window_completion_tokens)}
         ${progressBar(k.usage.window_tokens, k.token_limit)}
       </td>
-      <td class="px-4 py-3 text-sm text-neutral-400">${k.allowed_models ? esc(k.allowed_models.join(", ")) : "all public models"}${
-        k.flex_models ? `<div class="mt-1 text-xs text-amber-400">flex: ${esc(k.flex_models.join(", "))}</div>` : ""
+      <td class="px-4 py-3 text-sm text-ink-2">${k.allowed_models ? esc(k.allowed_models.join(", ")) : "all public models"}${
+        k.flex_models ? `<div class="mt-1 text-xs text-warn">flex: ${esc(k.flex_models.join(", "))}</div>` : ""
       }</td>
     </tr>`).join("");
 
   $("#view").innerHTML = `
     ${usageChart(usage)}
     <div class="mt-6 flex items-center justify-between">
-      <h2 class="text-base font-semibold text-white">API Keys</h2>
-      <button onclick="openCreateKey()" class="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500">Create key</button>
+      <h2 class="s-h3">API Keys</h2>
+      <button onclick="openCreateKey()" class="s-btn s-btn--primary">Create key</button>
     </div>
-    ${card(`<table class="mt-0 w-full text-left">
-      <thead><tr class="text-xs uppercase tracking-wide text-neutral-500">
+    ${card(`<table class="s-table mt-0 w-full text-left">
+      <thead><tr class="text-xs text-ink-2">
         <th class="px-4 py-3">Key</th><th class="px-4 py-3">Status</th>
         <th class="px-4 py-3">Window spend</th><th class="px-4 py-3">Window tokens</th>
         <th class="px-4 py-3">Models</th>
       </tr></thead>
-      <tbody>${rows || '<tr><td colspan="5" class="px-4 py-8 text-center text-neutral-600">No keys yet.</td></tr>'}</tbody>
+      <tbody>${rows || '<tr><td colspan="5" class="px-4 py-8 text-center text-ink-2">No keys yet.</td></tr>'}</tbody>
     </table>`, "mt-3 overflow-x-auto")}`;
 }
 
 function openCreateKey() {
   openModal(`
-    <h3 class="mb-4 text-base font-semibold text-white">Create API key</h3>
+    <h3 class="s-h3 mb-4">Create API key</h3>
     <form id="create-form" class="space-y-3">${keyFormFields()}
       <div class="flex justify-end gap-2 pt-2">
-        <button type="button" onclick="closeModal()" class="rounded-lg px-3 py-1.5 text-sm text-neutral-400 hover:text-white">Cancel</button>
-        <button class="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500">Create</button>
+        <button type="button" onclick="closeModal()" class="s-btn s-btn--ghost">Cancel</button>
+        <button class="s-btn s-btn--primary">Create</button>
       </div>
     </form>`);
   $("#create-form").addEventListener("submit", async e => {
@@ -1239,15 +1625,15 @@ function openCreateKey() {
     try {
       const created = await api("/admin/tokens", { method: "POST", body: JSON.stringify(readKeyForm(e.target)) });
       openModal(`
-        <h3 class="mb-2 text-base font-semibold text-white">Key created</h3>
-        <p class="mb-3 text-sm text-amber-400">Copy the token now — it is shown exactly once.</p>
+        <h3 class="s-h3 mb-2">Key created</h3>
+        <p class="mb-3 text-sm text-warn">Copy the token now — it is shown exactly once.</p>
         <div class="flex items-center gap-2">
-          <code id="new-token" class="flex-1 overflow-x-auto rounded-lg bg-neutral-950 px-3 py-2 text-xs">${esc(created.token)}</code>
+          <code id="new-token" class="s-code flex-1">${esc(created.token)}</code>
           <button onclick="navigator.clipboard.writeText($('#new-token').textContent).then(()=>this.textContent='Copied!')"
-            class="rounded-lg bg-neutral-700 px-3 py-2 text-xs hover:bg-neutral-600">Copy</button>
+            class="s-btn s-btn--sm">Copy</button>
         </div>
         <div class="mt-4 flex justify-end">
-          <button onclick="closeModal(); route()" class="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm text-white">Done</button>
+          <button onclick="closeModal(); route()" class="s-btn s-btn--primary">Done</button>
         </div>`);
     } catch (err) { toast(err.message); }
   });
@@ -1262,16 +1648,16 @@ async function renderKeyDetail(id) {
       + "&since=" + encodeURIComponent(sinceParam())),
   ]);
   $("#view").innerHTML = `
-    <a href="#/keys" class="text-sm text-neutral-500 hover:text-white">&larr; API Keys</a>
+    <a href="#/keys" class="text-sm text-ink-2 hover:text-ink">&larr; API Keys</a>
     <div class="mt-2 flex items-center gap-3">
-      <h2 class="text-xl font-semibold text-white">${esc(k.name)}</h2>
+      <h2 class="s-h2">${esc(k.name)}</h2>
       ${k.disabled
-        ? '<span class="rounded bg-red-500/15 px-2 py-0.5 text-xs text-red-400">Disabled</span>'
-        : '<span class="rounded bg-emerald-500/15 px-2 py-0.5 text-xs text-emerald-400">Enabled</span>'}
-      <a class="ml-auto text-sm text-sky-400 hover:underline" href="#/logs"
+        ? '<span class="s-pill s-pill--bad">Disabled</span>'
+        : '<span class="s-pill s-pill--ok">Enabled</span>'}
+      <a class="ml-auto text-sm" href="#/logs"
         onclick='setLogFilter(${esc(JSON.stringify({ token_id: k.id }))})'>View logs</a>
     </div>
-    <div class="mt-1 text-xs text-neutral-500">id: ${esc(k.id)} · created ${fmtDate(k.created_at)}</div>
+    <div class="mt-1 text-xs text-ink-2">id: ${esc(k.id)} · created ${fmtDate(k.created_at)}</div>
 
     <div class="mt-5 grid grid-cols-2 gap-3 md:grid-cols-4">
       ${statCard("Today", k.usage.today)}
@@ -1284,27 +1670,27 @@ async function renderKeyDetail(id) {
 
     <div class="mt-5 grid gap-5 md:grid-cols-2">
       ${card(`<form id="edit-form" class="space-y-3 p-5">
-        <h3 class="text-sm font-semibold text-white">Settings</h3>
+        <h3 class="text-sm font-semibold text-ink">Settings</h3>
         ${keyFormFields(k)}
         <div class="flex justify-end pt-1">
-          <button class="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500">Save</button>
+          <button class="s-btn s-btn--primary">Save</button>
         </div>
       </form>`)}
       ${card(`<div class="space-y-4 p-5">
         <div>
-          <h3 class="text-sm font-semibold text-white">${k.disabled ? "Enable key" : "Disable key"}</h3>
-          <p class="mt-1 text-sm text-neutral-400">${k.disabled
+          <h3 class="text-sm font-semibold text-ink">${k.disabled ? "Enable key" : "Disable key"}</h3>
+          <p class="mt-1 text-sm text-ink-2">${k.disabled
             ? "Allow this key to be used again."
             : "Prevent this key from being used. You can re-enable it later."}</p>
           <button onclick="toggleKey('${esc(k.id)}', ${!k.disabled})"
-            class="mt-2 rounded-lg ${k.disabled ? "bg-emerald-600 hover:bg-emerald-500" : "bg-amber-600 hover:bg-amber-500"} px-3 py-1.5 text-sm font-medium text-white">
+            class="s-btn mt-2 ${k.disabled ? "s-btn--primary" : ""}">
             ${k.disabled ? "Enable" : "Disable"}</button>
         </div>
-        <div class="border-t border-neutral-800 pt-4">
-          <h3 class="text-sm font-semibold text-red-400">Delete key</h3>
-          <p class="mt-1 text-sm text-neutral-400">Permanently delete this key. Request logs are kept. This cannot be undone.</p>
+        <div class="border-t border-line pt-4">
+          <h3 class="text-sm font-semibold text-bad">Delete key</h3>
+          <p class="mt-1 text-sm text-ink-2">Permanently delete this key. Request logs are kept. This cannot be undone.</p>
           <button onclick="deleteKey('${esc(k.id)}', '${esc(k.name)}')"
-            class="mt-2 rounded-lg bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-500">Delete</button>
+            class="s-btn s-btn--danger mt-2">Delete</button>
         </div>
       </div>`)}
     </div>`;
@@ -1348,11 +1734,11 @@ const PRICE_FIELDS = [
 
 function priceFields(prefix, p) {
   return `<div class="grid grid-cols-4 gap-2">
-    ${PRICE_FIELDS.map(([f, label]) => `<label class="block text-xs text-neutral-500">${label}
+    ${PRICE_FIELDS.map(([f, label]) => `<label class="s-label block">${label}
       ${input(prefix + f, 'type="number" step="any" min="0" placeholder="—"', p && p[f] != null ? p[f] : "")}
     </label>`).join("")}
   </div>
-  <p class="mt-1 text-xs text-neutral-500">USD per 1M tokens. Leave input+output blank for no pricing;
+  <p class="mt-1 text-xs text-ink-2">USD per 1M tokens. Leave input+output blank for no pricing;
     blank cache rates fall back to the input rate. Embedding models bill input only — set output to 0.</p>`;
 }
 
@@ -1379,100 +1765,100 @@ function readPricing(form, prefix, what) {
 }
 
 function priceSummary(p) {
-  if (!p) return '<span class="text-neutral-600">unpriced</span>';
+  if (!p) return '<span class="text-ink-2">unpriced</span>';
   return `${fmtCost(p.input_per_mtok)} in / ${fmtCost(p.output_per_mtok)} out
-    <span class="text-neutral-600">per 1M</span>`;
+    <span class="text-ink-2">per 1M</span>`;
 }
 
 /// Aliases shown under the model name — they route identically, so they
 /// are presented as extra names rather than as rows of their own.
 function aliasList(aliases) {
   if (!aliases || !aliases.length) return "";
-  return `<div class="mt-0.5 text-xs font-normal text-neutral-500">
+  return `<div class="mt-0.5 text-xs font-normal text-ink-2">
     also: ${aliases.map(esc).join(", ")}</div>`;
 }
 
 function targetChip(t) {
-  const rename = t.model ? ` <span class="text-neutral-500">→</span> ${esc(t.model)}` : "";
+  const rename = t.model ? ` <span class="text-ink-2">→</span> ${esc(t.model)}` : "";
   // A fallback target is off the normal rotation, so its weight is only
   // meaningful against the other fallbacks — show the role, not the weight.
   const role = t.fallback_only
-    ? '<span class="text-amber-400"> fallback</span>'
-    : `<span class="text-neutral-500"> ×${t.weight}</span>`;
-  return `<span class="mr-1 inline-block rounded bg-neutral-800 px-2 py-0.5 text-xs">
+    ? '<span class="text-warn"> fallback</span>'
+    : `<span class="text-ink-2"> ×${t.weight}</span>`;
+  return `<span class="s-pill mr-1 inline-block">
     ${esc(t.backend)}${rename}${role}</span>`;
 }
 
 /// The route's deadline policy, as one short cell.
 function qosSummary(m) {
   if (m.qos_max_wait_ms == null && m.qos_background_max_wait_ms == null) {
-    return '<span class="text-neutral-600">wait</span>';
+    return '<span class="text-ink-2">wait</span>';
   }
   const parts = [];
   if (m.qos_max_wait_ms != null) parts.push(`${m.qos_max_wait_ms} ms`);
   if (m.qos_background_max_wait_ms != null) {
-    parts.push(`<span class="text-neutral-500">bg ${m.qos_background_max_wait_ms} ms</span>`);
+    parts.push(`<span class="text-ink-2">bg ${m.qos_background_max_wait_ms} ms</span>`);
   }
   const noFallback = m.targets.some(t => t.fallback_only)
-    ? "" : ` <span class="text-amber-400">(${esc(m.on_shed_without_fallback)}, no fallback)</span>`;
+    ? "" : ` <span class="text-warn">(${esc(m.on_shed_without_fallback)}, no fallback)</span>`;
   return parts.join(" / ") + noFallback;
 }
 
 async function renderModels() {
   await loadCatalog();
   const rows = CATALOG.map(m => `
-    <tr class="border-t border-neutral-800">
+    <tr class="border-t border-line">
       <td class="px-4 py-3 font-medium">
-        <a class="text-sky-400 hover:underline" href="#/analytics/models/${encodeURIComponent(m.name)}"
+        <a class="" href="#/analytics/models/${encodeURIComponent(m.name)}"
           title="Usage analytics">${esc(m.name)}</a>${m.private
-            ? ' <span class="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-400">private</span>' : ""}${aliasList(m.aliases)}</td>
+            ? ' <span class="s-pill s-pill--warn">private</span>' : ""}${aliasList(m.aliases)}</td>
       <td class="px-4 py-3">${m.targets.map(targetChip).join("")}</td>
-      <td class="px-4 py-3 text-sm text-neutral-400">${priceSummary(m.pricing)}</td>
-      <td class="px-4 py-3 text-sm text-neutral-400">${qosSummary(m)}</td>
+      <td class="px-4 py-3 text-sm text-ink-2">${priceSummary(m.pricing)}</td>
+      <td class="px-4 py-3 text-sm text-ink-2">${qosSummary(m)}</td>
       <td class="px-4 py-3 text-right text-sm whitespace-nowrap">
-        <button onclick='openModelForm(${esc(JSON.stringify(m.name))})' class="text-sky-400 hover:underline">Edit</button>
-        <button onclick='deleteModel(${esc(JSON.stringify(m.name))})' class="ml-3 text-red-400 hover:underline">Delete</button>
+        <button onclick='openModelForm(${esc(JSON.stringify(m.name))})' class="s-btn s-btn--ghost s-btn--sm">Edit</button>
+        <button onclick='deleteModel(${esc(JSON.stringify(m.name))})' class="s-btn s-btn--ghost s-btn--sm ml-3 text-bad">Delete</button>
       </td>
     </tr>`).join("");
 
   $("#view").innerHTML = `
     <div class="flex items-center justify-between">
       <div>
-        <h2 class="text-base font-semibold text-white">Models</h2>
-        <p class="mt-1 text-sm text-neutral-400">Inbound model names and the weighted backends they route to. Changes apply immediately.</p>
+        <h2 class="s-h3">Models</h2>
+        <p class="mt-1 text-sm text-ink-2">Inbound model names and the weighted backends they route to. Changes apply immediately.</p>
       </div>
       <button onclick="openModelForm()" ${BACKENDS.length ? "" : "disabled"}
-        class="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40">Add model</button>
+        class="s-btn s-btn--primary disabled:opacity-40">Add model</button>
     </div>
-    ${BACKENDS.length ? "" : `<p class="mt-3 text-sm text-amber-400">Add a backend first — a model needs at least one target.</p>`}
-    ${card(`<table class="w-full text-left">
-      <thead><tr class="text-xs uppercase tracking-wide text-neutral-500">
+    ${BACKENDS.length ? "" : `<p class="mt-3 text-sm text-warn">Add a backend first — a model needs at least one target.</p>`}
+    ${card(`<table class="s-table w-full text-left">
+      <thead><tr class="text-xs text-ink-2">
         <th class="px-4 py-3">Model</th><th class="px-4 py-3">Targets</th>
         <th class="px-4 py-3">Pricing</th><th class="px-4 py-3">Deadline</th><th class="px-4 py-3"></th>
       </tr></thead>
-      <tbody>${rows || '<tr><td colspan="5" class="px-4 py-8 text-center text-neutral-600">No models yet.</td></tr>'}</tbody>
+      <tbody>${rows || '<tr><td colspan="5" class="px-4 py-8 text-center text-ink-2">No models yet.</td></tr>'}</tbody>
     </table>`, "mt-4 overflow-x-auto")}`;
 }
 
 function targetRowHtml(t = {}) {
   const opts = BACKENDS.map(b =>
     `<option value="${esc(b.name)}" ${t.backend === b.name ? "selected" : ""}>${esc(b.name)}</option>`).join("");
-  return `<div class="target-row rounded-lg border border-neutral-800 p-3">
+  return `<div class="s-inset target-row p-3">
     <div class="flex gap-2">
-      <label class="block flex-1 text-xs text-neutral-500">Backend
-        <select name="t_backend" class="mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm">${opts}</select></label>
-      <label class="block flex-1 text-xs text-neutral-500">Upstream model (optional)
+      <label class="s-label block flex-1">Backend
+        <select name="t_backend" class="s-select mt-1 w-full">${opts}</select></label>
+      <label class="s-label block flex-1">Upstream model (optional)
         ${input("t_model", 'placeholder="same as inbound"', t.model || "")}</label>
-      <label class="block w-20 text-xs text-neutral-500">Weight
+      <label class="s-label block w-20">Weight
         ${input("t_weight", 'type="number" min="1" step="1"', t.weight ?? 1)}</label>
       <button type="button" title="Remove target" onclick="this.closest('.target-row').remove()"
-        class="mt-5 h-8 rounded-lg px-2 text-neutral-500 hover:bg-neutral-800 hover:text-red-400">✕</button>
+        class="s-btn s-btn--ghost s-btn--sm mt-5 h-8">✕</button>
     </div>
-    <label class="mt-2 flex items-center gap-2 text-xs text-neutral-400">
-      <input type="checkbox" name="t_fallback_only" class="accent-amber-500" ${t.fallback_only ? "checked" : ""}>
+    <label class="mt-2 flex items-center gap-2 text-xs text-ink-2">
+      <input type="checkbox" name="t_fallback_only" class="accent-warn" ${t.fallback_only ? "checked" : ""}>
       Fallback only — skipped by normal routing, used when a request would miss its deadline</label>
     <details class="mt-2" ${t.pricing ? "open" : ""}>
-      <summary class="cursor-pointer text-xs text-neutral-500">Pricing override</summary>
+      <summary class="cursor-pointer text-xs text-ink-2">Pricing override</summary>
       <div class="mt-2">${priceFields("t_", t.pricing)}</div>
     </details>
   </div>`;
@@ -1486,54 +1872,54 @@ function openModelForm(name) {
   const m = name ? CATALOG.find(x => x.name === name) : null;
   const targets = m ? m.targets : [{}];
   openModal(`
-    <h3 class="mb-4 text-base font-semibold text-white">${m ? "Edit model" : "Add model"}</h3>
+    <h3 class="s-h3 mb-4">${m ? "Edit model" : "Add model"}</h3>
     <form id="model-form" class="space-y-4">
-      <label class="block text-sm">Model name
+      <label class="s-label block">Model name
         ${input("name", `required ${m ? "readonly" : ""} placeholder="gpt-4o"`, m ? m.name : "")}
-        ${m ? '<span class="text-xs text-neutral-500">Names are referenced by keys and logs and cannot be changed.</span>' : ""}
+        ${m ? '<span class="text-xs text-ink-2">Names are referenced by keys and logs and cannot be changed.</span>' : ""}
       </label>
-      <label class="block text-sm">Aliases (optional)
+      <label class="s-label block">Aliases (optional)
         ${input("aliases", 'placeholder="gpt-4o-latest, gpt4o"', m && m.aliases ? m.aliases.join(", ") : "")}
-        <span class="text-xs text-neutral-500">Comma-separated extra names clients may call. They route,
+        <span class="text-xs text-ink-2">Comma-separated extra names clients may call. They route,
           bill and log as the model name above.</span>
       </label>
-      <label class="flex items-center gap-2 text-sm text-neutral-300">
-        <input type="checkbox" name="private" class="accent-amber-500" ${m && m.private ? "checked" : ""}>
+      <label class="flex items-center gap-2 text-sm text-ink">
+        <input type="checkbox" name="private" class="accent-warn" ${m && m.private ? "checked" : ""}>
         Private — only keys whose allowlist names this model can use it</label>
-      <p class="-mt-2 text-xs text-neutral-500">A key with no allowlist gets every public model, but never
+      <p class="-mt-2 text-xs text-ink-2">A key with no allowlist gets every public model, but never
         a private one. Private models are also hidden from that key's model list.</p>
       <div class="text-sm">Default pricing${priceFields("m_", m && m.pricing)}</div>
-      <details class="rounded-lg border border-neutral-800 p-3"
+      <details class="s-inset p-3"
         ${m && (m.qos_max_wait_ms != null || m.qos_background_max_wait_ms != null) ? "open" : ""}>
-        <summary class="cursor-pointer text-sm text-neutral-300">Deadlines (QoS)</summary>
+        <summary class="cursor-pointer text-sm text-ink">Deadlines (QoS)</summary>
         <div class="mt-3 grid grid-cols-3 gap-3">
-          <label class="block text-xs text-neutral-500">Max wait (ms)
+          <label class="s-label block">Max wait (ms)
             ${input("qos_max_wait_ms", 'type="number" min="1" step="1" placeholder="wait forever"',
               m && m.qos_max_wait_ms != null ? m.qos_max_wait_ms : "")}</label>
-          <label class="block text-xs text-neutral-500">Background max wait (ms)
+          <label class="s-label block">Background max wait (ms)
             ${input("qos_background_max_wait_ms", 'type="number" min="1" step="1" placeholder="wait forever"',
               m && m.qos_background_max_wait_ms != null ? m.qos_background_max_wait_ms : "")}</label>
-          <label class="block text-xs text-neutral-500">Shed with no fallback
+          <label class="s-label block">Shed with no fallback
             <select name="on_shed_without_fallback"
-              class="mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm">
+              class="s-select mt-1 w-full">
               ${["wait", "error"].map(v => `<option value="${v}"
                 ${(m ? m.on_shed_without_fallback : "wait") === v ? "selected" : ""}>${v}</option>`).join("")}
             </select></label>
         </div>
-        <p class="mt-2 text-xs text-neutral-500">How long a request may be <em>predicted</em> to queue on a
+        <p class="mt-2 text-xs text-ink-2">How long a request may be <em>predicted</em> to queue on a
           grouped backend before it is sent to a fallback target instead. Background is what
           <code>x-router-qos: background</code> selects; a client may also send
           <code>x-router-max-wait-ms</code>. Blank means wait indefinitely.</p>
       </details>
       <div class="text-sm">
         <div class="flex items-center justify-between">Targets
-          <button type="button" onclick="addTargetRow()" class="rounded-lg bg-neutral-800 px-2 py-1 text-xs hover:bg-neutral-700">Add target</button>
+          <button type="button" onclick="addTargetRow()" class="s-btn s-btn--sm">Add target</button>
         </div>
         <div id="targets" class="mt-2 space-y-2">${targets.map(targetRowHtml).join("")}</div>
       </div>
       <div class="flex justify-end gap-2 pt-1">
-        <button type="button" onclick="closeModal()" class="rounded-lg px-3 py-1.5 text-sm text-neutral-400 hover:text-white">Cancel</button>
-        <button class="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500">Save</button>
+        <button type="button" onclick="closeModal()" class="s-btn s-btn--ghost">Cancel</button>
+        <button class="s-btn s-btn--primary">Save</button>
       </div>
     </form>`, "max-w-2xl");
 
@@ -1601,21 +1987,21 @@ const SCHEDULING_CLASSES = [
 /// both are unscheduled, but only one of them sits on a contended device.
 function schedulingSummary(b) {
   const limit = b.max_concurrency != null
-    ? `<span class="text-neutral-500"> ≤${b.max_concurrency} in flight</span>` : "";
+    ? `<span class="text-ink-2"> ≤${b.max_concurrency} in flight</span>` : "";
   if (b.scheduling_class === "grouped") {
-    return `<span class="rounded bg-amber-500/15 px-2 py-0.5 text-xs text-amber-400">leased: ${esc(b.exclusive_group_id || "?")}</span>
-      <span class="text-neutral-500 text-xs"> cap ${b.max_tokens_cap ?? "—"} tok</span>${limit}`;
+    return `<span class="s-pill s-pill--warn">leased: ${esc(b.exclusive_group_id || "?")}</span>
+      <span class="text-ink-2 text-xs"> cap ${b.max_tokens_cap ?? "—"} tok</span>${limit}`;
   }
   if (b.scheduling_class === "exempt") {
-    return `<span class="rounded bg-neutral-800 px-2 py-0.5 text-xs text-neutral-300">exempt: ${esc(b.exclusive_group_id || "?")}</span>${limit}`;
+    return `<span class="s-pill">exempt: ${esc(b.exclusive_group_id || "?")}</span>${limit}`;
   }
-  return `<span class="text-neutral-600 text-xs">unrestricted</span>${limit}`;
+  return `<span class="text-ink-2 text-xs">unrestricted</span>${limit}`;
 }
 
 function credentialSummary(b) {
-  if (b.api_key_env) return `<span class="text-neutral-400">env: <code class="text-xs">${esc(b.api_key_env)}</code></span>`;
-  if (b.has_api_key) return '<span class="text-emerald-400">stored key</span>';
-  return '<span class="text-neutral-600">none</span>';
+  if (b.api_key_env) return `<span class="text-ink-2">env: <code class="text-xs">${esc(b.api_key_env)}</code></span>`;
+  if (b.has_api_key) return '<span class="text-ok">stored key</span>';
+  return '<span class="text-ink-2">none</span>';
 }
 
 async function renderBackends() {
@@ -1623,24 +2009,24 @@ async function renderBackends() {
   const usedBy = name => CATALOG.filter(m => m.targets.some(t => t.backend === name)).map(m => m.name);
   const rows = BACKENDS.map(b => {
     const used = usedBy(b.name);
-    return `<tr class="border-t border-neutral-800">
+    return `<tr class="border-t border-line">
       <td class="px-4 py-3">
-        <a class="font-medium text-sky-400 hover:underline" href="#/analytics/providers/${encodeURIComponent(b.name)}"
+        <a class="" href="#/analytics/providers/${encodeURIComponent(b.name)}"
           title="Usage analytics">${esc(b.name)}</a>
-        <div class="text-xs text-neutral-500">${used.length ? esc(used.join(", ")) : "unused"}</div>
+        <div class="text-xs text-ink-2">${used.length ? esc(used.join(", ")) : "unused"}</div>
       </td>
       <td class="px-4 py-3">${b.kinds.map(k =>
-        `<span class="mr-1 rounded bg-neutral-800 px-2 py-0.5 text-xs">${esc(k)}</span>`).join("")}</td>
-      <td class="px-4 py-3 font-mono text-xs text-neutral-400">${esc(b.base_url)}${
+        `<span class="s-pill mr-1">${esc(k)}</span>`).join("")}</td>
+      <td class="px-4 py-3 font-mono text-xs text-ink-2">${esc(b.base_url)}${
         b.anthropic_base_url
-          ? `<div class="mt-1 text-[11px] text-neutral-500">anthropic: ${esc(b.anthropic_base_url)}</div>` : ""
+          ? `<div class="mt-1 text-[11px] text-ink-2">anthropic: ${esc(b.anthropic_base_url)}</div>` : ""
       }</td>
       <td class="px-4 py-3 text-sm">${credentialSummary(b)}</td>
-      <td class="px-4 py-3 text-sm text-neutral-400">${b.inject_usage ? "on" : "off"}</td>
+      <td class="px-4 py-3 text-sm text-ink-2">${b.inject_usage ? "on" : "off"}</td>
       <td class="px-4 py-3 text-sm">${schedulingSummary(b)}</td>
       <td class="px-4 py-3 text-right text-sm whitespace-nowrap">
-        <button onclick='openBackendForm(${esc(JSON.stringify(b.name))})' class="text-sky-400 hover:underline">Edit</button>
-        <button onclick='deleteBackend(${esc(JSON.stringify(b.name))})' class="ml-3 text-red-400 hover:underline">Delete</button>
+        <button onclick='openBackendForm(${esc(JSON.stringify(b.name))})' class="s-btn s-btn--ghost s-btn--sm">Edit</button>
+        <button onclick='deleteBackend(${esc(JSON.stringify(b.name))})' class="s-btn s-btn--ghost s-btn--sm ml-3 text-bad">Delete</button>
       </td>
     </tr>`;
   }).join("");
@@ -1648,101 +2034,101 @@ async function renderBackends() {
   $("#view").innerHTML = `
     <div class="flex items-center justify-between">
       <div>
-        <h2 class="text-base font-semibold text-white">Backends</h2>
-        <p class="mt-1 text-sm text-neutral-400">Upstream providers and their credentials. Stored keys are never shown again.</p>
+        <h2 class="s-h3">Backends</h2>
+        <p class="mt-1 text-sm text-ink-2">Upstream providers and their credentials. Stored keys are never shown again.</p>
       </div>
-      <button onclick="openBackendForm()" class="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500">Add backend</button>
+      <button onclick="openBackendForm()" class="s-btn s-btn--primary">Add backend</button>
     </div>
-    ${card(`<table class="w-full text-left">
-      <thead><tr class="text-xs uppercase tracking-wide text-neutral-500">
+    ${card(`<table class="s-table w-full text-left">
+      <thead><tr class="text-xs text-ink-2">
         <th class="px-4 py-3">Backend</th><th class="px-4 py-3">Kinds</th><th class="px-4 py-3">Base URL</th>
         <th class="px-4 py-3">Credential</th><th class="px-4 py-3">Inject usage</th>
         <th class="px-4 py-3">Scheduling</th><th class="px-4 py-3"></th>
       </tr></thead>
-      <tbody>${rows || '<tr><td colspan="7" class="px-4 py-8 text-center text-neutral-600">No backends yet.</td></tr>'}</tbody>
+      <tbody>${rows || '<tr><td colspan="7" class="px-4 py-8 text-center text-ink-2">No backends yet.</td></tr>'}</tbody>
     </table>`, "mt-4 overflow-x-auto")}`;
 }
 
 function openBackendForm(name) {
   const b = name ? BACKENDS.find(x => x.name === name) : null;
   openModal(`
-    <h3 class="mb-4 text-base font-semibold text-white">${b ? "Edit backend" : "Add backend"}</h3>
+    <h3 class="s-h3 mb-4">${b ? "Edit backend" : "Add backend"}</h3>
     <form id="backend-form" class="space-y-3">
-      <label class="block text-sm">Name
+      <label class="s-label block">Name
         ${input("name", `required ${b ? "readonly" : ""} placeholder="openai"`, b ? b.name : "")}
-        ${b ? '<span class="text-xs text-neutral-500">Names are referenced by model targets and cannot be changed.</span>' : ""}
+        ${b ? '<span class="text-xs text-ink-2">Names are referenced by model targets and cannot be changed.</span>' : ""}
       </label>
       <div class="text-sm">API kinds
         <div class="mt-1 flex gap-4">
-          ${KINDS.map(k => `<label class="flex items-center gap-2 text-sm text-neutral-300">
-            <input type="checkbox" name="kinds" value="${k}" class="accent-emerald-500"
+          ${KINDS.map(k => `<label class="flex items-center gap-2 text-sm text-ink">
+            <input type="checkbox" name="kinds" value="${k}" class="accent-primary"
               ${b ? (b.kinds.includes(k) ? "checked" : "") : (k === "openai" ? "checked" : "")}> ${k}</label>`).join("")}
         </div>
-        <p class="mt-1 text-xs text-neutral-500">openai serves /v1/chat/completions, /v1/responses, /v1/embeddings, /v1/audio/transcriptions, /v1/decisions and /v1/systemone; anthropic serves /v1/messages.</p>
+        <p class="mt-1 text-xs text-ink-2">openai serves /v1/chat/completions, /v1/responses, /v1/embeddings, /v1/audio/transcriptions, /v1/decisions and /v1/systemone; anthropic serves /v1/messages.</p>
       </div>
-      <label class="block text-sm">Base URL
+      <label class="s-label block">Base URL
         ${input("base_url", 'required placeholder="https://api.openai.com"', b ? b.base_url : "")}</label>
-      <label class="block text-sm">Anthropic base URL (optional)
+      <label class="s-label block">Anthropic base URL (optional)
         ${input("anthropic_base_url", 'placeholder="same as base URL"', b ? (b.anthropic_base_url || "") : "")}
-        <span class="text-xs text-neutral-500">Used only for <code>/v1/messages</code>. Set it when the
+        <span class="text-xs text-ink-2">Used only for <code>/v1/messages</code>. Set it when the
           provider exposes Anthropic on a different endpoint; blank means the base URL above serves both.</span>
       </label>
       <div class="grid grid-cols-2 gap-3">
-        <label class="block text-sm">API key
+        <label class="s-label block">API key
           ${input("api_key", `type="password" autocomplete="new-password" placeholder="${b && b.has_api_key ? "unchanged" : "none"}"`)}</label>
-        <label class="block text-sm">…or key from env var
+        <label class="s-label block">…or key from env var
           ${input("api_key_env", 'placeholder="OPENAI_API_KEY"', b ? (b.api_key_env || "") : "")}</label>
       </div>
       ${b && (b.has_api_key || b.api_key_env)
-        ? `<label class="flex items-center gap-2 text-sm text-neutral-300">
-             <input type="checkbox" name="clear_credential" class="accent-red-500"> Remove the stored credential (send no auth header)</label>`
+        ? `<label class="flex items-center gap-2 text-sm text-ink">
+             <input type="checkbox" name="clear_credential" class="accent-bad"> Remove the stored credential (send no auth header)</label>`
         : ""}
       <div class="grid grid-cols-2 gap-3">
-        <label class="block text-sm">anthropic-version
+        <label class="s-label block">anthropic-version
           ${input("anthropic_version", 'placeholder="2023-06-01"', b ? (b.anthropic_version || "") : "")}</label>
-        <label class="mt-6 flex items-center gap-2 text-sm text-neutral-300">
-          <input type="checkbox" name="inject_usage" class="accent-emerald-500" ${!b || b.inject_usage ? "checked" : ""}>
+        <label class="mt-6 flex items-center gap-2 text-sm text-ink">
+          <input type="checkbox" name="inject_usage" class="accent-primary" ${!b || b.inject_usage ? "checked" : ""}>
           Inject stream_options.include_usage</label>
       </div>
-      <details class="rounded-lg border border-neutral-800 p-3"
+      <details class="s-inset p-3"
         ${b && b.scheduling_class !== "unrestricted" ? "open" : ""}>
-        <summary class="cursor-pointer text-sm text-neutral-300">Device scheduling</summary>
+        <summary class="cursor-pointer text-sm text-ink">Device scheduling</summary>
         <div class="mt-3 space-y-3">
-          <label class="block text-sm">Scheduling class
+          <label class="s-label block">Scheduling class
             <select name="scheduling_class" onchange="syncSchedulingFields(this.form)"
-              class="mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm">
+              class="s-select mt-1 w-full">
               ${SCHEDULING_CLASSES.map(([v, label]) =>
                 `<option value="${v}" ${(b ? b.scheduling_class : "unrestricted") === v ? "selected" : ""}>${label}</option>`).join("")}
             </select>
-            <span id="sched-help" class="text-xs text-neutral-500"></span></label>
-          <label class="block text-sm">Exclusive group
+            <span id="sched-help" class="text-xs text-ink-2"></span></label>
+          <label class="s-label block">Exclusive group
             <select name="exclusive_group_id"
-              class="mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm">
+              class="s-select mt-1 w-full">
               <option value="">none</option>
               ${GROUPS.map(g => `<option value="${esc(g.id)}"
                 ${b && b.exclusive_group_id === g.id ? "selected" : ""}>${esc(g.id)}</option>`).join("")}
             </select>
-            ${GROUPS.length ? "" : '<span class="text-xs text-amber-400">No groups defined yet — add one on the Groups tab.</span>'}
+            ${GROUPS.length ? "" : '<span class="text-xs text-warn">No groups defined yet — add one on the Groups tab.</span>'}
           </label>
           <div class="grid grid-cols-3 gap-3">
-            <label class="block text-xs text-neutral-500">Max concurrency
+            <label class="s-label block">Max concurrency
               ${input("max_concurrency", 'type="number" min="1" step="1" placeholder="unlimited"',
                 b && b.max_concurrency != null ? b.max_concurrency : "")}</label>
-            <label class="block text-xs text-neutral-500">Max tokens cap
+            <label class="s-label block">Max tokens cap
               ${input("max_tokens_cap", 'type="number" min="1" step="1" placeholder="uncapped"',
                 b && b.max_tokens_cap != null ? b.max_tokens_cap : "")}</label>
-            <label class="block text-xs text-neutral-500">Throughput (tok/s)
+            <label class="s-label block">Throughput (tok/s)
               ${input("tok_s_estimate", 'type="number" min="0" step="any" placeholder="—"',
                 b && b.tok_s_estimate != null ? b.tok_s_estimate : "")}</label>
           </div>
-          <p class="text-xs text-neutral-500">A grouped backend must be token-capped: the cap is what
+          <p class="text-xs text-ink-2">A grouped backend must be token-capped: the cap is what
             bounds how long the device takes to drain, and with it every other member's queue wait.
             Set the slower model's cap lower so both drain in comparable time.</p>
         </div>
       </details>
       <div class="flex justify-end gap-2 pt-1">
-        <button type="button" onclick="closeModal()" class="rounded-lg px-3 py-1.5 text-sm text-neutral-400 hover:text-white">Cancel</button>
-        <button class="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500">Save</button>
+        <button type="button" onclick="closeModal()" class="s-btn s-btn--ghost">Cancel</button>
+        <button class="s-btn s-btn--primary">Save</button>
       </div>
     </form>`);
 
@@ -1833,19 +2219,19 @@ async function renderGroups() {
   const rows = GROUPS.map(g => {
     const members = membersOf(g.id);
     const chips = members.length
-      ? members.map(b => `<span class="mr-1 inline-block rounded bg-neutral-800 px-2 py-0.5 text-xs">
-          ${esc(b.name)}<span class="${b.scheduling_class === "grouped" ? "text-amber-400" : "text-neutral-500"}">
+      ? members.map(b => `<span class="s-pill mr-1 inline-block">
+          ${esc(b.name)}<span class="${b.scheduling_class === "grouped" ? "text-warn" : "text-ink-2"}">
             ${b.scheduling_class === "grouped" ? " leased" : " exempt"}</span></span>`).join("")
-      : '<span class="text-neutral-600">no members</span>';
-    return `<tr class="border-t border-neutral-800">
+      : '<span class="text-ink-2">no members</span>';
+    return `<tr class="border-t border-line">
       <td class="px-4 py-3 font-medium">${esc(g.id)}</td>
       <td class="px-4 py-3">${chips}</td>
-      <td class="px-4 py-3 text-sm text-neutral-400">${g.min_hold_ms} ms</td>
-      <td class="px-4 py-3 text-sm text-neutral-400">${g.max_hold_ms} ms</td>
-      <td class="px-4 py-3 text-sm text-neutral-400">${g.drain_timeout_ms} ms</td>
+      <td class="px-4 py-3 text-sm text-ink-2">${g.min_hold_ms} ms</td>
+      <td class="px-4 py-3 text-sm text-ink-2">${g.max_hold_ms} ms</td>
+      <td class="px-4 py-3 text-sm text-ink-2">${g.drain_timeout_ms} ms</td>
       <td class="px-4 py-3 text-right text-sm whitespace-nowrap">
-        <button onclick='openGroupForm(${esc(JSON.stringify(g.id))})' class="text-sky-400 hover:underline">Edit</button>
-        <button onclick='deleteGroup(${esc(JSON.stringify(g.id))})' class="ml-3 text-red-400 hover:underline">Delete</button>
+        <button onclick='openGroupForm(${esc(JSON.stringify(g.id))})' class="s-btn s-btn--ghost s-btn--sm">Edit</button>
+        <button onclick='deleteGroup(${esc(JSON.stringify(g.id))})' class="s-btn s-btn--ghost s-btn--sm ml-3 text-bad">Delete</button>
       </td>
     </tr>`;
   }).join("");
@@ -1853,48 +2239,48 @@ async function renderGroups() {
   $("#view").innerHTML = `
     <div class="flex items-center justify-between">
       <div>
-        <h2 class="text-base font-semibold text-white">Exclusive groups</h2>
-        <p class="mt-1 text-sm text-neutral-400">Backends sharing one accelerator. At most one
-          <span class="text-amber-400">leased</span> member generates at a time;
-          <span class="text-neutral-300">exempt</span> members are on the device but never wait.</p>
+        <h2 class="s-h3">Exclusive groups</h2>
+        <p class="mt-1 text-sm text-ink-2">Backends sharing one accelerator. At most one
+          <span class="text-warn">leased</span> member generates at a time;
+          <span class="text-ink">exempt</span> members are on the device but never wait.</p>
       </div>
-      <button onclick="openGroupForm()" class="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500">Add group</button>
+      <button onclick="openGroupForm()" class="s-btn s-btn--primary">Add group</button>
     </div>
-    ${card(`<table class="w-full text-left">
-      <thead><tr class="text-xs uppercase tracking-wide text-neutral-500">
+    ${card(`<table class="s-table w-full text-left">
+      <thead><tr class="text-xs text-ink-2">
         <th class="px-4 py-3">Group</th><th class="px-4 py-3">Members</th>
         <th class="px-4 py-3">Min hold</th><th class="px-4 py-3">Max hold</th>
         <th class="px-4 py-3">Drain timeout</th><th class="px-4 py-3"></th>
       </tr></thead>
-      <tbody>${rows || '<tr><td colspan="6" class="px-4 py-8 text-center text-neutral-600">No groups yet — every backend is scheduled independently.</td></tr>'}</tbody>
+      <tbody>${rows || '<tr><td colspan="6" class="px-4 py-8 text-center text-ink-2">No groups yet — every backend is scheduled independently.</td></tr>'}</tbody>
     </table>`, "mt-4 overflow-x-auto")}`;
 }
 
 function openGroupForm(id) {
   const g = id ? GROUPS.find(x => x.id === id) : null;
   openModal(`
-    <h3 class="mb-4 text-base font-semibold text-white">${g ? "Edit group" : "Add group"}</h3>
+    <h3 class="s-h3 mb-4">${g ? "Edit group" : "Add group"}</h3>
     <form id="group-form" class="space-y-3">
-      <label class="block text-sm">Group id
+      <label class="s-label block">Group id
         ${input("id", `required ${g ? "readonly" : ""} placeholder="dgx"`, g ? g.id : "")}
-        ${g ? '<span class="text-xs text-neutral-500">Ids are referenced by backends and cannot be changed.</span>' : ""}
+        ${g ? '<span class="text-xs text-ink-2">Ids are referenced by backends and cannot be changed.</span>' : ""}
       </label>
-      <label class="block text-sm">Min hold (ms)
+      <label class="s-label block">Min hold (ms)
         ${input("min_hold_ms", 'type="number" min="1" step="1" required', g ? g.min_hold_ms : 5000)}
-        <span class="text-xs text-neutral-500">Anti-thrash floor: how long a member keeps the device
+        <span class="text-xs text-ink-2">Anti-thrash floor: how long a member keeps the device
           before a waiting peer can take it.</span></label>
-      <label class="block text-sm">Max hold (ms)
+      <label class="s-label block">Max hold (ms)
         ${input("max_hold_ms", 'type="number" min="1" step="1" required', g ? g.max_hold_ms : 30000)}
-        <span class="text-xs text-neutral-500">Anti-starvation ceiling: held this long with someone
+        <span class="text-xs text-ink-2">Anti-starvation ceiling: held this long with someone
           waiting, the lease moves regardless.</span></label>
-      <label class="block text-sm">Drain timeout (ms)
+      <label class="s-label block">Drain timeout (ms)
         ${input("drain_timeout_ms", 'type="number" min="1" step="1" required', g ? g.drain_timeout_ms : 45000)}
-        <span class="text-xs text-neutral-500">Watchdog: a drain stuck longer than this force-flips the
+        <span class="text-xs text-ink-2">Watchdog: a drain stuck longer than this force-flips the
           lease and logs an error, rather than wedging the whole device.</span></label>
-      <p class="text-xs text-neutral-500">Must satisfy min hold ≤ max hold ≤ drain timeout.</p>
+      <p class="text-xs text-ink-2">Must satisfy min hold ≤ max hold ≤ drain timeout.</p>
       <div class="flex justify-end gap-2 pt-1">
-        <button type="button" onclick="closeModal()" class="rounded-lg px-3 py-1.5 text-sm text-neutral-400 hover:text-white">Cancel</button>
-        <button class="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-500">Save</button>
+        <button type="button" onclick="closeModal()" class="s-btn s-btn--ghost">Cancel</button>
+        <button class="s-btn s-btn--primary">Save</button>
       </div>
     </form>`);
 
@@ -1955,9 +2341,9 @@ const fmtElapsed = ms => ms < 60000
 // device lease or a concurrency slot); the other two are the provider's
 // time. Colouring them differently is the whole point of the panel.
 const PHASES = {
-  queued: ["bg-amber-500", "text-amber-400", "queued"],
-  upstream: ["bg-sky-500", "text-sky-400", "upstream"],
-  streaming: ["bg-emerald-500", "text-emerald-400", "streaming"],
+  queued: ["bg-chart-3", "text-ink", "queued"],
+  upstream: ["bg-chart-5", "text-ink", "upstream"],
+  streaming: ["bg-chart-1", "text-ink", "streaming"],
 };
 
 /// The Logs filters are applied here rather than on /admin/active: the
@@ -1972,17 +2358,17 @@ function activeMatches(r) {
 }
 
 function activeRowHtml(r) {
-  const [dot, text, label] = PHASES[r.phase] ?? ["bg-neutral-500", "text-neutral-400", r.phase];
+  const [dot, text, label] = PHASES[r.phase] ?? ["bg-ink-2", "text-ink-2", r.phase];
   return `
-    <tr class="border-t border-neutral-800">
-      <td class="whitespace-nowrap px-3 py-2.5 text-sm tabular-nums text-neutral-300">${fmtElapsed(r.elapsed_ms)}</td>
-      <td class="px-3 py-2.5 text-sm text-neutral-300">${esc(r.token_name)}</td>
-      <td class="px-3 py-2.5 text-sm text-white">${esc(r.model)}${tierBadge(r, "ml-1.5 px-1.5 py-0.5 text-[10px]")}</td>
-      <td class="px-3 py-2.5 text-sm text-neutral-400">${esc(r.backend ?? "–")}</td>
+    <tr class="border-t border-line">
+      <td class="whitespace-nowrap px-3 py-2.5 text-sm tabular-nums text-ink">${fmtElapsed(r.elapsed_ms)}</td>
+      <td class="px-3 py-2.5 text-sm text-ink">${esc(r.token_name)}</td>
+      <td class="px-3 py-2.5 text-sm text-ink">${esc(r.model)}${tierBadge(r, "ml-1.5 px-1.5 py-0.5 text-[10px]")}</td>
+      <td class="px-3 py-2.5 text-sm text-ink-2">${esc(r.backend ?? "–")}</td>
       <td class="whitespace-nowrap px-3 py-2.5 text-sm ${text}">
         <span class="mr-1.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full ${dot}"></span>${label}
-        ${r.streamed ? '<span class="ml-1 text-[10px] text-neutral-500">SSE</span>' : ""}</td>
-      <td class="px-3 py-2.5 font-mono text-xs text-neutral-500">${esc(r.path)}</td>
+        ${r.streamed ? '<span class="ml-1 text-[10px] text-ink-2">SSE</span>' : ""}</td>
+      <td class="px-3 py-2.5 font-mono text-xs text-ink-2">${esc(r.path)}</td>
     </tr>`;
 }
 
@@ -1997,12 +2383,12 @@ function renderActive(items) {
   }
   host.innerHTML = `
     <div class="mt-3 flex items-center gap-2">
-      <span class="inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-500"></span>
-      <h3 class="text-sm font-semibold text-white">In flight</h3>
-      <span class="text-xs text-neutral-500">${items.length} request${items.length === 1 ? "" : "s"}, longest-running first</span>
+      <span class="inline-block h-2 w-2 animate-pulse rounded-full bg-primary"></span>
+      <h3 class="text-sm font-semibold text-ink">In flight</h3>
+      <span class="text-xs text-ink-2">${items.length} request${items.length === 1 ? "" : "s"}, longest-running first</span>
     </div>
-    ${card(`<table class="w-full text-left">
-      <thead><tr class="text-xs uppercase tracking-wide text-neutral-500">
+    ${card(`<table class="s-table w-full text-left">
+      <thead><tr class="text-xs text-ink-2">
         <th class="px-3 py-3">Elapsed</th><th class="px-3 py-3">Key</th><th class="px-3 py-3">Model</th>
         <th class="px-3 py-3">Provider</th><th class="px-3 py-3">Phase</th><th class="px-3 py-3">Endpoint</th>
       </tr></thead>
@@ -2048,27 +2434,27 @@ function cacheRatio(r) {
 function keyLabel(r) {
   return r.token_name
     ? esc(r.token_name)
-    : '<span class="text-neutral-500">deleted key</span>';
+    : '<span class="text-ink-2">deleted key</span>';
 }
 
 function logRowHtml(r) {
-  const statusCls = r.status == null ? "text-neutral-500"
-    : r.status < 300 ? "text-emerald-400" : r.status < 500 ? "text-amber-400" : "text-red-400";
+  const statusCls = r.status == null ? "text-ink-2"
+    : r.status < 300 ? "text-ok" : r.status < 500 ? "text-warn" : "text-bad";
   return `
-    <tr class="cursor-pointer border-t border-neutral-800 hover:bg-neutral-800/50" onclick='openLog(${JSON.stringify(r.id)})'>
-      <td class="whitespace-nowrap px-3 py-2.5 text-xs text-neutral-400">${fmtDate(r.created_at)}</td>
-      <td class="px-3 py-2.5 text-sm text-neutral-300">${keyLabel(r)}</td>
-      <td class="px-3 py-2.5 text-sm text-white">${esc(r.model)}${tierBadge(r, "ml-1.5 px-1.5 py-0.5 text-[10px]")}</td>
-      <td class="px-3 py-2.5 text-sm text-neutral-400">${esc(r.backend ?? "–")}</td>
+    <tr class="cursor-pointer border-t border-line hover:bg-fill/50" onclick='openLog(${JSON.stringify(r.id)})'>
+      <td class="whitespace-nowrap px-3 py-2.5 text-xs text-ink-2">${fmtDate(r.created_at)}</td>
+      <td class="px-3 py-2.5 text-sm text-ink">${keyLabel(r)}</td>
+      <td class="px-3 py-2.5 text-sm text-ink">${esc(r.model)}${tierBadge(r, "ml-1.5 px-1.5 py-0.5 text-[10px]")}</td>
+      <td class="px-3 py-2.5 text-sm text-ink-2">${esc(r.backend ?? "–")}</td>
       <td class="px-3 py-2.5 text-sm ${statusCls}">${r.status ?? "–"}${r.error ? ' <span title="has error">⚠</span>' : ""}</td>
       <td class="whitespace-nowrap px-3 py-2.5 text-sm">
         <span class="${IN_TEXT}">${fmtInt(r.prompt_tokens)}</span>
-        <span class="text-neutral-600">→</span>
+        <span class="text-ink-2">→</span>
         <span class="${OUT_TEXT}">${fmtInt(r.completion_tokens)}</span>
-        ${r.cached_tokens ? `<span class="ml-1 rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] text-sky-400">cached ${cacheRatio(r)}</span>` : ""}</td>
+        ${r.cached_tokens ? `<span class="s-pill s-pill--soft ml-1">cached ${cacheRatio(r)}</span>` : ""}</td>
       <td class="px-3 py-2.5 text-sm">${fmtCost(r.cost)}</td>
-      <td class="px-3 py-2.5 text-sm text-neutral-400">${r.duration_ms != null ? r.duration_ms + " ms" : "–"}</td>
-      <td class="px-3 py-2.5 text-sm text-neutral-400">${esc(r.finish_reason ?? "–")}</td>
+      <td class="px-3 py-2.5 text-sm text-ink-2">${r.duration_ms != null ? r.duration_ms + " ms" : "–"}</td>
+      <td class="px-3 py-2.5 text-sm text-ink-2">${esc(r.finish_reason ?? "–")}</td>
     </tr>`;
 }
 
@@ -2077,40 +2463,40 @@ async function renderLogs() {
   ACTIVE_IDS = new Set();
   const keys = await api("/admin/tokens");
   $("#view").innerHTML = `
-    <h2 class="text-base font-semibold text-white">Request Logs</h2>
+    <h2 class="s-h3">Request Logs</h2>
     <div class="mt-3 flex flex-wrap items-end gap-2 text-sm">
-      <label class="block text-xs text-neutral-500">Key
-        <select id="f-key" class="mt-1 block rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm text-neutral-200">
+      <label class="s-label block">Key
+        <select id="f-key" class="s-select mt-1 block">
           <option value="">all keys</option>
           ${keys.map(k => `<option value="${esc(k.id)}" ${LOG_FILTER.token_id === k.id ? "selected" : ""}>${esc(k.name)}</option>`).join("")}
         </select></label>
-      <label class="block text-xs text-neutral-500">Model
-        <select id="f-model" class="mt-1 block rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm text-neutral-200">
+      <label class="s-label block">Model
+        <select id="f-model" class="s-select mt-1 block">
           <option value="">all models</option>${modelOptions(LOG_FILTER.model)}
         </select></label>
-      <label class="block text-xs text-neutral-500">Provider
-        <select id="f-backend" class="mt-1 block rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm text-neutral-200">
+      <label class="s-label block">Provider
+        <select id="f-backend" class="s-select mt-1 block">
           <option value="">all providers</option>
           ${BACKENDS.map(b => `<option value="${esc(b.name)}" ${LOG_FILTER.backend === b.name ? "selected" : ""}>${esc(b.name)}</option>`).join("")}
         </select></label>
-      <label class="block text-xs text-neutral-500">Status
+      <label class="s-label block">Status
         <input id="f-status" value="${esc(LOG_FILTER.status)}" placeholder="e.g. 200" size="6"
-          class="mt-1 block rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm"></label>
-      <button id="f-apply" class="rounded-lg bg-neutral-800 px-3 py-1.5 text-sm hover:bg-neutral-700">Apply</button>
+          class="s-input mt-1 block"></label>
+      <button id="f-apply" class="s-btn">Apply</button>
     </div>
     <div id="active"></div>
-    <h3 class="mt-4 text-sm font-semibold text-neutral-400">History</h3>
-    ${card(`<table class="w-full text-left">
-      <thead><tr class="text-xs uppercase tracking-wide text-neutral-500">
+    <h3 class="mt-4 text-sm font-semibold text-ink-2">History</h3>
+    ${card(`<table class="s-table w-full text-left">
+      <thead><tr class="text-xs text-ink-2">
         <th class="px-3 py-3">Time</th><th class="px-3 py-3">Key</th><th class="px-3 py-3">Model</th>
         <th class="px-3 py-3">Provider</th><th class="px-3 py-3">Status</th><th class="px-3 py-3">Tokens</th>
         <th class="px-3 py-3">Cost</th><th class="px-3 py-3">Duration</th><th class="px-3 py-3">Finish</th>
       </tr></thead>
       <tbody id="log-rows"></tbody>
     </table>
-    <div class="border-t border-neutral-800 p-3 text-center">
-      <button id="log-more" class="hidden rounded-lg bg-neutral-800 px-4 py-1.5 text-sm hover:bg-neutral-700">Load more</button>
-      <span id="log-empty" class="hidden text-sm text-neutral-600">No requests logged.</span>
+    <div class="border-t border-line p-3 text-center">
+      <button id="log-more" class="s-btn hidden">Load more</button>
+      <span id="log-empty" class="hidden text-sm text-ink-2">No requests logged.</span>
     </div>`, "mt-3 overflow-x-auto")}
     <div id="drawer"></div>`;
 
@@ -2151,22 +2537,22 @@ async function loadLogPage() {
 async function openLog(id) {
   const r = await api("/admin/logs/" + encodeURIComponent(id));
   const field = (label, val, mono = false) => `
-    <div class="flex justify-between gap-4 border-b border-neutral-800/60 py-2 text-sm">
-      <span class="text-neutral-500">${label}</span>
-      <span class="${mono ? "font-mono text-xs" : ""} break-all text-right text-neutral-200">${val}</span>
+    <div class="flex justify-between gap-4 border-b border-line/60 py-2 text-sm">
+      <span class="text-ink-2">${label}</span>
+      <span class="${mono ? "font-mono text-xs" : ""} break-all text-right text-ink">${val}</span>
     </div>`;
   $("#drawer").innerHTML = `
     <div class="fixed inset-0 z-40 bg-black/50" onclick="$('#drawer').innerHTML=''"></div>
-    <div class="fixed inset-y-0 right-0 z-50 w-full max-w-md overflow-y-auto border-l border-neutral-800 bg-neutral-900 p-5">
+    <div class="fixed inset-y-0 right-0 z-50 w-full max-w-md overflow-y-auto border-l border-line bg-card p-5">
       <div class="mb-3 flex items-center justify-between">
-        <h3 class="text-base font-semibold text-white">Request details</h3>
-        <button onclick="$('#drawer').innerHTML=''" class="text-neutral-500 hover:text-white">✕</button>
+        <h3 class="s-h3">Request details</h3>
+        <button onclick="$('#drawer').innerHTML=''" class="text-ink-2 hover:text-ink">✕</button>
       </div>
       <div class="mb-3 flex gap-2">
-        <span class="rounded bg-neutral-800 px-2 py-0.5 text-xs">${esc(r.model)}</span>
-        ${r.backend ? `<span class="rounded bg-neutral-800 px-2 py-0.5 text-xs">${esc(r.backend)}</span>` : ""}
-        ${r.cached_tokens ? `<span class="rounded bg-sky-500/15 px-2 py-0.5 text-xs text-sky-400">Cached ${cacheRatio(r)}</span>` : ""}
-        ${r.streamed ? '<span class="rounded bg-neutral-800 px-2 py-0.5 text-xs">streamed</span>' : ""}
+        <span class="s-pill">${esc(r.model)}</span>
+        ${r.backend ? `<span class="s-pill">${esc(r.backend)}</span>` : ""}
+        ${r.cached_tokens ? `<span class="s-pill s-pill--soft">Cached ${cacheRatio(r)}</span>` : ""}
+        ${r.streamed ? '<span class="s-pill">streamed</span>' : ""}
         ${tierBadge(r, "px-2 py-0.5 text-xs")}
       </div>
       ${field("Time", fmtDate(r.created_at))}
@@ -2180,13 +2566,13 @@ async function openLog(id) {
       ${field("Finish reason", esc(r.finish_reason ?? "–"))}
       ${field("Prompt tokens", fmtInt(r.prompt_tokens))}
       ${field("Completion tokens", fmtInt(r.completion_tokens))}
-      ${field("Cached tokens", r.cached_tokens ? `${fmtInt(r.cached_tokens)} <span class="text-neutral-500">(${cacheRatio(r)} of input)</span>` : fmtInt(r.cached_tokens))}
+      ${field("Cached tokens", r.cached_tokens ? `${fmtInt(r.cached_tokens)} <span class="text-ink-2">(${cacheRatio(r)} of input)</span>` : fmtInt(r.cached_tokens))}
       ${field("Cache write tokens", fmtInt(r.cache_write_tokens))}
       ${field("Total tokens", fmtInt(r.total_tokens))}
       ${field("Cost", fmtCost(r.cost))}
       ${field("Time to first byte", r.ttfb_ms != null ? r.ttfb_ms + " ms" : "–")}
       ${field("Duration", r.duration_ms != null ? r.duration_ms + " ms" : "–")}
-      ${r.error ? `<div class="mt-3 rounded-lg bg-red-500/10 p-3 text-sm text-red-300">${esc(r.error)}</div>` : ""}
+      ${r.error ? `<div class="s-alert s-alert--bad mt-3">${esc(r.error)}</div>` : ""}
     </div>`;
 }
 </script>
