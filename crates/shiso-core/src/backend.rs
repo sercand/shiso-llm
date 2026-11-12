@@ -246,6 +246,22 @@ pub trait Backend: Send + Sync + fmt::Debug {
         Ok(raw)
     }
 
+    /// [`Backend::import_raw`] for a payload every reader takes a byte at a
+    /// time: signed or unsigned codes read through byte loads, never as
+    /// words or vectors.
+    ///
+    /// A device that wraps host memory in place may need a wrapped range to
+    /// start on a word or vector boundary for its wider loads, and copies a
+    /// range that does not. A byte payload has no such need, so a backend
+    /// that can wrap it wherever it lies overrides this; the default is the
+    /// ordinary import.
+    ///
+    /// # Errors
+    ///
+    /// As [`Backend::import_raw`].
+    fn import_raw_bytes(&self, host: &dyn HostBytes, range: Range<usize>) -> CoreResult<RawBuffer> {
+        self.import_raw(host, range)
+    }
     /// Whether [`Backend::import_raw`] copies the host bytes, so nothing reads
     /// them once it returns.
     ///

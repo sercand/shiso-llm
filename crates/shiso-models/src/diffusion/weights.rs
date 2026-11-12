@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use half::bf16;
-use shiso_core::{Backend, DType, DeviceBuffer, HostBytes, import_host};
+use shiso_core::{Backend, DType, DeviceBuffer, HostBytes, import_host, import_host_bytes};
 use shiso_modelfile::GgufFile;
 use shiso_modelfile::st_header::{Shard, StDType};
 use shiso_vision::generator::ImageGenError;
@@ -358,6 +358,25 @@ impl StStore {
             .import(entry.start, entry.end)
             .map_err(|e| ImageGenError::Checkpoint(format!("{name}: {e}")))?;
         import_host(backend, host, range)
+            .map_err(|e| ImageGenError::Backend(format!("importing '{name}': {e}")))
+    }
+
+    /// [`Self::import`] for a tensor every kernel reads a byte at a time
+    /// (per-row INT8 codes): the device may wrap it in place wherever the
+    /// file put it, where a tensor read as words has to start on a vector
+    /// boundary or be copied. Both Qwen-Image-2.1 INT8 exports put every
+    /// tensor eight bytes off one, so their gigabytes of codes were copied
+    /// at every load.
+    pub(crate) fn import_bytes(
+        &self,
+        backend: &Arc<dyn Backend>,
+        name: &str,
+    ) -> Result<DeviceBuffer, ImageGenError> {
+        let entry = self.require(name)?;
+        let (host, range) = self.shards[entry.shard]
+            .import(entry.start, entry.end)
+            .map_err(|e| ImageGenError::Checkpoint(format!("{name}: {e}")))?;
+        import_host_bytes(backend, host, range)
             .map_err(|e| ImageGenError::Backend(format!("importing '{name}': {e}")))
     }
 

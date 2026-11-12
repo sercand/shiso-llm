@@ -352,6 +352,39 @@ pub fn import_host(
     ))
 }
 
+/// [`import_host`] for a payload every reader takes a byte at a time, which
+/// a backend can wrap in place whatever address it starts at
+/// ([`Backend::import_raw_bytes`]).
+///
+/// The caller vouches for the readers: a kernel that loads this buffer as
+/// words or vectors may read garbage from a range that is not aligned for
+/// them.
+///
+/// # Errors
+///
+/// As [`import_host`].
+pub fn import_host_bytes(
+    backend: &Arc<dyn Backend>,
+    host: Arc<dyn HostBytes>,
+    range: Range<usize>,
+) -> CoreResult<DeviceBuffer> {
+    let all: &[u8] = AsRef::<[u8]>::as_ref(&*host);
+    if range.end > all.len() {
+        return Err(CoreError::OutOfBounds {
+            offset: range.start as u64,
+            len: range.end.saturating_sub(range.start) as u64,
+            buffer_bytes: all.len() as u64,
+        });
+    }
+    let raw = backend.import_raw_bytes(host.as_ref(), range)?;
+    Ok(DeviceBuffer::wrapped_host(
+        raw,
+        Arc::clone(backend),
+        host,
+        ledger::current(),
+    ))
+}
+
 /// A backend that granted less memory than it claimed.
 #[derive(Debug)]
 struct ShortAllocation {

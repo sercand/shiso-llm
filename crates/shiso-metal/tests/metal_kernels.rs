@@ -29,7 +29,7 @@ use bytemuck::{Pod, Zeroable};
 use memmap2::Mmap;
 use shiso_core::{
     Backend, DeviceBuffer, Extent3, FnConst, FnConstValue, HostBytes, KernelArg, KernelRef,
-    LaunchArgs, alloc, import_host,
+    LaunchArgs, alloc, import_host, import_host_bytes,
 };
 use shiso_metal::MetalBackend;
 use shiso_modelfile::quant::BlockQ4K;
@@ -1543,6 +1543,110 @@ fn import_host_keeps_the_mapping_alive() {
         .copy_d2h(buffer.view(), &mut got)
         .expect("read the imported range");
     assert_eq!(got, pattern[OFFSET..OFFSET + SPAN]);
+}
+
+/// The per-row INT8 GEMM's argument block.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GemmI8Args {
+    m: u32,
+    n: u32,
+    k: u32,
+    has_bias: u32,
+}
+
+/// A payload whose readers take it a byte at a time is wrapped where it
+/// lies, whatever its address: a checkpoint whose header puts every tensor
+/// eight bytes off a 16-byte boundary - both of the Qwen-Image INT8 exports
+/// are such - then costs no copy of its gigabytes of codes at every load.
+///
+/// The codes sit at `page + 8` in a shared file mapping. The INT8 GEMM over
+/// the byte import must be bit for bit the GEMM over an uploaded copy, and
+/// after one code is changed through a second mapping of the same file the
+/// device must see the change: a copy would not.
+#[test]
+#[ignore = "requires Metal GPU"]
+fn a_byte_import_is_wrapped_in_place_and_read_by_the_int8_gemm() {
+    const OFFSET: usize = 16384 + 8;
+    let (m, n, k) = (64usize, 128usize, 256usize);
+    let Some(gpu) = Gpu::open() else { return };
+
+    let codes: Vec<u8> = (0..n * k).map(|i| (i as u32 * 37 + 11) as u8).collect();
+    let mut file_bytes = vec![0u8; OFFSET];
+    file_bytes.extend_from_slice(&codes);
+    file_bytes.resize(OFFSET + n * k + 16384, 0);
+    let temp = TempFile::new(format!(
+        "shiso-metal-byte-import-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos()),
+    ));
+    std::fs::write(temp.path(), &file_bytes).expect("codes written");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(temp.path())
+        .expect("mapped file handle");
+    // SAFETY: the file is this test's own and outlives both mappings; the
+    // writable one changes a single byte below, which is the point.
+    let mut writer = unsafe { memmap2::MmapMut::map_mut(&file) }.expect("writable mapping");
+    // SAFETY: as above; `Mapping` keeps the file open beside the mapping.
+    let bytes = unsafe { Mmap::map(&file) }.expect("shared file mapping");
+    let host: Arc<dyn HostBytes> = Arc::new(Mapping { file, bytes });
+    assert_eq!((host.as_ref().as_ref().as_ptr() as usize + OFFSET) % 16, 8);
+
+    let wrapped = import_host_bytes(&gpu.device, host, OFFSET..OFFSET + n * k)
+        .expect("a byte import off the vector boundary");
+    let input = gpu.upload(&f32_bytes(&signal(m * k, 0x51)));
+    let scales = gpu.upload(&f32_bytes(&vec![0.01f32; n]));
+    let no_bias = gpu.upload(&[0u8; 4]);
+    let args = GemmI8Args {
+        m: m as u32,
+        n: n as u32,
+        k: k as u32,
+        has_bias: 0,
+    };
+    let product = |weight: &DeviceBuffer| -> Vec<u32> {
+        let out = gpu.upload(&vec![0u8; m * n * 4]);
+        run(
+            &gpu,
+            KernelRef::new("diffusion", "kernel_dit_gemm64_i8"),
+            &LaunchArgs::new(
+                Extent3::new((n as u32).div_ceil(64), (m as u32).div_ceil(64), 1),
+                Extent3::linear(128),
+                &[
+                    KernelArg::Bytes(bytemuck::bytes_of(&args)),
+                    KernelArg::Buffer(out.view()),
+                    KernelArg::Buffer(input.view()),
+                    KernelArg::Buffer(weight.view()),
+                    KernelArg::Buffer(scales.view()),
+                    KernelArg::Buffer(no_bias.view()),
+                ],
+            ),
+        );
+        drain(&gpu);
+        gpu.read_f32(&out).iter().map(|v| v.to_bits()).collect()
+    };
+    assert_eq!(
+        product(&wrapped),
+        product(&gpu.upload(&codes)),
+        "the wrapped codes multiply as the uploaded ones"
+    );
+
+    // One code changes in the file. The wrap is the file's pages, so the
+    // device multiplies the new code; an import that copied would not.
+    let mut changed = codes.clone();
+    changed[5] = changed[5].wrapping_add(64);
+    writer[OFFSET + 5] = changed[5];
+    writer.flush().expect("the change reaches the shared pages");
+    let after = product(&wrapped);
+    assert_eq!(
+        after,
+        product(&gpu.upload(&changed)),
+        "the device reads the mapping itself"
+    );
+    assert_ne!(after, product(&gpu.upload(&codes)), "the change is visible");
 }
 
 /// A named file under the temporary directory, removed whatever path the test

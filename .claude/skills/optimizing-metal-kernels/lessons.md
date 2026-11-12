@@ -126,6 +126,13 @@ shapes differ.
   - bf16 rows have 2.0e-3 relative error against 7e-7 for f32. If bf16 ever looks *tighter* than f32, suspect the f32 path.
   - Q8_0 staged through half gave 1.1e-2 error against 2.3e-5 through f32.
 
+## Loading
+
+- **A checkpoint's tensors may all be off the vector boundary, and then every import is a copy** (`shiso-metal` `import_raw_bytes`, `diffusion/weights.rs` `import_bytes`, M4, 2026-11-12): a safetensors header whose length is 8 mod 16 puts every tensor 8 bytes off a 16-byte boundary, and the no-copy wrap refuses those because float kernels load 16-byte vectors. Both Qwen-Image-2.1 INT8 exports are such, so 7 GB of codes were copied at every load.
+  - INT8 codes are read through `packed_char4` loads, which no address misaligns, so they are now wrapped wherever they lie. Transformer load 1.0-1.2 s -> 48 ms, text encoder 0.9 s -> 3-8 ms, server boot 12.4 -> 4.5 s.
+  - The copy also held the weights twice (private buffer plus page cache), which pushed the other swapped component out of the page cache: its prefetch read from the SSD at 3.9 GB/s (1.8 s). Wrapped, both files stay cached and the prefetch runs at 30 GB/s (0.23 s).
+  - Small per-job imports from a file the swap traffic evicts fault in a page at a time: the VAE encoder's 311 MB took 1.9 s to load until its byte ranges were read ahead (0.2 s).
+
 ## Tuning
 
 - **Startup tuner** (`shiso-engine/src/tune.rs`, `shiso-models/src/qwen35/kernels/gdn_tune.rs`):

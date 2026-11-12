@@ -42,6 +42,7 @@ pub use backend::{
 };
 pub use buffer::{
     DeviceBuffer, DeviceView, HostBytes, RawBuffer, alloc, alloc_tagged, import_host,
+    import_host_bytes,
 };
 pub use config::{HfConfig, HiddenAct, VisionConfig};
 pub use decision::{
