@@ -24,8 +24,9 @@ use crate::harness::{Gpu, drain, f32_bytes, run};
 use crate::oracle::signal;
 
 /// Every entry point this file's cases launch.
-pub const ENTRIES: [&str; 10] = [
+pub const ENTRIES: [&str; 11] = [
     "kernel_dit_gqa_f32",
+    "kernel_dit_flash_gqa_d128_f32",
     "kernel_dit_rope_half",
     "kernel_dit_rope_half_table",
     "kernel_dit_flash_sdpa_f32",
@@ -489,8 +490,26 @@ fn gqa_host(
     out
 }
 
+/// Query rows per threadgroup of the fused grouped-query tile.
+const FLASH_GQA_ROWS: u32 = 64;
+/// Threads per threadgroup of the fused grouped-query tile.
+const FLASH_GQA_THREADS: u32 = 256;
+
 fn gqa_device(
     gpu: &Gpu,
+    qkv: (&[f32], &[f32], &[f32]),
+    shape: (usize, usize, usize, usize),
+    valid: usize,
+) -> Vec<f32> {
+    gqa_entry(gpu, "kernel_dit_gqa_f32", qkv, shape, valid)
+}
+
+/// Runs one grouped-query entry, each with its own launch geometry: a
+/// threadgroup per (row, head) for the per-row kernel, per (64 rows, head)
+/// for the fused tile.
+fn gqa_entry(
+    gpu: &Gpu,
+    entry: &'static str,
     qkv: (&[f32], &[f32], &[f32]),
     shape: (usize, usize, usize, usize),
     valid: usize,
@@ -505,11 +524,22 @@ fn gqa_device(
         head_dim: hd as u32,
         valid_keys: valid as u32,
     };
+    let (grid, block) = if entry == "kernel_dit_gqa_f32" {
+        (
+            Extent3::new(rows as u32, q_heads as u32, 1),
+            Extent3::linear(BLOCK),
+        )
+    } else {
+        (
+            Extent3::new((rows as u32).div_ceil(FLASH_GQA_ROWS), q_heads as u32, 1),
+            Extent3::linear(FLASH_GQA_THREADS),
+        )
+    };
     launch(
         gpu,
-        "kernel_dit_gqa_f32",
-        Extent3::new(rows as u32, q_heads as u32, 1),
-        Extent3::linear(BLOCK),
+        entry,
+        grid,
+        block,
         &[
             KernelArg::Bytes(bytemuck::bytes_of(&args)),
             KernelArg::Buffer(out.view()),
@@ -520,6 +550,67 @@ fn gqa_device(
     );
     drain(gpu);
     gpu.read_f32(&out)
+}
+
+/// The fused grouped-query tile is the per-row kernel's attention: against
+/// the `f64` oracle and against the per-row entry on the same device, over
+/// rows that leave a ragged last tile and a ragged last key block, with
+/// query heads sharing kv heads, unpadded and with pad rows that attend only
+/// the real keys.
+///
+/// # Panics
+///
+/// When the fused entry leaves 1e-4 of the oracle or 1e-5 of the values'
+/// size from the per-row entry, or the pad rows' masked answer is the unmasked one.
+pub fn flash_gqa_is_the_per_row_attention(gpu: &Gpu) {
+    let (rows, q_heads, kv_heads, hd) = (150usize, 4usize, 2usize, 128usize);
+    let scaled = |n: usize, seed: u32| -> Vec<f32> {
+        signal(rows * n * hd, seed)
+            .iter()
+            .map(|v| v * 0.3)
+            .collect()
+    };
+    let (q, k, v) = (
+        scaled(q_heads, 71),
+        scaled(kv_heads, 72),
+        scaled(kv_heads, 73),
+    );
+    let shape = (rows, q_heads, kv_heads, hd);
+    let mut answers = Vec::new();
+    for valid in [rows, 97] {
+        let fused = gqa_entry(
+            gpu,
+            "kernel_dit_flash_gqa_d128_f32",
+            (&q, &k, &v),
+            shape,
+            valid,
+        );
+        close(
+            &fused,
+            &gqa_host((&q, &k, &v), shape, valid),
+            1e-4,
+            1e-3,
+            &format!("fused gqa vs f64, valid {valid}"),
+        );
+        close(
+            &fused,
+            &gqa_device(gpu, (&q, &k, &v), shape, valid),
+            // Both are f32 sums in different orders; an output is an average
+            // of values up to 0.3 in size, so one that cancels to near zero
+            // is graded against that size, not its own.
+            1e-5,
+            0.3,
+            &format!("fused gqa vs per-row, valid {valid}"),
+        );
+        answers.push(fused);
+    }
+    let real = 97 * q_heads * hd;
+    differs(
+        &answers[1][real..],
+        &answers[0][real..],
+        1e-3,
+        "fused gqa pad rows masked vs unmasked",
+    );
 }
 
 /// The text encoder's padded prefill: rows at or past `valid_keys` are pad

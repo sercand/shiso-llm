@@ -2199,6 +2199,200 @@ kernel void kernel_dit_flash_sdpa<false, DIT_FA_RB, DIT_FA_SG, 128u, false, true
 template [[host_name("kernel_dit_flash_sdpa_unit_d64_f32")]]
 kernel void kernel_dit_flash_sdpa<false, DIT_FA_RB, DIT_FA_SG, 64u, true>(DIT_FLASH_SDPA_PARAMS);
 
+// --- fused grouped-query attention ------------------------------------------------
+
+/// Causal grouped-query attention in one pass over the keys, on simdgroup
+/// matrices: `kernel_dit_gqa_f32`'s contract, bindings and output for heads
+/// of exactly `HD` (a multiple of eight, at most DIT_FA_MAX_D).
+///
+/// The tile is `kernel_dit_flash_sdpa`'s - 64 query rows of one head per
+/// threadgroup, eight per simdgroup held in registers, keys streamed through
+/// threadgroup memory with the next block prefetched, the softmax folded
+/// online in registers - with two differences. Query head `h` reads kv head
+/// `h / (q_heads / kv_heads)` of packed rows, natively, so the kv heads are
+/// never repeated out. And every operand is staged in f32: a language
+/// model's residual stream is not query-key-normed, and its keys and values
+/// staged as half moved the encoder's worst token to a cosine of 0.9928
+/// against the reference, where the f32 stream stays at rounding. An f32
+/// block of 32 keys does not fit threadgroup memory (34816 B of 32768), so
+/// the keys stream 16 at a time.
+///
+/// Row `t` attends keys `0..=t` below `valid_keys`, so the stream stops at
+/// the tile's last row or the valid limit, whichever is first; key 0 is
+/// visible to every row, so no row's first block is all masked.
+///
+/// Measured on an M4 (10-core GPU) on a one-picture edit prompt (1060 rows,
+/// 128-wide heads): the encoder's tower and prefill together take 7.5 s
+/// with this tile against 12.8 s with the per-row kernel, and the worst
+/// token's cosine against the reference is 0.9999987 (per-row: 0.9999978).
+#define DIT_FLASH_GQA_KEYS 16u
+
+template <uint HD>
+kernel void kernel_dit_flash_gqa(
+        constant dit_args_gqa & args [[buffer(0)]],
+        device float *out               [[buffer(1)]],
+        device const float *q           [[buffer(2)]],
+        device const float *k           [[buffer(3)]],
+        device const float *v           [[buffer(4)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint QR = DIT_FA_QROWS;
+    const uint KB = DIT_FLASH_GQA_KEYS;
+    const uint NB = KB / 8u;
+    const uint NT = DIT_FA_THREADS;
+    // Each staged row is padded by eight floats so the transposed K loads
+    // do not land eight rows on one bank.
+    const uint LDK = HD + 8u;
+    threadgroup float kv[2u * DIT_FLASH_GQA_KEYS * (HD + 8u)];
+
+    const uint h = tgpig.y;
+    const uint q0 = tgpig.x * QR;
+    if (h >= args.q_heads) {
+        return;
+    }
+    const uint kvh = h / (args.q_heads / args.kv_heads);
+    const uint rows = args.tokens;
+    const uint keys = min(min(rows, q0 + QR), args.valid_keys);
+    const float scale = 1.0f / sqrt(float(HD));
+
+    // The lane's place in every 8x8 fragment: columns `fn, fn + 1` of row
+    // `fr`; the four lanes sharing a row differ in lane bits 0 and 3.
+    const ushort fn = ((lane / 4u) & 2u) * 2u + (lane % 2u) * 2u;
+    const ushort fr = ((lane / 4u) & 4u) + ((lane / 2u) % 4u);
+    const uint qrow = q0 + sg * 8u + fr;
+    const bool live = qrow < rows;
+
+    simdgroup_float8x8 qf[HD / 8u];
+    simdgroup_float8x8 of[HD / 8u];
+    device const float *qp = q + (uint64_t) (live ? qrow : 0u) * (args.q_heads * HD) + h * HD;
+    DIT_UNROLL for (uint i = 0; i < HD / 8u; ++i) {
+        const float2 qv = live ? float2(qp[8u * i + fn], qp[8u * i + fn + 1u]) * scale
+                               : float2(0.0f);
+        qf[i].thread_elements()[0] = qv.x;
+        qf[i].thread_elements()[1] = qv.y;
+        of[i] = simdgroup_float8x8(0.0f);
+    }
+
+    float run_max = -INFINITY;
+    float run_sum = 0.0f;
+    threadgroup float *sk = kv;
+    threadgroup float *sv = kv + KB * LDK;
+    // Four consecutive head values per load; a key past the end stages as
+    // zero and is masked below.
+    const uint SL = (KB * HD / 4u + NT - 1u) / NT;
+    const uint hd4 = HD / 4u;
+    const uint kv_width = args.kv_heads * HD;
+    float4 rk[SL];
+    float4 rv[SL];
+    auto fetch = [&](uint s0) {
+        DIT_UNROLL for (uint i = 0; i < SL; ++i) {
+            const uint e = tid + i * NT;
+            const uint j = e / hd4;
+            const uint d = (e - j * hd4) * 4u;
+            const uint s = s0 + j;
+            rk[i] = float4(0.0f);
+            rv[i] = float4(0.0f);
+            if (e < KB * hd4 && s < keys) {
+                const uint64_t o = (uint64_t) s * kv_width + kvh * HD + d;
+                rk[i] = float4(*((device const packed_float4 *) (k + o)));
+                rv[i] = float4(*((device const packed_float4 *) (v + o)));
+            }
+        }
+    };
+    fetch(0);
+    for (uint s0 = 0; s0 < keys; s0 += KB) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        DIT_UNROLL for (uint i = 0; i < SL; ++i) {
+            const uint e = tid + i * NT;
+            if (e < KB * hd4) {
+                const uint j = e / hd4;
+                const uint d = (e - j * hd4) * 4u;
+                *((threadgroup float4 *) (sk + j * LDK + d)) = rk[i];
+                *((threadgroup float4 *) (sv + j * LDK + d)) = rv[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s0 + KB < keys) {
+            fetch(s0 + KB);
+        }
+
+        // Scores: S (8 x KB) = Q (8 x HD) . K^T, one fragment per 8 keys.
+        simdgroup_float8x8 sf[NB];
+        DIT_UNROLL for (uint b = 0; b < NB; ++b) {
+            sf[b] = simdgroup_float8x8(0.0f);
+        }
+        DIT_UNROLL for (uint i = 0; i < HD / 8u; ++i) {
+            DIT_UNROLL for (uint b = 0; b < NB; ++b) {
+                simdgroup_float8x8 kt;
+                // kt(r, c) = K[8b + c][8i + r]: the transposed load.
+                simdgroup_load(kt, sk + 8u * b * LDK + 8u * i, LDK, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(sf[b], qf[i], kt, sf[b]);
+            }
+        }
+
+        simdgroup_float8x8 pf[NB];
+        float block_max = -INFINITY;
+        DIT_UNROLL for (uint b = 0; b < NB; ++b) {
+            DIT_UNROLL for (uint c = 0; c < 2u; ++c) {
+                const uint key = s0 + 8u * b + fn + c;
+                if (key >= keys || key > qrow) {
+                    sf[b].thread_elements()[c] = -INFINITY;
+                }
+                block_max = max(block_max, sf[b].thread_elements()[c]);
+            }
+        }
+        block_max = max(block_max, simd_shuffle_xor(block_max, 1));
+        block_max = max(block_max, simd_shuffle_xor(block_max, 8));
+        const float new_max = max(run_max, block_max);
+        const float alpha = exp(run_max - new_max);
+        float block_sum = 0.0f;
+        DIT_UNROLL for (uint b = 0; b < NB; ++b) {
+            DIT_UNROLL for (uint c = 0; c < 2u; ++c) {
+                const float p = exp(sf[b].thread_elements()[c] - new_max);
+                pf[b].thread_elements()[c] = p;
+                block_sum += p;
+            }
+        }
+        block_sum += simd_shuffle_xor(block_sum, 1);
+        block_sum += simd_shuffle_xor(block_sum, 8);
+        run_sum = run_sum * alpha + block_sum;
+        run_max = new_max;
+        DIT_UNROLL for (uint i = 0; i < HD / 8u; ++i) {
+            of[i].thread_elements()[0] *= alpha;
+            of[i].thread_elements()[1] *= alpha;
+            DIT_UNROLL for (uint b = 0; b < NB; ++b) {
+                simdgroup_float8x8 vf;
+                simdgroup_load(vf, sv + 8u * b * LDK + 8u * i, LDK);
+                simdgroup_multiply_accumulate(of[i], pf[b], vf, of[i]);
+            }
+        }
+    }
+
+    if (!live) {
+        return;
+    }
+    const float inv = 1.0f / run_sum;
+    device float *op = out + (uint64_t) qrow * (args.q_heads * HD) + h * HD;
+    DIT_UNROLL for (uint i = 0; i < HD / 8u; ++i) {
+        op[8u * i + fn] = of[i].thread_elements()[0] * inv;
+        op[8u * i + fn + 1u] = of[i].thread_elements()[1] * inv;
+    }
+}
+
+template [[host_name("kernel_dit_flash_gqa_d128_f32")]]
+kernel void kernel_dit_flash_gqa<128u>(
+        constant dit_args_gqa & args [[buffer(0)]],
+        device float *out               [[buffer(1)]],
+        device const float *q           [[buffer(2)]],
+        device const float *k           [[buffer(3)]],
+        device const float *v           [[buffer(4)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]);
+
 // --- fused linear: swiglu/concat input, gated-residual output --------------------
 
 /// The input row of a block's output linear without materializing it:

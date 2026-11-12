@@ -918,6 +918,9 @@ pub(crate) struct Ops {
     /// The smallest projection, in multiply-adds, the host is given a share
     /// of: [`HOST_MIN_PRODUCTS`] outside the tests that split a small one.
     host_min_products: usize,
+    /// The fewest rows [`Ops::gqa`] sends to the fused tile
+    /// ([`FUSED_GQA_KERNEL`]); `usize::MAX` on a device without it.
+    gqa_fused_min: usize,
 }
 
 /// A pooled working buffer: derefs to the [`DeviceBuffer`] it holds and goes
@@ -970,6 +973,22 @@ pub(crate) const HALF_KV_KERNELS: [&str; 3] = [
     "kernel_dit_flash_sdpa_d128_kvh",
     "kernel_dit_flash_sdpa_d128_kvhc",
 ];
+
+/// The fused causal grouped-query tile for 128-wide heads. Optional, like
+/// [`HALF_KV_KERNELS`]: a device without it keeps the per-row kernel.
+pub(crate) const FUSED_GQA_KERNEL: &str = "kernel_dit_flash_gqa_d128_f32";
+/// Query rows per threadgroup of the fused grouped-query tile.
+const FUSED_GQA_ROWS: u32 = 64;
+/// Threads per threadgroup of the fused grouped-query tile.
+const FUSED_GQA_THREADS: u32 = 256;
+/// The head width the fused grouped-query tile is instantiated for.
+const FUSED_GQA_HEAD_DIM: usize = 128;
+/// The fewest rows sent to the fused grouped-query tile. A prompt without a
+/// picture is tens of rows and its attention is not worth moving: below this
+/// the per-row kernel keeps its own summation order, so a text-only prompt's
+/// features - and the picture they condition - stay bit for bit what they
+/// were. A prompt carrying a picture is a thousand rows and up.
+const GQA_FUSED_MIN_TOKENS: usize = 768;
 
 /// Every diffusion kernel entry this driver launches: the module's full
 /// registration in `metal/diffusion/diffusion.metal`. [`Ops::new`] probes the device
@@ -1074,6 +1093,11 @@ impl Ops {
                 .max_block_threads(KernelRef::new(MODULE, entry))
                 .is_some()
         });
+        // The tile needs its full threadgroup: a pipeline the device caps
+        // below it (the cap follows register use) keeps the per-row kernel.
+        let fused_gqa = backend
+            .max_block_threads(KernelRef::new(MODULE, FUSED_GQA_KERNEL))
+            .is_some_and(|threads| threads >= FUSED_GQA_THREADS);
         let dummy = alloc(backend, 4).map_err(|e| ImageGenError::Backend(e.to_string()))?;
         backend
             .fill_zero(dummy.view())
@@ -1085,6 +1109,11 @@ impl Ops {
             half_kv,
             host_share: 0,
             host_min_products: HOST_MIN_PRODUCTS,
+            gqa_fused_min: if fused_gqa {
+                GQA_FUSED_MIN_TOKENS
+            } else {
+                usize::MAX
+            },
         })
     }
 
@@ -1105,6 +1134,7 @@ impl Ops {
             half_kv: false,
             host_share: 0,
             host_min_products: HOST_MIN_PRODUCTS,
+            gqa_fused_min: usize::MAX,
         })
     }
 
@@ -1136,6 +1166,25 @@ impl Ops {
         }
         self.host_share = per_mille;
         Ok(self)
+    }
+
+    /// Sends every grouped-query attention the fused tile can take to it,
+    /// whatever its row count, so a test can grade the tile on a prompt
+    /// short enough to have a reference. A device without the tile keeps
+    /// the per-row kernel.
+    #[cfg(test)]
+    pub(crate) fn fusing_short_prompts(mut self) -> Self {
+        if self.gqa_fused_min != usize::MAX {
+            self.gqa_fused_min = 0;
+        }
+        self
+    }
+
+    /// Whether [`Ops::gqa`] runs `tokens` rows of `head_dim`-wide heads on
+    /// the fused tile.
+    #[cfg(test)]
+    pub(crate) fn fuses_gqa(&self, tokens: usize, head_dim: usize) -> bool {
+        head_dim == FUSED_GQA_HEAD_DIM && tokens >= self.gqa_fused_min
     }
 
     /// Shares projections of every size, so a test can split one that is
@@ -2460,11 +2509,31 @@ impl Ops {
             head_dim: call.head_dim as u32,
             valid_keys: call.valid_keys as u32,
         };
+        // The fused tile is the same attention summed in another order, six
+        // to seven times faster on a long prompt; see `GQA_FUSED_MIN_TOKENS`.
+        let fused = call.head_dim == FUSED_GQA_HEAD_DIM && call.tokens >= self.gqa_fused_min;
+        let (entry, grid, block) = if fused {
+            (
+                FUSED_GQA_KERNEL,
+                Extent3::new(
+                    grid_for(call.tokens as u32, FUSED_GQA_ROWS),
+                    call.q_heads as u32,
+                    1,
+                ),
+                Extent3::linear(FUSED_GQA_THREADS),
+            )
+        } else {
+            (
+                "kernel_dit_gqa_f32",
+                Extent3::new(call.tokens as u32, call.q_heads as u32, 1),
+                Extent3::linear(BLOCK),
+            )
+        };
         self.launch(
             call.step,
-            "kernel_dit_gqa_f32",
-            Extent3::new(call.tokens as u32, call.q_heads as u32, 1),
-            Extent3::linear(BLOCK),
+            entry,
+            grid,
+            block,
             &[
                 KernelArg::Bytes(bytemuck::bytes_of(&args)),
                 KernelArg::Buffer(call.out),

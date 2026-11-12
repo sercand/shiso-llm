@@ -255,6 +255,26 @@ fn numbers(value: &serde_json::Value) -> Vec<u32> {
 #[test]
 #[ignore = "requires a Metal device and SHISO_TEST_MODEL_QWEN_IMAGE21"]
 fn edit_features_match_reference() {
+    edit_features_against_the_reference(false);
+}
+
+/// The same prompt with its attention on the fused grouped-query tile, which
+/// a prompt this short would not reach on its own: the features meet the
+/// same bar, so the tile is the per-row attention and not a cheaper one.
+#[test]
+#[ignore = "requires a Metal device and SHISO_TEST_MODEL_QWEN_IMAGE21"]
+fn edit_features_match_reference_on_the_fused_attention() {
+    edit_features_against_the_reference(true);
+}
+
+/// Encodes the reference's picture prompt and grades the kept features
+/// against the reference's, with the prefill's attention on the fused tile
+/// when `fused`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one case: tokenize, encode the picture, prefill, grade, straight-line"
+)]
+fn edit_features_against_the_reference(fused: bool) {
     let Some((root, backend)) = setup() else {
         return;
     };
@@ -269,11 +289,21 @@ fn edit_features_match_reference() {
     let slots = (height as usize / 32, width as usize / 32);
 
     let ops = Ops::new(&backend).expect("the diffusion kernel set");
+    let ops = if fused {
+        ops.fusing_short_prompts()
+    } else {
+        ops
+    };
     let prompt =
         QwenImagePrompt::load(&root.join("image_assets/processor")).expect("the prompt loads");
     let ids = prompt
         .tokenize_edit(doc["prompt"].as_str().expect("a prompt"), &[slots])
         .expect("the edit prompt encodes");
+    assert_eq!(
+        ops.fuses_gqa(ids.ids.len(), 128),
+        fused,
+        "the prompt's attention runs on the kernel this case is about"
+    );
     assert_eq!(ids.ids, numbers(&doc["ids"]), "our ids are the reference's");
     let positions = ids.positions();
     for (axis, want) in (0..3).map(|a| (a, numbers(&doc["position_ids"][a]))) {

@@ -111,6 +111,7 @@ const ENTRIES: &[&str] = &[
     "kernel_dit_kv_half_f32",
     "kernel_dit_flash_sdpa_d128_kvh",
     "kernel_dit_flash_sdpa_d128_kvhc",
+    "kernel_dit_flash_gqa_d128_f32",
 ];
 
 // --- argument blocks: byte-for-byte the driver's `#[repr(C)]` Pods ---------
@@ -3630,6 +3631,7 @@ prefix_cases!(
     qk_norm_rope_normalizes_then_turns_adjacent_pairs,
     tanh_and_gelu_tanh_match_their_formulas,
     gqa_valid_keys_masks_pad_keys,
+    flash_gqa_is_the_per_row_attention,
     rope_half_pins_trailing_rows_to_one_position,
     rope_half_table_turns_each_pair_by_its_own_angle,
 );
