@@ -9,9 +9,9 @@
 //! processor 1.32) - the processor's share costs the GPU about 7% of its own
 //! rate to memory contention and returns four times that.
 //!
-//! The matrix library has no byte operand, so the codes are widened one piece
-//! of the range at a time into a scratch that stays cache-sized; the weight is
-//! never dequantized as a whole. The row scale, the bias and the gate are
+//! The matrix library has no byte operand, so the host's rows of the codes
+//! are widened into a scratch for the one call that reads them; the weight
+//! as a whole is never dequantized. The row scale, the bias and the gate are
 //! applied to the product exactly as the GPU's epilogue applies them.
 
 use std::ffi::{c_int, c_long, c_ulong};
@@ -29,10 +29,16 @@ const NO_TRANS: c_int = 111;
 /// `CblasTrans`.
 const TRANS: c_int = 112;
 
-/// Widened codes held at once, in elements: 16 MiB of `f32`, which keeps one
-/// piece's weight inside the performance cores' shared cache while leaving
-/// each product large enough that the library's threads stay busy.
-const PIECE_ELEMENTS: usize = 4 << 20;
+/// Widened codes held at once, in elements: 256 MiB of `f32`, a bound on
+/// the scratch and nothing more. Every shared projection of the image
+/// models fits one piece, and should: the library walks the whole left
+/// operand once per call, so cutting the range into cache-sized pieces was
+/// slower, not faster. Measured on an M4, a 1024x1024 Qwen-Image-2.1 step
+/// at a 34% host share: 19.5 s with 4 MiB pieces, 17.0 s with 16 MiB,
+/// 16.4 s with 128 MiB or the whole range. The picture was bit for bit the
+/// same at every size: the library's sum for a column does not depend on
+/// how many columns share the call.
+const PIECE_ELEMENTS: usize = 64 << 20;
 
 /// Threads the two passes around each product run on. Both are streaming
 /// passes over tens of megabytes the matrix library's own threads sit out,
@@ -70,7 +76,8 @@ unsafe extern "C" {
 pub(crate) struct HostScratch {
     /// One piece of the weight, widened: `[piece, k]`.
     weight: Vec<f32>,
-    /// That piece's unscaled product: `[m, piece]`.
+    /// That piece's unscaled product, `[m, piece]`, when it is added into a
+    /// stream; an overwritten product is written where it belongs.
     product: Vec<f32>,
 }
 
@@ -155,17 +162,31 @@ impl HostGemm for MetalBackend {
             product,
         } = &mut *scratch;
         wide.resize(elements(piece, k)?, 0.0);
-        product.resize(elements(m, piece)?, 0.0);
+        if gate.is_some() {
+            product.resize(elements(m, piece)?, 0.0);
+        }
         let (blas_m, blas_k) = (dim(m)?, dim(k)?);
 
         let mut first = start;
         while first < end {
             let cols = piece.min(end - first);
             widen(weight + first * k, &mut wide[..cols * k], k);
+            // An overwritten product lands straight in its columns of `out`
+            // (row stride `n`); a gated one needs the stream it adds into
+            // intact, so it goes through the scratch.
+            let (target, stride) = if gate.is_some() {
+                (product.as_mut_ptr(), cols)
+            } else {
+                ((out + first * 4) as *mut f32, n)
+            };
             // SAFETY: `input` addresses `m * k` live, 4-aligned floats the
             // device is not writing (the caller synced past its writes and
-            // submits nothing that touches it); `wide` is `[cols, k]` and
-            // `product` at least `[m, cols]`, both owned here.
+            // submits nothing that touches it), and `wide` is `[cols, k]`,
+            // owned here. The target is `m` rows of `cols` floats at a
+            // stride of `stride`: the scratch, at least `[m, cols]` and owned
+            // here, or columns `first..first + cols` of `out`'s `m * n` live,
+            // 4-aligned floats, which the device is not touching - it writes
+            // only columns outside this call's range.
             unsafe {
                 cblas_sgemm(
                     ROW_MAJOR,
@@ -180,8 +201,8 @@ impl HostGemm for MetalBackend {
                     wide.as_ptr(),
                     blas_k,
                     0.0,
-                    product.as_mut_ptr(),
-                    dim(cols)?,
+                    target,
+                    dim(stride)?,
                 );
             }
             let finish = Finish {
@@ -190,12 +211,13 @@ impl HostGemm for MetalBackend {
                 gate: gate.as_ref().map(|g| &g[first..first + cols]),
             };
             let band = m.div_ceil(HELPERS).max(1);
+            let product = &product[..];
             std::thread::scope(|scope| {
-                for (index, rows) in product[..m * cols].chunks(band * cols).enumerate() {
+                for index in 0..m.div_ceil(band) {
                     let finish = &finish;
                     scope.spawn(move || {
-                        for (r, row) in rows.chunks_exact(cols).enumerate() {
-                            let at = out + ((index * band + r) * n + first) * 4;
+                        for r in index * band..m.min((index + 1) * band) {
+                            let at = out + (r * n + first) * 4;
                             // SAFETY: `out` addresses `m * n` live, 4-aligned
                             // floats, and this run is columns `first..first +
                             // cols` of one row, inside them. Each row belongs
@@ -204,7 +226,11 @@ impl HostGemm for MetalBackend {
                             // outside this call's range. Nothing else reads
                             // or writes these bytes while the borrow lives.
                             let dst = unsafe { from_raw_parts_mut(at as *mut f32, cols) };
-                            finish.row(dst, row);
+                            if finish.gate.is_some() {
+                                finish.add(dst, &product[r * cols..(r + 1) * cols]);
+                            } else {
+                                finish.overwrite(dst);
+                            }
                         }
                     });
                 }
@@ -250,43 +276,32 @@ struct Finish<'a> {
 }
 
 impl Finish<'_> {
-    /// Finishes one row's run of columns from its raw `product`.
-    fn row(&self, dst: &mut [f32], product: &[f32]) {
-        epilogue(dst, product, self.scale, self.bias, self.gate);
+    /// Finishes one row's run of columns in place, where the multiply left
+    /// its raw product: `v * scale + bias`.
+    fn overwrite(&self, dst: &mut [f32]) {
+        match self.bias {
+            None => {
+                for (d, &s) in dst.iter_mut().zip(self.scale) {
+                    *d *= s;
+                }
+            }
+            Some(bias) => {
+                for ((d, &s), &b) in dst.iter_mut().zip(self.scale).zip(bias) {
+                    *d = *d * s + b;
+                }
+            }
+        }
     }
-}
 
-/// One row's run of columns, finished the way the GPU's epilogue finishes
-/// it: `v * scale + bias`, stored, or added scaled by the gate.
-fn epilogue(
-    dst: &mut [f32],
-    product: &[f32],
-    scale: &[f32],
-    bias: Option<&[f32]>,
-    gate: Option<&[f32]>,
-) {
-    match (bias, gate) {
-        (None, None) => {
-            for ((d, &v), &s) in dst.iter_mut().zip(product).zip(scale) {
-                *d = v * s;
-            }
-        }
-        (Some(bias), None) => {
-            for (((d, &v), &s), &b) in dst.iter_mut().zip(product).zip(scale).zip(bias) {
-                *d = v * s + b;
-            }
-        }
-        (None, Some(gate)) => {
-            for (((d, &v), &s), &g) in dst.iter_mut().zip(product).zip(scale).zip(gate) {
-                *d += g * (v * s);
-            }
-        }
-        (Some(bias), Some(gate)) => {
-            for ((((d, &v), &s), &b), &g) in
-                dst.iter_mut().zip(product).zip(scale).zip(bias).zip(gate)
-            {
-                *d += g * (v * s + b);
-            }
+    /// Adds one row's run of columns into the stream from its raw
+    /// `product`: `gate * (v * scale + bias)`. A finish without a gate adds
+    /// at unit gain.
+    fn add(&self, dst: &mut [f32], product: &[f32]) {
+        let columns = dst.iter_mut().zip(product).zip(self.scale).enumerate();
+        for (c, ((d, &v), &s)) in columns {
+            let b = self.bias.map_or(0.0, |bias| bias[c]);
+            let g = self.gate.map_or(1.0, |gate| gate[c]);
+            *d += g * (v * s + b);
         }
     }
 }

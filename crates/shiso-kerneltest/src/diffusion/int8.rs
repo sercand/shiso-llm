@@ -931,7 +931,9 @@ pub fn host_gemm_i8_computes_only_its_columns(gpu: &Gpu) {
     let cases: [((usize, usize, usize), std::ops::Range<usize>); 3] = [
         ((5, 192, 256), 64..192),
         ((9, 320, 512), 128..256),
-        ((3, 1344, 4096), 64..1344),
+        // 16448 rows of 4096 codes are past the 64 Mi elements the host
+        // widens at once, so this range is multiplied in two pieces.
+        ((2, 16512, 4096), 64..16512),
     ];
     for (index, (shape, cols)) in cases.iter().enumerate() {
         let (m, n, _) = *shape;
