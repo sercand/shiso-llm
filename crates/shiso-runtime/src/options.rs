@@ -2119,7 +2119,7 @@ mod tests {
             .expect("a positive count parses");
         assert_eq!(
             parsed.options.image_max_references,
-            std::num::NonZeroU32::new(3)
+            NonZeroU32::new(3)
         );
         assert!(Probe::try_parse_from(["probe", "--image-max-references", "0"]).is_err());
         assert!(Probe::try_parse_from(["probe", "--image-max-references", "many"]).is_err());
