@@ -207,26 +207,74 @@ pub(super) fn open_stream(
     Ok(stream)
 }
 
-/// Opens the pack's n-gram table, `ple-fp8.gguf`, as one contiguous stream of
-/// `f8_e4m3` rows under the one scale its metadata holds.
+/// Rows the table is stored in are rounded up to a multiple of this past the
+/// last head: the pack's table holds 320,001,536 rows behind 320,001,446
+/// addressable ones, which is the next multiple of 128. A table longer than
+/// that rounding is not this pack's, and rows read past the hash would be
+/// another tensor's bytes.
+const ROW_ROUNDING: u64 = 128;
+
+/// Refuses a stored row count that is not the one the hashing metadata
+/// needs, allowing the writer's rounding ([`ROW_ROUNDING`]) and nothing more.
+pub(super) fn check_rows(stored: u64, needed: u64) -> CoreResult<()> {
+    if stored >= needed && stored - needed < ROW_ROUNDING {
+        return Ok(());
+    }
+    Err(CoreError::ShapeMismatch {
+        field: "n-gram table rows",
+        expected: needed,
+        got: stored,
+    })
+}
+
+/// Widens a half-precision vector to `f32` bytes, exactly.
 ///
-/// The container's own claims are held to what this reader decodes: the codec
-/// name, a tensor of raw bytes, and rows exactly one n-gram head wide. The two
-/// metadata keys are found by their suffix, since the prefix names the
-/// container's writer.
+/// The widening is lossless (every half value, subnormals included, is an
+/// `f32`), so it is not the dequantisation the load otherwise avoids. A byte
+/// length that is odd or does not match `elements` is refused rather than
+/// truncated.
+///
+/// # Errors
+///
+/// [`CoreError::ShapeMismatch`] when `bytes` is not exactly `2 * elements`.
+pub(super) fn widen_half(bytes: &[u8], elements: u64) -> CoreResult<Vec<u8>> {
+    let want = elements.saturating_mul(2);
+    if bytes.len() as u64 != want || !bytes.len().is_multiple_of(2) {
+        return Err(CoreError::ShapeMismatch {
+            field: "half-precision vector bytes",
+            expected: want,
+            got: bytes.len() as u64,
+        });
+    }
+    Ok(bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .flat_map(|pair| f32::from(half::f16::from_le_bytes(*pair)).to_le_bytes())
+        .collect())
+}
+
+/// The n-gram container, checked: where its rows start and how they decode.
+pub(super) struct NgramFile {
+    file: GgufFile,
+    offset: u64,
+    rows: u64,
+    scale: f32,
+}
+
+/// Opens `dir/ple-fp8.gguf` and holds it to what this reader decodes: the
+/// codec name, a tensor of raw bytes, rows exactly one n-gram head wide, a
+/// positive finite scale, and bytes that cover every row. The two metadata
+/// keys are found by their suffix, since the prefix names the container's
+/// writer.
 ///
 /// # Errors
 ///
 /// [`CoreError::ConfigMissing`] for an absent file, key or tensor,
 /// [`CoreError::InvalidValue`] for a codec, type or scale this reader does not
-/// decode, [`CoreError::ShapeMismatch`] for a row width or count that
-/// disagrees with the hash, and whatever the stream's open reports.
-pub(super) fn open_ngram(
-    backend: &Arc<dyn Backend>,
-    dir: &Path,
-    config: &Qwen4ExpConfig,
-    opts: &SparseOptions,
-) -> CoreResult<NgramTable> {
+/// decode, [`CoreError::ShapeMismatch`] for a row width that disagrees, and
+/// [`CoreError::Backend`] for a file whose tensor runs past its end.
+pub(super) fn read_table(dir: &Path) -> CoreResult<NgramFile> {
     let path = dir.join(NGRAM_FILE);
     let file = GgufFile::open_shared(&path).map_err(|source| CoreError::Backend {
         backend: "qwen4exp",
@@ -291,6 +339,41 @@ pub(super) fn open_ngram(
             got: width,
         });
     }
+    // The container's reader has already refused a tensor that runs past the
+    // end of the file; this is the same fact stated for the rows, so a change
+    // in how bytes are counted cannot let a short table through.
+    let bytes = rows.saturating_mul(width);
+    if desc.bytes != bytes {
+        return Err(CoreError::ShapeMismatch {
+            field: "n-gram table bytes",
+            expected: bytes,
+            got: desc.bytes,
+        });
+    }
+    let offset = u64::try_from(file.range_of(desc).start).unwrap_or(u64::MAX);
+    Ok(NgramFile {
+        file,
+        offset,
+        rows,
+        scale,
+    })
+}
+
+/// Opens the pack's n-gram table, `ple-fp8.gguf`, as one contiguous stream of
+/// `f8_e4m3` rows under the one scale its metadata holds.
+///
+/// # Errors
+///
+/// As [`read_table`], plus [`CoreError::ShapeMismatch`] for a row count other
+/// than the hash needs ([`check_rows`]), and whatever the stream's open
+/// reports.
+pub(super) fn open_ngram(
+    backend: &Arc<dyn Backend>,
+    dir: &Path,
+    config: &Qwen4ExpConfig,
+    opts: &SparseOptions,
+) -> CoreResult<NgramTable> {
+    let table = read_table(dir)?;
     let ple = config.shape().ple.ok_or(CoreError::ShapeMismatch {
         field: "n-gram slot",
         expected: 1,
@@ -299,27 +382,30 @@ pub(super) fn open_ngram(
     let params = config.ngram().params(
         ple,
         PleRowType::Fp8E4M3 {
-            scale_bits: scale.to_bits(),
+            scale_bits: table.scale.to_bits(),
         },
         None,
     )?;
-    if params.total_rows() > rows {
-        return Err(CoreError::ShapeMismatch {
-            field: "n-gram table rows",
-            expected: rows,
-            got: params.total_rows(),
-        });
-    }
-    let offset = u64::try_from(file.range_of(desc).start).unwrap_or(u64::MAX);
-    let shard = File::open(file.path_of(desc)).map_err(CoreError::Io)?;
+    check_rows(table.rows, params.total_rows())?;
+    let desc = table
+        .file
+        .find(NGRAM_TENSOR)
+        .ok_or_else(|| CoreError::ConfigMissing {
+            key: NGRAM_TENSOR.to_owned(),
+        })?;
+    let shard = File::open(table.file.path_of(desc)).map_err(CoreError::Io)?;
     let stream = PleStream::open(
         shard,
-        offset,
-        rows,
+        table.offset,
+        table.rows,
         params,
         opts.ngram_cache_bytes,
         &opts.ngram_reader,
     )?;
-    let scale_buffer = upload(backend, scale.to_le_bytes().to_vec())?;
+    let scale_buffer = upload(backend, table.scale.to_le_bytes().to_vec())?;
     NgramTable::new(DType::Fp8E4M3, Arc::new(stream), Some(scale_buffer))
 }
+
+#[cfg(test)]
+#[path = "latent_load_tests.rs"]
+mod tests;

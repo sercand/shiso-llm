@@ -1647,14 +1647,8 @@ fn vector(
     view: &TensorView<'_>,
 ) -> CoreResult<DeviceBuffer> {
     if view.dtype == DType::F16 {
-        let wide: Vec<u8> = view
-            .data
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .flat_map(|pair| f32::from(half::f16::from_le_bytes(*pair)).to_le_bytes())
-            .collect();
-        return mlx::upload(backend, wide);
+        let elements = view.shape.elements().map_err(open_failure)?;
+        return mlx::upload(backend, latent_load::widen_half(view.data, elements)?);
     }
     if view.dtype != DType::F32 {
         return Err(CoreError::Unsupported {

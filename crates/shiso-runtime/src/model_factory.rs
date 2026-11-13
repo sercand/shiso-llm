@@ -1423,32 +1423,7 @@ fn load_qwen4exp_latent(
     opts: EngineOptions,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
-    if args.draft_model.is_some() {
-        return Err(FactoryError::Load(CoreError::InvalidValue {
-            key: "--draft-model",
-            value: format!(
-                "{} carries its own draft head under mtp/; drop --draft-model",
-                path.display()
-            ),
-        }));
-    }
-    if args.prefill_activations == crate::options::PrefillActivations::Lowp {
-        return Err(FactoryError::Load(CoreError::InvalidValue {
-            key: "--prefill-activations",
-            value: "lowp: the latent pack's routed stage reads half-precision prompt activations \
-                    only"
-                .to_owned(),
-        }));
-    }
-    if args.spec_k > 0 {
-        return Err(FactoryError::Load(CoreError::InvalidValue {
-            key: "--spec-k",
-            value: format!(
-                "{}: the latent pack's draft head is not loadable yet",
-                args.spec_k
-            ),
-        }));
-    }
+    refuse_latent_flags(path, args).map_err(FactoryError::Load)?;
     let slots = match args.expert_residency {
         crate::options::ExpertResidencyChoice::Resident => {
             Some(shiso_models::qwen4exp::EXPERTS * shiso_models::qwen4exp::N_LAYERS)
@@ -1477,6 +1452,47 @@ fn load_qwen4exp_latent(
         defaults,
         speech: None,
     })
+}
+
+/// The flags a latent pack cannot honour, refused by name before any weight
+/// moves: a second draft head beside the pack's own, prompt activations other
+/// than half precision (the latent stage reads those only, and the dense
+/// projections' low-precision path is not exercised against the pack), and a
+/// speculation depth, whose head is not loadable yet.
+///
+/// # Errors
+///
+/// [`CoreError::InvalidValue`] naming the flag.
+fn refuse_latent_flags(path: &Path, args: &ServeOptions) -> Result<(), CoreError> {
+    use crate::options::PrefillActivations;
+    if args.draft_model.is_some() {
+        return Err(CoreError::InvalidValue {
+            key: "--draft-model",
+            value: format!(
+                "{} carries its own draft head under mtp/; drop --draft-model",
+                path.display()
+            ),
+        });
+    }
+    if args.prefill_activations != PrefillActivations::A16 {
+        return Err(CoreError::InvalidValue {
+            key: "--prefill-activations",
+            value: format!(
+                "{:?}: the latent pack reads half-precision prompt activations only",
+                args.prefill_activations
+            ),
+        });
+    }
+    if args.spec_k > 0 {
+        return Err(CoreError::InvalidValue {
+            key: "--spec-k",
+            value: format!(
+                "{}: the latent pack's draft head is not loadable yet",
+                args.spec_k
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// NVIDIA's two `modelopt` exports of the sparse family, both with NVFP4
@@ -1732,6 +1748,42 @@ mod tests {
     fn document(model_type: &str) -> HfConfig {
         HfConfig::from_json_str(&format!(r#"{{"model_type":"{model_type}"}}"#))
             .expect("the document parses")
+    }
+
+    #[test]
+    fn a_latent_pack_refuses_what_it_cannot_honour() {
+        use super::refuse_latent_flags;
+        use crate::options::{PrefillActivations, ServeOptions};
+        let path = std::path::Path::new("/pack");
+        assert!(refuse_latent_flags(path, &ServeOptions::default()).is_ok());
+        let base = ServeOptions::default;
+        let draft = ServeOptions {
+            draft_model: Some("/head.gguf".into()),
+            ..base()
+        };
+        let lowp = ServeOptions {
+            prefill_activations: PrefillActivations::Lowp,
+            ..base()
+        };
+        let dense8 = ServeOptions {
+            prefill_activations: PrefillActivations::Dense8,
+            ..base()
+        };
+        let spec = ServeOptions {
+            spec_k: 3,
+            ..base()
+        };
+        for (args, key) in [
+            (draft, "--draft-model"),
+            (lowp, "--prefill-activations"),
+            (dense8, "--prefill-activations"),
+            (spec, "--spec-k"),
+        ] {
+            match refuse_latent_flags(path, &args) {
+                Err(CoreError::InvalidValue { key: got, .. }) => assert_eq!(got, key),
+                other => panic!("{key}: {other:?}"),
+            }
+        }
     }
 
     #[test]

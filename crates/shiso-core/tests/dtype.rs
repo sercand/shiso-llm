@@ -214,3 +214,11 @@ fn mxfp8_is_this_project_s_own_id_and_never_read_from_a_container() {
     assert!(!DType::Mxfp8E4M3G32.is_modelopt());
     assert!(!DType::Mxfp8E4M3G32.is_affine());
 }
+
+#[test]
+fn an_i8_tensor_is_one_byte_an_element() {
+    assert_eq!(DType::I8.block_elems().get(), 1);
+    assert_eq!(DType::I8.block_bytes().get(), 1);
+    assert_eq!(DType::I8.gguf_id(), 24);
+    assert_eq!(DType::I8.type_name(), "i8");
+}
