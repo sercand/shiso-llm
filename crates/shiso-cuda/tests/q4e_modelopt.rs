@@ -176,3 +176,10 @@ fn latent_combine_matches_host() {
     let Some(gpu) = open() else { return };
     latent::latent_combine_matches_host(&gpu);
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn latent_step_projections_skip_unused_groups() {
+    let Some(gpu) = open() else { return };
+    latent::latent_step_projections_skip_unused_groups(&gpu);
+}

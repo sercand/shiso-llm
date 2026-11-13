@@ -20,6 +20,17 @@
 //! kernels at the latent width in place of the residual width, and the same
 //! shared expert after it. That is why this module plans only the seams.
 //!
+//! # A step pass skips the groups nobody routes to
+//!
+//! A token's experts cover a few of the groups, and nothing reads the rest:
+//! `D`'s rows for an unused group are no expert's input, and `U`'s terms
+//! over an unused group multiply the zeros the combine left. On a step or
+//! verify pass, whose projections are bound by the bytes they stream, one
+//! small launch writes which groups each block of rows uses and the two
+//! projections take entries that leave the others out. Every value that is
+//! read is the plain entries' value bit for bit, so which pass a row shares
+//! still moves nothing. What it measured is on [`projection`].
+//!
 //! # Refused rather than approximated
 //!
 //! A latent bank in any format but NVFP4, over a prompt that quantizes its
@@ -32,17 +43,91 @@ use shiso_core::DType;
 use shiso_core::error::{CoreError, CoreResult};
 
 use crate::sparse::bind::{Args, LayerRef, Operand, Role, WeightRef, WeightSet};
-use crate::sparse::kernels::{self, Entry, MOD_MODELOPT, MOD_MOE};
+use crate::sparse::ggml;
+use crate::sparse::kernels::{self, Entry, MOD_GGML, MOD_MODELOPT, MOD_MOE};
 use crate::sparse::matmul::{self, Bound, Device, LatentKernels};
 use crate::sparse::moe::{self, NVFP4_GEMM_K_ALIGN};
 use crate::sparse::plan::{Plan, Step};
 use crate::sparse::scratch::Buf;
 use crate::sparse::shape::SparseShape;
-use crate::sparse::weights::{ExpertDesc, LatentDesc, WeightPart};
+use crate::sparse::weights::{ExpertDesc, LatentDesc, WeightDesc, WeightPart};
 
 /// Rows a pass may have: the combine puts the token on the grid's second axis,
 /// which the driver caps at 65535.
 pub const LATENT_MAX_ROWS: u32 = 65_535;
+
+/// Groups a step pass's mask word has a bit for.
+pub const LATENT_MASK_GROUPS: u32 = 32;
+
+/// Which side of a step projection the unused groups are on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// `D`: the output rows of an unused group.
+    Down,
+    /// `U`: the contraction terms of an unused group.
+    Up,
+}
+
+/// Whether this pass's two projections take the entries that skip unused
+/// groups: a step or verify pass over `Q8_0` projections on the lanes-a-row
+/// step kernels, with few enough groups for a mask word.
+fn masks(latent: &LatentDesc, n_tok: u32, device: Device) -> bool {
+    latent.groups <= LATENT_MASK_GROUPS
+        && latent.down.dtype == DType::Q8_0
+        && latent.up.dtype == DType::Q8_0
+        && matches!(matmul::step_tier(device), ggml::StepTier::Runs)
+        && matmul::ggml_step(DType::Q8_0, ggml::step_stage(n_tok).0, device).is_some()
+}
+
+/// One of the stage's two projections: the plain projection, or on a pass
+/// [`masks`] accepts the step entry that leaves the unused groups out.
+///
+/// The masked entries are the plain step entries with two more arguments
+/// (`out, w, x, in_dim, out_dim, rows, lanes, masks, width`), on the plain
+/// launch.
+///
+/// Measured on a GB10 serving a 48-layer pack with eight groups of 1792,
+/// whose two projections are 78 MB of the 190 MB a layer streams a token:
+/// plain decode 18.9 -> 21.7 tok/s, greedy text unchanged. A five-row verify
+/// pass does not move (27-43 tok/s either way): its rows' groups together
+/// cover nearly every group, and a group any row uses is read for all.
+fn projection(
+    plan: &mut Plan,
+    weight: WeightDesc,
+    bound: Bound,
+    side: Side,
+    latent: &LatentDesc,
+    pass: (u32, Device),
+) -> CoreResult<()> {
+    let (n_tok, device) = pass;
+    if !masks(latent, n_tok, device) {
+        return matmul::project(plan, weight, bound, n_tok, device);
+    }
+    let four = ggml::step_stage(n_tok).1 == 4;
+    let name = match (side, four) {
+        (Side::Down, false) => "q4e_g_step_latent_down_q8_0_kernel",
+        (Side::Down, true) => "q4e_g_step_latent_down4_q8_0_kernel",
+        (Side::Up, false) => "q4e_g_step_latent_up_q8_0_kernel",
+        (Side::Up, true) => "q4e_g_step_latent_up4_q8_0_kernel",
+    };
+    let lanes = ggml::step_lanes(weight.in_dim, matmul::step_tier(device));
+    plan.launch(
+        Entry::plain(MOD_GGML, name),
+        ggml::step_launch(weight.out_dim, n_tok, lanes),
+        Args::of(&[
+            bound.dst,
+            Operand::Weight(bound.weight),
+            bound.src,
+            Operand::U32(weight.in_dim),
+            Operand::U32(weight.out_dim),
+            Operand::U32(n_tok),
+            Operand::U32(lanes),
+            Operand::Scratch(Buf::LatentMask),
+            Operand::U32(latent.width),
+        ]),
+    );
+    Ok(())
+}
 
 /// A refusal by name.
 fn refuse(what: &'static str) -> CoreError {
@@ -164,7 +249,21 @@ pub fn block(
         plan.append(moe::sort(shape, n_tok));
         plan
     };
-    matmul::project(
+    if masks(&latent, n_tok, device) {
+        plan.launch(
+            Entry::plain(MOD_MOE, "q4e_latent_groups_kernel"),
+            kernels::latent_groups(n_tok),
+            // `masks, ids, labels, n_tok, n_used`
+            Args::of(&[
+                Operand::Scratch(Buf::LatentMask),
+                Operand::Scratch(Buf::MoeIds),
+                Operand::ExpertLabels(layer.index),
+                Operand::U32(n_tok),
+                Operand::U32(shape.moe.used),
+            ]),
+        );
+    }
+    projection(
         &mut plan,
         latent.down,
         Bound::new(
@@ -172,8 +271,9 @@ pub fn block(
             Operand::Scratch(Buf::Mixed),
             Operand::Scratch(Buf::Latent),
         ),
-        n_tok,
-        device,
+        Side::Down,
+        &latent,
+        (n_tok, device),
     )?;
     plan.push(Step::Fetch {
         layer: layer.index,
@@ -195,7 +295,7 @@ pub fn block(
             Operand::U32(shape.moe.used),
         ]),
     );
-    matmul::project(
+    projection(
         &mut plan,
         latent.up,
         Bound::new(
@@ -203,8 +303,9 @@ pub fn block(
             Operand::Scratch(Buf::LatentSum),
             Operand::Scratch(Buf::BlockOut),
         ),
-        n_tok,
-        device,
+        Side::Up,
+        &latent,
+        (n_tok, device),
     )?;
     moe::with_shared(shape, desc, layer, n_tok, device, plan)
 }

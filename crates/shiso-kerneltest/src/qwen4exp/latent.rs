@@ -461,3 +461,240 @@ pub fn latent_combine_matches_host(gpu: &Gpu) {
         combine_case(gpu, &routing(5, 93), &labels, width, grid_x);
     }
 }
+
+/// The module the block-format step projections live in.
+const GGML_MODULE: &str = "q4e_ggml";
+
+/// Activation rows one block of a step projection carries.
+const STEP_COLS: usize = 8;
+
+/// Random `Q8_0` rows: `in_dim / 32` blocks of a half-precision scale and 32
+/// signed codes a row, every scale finite and small.
+fn q8_rows(out_dim: usize, in_dim: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut bytes = Vec::with_capacity(out_dim * (in_dim / 32) * 34);
+    for _ in 0..out_dim * (in_dim / 32) {
+        // 0x2c00..0x2fff: positive, between 2^-4 and 2^-3.
+        let scale = 0x2c00u16 | (xorshift(&mut state) & 0x3ff) as u16;
+        bytes.extend(scale.to_le_bytes());
+        bytes.extend((0..32).map(|_| xorshift(&mut state) as u8));
+    }
+    bytes
+}
+
+/// Which of the latent stage's two step projections a launch is.
+#[derive(Clone, Copy)]
+enum Side {
+    /// Into the latent rows: unused groups' output rows are left out.
+    Down,
+    /// Out of them: unused groups' contraction runs are left out.
+    Up,
+}
+
+/// One step projection launch, plain or masked, as the host plans it: lanes a
+/// row from the contraction width, four output rows a unit past two
+/// activation rows.
+fn step_projection(
+    gpu: &Gpu,
+    side: Option<Side>,
+    dims: (usize, usize, usize),
+    buffers: (&DeviceBuffer, &DeviceBuffer, &DeviceBuffer),
+    masks: Option<(&DeviceBuffer, usize)>,
+) {
+    let (in_dim, out_dim, rows) = dims;
+    let (out, w, x) = buffers;
+    let lanes: u32 = if in_dim / 16 <= 32 { 32 } else { 128 };
+    let unit: u32 = if rows > 2 { 4 } else { 1 };
+    let name = match (side, unit == 4) {
+        (None, false) => "q4e_g_step_matvec_q8_0_kernel",
+        (None, true) => "q4e_g_step_matvec4_q8_0_kernel",
+        (Some(Side::Down), false) => "q4e_g_step_latent_down_q8_0_kernel",
+        (Some(Side::Down), true) => "q4e_g_step_latent_down4_q8_0_kernel",
+        (Some(Side::Up), false) => "q4e_g_step_latent_up_q8_0_kernel",
+        (Some(Side::Up), true) => "q4e_g_step_latent_up4_q8_0_kernel",
+    };
+    let mut args = vec![
+        KernelArg::Buffer(out.view()),
+        KernelArg::Buffer(w.view()),
+        KernelArg::Buffer(x.view()),
+        KernelArg::U32(in_dim as u32),
+        KernelArg::U32(out_dim as u32),
+        KernelArg::U32(rows as u32),
+        KernelArg::U32(lanes),
+    ];
+    if let Some((masks, width)) = masks {
+        args.push(KernelArg::Buffer(masks.view()));
+        args.push(KernelArg::U32(width as u32));
+    }
+    let per_block = 4 * 32 / lanes * unit;
+    run(
+        gpu,
+        KernelRef::new(GGML_MODULE, name),
+        &LaunchArgs::new(
+            Extent3::new(
+                (out_dim as u32).div_ceil(per_block),
+                rows.div_ceil(STEP_COLS) as u32,
+                1,
+            ),
+            Extent3::linear(128),
+            &args,
+        ),
+    );
+    drain(gpu);
+}
+
+/// The groups token `t` routes to, as a mask.
+fn used_groups(ids: &[i32], labels: &[u32], t: usize) -> u32 {
+    ids[t * USED..(t + 1) * USED]
+        .iter()
+        .fold(0u32, |m, &e| m | 1 << labels[e as usize])
+}
+
+/// The mask launch over a routing, checked against a host fold: the device
+/// buffer and the masks, one a block of eight rows.
+fn group_masks(gpu: &Gpu, ids: &[i32], labels: &[u32]) -> (DeviceBuffer, Vec<u32>) {
+    let n_tok = ids.len() / USED;
+    let want: Vec<u32> = (0..n_tok.div_ceil(STEP_COLS))
+        .map(|b| {
+            (b * STEP_COLS..n_tok.min((b + 1) * STEP_COLS))
+                .fold(0, |m, t| m | used_groups(ids, labels, t))
+        })
+        .collect();
+    let (ids_dev, labels_dev) = (gpu.upload(&i32_bytes(ids)), gpu.upload(&u32_bytes(labels)));
+    let masks = gpu.upload(&u32_bytes(&vec![u32::MAX; want.len()]));
+    run(
+        gpu,
+        KernelRef::new(MOE_MODULE, "q4e_latent_groups_kernel"),
+        &LaunchArgs::new(
+            Extent3::new(want.len() as u32, 1, 1),
+            Extent3::linear(32),
+            &[
+                KernelArg::Buffer(masks.view()),
+                KernelArg::Buffer(ids_dev.view()),
+                KernelArg::Buffer(labels_dev.view()),
+                KernelArg::U32(n_tok as u32),
+                KernelArg::U32(USED as u32),
+            ],
+        ),
+    );
+    drain(gpu);
+    let got: Vec<u32> = gpu
+        .read(&masks)
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    assert_eq!(got, want, "q4e_latent_groups_kernel");
+    (masks, want)
+}
+
+/// One shape and routing of [`latent_step_projections_skip_unused_groups`].
+fn masked_case(gpu: &Gpu, hidden: usize, width: usize, ids: &[i32], labels: &[u32], seed: u64) {
+    let n_tok = ids.len() / USED;
+    let span = GROUPS * width;
+    let used = |t: usize| used_groups(ids, labels, t);
+    let (masks, want_masks) = group_masks(gpu, ids, labels);
+
+    // Down: `hidden` in, `span` out. A used group's rows are the plain
+    // entry's; an unused group's are left as they were.
+    let down_w = gpu.upload(&q8_rows(span, hidden, seed));
+    let x = gpu.upload(&f32_bytes(&signal(n_tok * hidden, 1501)));
+    let plain = gpu.upload(&f32_bytes(&vec![f32::NAN; n_tok * span]));
+    let masked = gpu.upload(&f32_bytes(&vec![f32::NAN; n_tok * span]));
+    step_projection(
+        gpu,
+        None,
+        (hidden, span, n_tok),
+        (&plain, &down_w, &x),
+        None,
+    );
+    step_projection(
+        gpu,
+        Some(Side::Down),
+        (hidden, span, n_tok),
+        (&masked, &down_w, &x),
+        Some((&masks, width)),
+    );
+    let (plain, masked) = (gpu.read_f32(&plain), gpu.read_f32(&masked));
+    let mut skipped = 0;
+    for t in 0..n_tok {
+        for g in 0..GROUPS {
+            let at = (t * GROUPS + g) * width;
+            if want_masks[t / STEP_COLS] >> g & 1 == 1 {
+                same_bits(
+                    "latent down, a used group",
+                    &masked[at..at + width],
+                    &plain[at..at + width],
+                );
+            } else {
+                assert!(
+                    masked[at..at + width].iter().all(|v| v.is_nan()),
+                    "latent down wrote group {g} of token {t}, which no row of its block uses"
+                );
+                skipped += 1;
+            }
+        }
+    }
+    assert!(
+        skipped > 0,
+        "the routing leaves no group unused; the case tests nothing"
+    );
+
+    // Up: `span` in, `hidden` out, over sums that are zero in every group the
+    // token does not use, as the combine leaves them. Every output is the
+    // plain entry's.
+    let mut sums = signal(n_tok * span, 1502);
+    for t in 0..n_tok {
+        for g in 0..GROUPS {
+            if used(t) >> g & 1 == 0 {
+                sums[(t * GROUPS + g) * width..][..width].fill(0.0);
+            }
+        }
+    }
+    let up_w = gpu.upload(&q8_rows(hidden, span, seed + 1));
+    let sums = gpu.upload(&f32_bytes(&sums));
+    let plain = gpu.upload(&f32_bytes(&vec![f32::NAN; n_tok * hidden]));
+    let masked = gpu.upload(&f32_bytes(&vec![f32::NAN; n_tok * hidden]));
+    step_projection(
+        gpu,
+        None,
+        (span, hidden, n_tok),
+        (&plain, &up_w, &sums),
+        None,
+    );
+    step_projection(
+        gpu,
+        Some(Side::Up),
+        (span, hidden, n_tok),
+        (&masked, &up_w, &sums),
+        Some((&masks, width)),
+    );
+    same_bits("latent up", &gpu.read_f32(&masked), &gpu.read_f32(&plain));
+}
+
+/// A step pass's two latent projections against the plain step entries on the
+/// same inputs, bit for bit, with the group masks checked against a host
+/// fold: the down entry writes exactly the groups a block of rows uses, and
+/// the up entry's skipped runs change no output.
+///
+/// Over one row (one output row a unit), five and eleven (four a unit, the
+/// second with two blocks of rows whose masks differ), at a contraction a
+/// block of lanes sums and at one a warp does.
+///
+/// # Panics
+///
+/// When a mask, a used group's row or an up output differs, an unused group
+/// is written, or the device refuses a launch or a read.
+pub fn latent_step_projections_skip_unused_groups(gpu: &Gpu) {
+    // Experts land in groups 0 to 4 only, so 5 to 7 are never used.
+    let edge: Vec<u32> = (0..EXPERTS as u32).map(|e| e % 5).collect();
+    // Three groups in all.
+    let few: Vec<u32> = (0..EXPERTS as u32)
+        .map(|e| [1, 4, 6][e as usize % 3])
+        .collect();
+    for (hidden, width) in [(2560, 128), (256, 32)] {
+        for (n_tok, seed) in [(1, 201), (5, 202), (11, 203)] {
+            masked_case(gpu, hidden, width, &routing(n_tok, seed), &edge, seed);
+            masked_case(gpu, hidden, width, &routing(n_tok, seed + 50), &few, seed);
+        }
+    }
+}

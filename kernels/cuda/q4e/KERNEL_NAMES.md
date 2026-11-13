@@ -327,6 +327,13 @@ entry takes its step twin's arguments; a step entry takes them and `lpr` last.
 - `q4e_g_experts_gemm_down_iq2_s_kernel`
 - `q4e_g_experts_gemm_down_iq4_xs_kernel`
 - `q4e_g_experts_gemm_down_q2_0_kernel`
+- `q4e_g_step_latent_down_q8_0_kernel`, `q4e_g_step_latent_down4_q8_0_kernel` -
+  a latent stage's down projection on a step pass: the `q8_0` step entries'
+  sums, with the output rows of a group no row of the block routes to left
+  unwritten (`masks, width` after the plain arguments).
+- `q4e_g_step_latent_up_q8_0_kernel`, `q4e_g_step_latent_up4_q8_0_kernel` - its
+  up projection: the same sums with the runs of such a group, which multiply
+  zeros, left out.
 - `q4e_g_step_matvec_f32_kernel`
 - `q4e_g_step_matvec_q8_0_kernel`
 - `q4e_g_step_matvec_q6_k_kernel`
@@ -368,6 +375,8 @@ entry takes its step twin's arguments; a step entry takes them and `lpr` last.
 - `q4e_moe_combine_kernel`
 - `q4e_latent_combine_kernel` - a token's routed outputs summed per label
   group, slots in ascending order.
+- `q4e_latent_groups_kernel` - which label groups each block of eight step
+  rows routes to, one mask word a block, for the latent step projections.
 - `q4e_shared_add_kernel`
 - `q4e_moe_rows_per_slot_kernel`
 - `q4e_moe_sort_count_kernel`
@@ -709,6 +718,7 @@ refuses the call outright when `n_embd > 256 * Q4E_HC_FUSE_MAX`.
 | `q4e_swiglu_kernel` | `ceil(n / 256)` | `256` | `0` |
 | `q4e_moe_combine_kernel` | `(ceil(n_embd / 256), n_tok, 1)` | `256` | `0` |
 | `q4e_latent_combine_kernel` | `(ceil(n_groups * width / 256), n_tok, 1)` | `256` | `0` |
+| `q4e_latent_groups_kernel` | `(ceil(n_tok / 8), 1, 1)` | `32` | `0` |
 | `q4e_shared_add_kernel` | `(ceil(n_embd / 256), n_tok, 1)` | `256` | `0` |
 | `q4e_moe_rows_per_slot_kernel` | `ceil(n_tok * n_used * in_dim / 256)` | `256` | `0` |
 | `q4e_moe_sort_count_kernel` | `ceil(n_rows / 256)` | `256` | `0` |
@@ -976,6 +986,8 @@ the table; the block-quantized entry does not, so its caller owns the range.
 | `q4e_g_experts_gemm_down_*` | `(ceil(out_dim / Q4E_GG_DOWN_BM), min(n_tok * n_used, n_expert))` | `2 * Q4E_GG_DOWN_BM` | `Q4E_GG_SMEM_H(Q4E_GG_DOWN_BM, Q4E_GG_EXPERT_BN)` |
 | `q4e_g_step_matvec_*` | `(ceil(out_dim / (Q4E_GS_WARPS * 32 / lpr)), ceil(n_tok / Q4E_GS_COLS))` | `32 * Q4E_GS_WARPS` | `0` |
 | `q4e_g_step_matvec4_*` | `(ceil(out_dim / (4 * Q4E_GS_WARPS * 32 / lpr)), ceil(n_tok / Q4E_GS_COLS))` | `32 * Q4E_GS_WARPS` | `0` |
+| `q4e_g_step_latent_{down,up}_q8_0_kernel` | as `q4e_g_step_matvec_*` | `32 * Q4E_GS_WARPS` | `0` |
+| `q4e_g_step_latent_{down,up}4_q8_0_kernel` | as `q4e_g_step_matvec4_*` | `32 * Q4E_GS_WARPS` | `0` |
 | `q4e_g_step_gate_up_*` | `(ceil(out_dim / (Q4E_GS_WARPS * 16 / lpr)), min(n_tok * n_used, n_expert))` | `32 * Q4E_GS_WARPS` | `0` |
 | `q4e_g_step_down_*` | `(ceil(out_dim / (Q4E_GS_WARPS * 32 / lpr)), min(n_tok * n_used, n_expert))` | `32 * Q4E_GS_WARPS` | `0` |
 

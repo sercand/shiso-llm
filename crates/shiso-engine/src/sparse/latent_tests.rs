@@ -520,3 +520,68 @@ fn scratch_latent_sized() {
     assert_eq!(Buf::Latent.bytes(&sparse_shape(), 512, 8, 0), 0);
     assert_eq!(Buf::Latent.tag(), shiso_core::ledger::MemTag::MoeScratch);
 }
+
+/// A step or verify pass writes the groups its rows use once, before the
+/// down projection, and both projections take the entries that leave the
+/// rest out; a prompt pass, whose projections are the tensor-core tiles,
+/// launches none of the three.
+#[test]
+fn a_step_pass_skips_unused_groups_and_a_prompt_pass_does_not() {
+    let shape = sparse_shape();
+    let desc = latent_desc();
+    let layer = LayerRef::target(0);
+    for (n_tok, down, up) in [
+        (
+            1,
+            "q4e_g_step_latent_down_q8_0_kernel",
+            "q4e_g_step_latent_up_q8_0_kernel",
+        ),
+        (
+            5,
+            "q4e_g_step_latent_down4_q8_0_kernel",
+            "q4e_g_step_latent_up4_q8_0_kernel",
+        ),
+    ] {
+        let plan = block(&shape, &desc, layer, n_tok, step()).expect("plans");
+        plan.validate().expect("every launch has work");
+        let groups = at(&plan, "q4e_latent_groups_kernel");
+        let (down, up) = (at(&plan, down), at(&plan, up));
+        let route = at(
+            &plan,
+            names(&plan)
+                .iter()
+                .find(|n| n.starts_with("q4e_moe_route"))
+                .expect("a route launch"),
+        );
+        assert!(
+            route < groups && groups < down && down < up,
+            "{:?}",
+            names(&plan)
+        );
+        for at in [down, up] {
+            let Step::Kernel { args, launch, .. } = &plan.steps()[at] else {
+                panic!("a projection is a kernel step");
+            };
+            let ops = args.operands().expect("plain operands");
+            // `out, w, x, in_dim, out_dim, rows, lanes, masks, width`
+            assert_eq!(ops.len(), 9);
+            assert_eq!(ops[7], Operand::Scratch(Buf::LatentMask));
+            assert_eq!(ops[8], Operand::U32(WIDTH));
+            // The plain step launch at this pass width.
+            assert_eq!(launch.grid.y, n_tok.div_ceil(ggml::STEP_COLS));
+        }
+    }
+    let plan = block(&shape, &desc, layer, 512, prompt()).expect("plans");
+    for name in names(&plan) {
+        assert!(
+            name != "q4e_latent_groups_kernel" && !name.starts_with("q4e_g_step_latent"),
+            "a prompt pass launched {name}"
+        );
+    }
+    // More groups than a mask word has bits keeps the plain projections.
+    let mut wide = latent_desc();
+    if let Some(latent) = wide.latent.as_mut() {
+        latent.groups = LATENT_MASK_GROUPS + 1;
+    }
+    assert!(!masks(&wide.latent.expect("latent"), 1, step()));
+}
