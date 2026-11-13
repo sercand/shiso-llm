@@ -478,6 +478,40 @@ extern "C" __global__ void q4e_moe_combine_kernel(
     }
 }
 
+/* The latent experts' combine: each token's routed outputs summed per group
+ * rather than per token, in the latent space the experts work in. Output
+ * `(t, g, i)` is the sum, over the token's slots `s` ascending whose expert
+ * `ids[t * n_used + s]` has label `g`, of `weights[col] * down[col * width + i]`
+ * with `col = t * n_used + s`, each term one fused multiply-add into the running
+ * sum (spelled `fmaf`, so a host restatement can match every bit). A group no
+ * slot lands in is zero. One thread
+ * owns one output element and walks the slots in order, so the sum has one
+ * fixed order whatever the launch looks like.
+ *
+ * Buffers: out (f32, `[n_tok * n_groups, width]`), down (f32, `[n_tok * n_used,
+ * width]`), weights (f32, one a column), ids (i32, one a column, the router's
+ * expert ids), labels (u32, one a expert), width, n_groups, n_used. Grid
+ * `(ceil(width / 256), n_tok * n_groups, 1)`, 256 threads. */
+extern "C" __global__ void q4e_latent_combine_kernel(
+        float *out, const float *down, const float *weights, const int *ids,
+        const uint32_t *labels, uint32_t width, uint32_t n_groups, uint32_t n_used) {
+    const uint32_t row = blockIdx.y; /* t * n_groups + g */
+    const uint32_t t = row / n_groups;
+    const uint32_t g = row % n_groups;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < width;
+         i += gridDim.x * blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t s = 0; s < n_used; s++) {
+            const uint64_t col = (uint64_t)t * n_used + s;
+            const int e = ids[col];
+            if (e >= 0 && labels[e] == g) {
+                acc = fmaf(weights[col], down[col * width + i], acc);
+            }
+        }
+        out[(uint64_t)row * width + i] = acc;
+    }
+}
+
 /* moe_out += shared_out * sigmoid(shared_logit) -- the shared expert carries a
  * single scalar gate per token, not a per-channel one. */
 extern "C" __global__ void q4e_shared_add_kernel(

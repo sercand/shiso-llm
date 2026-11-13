@@ -34,7 +34,7 @@ back to the kernel it belongs to.
 | Registry key | Unit | Plain entries | Template instantiations |
 |---|---|---|---|
 | `q4e_hc` | `hc.cu` | 4 | 6 |
-| `q4e_moe` | `moe.cu` | 9 | 4 |
+| `q4e_moe` | `moe.cu` | 10 | 4 |
 | `q4e_gdn` | `gdn.cu` | 8 | 0 |
 | `q4e_gdn_tc` | `gdn_tc.cu` | 4 | 0 |
 | `q4e_ple` | `ple.cu` | 5 | 0 |
@@ -44,7 +44,7 @@ back to the kernel it belongs to.
 | `q4e_idx` | `idx.cu` | 8 | 0 |
 | `q4e_misc` | `misc.cu` | 3 | 0 |
 | `q4e_embed` | `embed.cu` | 4 | 0 |
-| `q4e_modelopt` | `modelopt.cu` | 9 | 0 |
+| `q4e_modelopt` | `modelopt.cu` | 12 | 0 |
 | `q4e_exact` | `exact.cu` | 2 | 0 |
 | `q4e_kv8` | `kv8.cu` | 8 | 0 |
 | `q4e_mxfp8` | `mxfp8.cu` | 9 | 0 |
@@ -53,7 +53,7 @@ back to the kernel it belongs to.
 | `q4e_gdn_fused` | `gdn_fused.cu` | 2 | 0 |
 | `q4e_ffn` | `ffn.cu` | 3 | 0 |
 | `q4e_ggml` | `ggml.cu` | 84 | 0 |
-| **total** | 20 units | **192** | **105** |
+| **total** | 20 units | **196** | **105** |
 
 ## Plain entries, by module
 
@@ -77,7 +77,14 @@ n-gram decode, for the `modelopt` export.
 - `q4e_nvfp4_experts_gate_up_act_held_kernel` - the same activated rows, a
   2560-wide row held in registers across an expert's columns (a verify).
 - `q4e_nvfp4_experts_down_kernel`
+- `q4e_nvfp4_latent_gate_up_act_kernel` - the activated rows of a latent
+  expert, which reads row `(col / n_used) * n_groups + labels[expert]` of the
+  token's `n_groups` latent rows.
+- `q4e_nvfp4_latent_gate_up_act_held_kernel` - the same, the row held in
+  registers (a verify).
 - `q4e_nvfp4_experts_gemm_gate_up_kernel`
+- `q4e_nvfp4_latent_gemm_gate_up_kernel` - the prompt gate and up of a latent
+  expert, reading its label's row.
 - `q4e_nvfp4_experts_gemm_down_kernel`
 - `q4e_fp8_experts_gate_up_kernel`
 - `q4e_fp8_experts_down_kernel`
@@ -359,6 +366,8 @@ entry takes its step twin's arguments; a step entry takes them and `lpr` last.
   eight tokens, at a shorter serial chain.
 - `q4e_swiglu_kernel`
 - `q4e_moe_combine_kernel`
+- `q4e_latent_combine_kernel` - a token's routed outputs summed per label
+  group, slots in ascending order.
 - `q4e_shared_add_kernel`
 - `q4e_moe_rows_per_slot_kernel`
 - `q4e_moe_sort_count_kernel`
@@ -699,6 +708,7 @@ refuses the call outright when `n_embd > 256 * Q4E_HC_FUSE_MAX`.
 | `q4e_moe_route_sort_tiny_kernel` | `1` | `256` | `0` |
 | `q4e_swiglu_kernel` | `ceil(n / 256)` | `256` | `0` |
 | `q4e_moe_combine_kernel` | `(ceil(n_embd / 256), n_tok, 1)` | `256` | `0` |
+| `q4e_latent_combine_kernel` | `(ceil(width / 256), n_tok * n_groups, 1)` | `256` | `0` |
 | `q4e_shared_add_kernel` | `(ceil(n_embd / 256), n_tok, 1)` | `256` | `0` |
 | `q4e_moe_rows_per_slot_kernel` | `ceil(n_tok * n_used * in_dim / 256)` | `256` | `0` |
 | `q4e_moe_sort_count_kernel` | `ceil(n_rows / 256)` | `256` | `0` |
