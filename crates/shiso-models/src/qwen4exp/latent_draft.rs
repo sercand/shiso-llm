@@ -654,6 +654,26 @@ pub(super) fn open(backend: &Arc<dyn Backend>, dir: &Path, rank: u32) -> CoreRes
     })
 }
 
+/// Bytes the head holds on the device once loaded: its routed experts and its
+/// dense file, both uploaded whole. The expert pool of a model that sizes
+/// itself to the device has to leave this much room, or the pool and the head
+/// together overrun the machine.
+///
+/// # Errors
+///
+/// [`CoreError::ConfigMissing`] for a missing file, [`CoreError::Io`] for any
+/// other failure to stat one.
+pub(super) fn resident_bytes(dir: &Path) -> CoreResult<u64> {
+    let size = |name: &'static str| match std::fs::metadata(dir.join(name)) {
+        Ok(meta) => Ok(meta.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(CoreError::ConfigMissing {
+            key: format!("mtp/{name}"),
+        }),
+        Err(e) => Err(CoreError::Io(e)),
+    };
+    Ok(size(EXPERTS_FILE)?.saturating_add(size(DENSE)?))
+}
+
 #[cfg(test)]
 #[path = "latent_draft_tests.rs"]
 mod tests;

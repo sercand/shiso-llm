@@ -552,9 +552,17 @@ impl Qwen4ExpModel {
             // The projections are uploaded, not wrapped file pages, so they
             // count once; the skeleton's wrapped pages count twice, as the
             // other streamed exports' dense weights do.
+            // The draft head's experts and dense file are uploaded before the
+            // stack is built, out of the same device memory the pool fills.
+            let head = if load.draft {
+                latent_draft::resident_bytes(&dir.join("mtp"))?
+            } else {
+                0
+            };
             let rest = stored
                 .saturating_mul(2)
-                .saturating_add(latent_load::projection_resident_bytes(&pack));
+                .saturating_add(latent_load::projection_resident_bytes(&pack))
+                .saturating_add(head);
             let room = total.saturating_sub(rest.saturating_add(load.reserve));
             let fit = u32::try_from(room / slot_bytes).unwrap_or(u32::MAX);
             if fit < EXPERTS {

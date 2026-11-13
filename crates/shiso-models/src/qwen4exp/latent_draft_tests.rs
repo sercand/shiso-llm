@@ -239,3 +239,87 @@ fn indexer_proj_splits_512_128() {
     assert!(split_rows(&bytes[1..], 640, 512).is_none());
     assert!(split_rows(&bytes, 640, 641).is_none());
 }
+
+/// The file-level refusals of `open`, on temp folders of tiny files. Every
+/// case stops before a byte is uploaded, so the CPU device is only the
+/// argument `open` asks for.
+mod open_refusals {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use shiso_core::backend::Backend;
+    use shiso_core::error::CoreError;
+    use shiso_cpu::{CpuBackend, CpuOptions};
+
+    use super::super::{Dense, DenseIndex, DenseKind, EXPERTS_FILE, open, resident_bytes};
+
+    fn cpu() -> Arc<dyn Backend> {
+        CpuBackend::new(CpuOptions::default()).expect("cpu device")
+    }
+
+    /// A one-tensor index and the bytes it describes.
+    const INDEX: &str = "t.weight bf16 2 4 0 16\n";
+
+    fn write(dir: &Path, name: &str, bytes: &[u8]) {
+        std::fs::write(dir.join(name), bytes).expect("write fixture");
+    }
+
+    fn message(result: Result<impl Sized, CoreError>) -> String {
+        match result {
+            Ok(_) => panic!("wanted a refusal"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn missing_files_are_named() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert!(message(open(&cpu(), dir.path(), 0)).contains("dense.txt"));
+        write(dir.path(), "dense.txt", INDEX.as_bytes());
+        assert!(message(open(&cpu(), dir.path(), 0)).contains("dense.bin"));
+        write(dir.path(), "dense.bin", &[0; 16]);
+        assert!(message(open(&cpu(), dir.path(), 0)).contains(EXPERTS_FILE));
+        assert!(message(resident_bytes(dir.path())).contains(EXPERTS_FILE));
+    }
+
+    #[test]
+    fn short_dense_file_is_named() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write(dir.path(), "dense.txt", INDEX.as_bytes());
+        write(dir.path(), "dense.bin", &[0; 12]);
+        let text = message(open(&cpu(), dir.path(), 0));
+        assert!(text.contains("dense.bin"), "{text}");
+        assert!(text.contains("12 bytes"), "{text}");
+    }
+
+    #[test]
+    fn experts_of_the_wrong_length_are_named() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write(dir.path(), "dense.txt", INDEX.as_bytes());
+        write(dir.path(), "dense.bin", &[0; 16]);
+        write(dir.path(), EXPERTS_FILE, &[0; 100]);
+        let text = message(open(&cpu(), dir.path(), 0));
+        assert!(text.contains(EXPERTS_FILE), "{text}");
+        assert!(text.contains("100 bytes"), "{text}");
+        assert_eq!(resident_bytes(dir.path()).expect("both files exist"), 116);
+    }
+
+    #[test]
+    fn tensor_of_the_wrong_kind_or_shape_names_the_index() {
+        let dense = Dense {
+            index: DenseIndex::parse(INDEX).expect("index"),
+            bytes: vec![0; 16],
+        };
+        assert!(dense.tensor("t.weight", DenseKind::Bf16, 2, 4).is_ok());
+        for (kind, rows, cols) in [
+            (DenseKind::F32, 2, 4),
+            (DenseKind::Bf16, 4, 2),
+            (DenseKind::Bf16, 2, 8),
+        ] {
+            let text = message(dense.tensor("t.weight", kind, rows, cols));
+            assert!(text.contains("dense.txt"), "{text}");
+        }
+        let text = message(dense.tensor("absent.weight", DenseKind::Bf16, 2, 4));
+        assert!(text.contains("absent.weight"), "{text}");
+    }
+}
