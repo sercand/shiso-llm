@@ -254,11 +254,40 @@ fn latent_launch_grids_use_the_latent_width() {
         launch("q4e_latent_combine_kernel"),
         kernels::latent_combine(WIDTH, GROUPS, 1)
     );
-    // 1792 elements a group, 256 threads a block, one grid row a (token, group).
+    // 8 * 1792 elements a token, 256 threads a block, one grid row a token.
     assert_eq!(
         kernels::latent_combine(WIDTH, GROUPS, 3).grid,
-        shiso_core::Extent3::new(7, 24, 1)
+        shiso_core::Extent3::new(56, 3, 1)
     );
+}
+
+#[test]
+fn latent_plans_full_prompt_chunk() {
+    let shape = sparse_shape();
+    let plan = block(&shape, &latent_desc(), LayerRef::target(0), 8_192, prompt())
+        .expect("a default prompt chunk plans");
+    match plan.steps()[at(&plan, "q4e_latent_combine_kernel")] {
+        Step::Kernel { launch, .. } => {
+            assert_eq!(launch.grid, shiso_core::Extent3::new(56, 8_192, 1));
+        }
+        other => panic!("a kernel, not {other:?}"),
+    }
+    block(
+        &shape,
+        &latent_desc(),
+        LayerRef::target(0),
+        65_535,
+        prompt(),
+    )
+    .expect("the widest");
+    let what = refused(block(
+        &shape,
+        &latent_desc(),
+        LayerRef::target(0),
+        65_536,
+        prompt(),
+    ));
+    assert!(what.contains("grid has rows"), "{what}");
 }
 
 #[test]
@@ -396,6 +425,13 @@ fn plain_bank_plan_unchanged() {
     }
 }
 
+// How these were produced: `digest` above (FNV-1a over the `Debug` text
+// of `plan.steps()`) of `moe::block` for `plain_desc()` at the devices named in
+// `plain_bank_plan_unchanged`, run at commit f4a9e2ed (before the latent
+// stage) in a clean worktree with an equivalent throwaway test that printed
+// the three values. To regenerate after an intended change to a plain bank's
+// plan, print `digest(&plan)` in that test, check the plan diff is intended,
+// and paste the new values.
 const PLAIN_STEP_1: u64 = 16_962_141_729_033_441_160;
 const PLAIN_STEP_4: u64 = 4_646_864_847_006_760_388;
 const PLAIN_PROMPT_512: u64 = 5_869_114_533_540_638_767;

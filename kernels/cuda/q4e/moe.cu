@@ -485,21 +485,25 @@ extern "C" __global__ void q4e_moe_combine_kernel(
  * with `col = t * n_used + s`, each term one fused multiply-add into the running
  * sum (spelled `fmaf`, so a host restatement can match every bit). A group no
  * slot lands in is zero. One thread
- * owns one output element and walks the slots in order, so the sum has one
+ * owns one output element (`e = g * width + i` within the token's row block of
+ * `n_groups * width` elements) and walks the slots in order, so the sum has one
  * fixed order whatever the launch looks like.
  *
  * Buffers: out (f32, `[n_tok * n_groups, width]`), down (f32, `[n_tok * n_used,
  * width]`), weights (f32, one a column), ids (i32, one a column, the router's
  * expert ids), labels (u32, one a expert), width, n_groups, n_used. Grid
- * `(ceil(width / 256), n_tok * n_groups, 1)`, 256 threads. */
+ * `(ceil(n_groups * width / 256), n_tok, 1)`, 256 threads: the token alone is
+ * on the y axis, which a grid caps at 65535 and a prompt chunk of 8192 rows
+ * times eight groups would pass. */
 extern "C" __global__ void q4e_latent_combine_kernel(
         float *out, const float *down, const float *weights, const int *ids,
         const uint32_t *labels, uint32_t width, uint32_t n_groups, uint32_t n_used) {
-    const uint32_t row = blockIdx.y; /* t * n_groups + g */
-    const uint32_t t = row / n_groups;
-    const uint32_t g = row % n_groups;
-    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < width;
-         i += gridDim.x * blockDim.x) {
+    const uint32_t t = blockIdx.y;
+    const uint32_t span = n_groups * width;
+    for (uint32_t e_out = blockIdx.x * blockDim.x + threadIdx.x; e_out < span;
+         e_out += gridDim.x * blockDim.x) {
+        const uint32_t g = e_out / width;
+        const uint32_t i = e_out % width;
         float acc = 0.0f;
         for (uint32_t s = 0; s < n_used; s++) {
             const uint64_t col = (uint64_t)t * n_used + s;
@@ -508,7 +512,7 @@ extern "C" __global__ void q4e_latent_combine_kernel(
                 acc = fmaf(weights[col], down[col * width + i], acc);
             }
         }
-        out[(uint64_t)row * width + i] = acc;
+        out[(uint64_t)t * span + e_out] = acc;
     }
 }
 

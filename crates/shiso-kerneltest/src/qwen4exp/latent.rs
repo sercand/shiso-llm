@@ -431,7 +431,7 @@ fn combine_case(gpu: &Gpu, ids: &[i32], labels: &[u32], width: usize, grid_x: u3
         gpu,
         KernelRef::new(MOE_MODULE, "q4e_latent_combine_kernel"),
         &LaunchArgs::new(
-            Extent3::new(grid_x, (n_tok * GROUPS) as u32, 1),
+            Extent3::new(grid_x, n_tok as u32, 1),
             Extent3::linear(256),
             &args,
         ),
@@ -442,8 +442,8 @@ fn combine_case(gpu: &Gpu, ids: &[i32], labels: &[u32], width: usize, grid_x: u3
 
 /// The latent combine over a routing built to hit its edges - a token with
 /// three experts in one group, groups no expert is in - and over a random one,
-/// each at a full-width grid and at a grid narrower than the width, so the
-/// stride over the width is run.
+/// each at a full grid over the token's `GROUPS * width` elements and at a grid
+/// narrower than that, so the stride is run.
 ///
 /// # Panics
 ///
@@ -455,7 +455,7 @@ pub fn latent_combine_matches_host(gpu: &Gpu) {
     let edge_labels: Vec<u32> = (0..EXPERTS as u32).map(|e| e % 5).collect();
     let mut ids = vec![0, 5, 10, 1, 2, 3, 4, 6, 7, 8];
     ids.extend(routing(2, 77));
-    for grid_x in [width.div_ceil(256) as u32, 2] {
+    for grid_x in [(GROUPS * width).div_ceil(256) as u32, 2] {
         combine_case(gpu, &ids, &edge_labels, width, grid_x);
         let labels = random_labels(GROUPS, 91);
         combine_case(gpu, &routing(5, 93), &labels, width, grid_x);

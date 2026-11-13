@@ -40,6 +40,10 @@ use crate::sparse::scratch::Buf;
 use crate::sparse::shape::SparseShape;
 use crate::sparse::weights::{ExpertDesc, LatentDesc, WeightPart};
 
+/// Rows a pass may have: the combine puts the token on the grid's second axis,
+/// which the driver caps at 65535.
+pub const LATENT_MAX_ROWS: u32 = 65_535;
+
 /// A refusal by name.
 fn refuse(what: &'static str) -> CoreError {
     CoreError::Unsupported {
@@ -143,6 +147,11 @@ pub fn block(
     device: Device,
 ) -> CoreResult<Plan> {
     let latent = check(shape, desc, layer, device)?;
+    if n_tok > LATENT_MAX_ROWS {
+        return Err(refuse(
+            "a latent routed stage over more rows than a launch grid has rows for",
+        ));
+    }
     // Never the fused route launch: it ends in a combine that adds the shared
     // expert to the routed sum, and this stage's routed sum is the up
     // projection's, which has to land in `BlockOut` first.

@@ -984,6 +984,11 @@ pub struct LatentBank {
     /// One `u32` per expert: the group (below `groups`) whose latent row that
     /// expert reads. Indexed by expert id, not by the slot a streamed bank
     /// keeps it in, because the kernels index it with the active list's ids.
+    ///
+    /// Every value must be below `groups`. The engine can check this buffer's
+    /// length ([`LatentBank::check_labels`]) but cannot read a device buffer,
+    /// so the loader validates the values before uploading them; a larger one
+    /// would make the experts read past the token's latent rows.
     pub labels: DeviceBuffer,
     /// Groups of latent rows a token has.
     pub groups: u32,

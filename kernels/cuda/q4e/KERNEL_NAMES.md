@@ -708,7 +708,7 @@ refuses the call outright when `n_embd > 256 * Q4E_HC_FUSE_MAX`.
 | `q4e_moe_route_sort_tiny_kernel` | `1` | `256` | `0` |
 | `q4e_swiglu_kernel` | `ceil(n / 256)` | `256` | `0` |
 | `q4e_moe_combine_kernel` | `(ceil(n_embd / 256), n_tok, 1)` | `256` | `0` |
-| `q4e_latent_combine_kernel` | `(ceil(width / 256), n_tok * n_groups, 1)` | `256` | `0` |
+| `q4e_latent_combine_kernel` | `(ceil(n_groups * width / 256), n_tok, 1)` | `256` | `0` |
 | `q4e_shared_add_kernel` | `(ceil(n_embd / 256), n_tok, 1)` | `256` | `0` |
 | `q4e_moe_rows_per_slot_kernel` | `ceil(n_tok * n_used * in_dim / 256)` | `256` | `0` |
 | `q4e_moe_sort_count_kernel` | `ceil(n_rows / 256)` | `256` | `0` |

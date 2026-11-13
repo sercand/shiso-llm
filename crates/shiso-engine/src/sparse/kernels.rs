@@ -856,14 +856,18 @@ pub fn moe_combine(hidden: u32, n_tok: u32) -> Launch {
     )
 }
 
-/// The latent combine: a block of [`BLOCK_LINEAR`] threads a slice of a latent
-/// row, and one grid row for every (token, group).
+/// The latent combine: a block of [`BLOCK_LINEAR`] threads a slice of a
+/// token's `groups * width` outputs, and one grid row a token. The token is
+/// alone on the second axis, which a launch caps at 65535 rows.
 #[must_use]
 pub fn latent_combine(width: u32, groups: u32, n_tok: u32) -> Launch {
     Launch::new(
         Extent3::new(
-            blocks_for(u64::from(width), u64::from(BLOCK_LINEAR)),
-            n_tok.saturating_mul(groups),
+            blocks_for(
+                u64::from(width) * u64::from(groups),
+                u64::from(BLOCK_LINEAR),
+            ),
+            n_tok,
             1,
         ),
         BLOCK_LINEAR,
