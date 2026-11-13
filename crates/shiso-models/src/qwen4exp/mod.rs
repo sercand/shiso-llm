@@ -23,6 +23,7 @@ mod config;
 pub mod exl3;
 pub mod fp8;
 pub mod gguf_experts;
+pub mod latent;
 pub mod mlx;
 mod model;
 pub mod modelopt_mixed;
