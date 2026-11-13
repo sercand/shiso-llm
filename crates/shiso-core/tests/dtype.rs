@@ -8,7 +8,7 @@
 use shiso_core::DType;
 
 /// Every variant, so the round-trip test cannot silently skip one.
-const ALL: [DType; 32] = [
+const ALL: [DType; 33] = [
     DType::F32,
     DType::F16,
     DType::Q4_0,
@@ -30,6 +30,7 @@ const ALL: [DType; 32] = [
     DType::IQ2_S,
     DType::IQ4_XS,
     DType::Q2_0,
+    DType::I8,
     DType::I32,
     DType::IQ1_M,
     DType::BF16,
@@ -62,7 +63,7 @@ fn on_disk_ids_are_unique() {
 
 #[test]
 fn discriminants_are_the_documented_ids() {
-    let expected: [(DType, u32); 32] = [
+    let expected: [(DType, u32); 33] = [
         (DType::F32, 0),
         (DType::F16, 1),
         (DType::Q4_0, 2),
@@ -84,6 +85,7 @@ fn discriminants_are_the_documented_ids() {
         (DType::IQ2_S, 22),
         (DType::IQ4_XS, 23),
         (DType::Q2_0, 42),
+        (DType::I8, 24),
         (DType::I32, 26),
         (DType::IQ1_M, 29),
         (DType::BF16, 30),
@@ -154,7 +156,7 @@ fn mxfp4_is_one_byte_narrower_than_a_same_width_block_quant() {
 
 #[test]
 fn unquantized_formats_are_one_element_per_block() {
-    for dtype in [DType::F32, DType::F16, DType::BF16, DType::I32] {
+    for dtype in [DType::F32, DType::F16, DType::BF16, DType::I8, DType::I32] {
         assert_eq!(dtype.block_elems().get(), 1, "{dtype:?}");
         assert!(!dtype.is_quantized(), "{dtype:?}");
     }

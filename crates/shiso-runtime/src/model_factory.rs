@@ -1389,7 +1389,11 @@ fn load_qwen4exp_dir(
     opts: EngineOptions,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
-    if shiso_models::qwen4exp::exl3::is_exl3_dir(path) {
+    if shiso_models::qwen4exp::latent::is_latent_pack(path) {
+        // First: the pack is a skeleton container beside flat files, and none
+        // of the arms below would recognise it.
+        load_qwen4exp_latent(backend, path, config, args, opts, defaults)
+    } else if shiso_models::qwen4exp::exl3::is_exl3_dir(path) {
         load_qwen4exp_exl3(backend, path, config, args, opts, defaults)
     } else if shiso_models::qwen4exp::modelopt_mixed::is_export(path) {
         // Asked before both arms below, whose tests this directory may also
@@ -1403,6 +1407,76 @@ fn load_qwen4exp_dir(
     } else {
         load_qwen4exp_mlx(backend, path, config, args, opts, defaults)
     }
+}
+
+/// The sparse family's latent pack: a skeleton container, flat expert records
+/// and dense latent projections, the experts always streamed.
+///
+/// Refused here rather than inside the engine, where the refusal would name a
+/// plan instead of the flag: a second draft head beside the pack's own, and
+/// low-precision prompt activations, which the latent stage does not take.
+fn load_qwen4exp_latent(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    config: &HfConfig,
+    args: &ServeOptions,
+    opts: EngineOptions,
+    defaults: FamilyDefaults,
+) -> Result<Loaded, FactoryError> {
+    if args.draft_model.is_some() {
+        return Err(FactoryError::Load(CoreError::InvalidValue {
+            key: "--draft-model",
+            value: format!(
+                "{} carries its own draft head under mtp/; drop --draft-model",
+                path.display()
+            ),
+        }));
+    }
+    if args.prefill_activations == crate::options::PrefillActivations::Lowp {
+        return Err(FactoryError::Load(CoreError::InvalidValue {
+            key: "--prefill-activations",
+            value: "lowp: the latent pack's routed stage reads half-precision prompt activations \
+                    only"
+                .to_owned(),
+        }));
+    }
+    if args.spec_k > 0 {
+        return Err(FactoryError::Load(CoreError::InvalidValue {
+            key: "--spec-k",
+            value: format!(
+                "{}: the latent pack's draft head is not loadable yet",
+                args.spec_k
+            ),
+        }));
+    }
+    let slots = match args.expert_residency {
+        crate::options::ExpertResidencyChoice::Resident => {
+            Some(shiso_models::qwen4exp::EXPERTS * shiso_models::qwen4exp::N_LAYERS)
+        }
+        _ if args.expert_slots > 0 => Some(args.expert_slots),
+        _ => None,
+    };
+    let model = Qwen4ExpModel::load_latent(
+        backend,
+        path,
+        config,
+        sparse_options(args, opts, backend)?,
+        &shiso_models::qwen4exp::StreamedLoad {
+            slots,
+            reserve: args.expert_reserve_gb.saturating_mul(1 << 30),
+            draft: false,
+            counts: draft_vocab_of(args),
+        },
+    )
+    .map_err(FactoryError::Load)?;
+    Ok(Loaded {
+        model: Box::new(model),
+        open_tower: open_qwen35_tower,
+        open_audio: no_audio_tower,
+        placement: Qwen35Tower::PLACEMENT,
+        defaults,
+        speech: None,
+    })
 }
 
 /// NVIDIA's two `modelopt` exports of the sparse family, both with NVFP4

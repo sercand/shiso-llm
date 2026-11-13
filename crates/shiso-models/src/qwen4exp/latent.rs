@@ -55,7 +55,7 @@ const PROJECTIONS_Q8: &str = "latent_dense_q8.bin";
 /// The same projections at four bits, which this reader does not take.
 const PROJECTIONS_Q4: &str = "latent_dense_q4.bin";
 /// The pack's non-expert tensors.
-const SKELETON: &str = "model-skeleton.gguf";
+pub(crate) const SKELETON: &str = "model-skeleton.gguf";
 
 /// The index's type code for NVFP4 blocks in the record.
 const NVFP4_TYPE: u32 = 40;
