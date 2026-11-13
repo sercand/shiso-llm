@@ -24,6 +24,7 @@ pub mod exl3;
 pub mod fp8;
 pub mod gguf_experts;
 pub mod latent;
+mod latent_draft;
 mod latent_load;
 pub mod mlx;
 mod model;

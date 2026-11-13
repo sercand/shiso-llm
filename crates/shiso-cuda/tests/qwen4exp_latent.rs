@@ -16,6 +16,10 @@
 //!    the constants below);
 //! 3. the same 48 greedy tokens from a pool of 2048 streamed slots.
 //!
+//! A second case, `latent_pack_speculates`, loads the pack's own draft head
+//! from its `mtp/` folder and holds speculative greedy decoding (depth 4) to
+//! the plain run's tokens, for two prompts, token for token.
+//!
 //! ```text
 //! SHISO_CUDA_COMPILE=1 \
 //!   SHISO_TEST_MODEL_QWEN4EXP_LATENT=/path/to/servable/directory \
@@ -33,6 +37,7 @@ use shiso_core::ids::{SessionId, TokenId};
 use shiso_core::model::{DecodeStep, Model};
 use shiso_cuda::{CudaBackend, CudaOptions};
 use shiso_engine::sparse::capture;
+use shiso_engine::sparse::mtp::SpecDepth;
 use shiso_engine::sparse::stack::SparseOptions;
 use shiso_engine::{EngineOptions, argmax};
 use shiso_models::qwen4exp::{EXPERTS, N_LAYERS, Qwen4ExpModel, StreamedLoad};
@@ -119,6 +124,17 @@ fn directory() -> Option<PathBuf> {
 
 /// Loads the pack with `slots` expert slots and no draft head.
 fn load(backend: &Arc<dyn Backend>, dir: &std::path::Path, slots: u32) -> Qwen4ExpModel {
+    load_speculating(backend, dir, slots, 0)
+}
+
+/// Loads the pack with `slots` expert slots and, for a `depth` above zero,
+/// its draft head at that speculation depth.
+fn load_speculating(
+    backend: &Arc<dyn Backend>,
+    dir: &std::path::Path,
+    slots: u32,
+    depth: u32,
+) -> Qwen4ExpModel {
     let document = HfConfig::from_file(&dir.join("config.json")).expect("the config document");
     let mut engine = EngineOptions::default();
     engine.ctx = CTX;
@@ -127,6 +143,7 @@ fn load(backend: &Arc<dyn Backend>, dir: &std::path::Path, slots: u32) -> Qwen4E
         engine,
         co_resident_blocks: capture::co_resident_blocks(backend.as_ref(), entries),
         entries,
+        spec: SpecDepth::new(depth),
         prefill_rows: SparseOptions::prefill_rows_for(PREFILL),
         ..SparseOptions::default()
     };
@@ -139,7 +156,7 @@ fn load(backend: &Arc<dyn Backend>, dir: &std::path::Path, slots: u32) -> Qwen4E
         &StreamedLoad {
             slots: Some(slots),
             reserve: 6 << 30,
-            draft: false,
+            draft: depth > 0,
             counts: None,
         },
     )
@@ -426,5 +443,178 @@ fn the_gguf_arm_pass_vs_steps_reference() {
     let long = long_prompt(&tokenizer);
     let found = pass_vs_steps(&backend, &mut model, &long, "gguf arm");
     assert!(found.top1, "the same top-1 token: {found:?}");
+    model.teardown().expect("the model tears down");
+}
+
+/// Tokens each speculation prompt may produce.
+const SPEC_TOKENS: usize = 256;
+
+/// The speculation depth the server's flag `--spec-k 4` asks for.
+const SPEC_DEPTH: u32 = 4;
+
+/// A chat prompt with thinking off, rendered as the template renders it.
+fn user_turn(tokenizer: &tokenizers::Tokenizer, question: &str) -> Vec<TokenId> {
+    let prompt = format!(
+        "<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    );
+    let encoded = tokenizer.encode(prompt, false).expect("the prompt encodes");
+    encoded
+        .get_ids()
+        .iter()
+        .map(|id| TokenId::new(*id))
+        .collect()
+}
+
+/// The ids up to and including the first end-of-turn token, and no more than
+/// [`SPEC_TOKENS`] of them.
+fn turn_of(ids: &[u32]) -> Vec<u32> {
+    let end = ids
+        .iter()
+        .position(|id| END_OF_TURN.contains(id))
+        .map_or(ids.len(), |at| at + 1);
+    ids[..end.min(SPEC_TOKENS)].to_vec()
+}
+
+/// Greedy plain decode of up to [`SPEC_TOKENS`] tokens or the end of the turn,
+/// and its decode rate.
+fn plain_turn(
+    backend: &Arc<dyn Backend>,
+    model: &mut Qwen4ExpModel,
+    prompt: &[TokenId],
+) -> (Vec<u32>, f64) {
+    let session = model.open_session().expect("a session opens");
+    let first = {
+        let rows = model
+            .prefill_last(session, prompt)
+            .expect("the prompt runs");
+        argmax(&row_of(backend, rows.row(0).expect("one row")))
+    };
+    let mut ids = vec![first.get()];
+    let mut token = first;
+    let clock = Instant::now();
+    while ids.len() < SPEC_TOKENS && !END_OF_TURN.contains(&token.get()) {
+        let rows = model
+            .decode_batch(&[DecodeStep { session, token }])
+            .expect("a step runs");
+        token = argmax(&row_of(backend, rows.row(0).expect("one row")));
+        ids.push(token.get());
+    }
+    let seconds = clock.elapsed().as_secs_f64();
+    model.close_session(session).expect("the session closes");
+    let steps = ids.len() - 1;
+    (ids, per_second(steps, seconds))
+}
+
+/// What a speculative run did: its tokens, its decode rate, and how many of
+/// the head's guesses the target kept.
+struct Speculative {
+    /// The run's tokens, the first from the prompt pass.
+    ids: Vec<u32>,
+    /// Tokens a second after the prompt pass.
+    rate: f64,
+    /// Guesses the target agreed with.
+    accepted: u32,
+    /// Guesses the head made.
+    drafted: u32,
+}
+
+/// Greedy speculative decode of the same turn.
+fn speculative_turn(
+    backend: &Arc<dyn Backend>,
+    model: &mut Qwen4ExpModel,
+    prompt: &[TokenId],
+) -> Speculative {
+    let eos = model.info().stop_tokens.primary();
+    let session = model.open_session().expect("a session opens");
+    let first = {
+        let rows = model
+            .prefill_last(session, prompt)
+            .expect("the prompt runs");
+        argmax(&row_of(backend, rows.row(0).expect("one row")))
+    };
+    let last = u32::try_from(prompt.len() - 1).expect("a position fits");
+    model
+        .stack_mut()
+        .stage_draft_row(session, last)
+        .expect("the prompt's last row stages");
+    let mut ids = vec![first.get()];
+    let (mut accepted, mut drafted) = (0, 0);
+    let clock = Instant::now();
+    while ids.len() < SPEC_TOKENS && !ids.iter().any(|id| END_OF_TURN.contains(id)) {
+        let token = TokenId::new(*ids.last().expect("one token at least"));
+        let step = model
+            .stack_mut()
+            .speculate(session, token, eos)
+            .expect("a speculative step runs");
+        accepted += step.accepted;
+        drafted += step.drafted;
+        ids.extend(step.produced.iter().map(|t| t.get()));
+    }
+    let seconds = clock.elapsed().as_secs_f64();
+    model.close_session(session).expect("the session closes");
+    let produced = ids.len() - 1;
+    Speculative {
+        ids,
+        rate: per_second(produced, seconds),
+        accepted,
+        drafted,
+    }
+}
+
+/// The pack's own draft head, loaded from `mtp/`: greedy speculation at depth
+/// [`SPEC_DEPTH`] emits exactly the plain greedy tokens, for an English
+/// question and for a request for code, thinking off, and the head's
+/// acceptance rate is reported. Below about 30 % the head is mis-bound.
+#[test]
+#[ignore = "needs a CUDA device and the latent pack's servable directory"]
+fn latent_pack_speculates() {
+    let _alone = one_model();
+    let Some(dir) = directory() else {
+        skip("no servable directory named by SHISO_TEST_MODEL_QWEN4EXP_LATENT");
+        return;
+    };
+    let tokenizer =
+        tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("the vocabulary");
+    let backend: Arc<dyn Backend> =
+        CudaBackend::new(0, CudaOptions::default()).expect("a CUDA device");
+    let mut model = load_speculating(&backend, &dir, EXPERTS * N_LAYERS, SPEC_DEPTH);
+    let questions = [
+        (
+            "prose",
+            "Why is the sky blue during the day but red at sunset? Explain it to a curious child.",
+        ),
+        (
+            "code",
+            "Write a Python function that returns the n-th Fibonacci number iteratively.",
+        ),
+    ];
+    for (label, question) in questions {
+        let prompt = user_turn(&tokenizer, question);
+        let (plain, plain_rate) = plain_turn(&backend, &mut model, &prompt);
+        let spec = speculative_turn(&backend, &mut model, &prompt);
+        let (want, got) = (turn_of(&plain), turn_of(&spec.ids));
+        let rate = f64::from(spec.accepted) / f64::from(spec.drafted.max(1));
+        report(&format!(
+            "{label}: {} tokens; plain {plain_rate:.2} tok/s, speculative depth {SPEC_DEPTH} {:.2} tok/s; \
+             drafts accepted {}/{} = {:.1} %; equal: {}",
+            want.len(),
+            spec.rate,
+            spec.accepted,
+            spec.drafted,
+            rate * 100.0,
+            want == got
+        ));
+        report(&format!(
+            "{label}: {:?}",
+            tokenizer.decode(&want, false).expect("decodes")
+        ));
+        assert_eq!(got, want, "{label}: speculation changed the greedy text");
+        assert!(spec.drafted > 0, "{label}: the head drafted nothing");
+        assert!(
+            rate >= 0.30,
+            "{label}: acceptance {:.1} % is below 30 %, the head is mis-bound",
+            rate * 100.0
+        );
+    }
     model.teardown().expect("the model tears down");
 }

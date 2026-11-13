@@ -92,7 +92,7 @@ use crate::qwen4exp::binding::{
 };
 use crate::qwen4exp::config::Qwen4ExpConfig;
 use crate::qwen4exp::gguf_experts::{self, GgufExperts};
-use crate::qwen4exp::{exl3, latent, latent_load, mlx};
+use crate::qwen4exp::{exl3, latent, latent_draft, latent_load, mlx};
 
 /// The formats a bound projection may be stored as.
 ///
@@ -514,13 +514,13 @@ impl Qwen4ExpModel {
     ///
     /// The pool is sized as [`Qwen4ExpModel::load_nvfp4`]'s is, with the
     /// latent projections counted among the dense bytes that sit beside it.
-    /// The pack's draft head is not bound yet, so `load.draft` is refused
-    /// rather than ignored.
+    /// With `load.draft` the pack's own head is read from its `mtp/` folder
+    /// (`latent_draft::open`) and held resident, its experts as `Q2_0`.
     ///
     /// # Errors
     ///
-    /// [`CoreError::Unsupported`] for `load.draft` or a device whose working
-    /// set cannot hold one layer's experts beside the dense weights; whatever
+    /// [`CoreError::Unsupported`] for a device whose working set cannot hold
+    /// one layer's experts beside the dense weights; whatever
     /// [`latent::LatentPack::open`], the skeleton's binding and imports, the
     /// n-gram table's open and [`SparseStack::new`] report.
     pub fn load_latent(
@@ -531,12 +531,6 @@ impl Qwen4ExpModel {
         load: &StreamedLoad<'_>,
     ) -> CoreResult<Self> {
         use crate::qwen4exp::config::{EXPERTS, N_LAYERS};
-        if load.draft {
-            return Err(CoreError::Unsupported {
-                what: "the latent pack's draft head is not loadable yet",
-                backend: "qwen4exp",
-            });
-        }
         let pack = latent::LatentPack::open(dir)?;
         let skeleton = dir.join(latent::SKELETON);
         let config = Qwen4ExpConfig::from_hf(hf, &skeleton)?;
@@ -573,7 +567,7 @@ impl Qwen4ExpModel {
             fit.min(all)
         };
         tracing::info!(slots, all, "routed expert pool of the latent pack");
-        let weights = import(
+        let mut weights = import(
             backend,
             &file,
             &binding,
@@ -585,6 +579,13 @@ impl Qwen4ExpModel {
         )?;
         drop(binding);
         drop(file);
+        if load.draft {
+            let rank = config.shape().count(shiso_engine::shape::LayerKind::Attn);
+            weights.draft = Some(latent_draft::open(backend, &dir.join("mtp"), rank)?);
+            if let Some(list) = load.counts {
+                narrow_draft_head(backend, &mut weights, list, config.shape().vocab)?;
+            }
+        }
         // Opened and filled before the stack for the reason `load_streamed`
         // gives: the stack's KV pool is sized to the free memory it sees.
         let early = if slots >= all {

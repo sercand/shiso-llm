@@ -1439,7 +1439,7 @@ fn load_qwen4exp_latent(
         &shiso_models::qwen4exp::StreamedLoad {
             slots,
             reserve: args.expert_reserve_gb.saturating_mul(1 << 30),
-            draft: false,
+            draft: args.spec_k > 0,
             counts: draft_vocab_of(args),
         },
     )
@@ -1457,8 +1457,8 @@ fn load_qwen4exp_latent(
 /// The flags a latent pack cannot honour, refused by name before any weight
 /// moves: a second draft head beside the pack's own, prompt activations other
 /// than half precision (the latent stage reads those only, and the dense
-/// projections' low-precision path is not exercised against the pack), and a
-/// speculation depth, whose head is not loadable yet.
+/// projections' low-precision path is not exercised against the pack). A
+/// speculation depth is not refused: the pack's head loads from `mtp/`.
 ///
 /// # Errors
 ///
@@ -1480,15 +1480,6 @@ fn refuse_latent_flags(path: &Path, args: &ServeOptions) -> Result<(), CoreError
             value: format!(
                 "{:?}: the latent pack reads half-precision prompt activations only",
                 args.prefill_activations
-            ),
-        });
-    }
-    if args.spec_k > 0 {
-        return Err(CoreError::InvalidValue {
-            key: "--spec-k",
-            value: format!(
-                "{}: the latent pack's draft head is not loadable yet",
-                args.spec_k
             ),
         });
     }
@@ -1756,6 +1747,12 @@ mod tests {
         use crate::options::{PrefillActivations, ServeOptions};
         let path = std::path::Path::new("/pack");
         assert!(refuse_latent_flags(path, &ServeOptions::default()).is_ok());
+        // The pack carries its own head, so a speculation depth is honoured.
+        let spec = ServeOptions {
+            spec_k: 3,
+            ..ServeOptions::default()
+        };
+        assert!(refuse_latent_flags(path, &spec).is_ok());
         let base = ServeOptions::default;
         let draft = ServeOptions {
             draft_model: Some("/head.gguf".into()),
@@ -1769,15 +1766,10 @@ mod tests {
             prefill_activations: PrefillActivations::Dense8,
             ..base()
         };
-        let spec = ServeOptions {
-            spec_k: 3,
-            ..base()
-        };
         for (args, key) in [
             (draft, "--draft-model"),
             (lowp, "--prefill-activations"),
             (dense8, "--prefill-activations"),
-            (spec, "--spec-k"),
         ] {
             match refuse_latent_flags(path, &args) {
                 Err(CoreError::InvalidValue { key: got, .. }) => assert_eq!(got, key),
