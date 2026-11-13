@@ -962,6 +962,80 @@ pub struct ExpertBank {
     pub shared_up: Weight,
     /// The shared expert's down projection.
     pub shared_down: Weight,
+    /// The latent stage the routed experts run inside, on a checkpoint whose
+    /// experts do not read the residual width.
+    pub latent: Option<LatentBank>,
+}
+
+/// The two dense projections a latent routed feed-forward wraps its experts
+/// in, and the group each expert reads.
+///
+/// The block input is projected down to `groups` latent rows of `width`
+/// elements; an expert reads the row of its own group, and the experts'
+/// combined outputs are summed per group and projected back up. `gate`, `up`
+/// and `down` of the [`ExpertBank`] then run at `width` rather than at the
+/// residual width.
+#[derive(Debug)]
+pub struct LatentBank {
+    /// The projection from the residual width to `groups * width`.
+    pub down: Weight,
+    /// The projection from `groups * width` back to the residual width.
+    pub up: Weight,
+    /// One `u32` per expert: the group (below `groups`) whose latent row that
+    /// expert reads. Indexed by expert id, not by the slot a streamed bank
+    /// keeps it in, because the kernels index it with the active list's ids.
+    pub labels: DeviceBuffer,
+    /// Groups of latent rows a token has.
+    pub groups: u32,
+    /// Elements of one latent row.
+    pub width: u32,
+}
+
+/// The widths a latent stage's plan is built from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LatentDesc {
+    /// The projection from the residual width to `groups * width`.
+    pub down: WeightDesc,
+    /// The projection from `groups * width` back to the residual width.
+    pub up: WeightDesc,
+    /// Groups of latent rows a token has.
+    pub groups: u32,
+    /// Elements of one latent row.
+    pub width: u32,
+}
+
+impl LatentBank {
+    /// The widths this stage plans from.
+    #[must_use]
+    pub fn desc(&self) -> LatentDesc {
+        LatentDesc {
+            down: WeightDesc::from(&self.down),
+            up: WeightDesc::from(&self.up),
+            groups: self.groups,
+            width: self.width,
+        }
+    }
+
+    /// Checks that the label buffer holds one `u32` per expert.
+    ///
+    /// A shorter buffer would be read past its end by every kernel that maps
+    /// an active expert to its group, and nothing would fail.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] when the buffer is not `experts * 4` bytes.
+    pub fn check_labels(&self, experts: u32) -> CoreResult<()> {
+        let want = u64::from(experts) * 4;
+        if self.labels.len() == want {
+            Ok(())
+        } else {
+            Err(CoreError::ShapeMismatch {
+                field: "latent expert labels",
+                expected: want,
+                got: self.labels.len(),
+            })
+        }
+    }
 }
 
 /// The widths a routed feed-forward's plan is built from.
@@ -983,6 +1057,8 @@ pub struct ExpertDesc {
     pub shared_up: WeightDesc,
     /// The shared expert's down.
     pub shared_down: WeightDesc,
+    /// The latent stage the routed experts run inside, when there is one.
+    pub latent: Option<LatentDesc>,
 }
 
 impl ExpertBank {
@@ -998,6 +1074,7 @@ impl ExpertBank {
             shared_gate: WeightDesc::from(&self.shared_gate),
             shared_up: WeightDesc::from(&self.shared_up),
             shared_down: WeightDesc::from(&self.shared_down),
+            latent: self.latent.as_ref().map(LatentBank::desc),
         }
     }
 }
@@ -1352,6 +1429,20 @@ pub struct SparseWeights {
 }
 
 impl SparseWeights {
+    /// Latent elements one token needs room for: the widest `groups * width`
+    /// any layer's latent stage has, zero when no layer has one.
+    ///
+    /// What sizes [`Buf::Latent`](crate::sparse::scratch::Buf::Latent).
+    #[must_use]
+    pub fn latent_columns(&self) -> u32 {
+        self.layers
+            .iter()
+            .filter_map(|layer| layer.experts.latent.as_ref())
+            .map(|latent| latent.groups.saturating_mul(latent.width))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The matrix the logits come out of: the file's own projection when it has
     /// one, and the embedding table otherwise.
     #[must_use]

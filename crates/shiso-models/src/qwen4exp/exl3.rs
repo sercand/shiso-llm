@@ -1014,6 +1014,7 @@ impl Loader<'_> {
                 HIDDEN,
                 Move::InPlace,
             )?,
+            latent: None,
         })
     }
 

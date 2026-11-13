@@ -121,6 +121,17 @@ pub const LOWP_ENTRIES: [(&str, &str); 7] = [
     (MOD_MXFP8_A8, "q4e_mxfp8_a8_gemm_kernel"),
 ];
 
+/// The entries a latent routed stage launches beyond the ones every NVFP4
+/// bank does, as (module, entry): gate and up reading a per-expert group of
+/// the activation rows, and the per-group combine. CUDA only; a device that
+/// lacks any of them cannot run a latent bank.
+pub const LATENT_ENTRIES: [(&str, &str); 4] = [
+    (MOD_MODELOPT, "q4e_nvfp4_latent_gate_up_act_kernel"),
+    (MOD_MODELOPT, "q4e_nvfp4_latent_gate_up_act_held_kernel"),
+    (MOD_MODELOPT, "q4e_nvfp4_latent_gemm_gate_up_kernel"),
+    (MOD_MOE, "q4e_latent_combine_kernel"),
+];
+
 /// Dense projections over a brain-float weight, read as stored, on a device
 /// with tensor cores: split step kernels that sum a row one way whatever the
 /// pass width, and the tensor-core prompt GEMM. Not an upstream unit, for the
@@ -838,6 +849,21 @@ pub fn moe_combine(hidden: u32, n_tok: u32) -> Launch {
         Extent3::new(
             blocks_for(u64::from(hidden), u64::from(BLOCK_LINEAR)),
             n_tok,
+            1,
+        ),
+        BLOCK_LINEAR,
+        0,
+    )
+}
+
+/// The latent combine: a block of [`BLOCK_LINEAR`] threads a slice of a latent
+/// row, and one grid row for every (token, group).
+#[must_use]
+pub fn latent_combine(width: u32, groups: u32, n_tok: u32) -> Launch {
+    Launch::new(
+        Extent3::new(
+            blocks_for(u64::from(width), u64::from(BLOCK_LINEAR)),
+            n_tok.saturating_mul(groups),
             1,
         ),
         BLOCK_LINEAR,

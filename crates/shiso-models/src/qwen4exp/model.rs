@@ -1287,6 +1287,7 @@ fn import_experts(
         shared_gate: weight(backend, file, &roles.shared_gate)?,
         shared_up: weight(backend, file, &roles.shared_up)?,
         shared_down: weight(backend, file, &roles.shared_down)?,
+        latent: None,
     })
 }
 

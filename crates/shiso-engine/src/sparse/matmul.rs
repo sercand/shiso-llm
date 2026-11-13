@@ -568,6 +568,20 @@ pub struct Device {
     /// about the pass, set once for all of it, for the reason
     /// `half_block_input` is.
     pub normed: NormedStreams,
+    /// Whether the kernel set has the latent routed entries. A probed device
+    /// fact, for the reason `prompt_matmul` is.
+    pub latent_kernels: LatentKernels,
+}
+
+/// Whether a kernel set has every entry of
+/// [`crate::sparse::kernels::LATENT_ENTRIES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LatentKernels {
+    /// A device whose build lacks them, which a latent stage refuses by name.
+    #[default]
+    Absent,
+    /// A device that has all of them.
+    Present,
 }
 
 /// What the combine that closes a block leaves for the next mix to read.
@@ -2340,6 +2354,7 @@ mod tests {
         prefill_activations: PrefillActivations::A16,
         route_sort: RouteSort::Tiny,
         normed: NormedStreams::Stored,
+        latent_kernels: LatentKernels::Absent,
     };
 
     #[test]

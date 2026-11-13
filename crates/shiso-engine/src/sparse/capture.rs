@@ -577,6 +577,54 @@ pub fn check_kv_elem(backend: &dyn Backend, kv: KvElem) -> CoreResult<()> {
     Ok(())
 }
 
+/// Whether the device has every entry a latent routed stage launches
+/// ([`kernels::LATENT_ENTRIES`]).
+#[must_use]
+pub fn latent_kernels(backend: &dyn Backend) -> crate::sparse::matmul::LatentKernels {
+    if first_missing_latent(backend).is_none() {
+        crate::sparse::matmul::LatentKernels::Present
+    } else {
+        crate::sparse::matmul::LatentKernels::Absent
+    }
+}
+
+/// The first of [`kernels::LATENT_ENTRIES`] the device cannot resolve.
+fn first_missing_latent(backend: &dyn Backend) -> Option<(&'static str, &'static str)> {
+    kernels::LATENT_ENTRIES.iter().copied().find(|entry| {
+        backend
+            .max_block_threads(shiso_core::backend::KernelRef::new(entry.0, entry.1))
+            .is_none()
+    })
+}
+
+/// Refuses a latent routed stage on a device whose kernel set lacks any of
+/// its entries, naming the first one missing.
+///
+/// Asked before the first pass, for the reason [`check_kv_elem`] is: the
+/// stage's launches would otherwise fail partway into the first prompt, after
+/// the router and the dense projections had already run.
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] when an entry is missing (Metal's kernel set, or
+/// a build whose kernels were not compiled).
+pub fn check_latent_kernels(backend: &dyn Backend) -> CoreResult<()> {
+    if let Some((module, entry)) = first_missing_latent(backend) {
+        tracing::error!(
+            module,
+            entry,
+            backend = backend.backend_name(),
+            "a latent routed stage needs a kernel this device does not have"
+        );
+        return Err(CoreError::Unsupported {
+            what: "a latent routed feed-forward on a device whose kernel set lacks the latent \
+                   expert kernels (only the CUDA build compiled with its kernels has them)",
+            backend: "engine",
+        });
+    }
+    Ok(())
+}
+
 /// Refuses [`PrefillActivations::Lowp`] on a device whose kernel set lacks
 /// any of the block-scaled prompt kernels, naming the first one missing.
 ///

@@ -97,6 +97,7 @@ const GPU: Device = Device {
     prefill_activations: matmul::PrefillActivations::A16,
     route_sort: matmul::RouteSort::Tiny,
     normed: matmul::NormedStreams::Stored,
+    latent_kernels: matmul::LatentKernels::Absent,
 };
 
 fn half(in_dim: u32, out_dim: u32) -> WeightDesc {
@@ -149,6 +150,7 @@ fn expert_desc(shape: &SparseShape) -> ExpertDesc {
         shared_gate: trellis(shape.hidden, inter),
         shared_up: trellis(shape.hidden, inter),
         shared_down: trellis(inter, shape.hidden),
+        latent: None,
     }
 }
 
@@ -741,6 +743,7 @@ fn mixed_experts(shape: &SparseShape) -> ExpertDesc {
         shared_gate: mx(shape.hidden, inter),
         shared_up: mx(shape.hidden, inter),
         shared_down: mx(inter, shape.hidden),
+        latent: None,
     }
 }
 
