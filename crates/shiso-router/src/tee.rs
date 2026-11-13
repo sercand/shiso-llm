@@ -27,6 +27,10 @@ pub(crate) enum Dialect {
     OpenAiChat,
     OpenAiResponses,
     OpenAiEmbeddings,
+    /// Rerank (`/v1/rerank`, OpenRouter's wire): scored documents, no
+    /// generated text. `usage` carries `total_tokens` (and Cohere's
+    /// `search_units`, OpenRouter's `cost`), counted as input tokens.
+    Rerank,
     OpenAiTranscriptions,
     /// The decision-scoring endpoints (`/v1/decisions`, `/v1/systemone`):
     /// scored answers, no generated text. Both usage objects spell the counts
@@ -55,6 +59,8 @@ impl Dialect {
             Dialect::OpenAiResponses
         } else if path.ends_with("/v1/embeddings") {
             Dialect::OpenAiEmbeddings
+        } else if path.ends_with("/v1/rerank") {
+            Dialect::Rerank
         } else if path.ends_with("/v1/audio/transcriptions") {
             Dialect::OpenAiTranscriptions
         } else if path.ends_with("/v1/decisions") || path.ends_with("/v1/systemone") {
@@ -595,6 +601,17 @@ fn apply_event(dialect: Dialect, ext: &mut Extracted, v: &Value) {
         // Embeddings report only `prompt_tokens`/`total_tokens` and have no
         // notion of a finish reason.
         Dialect::OpenAiEmbeddings => apply_openai_usage(ext, &v["usage"]),
+        // A rerank reply has no finish reason; its `usage.total_tokens` is
+        // all input (the query and documents), unless the backend spells
+        // the OpenAI prompt/input fields, which win.
+        Dialect::Rerank => {
+            apply_openai_usage(ext, &v["usage"]);
+            if ext.input_tokens.is_none()
+                && let Some(n) = v["usage"]["total_tokens"].as_i64()
+            {
+                ext.input_tokens = Some(n);
+            }
+        }
         // Token-billed models (`gpt-4o-transcribe`, …) report
         // `input_tokens`/`output_tokens` in the JSON body or on the stream's
         // `transcript.text.done` event. `whisper-1` reports
@@ -1196,6 +1213,28 @@ mod tests {
         assert_eq!(systemone.prompt_tokens, Some(17));
         assert_eq!(systemone.completion_tokens, Some(0));
         assert_eq!(systemone.total_tokens, Some(17));
+    }
+
+    /// OpenRouter's rerank reply: `usage.total_tokens` is the input count,
+    /// `search_units` and `cost` are not tokens.
+    #[test]
+    fn rerank_json_body_records_total_as_input() {
+        let usage = feed(
+            Dialect::Rerank,
+            false,
+            &[br#"{"id":"gen-rerank-1","model":"cohere/rerank-v3.5","provider":"Cohere","results":[{"document":{"text":"Paris is the capital of France."},"index":0,"relevance_score":0.98}],"usage":{"search_units":1,"total_tokens":150,"cost":0.002}}"#],
+        );
+        assert_eq!(usage.prompt_tokens, Some(150));
+        assert_eq!(usage.completion_tokens, None);
+        assert_eq!(usage.total_tokens, Some(150));
+        assert_eq!(usage.finish_reason, None);
+
+        let none = feed(
+            Dialect::Rerank,
+            false,
+            &[br#"{"results":[{"index":0,"relevance_score":0.5}]}"#],
+        );
+        assert_eq!(none.prompt_tokens, None);
     }
 
     /// OpenRouter's embeddings response adds `id` and enriches `usage` with

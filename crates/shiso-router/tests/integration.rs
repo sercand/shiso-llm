@@ -770,6 +770,54 @@ async fn scoring_endpoints_are_proxied_and_usage_logged() {
     }
 }
 
+/// Rerank rides the proxy like any JSON endpoint: both spellings reach the
+/// upstream as `/v1/rerank`, the model is resolved, and the usage row takes
+/// `total_tokens` as the prompt.
+#[tokio::test]
+async fn rerank_is_proxied_and_usage_logged() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/rerank"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "gen-rerank-1", "model": "rerank-test",
+            "results": [
+                {"document": {"text": "b"}, "index": 1, "relevance_score": 0.9},
+                {"document": {"text": "a"}, "index": 0, "relevance_score": 0.1}
+            ],
+            "usage": {"search_units": 1, "total_tokens": 23}
+        })))
+        .expect(2)
+        .mount(&mock)
+        .await;
+
+    let router = TestRouter::start(
+        &(backend_toml("b1", &mock.uri(), "k")
+            + "[[models]]\nname = \"rerank-test\"\n[[models.targets]]\nbackend = \"b1\"\n"),
+    )
+    .await;
+    let (token, _) = router.create_token().await;
+
+    for path in ["/v1/rerank", "/rerank"] {
+        let resp = router
+            .client
+            .post(router.url(path))
+            .bearer_auth(&token)
+            .body(r#"{"model":"rerank-test","query":"q","documents":["a","b"],"top_n":2}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "POST {path}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["results"][0]["index"], 1);
+    }
+
+    let logs = router.wait_for_logs(2).await;
+    for row in &logs {
+        assert_eq!(row["path"].as_str(), Some("/v1/rerank"));
+        assert_eq!(row["prompt_tokens"].as_i64(), Some(23), "row: {row:?}");
+    }
+}
+
 #[tokio::test]
 async fn trace_header_is_not_forwarded_upstream() {
     let mock = MockServer::start().await;

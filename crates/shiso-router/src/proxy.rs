@@ -655,7 +655,7 @@ fn deadline_ms(headers: &HeaderMap, qos: &RouteQos) -> Option<i64> {
 
 /// The API kind an inbound endpoint speaks (same mapping as
 /// `Dialect::for_path`): `/v1/messages` is Anthropic wire format,
-/// `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`,
+/// `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/rerank`,
 /// `/v1/audio/transcriptions`, `/v1/decisions`, `/v1/systemone`,
 /// `/v1/images/generations` and `/v1/3d/generations` are OpenAI.
 fn required_kind(path: &str) -> BackendKind {
@@ -675,6 +675,9 @@ fn canonical_path(path: &str) -> &str {
         "/responses" => "/v1/responses",
         "/v1/v1/responses" => "/v1/responses",
         "/embeddings" => "/v1/embeddings",
+        // Rerank is OpenRouter's wire (`POST /api/v1/rerank`): JSON in and
+        // out, so it rides the proxy like embeddings.
+        "/rerank" => "/v1/rerank",
         "/audio/transcriptions" => "/v1/audio/transcriptions",
         "/messages" => "/v1/messages",
         "/v1/v1/messages" => "/v1/messages",
@@ -796,7 +799,7 @@ fn prepare_body(body: &Bytes, edits: &BodyEdits<'_>) -> Result<Bytes, AppError> 
 }
 
 /// The request field that caps generated tokens on each endpoint. `None`
-/// for embeddings, which generate nothing, and transcriptions, whose output
+/// for embeddings and rerank, which generate nothing, and transcriptions, whose output
 /// is bounded by the audio rather than by a request field.
 fn token_limit_field(
     dialect: Dialect,
@@ -817,7 +820,7 @@ fn token_limit_field(
         // Required on this endpoint, so it is always a clamp, never an
         // injection.
         Dialect::Anthropic => Some("max_tokens"),
-        Dialect::OpenAiEmbeddings | Dialect::OpenAiTranscriptions => None,
+        Dialect::OpenAiEmbeddings | Dialect::Rerank | Dialect::OpenAiTranscriptions => None,
         // Scoring endpoints generate no tokens, so there is no limit to
         // clamp — and injecting one would be a refusal: the decisions wire
         // refuses unknown fields.
@@ -1487,6 +1490,9 @@ mod tests {
         assert_eq!(canonical_path("/messages"), "/v1/messages");
         assert_eq!(canonical_path("/chat/completions"), "/v1/chat/completions");
         assert_eq!(canonical_path("/embeddings"), "/v1/embeddings");
+        assert_eq!(canonical_path("/rerank"), "/v1/rerank");
+        assert_eq!(canonical_path("/v1/rerank"), "/v1/rerank");
+        assert_eq!(Dialect::for_path("/v1/rerank"), Dialect::Rerank);
         assert_eq!(
             canonical_path("/audio/transcriptions"),
             "/v1/audio/transcriptions"
@@ -1518,6 +1524,7 @@ mod tests {
         assert_eq!(required_kind("/v1/chat/completions"), BackendKind::Openai);
         assert_eq!(required_kind("/v1/responses"), BackendKind::Openai);
         assert_eq!(required_kind("/v1/embeddings"), BackendKind::Openai);
+        assert_eq!(required_kind("/v1/rerank"), BackendKind::Openai);
         assert_eq!(
             required_kind("/v1/audio/transcriptions"),
             BackendKind::Openai
