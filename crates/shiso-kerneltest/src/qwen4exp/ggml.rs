@@ -59,6 +59,10 @@ pub enum Format {
     Iq4Xs,
     /// 2-bit codes standing for -1..2 steps, 64 weights.
     Q2_0,
+    /// 4-bit linear codes, each its nibble less eight, 32 weights. It has
+    /// only the prompt and step projection entries (a latent stage's
+    /// projections), so it is not in [`FORMATS`].
+    Q4_0,
 }
 
 /// Every format, in instantiation order.
@@ -91,6 +95,7 @@ impl Format {
             Self::Iq2S => "iq2_s",
             Self::Iq4Xs => "iq4_xs",
             Self::Q2_0 => "q2_0",
+            Self::Q4_0 => "q4_0",
         }
     }
 
@@ -102,7 +107,7 @@ impl Format {
             Self::Q8_0 => (32, 34),
             Self::Q6K => (256, 210),
             Self::Iq3Xxs => (256, 98),
-            Self::Iq4Nl => (32, 18),
+            Self::Iq4Nl | Self::Q4_0 => (32, 18),
             Self::Iq2S => (256, 82),
             Self::Iq4Xs => (256, 136),
             Self::Q2_0 => (64, 18),
@@ -146,6 +151,14 @@ impl Format {
                 for j in 0..16 {
                     out[j] = d * IQ4NL[usize::from(b[2 + j] & 0xF)];
                     out[j + 16] = d * IQ4NL[usize::from(b[2 + j] >> 4)];
+                }
+                out
+            }
+            Self::Q4_0 => {
+                let mut out = vec![0f32; 32];
+                for j in 0..16 {
+                    out[j] = d * (f32::from(b[2 + j] & 0xF) - 8.0);
+                    out[j + 16] = d * (f32::from(b[2 + j] >> 4) - 8.0);
                 }
                 out
             }
@@ -239,6 +252,7 @@ fn entry(format: Format, stage: Stage) -> &'static str {
         Format::Iq2S => names!("iq2_s"),
         Format::Iq4Xs => names!("iq4_xs"),
         Format::Q2_0 => names!("q2_0"),
+        Format::Q4_0 => names!("q4_0"),
     }
 }
 
@@ -1249,4 +1263,49 @@ bench_cases! {
     bench_q8_0_10240x320_r1_l1 => |g| bench_step_matvec(g, Format::Q8_0, (10240, 320), 1, 1);
     bench_q8_0_10240x320_r1_l4 => |g| bench_step_matvec(g, Format::Q8_0, (10240, 320), 1, 4);
     bench_q6_k_head_r1_l8 => |g| bench_step_matvec(g, Format::Q6K, (62080, 2560), 1, 8);
+}
+
+/// The four-bit linear format's two entries - the prompt projection on tensor
+/// cores and the lanes-a-row step projection - against the host, as the
+/// block formats' own cases hold theirs: across partial tiles, at a warp and
+/// a block of lanes a row, with a row unmoved by the pass width, by running
+/// alone, or by four output rows a unit.
+///
+/// # Panics
+///
+/// When an output is outside the host's tolerance, a row moves, or the device
+/// refuses a launch or a read.
+pub fn the_four_bit_projection_entries_match_the_host(gpu: &Gpu) {
+    let format = Format::Q4_0;
+    let (out_dim, in_dim, rows) = (137usize, 512usize, 70usize);
+    let bank = Bank::new(format, 1, out_dim, in_dim, 2101);
+    let x = halves(&signal(rows * in_dim, 2102));
+    let got = gemm(gpu, format, &bank, &x, rows);
+    let want: Vec<f32> = (0..rows)
+        .flat_map(|r| bank.project(0, &x[r * in_dim..(r + 1) * in_dim]))
+        .collect();
+    assert_close("q4_0 prompt", &got, &want, 2e-4);
+    assert!(
+        gemm(gpu, format, &bank, &x, 5) == got[..5 * out_dim],
+        "q4_0: a row moved with the chunk width"
+    );
+
+    let (out_dim, in_dim, rows) = (37usize, 1024usize, 11usize);
+    let bank = Bank::new(format, 1, out_dim, in_dim, 2103);
+    let x = signal(rows * in_dim, 2104);
+    let want: Vec<f32> = (0..rows)
+        .flat_map(|r| bank.project(0, &x[r * in_dim..(r + 1) * in_dim]))
+        .collect();
+    for lpr in [32, 128] {
+        let got = step_matvec(gpu, format, &bank, &x, rows, lpr, false);
+        assert_close(&format!("q4_0 lpr {lpr}"), &got, &want, 2e-4);
+        assert!(
+            step_matvec(gpu, format, &bank, &x, 1, lpr, false) == got[..out_dim],
+            "q4_0 lpr {lpr}: row 0 moved alone"
+        );
+        assert!(
+            step_matvec(gpu, format, &bank, &x, rows, lpr, true) == got,
+            "q4_0 lpr {lpr}: four rows a unit moved a row"
+        );
+    }
 }

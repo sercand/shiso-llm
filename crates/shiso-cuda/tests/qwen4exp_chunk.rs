@@ -58,6 +58,24 @@ const WHOLE: &[usize] = &[4_096];
 /// the weight-stationary expert launch; the scheduler's mixed quantum.
 const CUTS: &[&[usize]] = &[&[64], &[1_024, 128, 1_408, 64], &[2_560], &[128], &[576]];
 
+/// Held for the whole of every device test in this file.
+///
+/// The machine's memory is one pool shared by the CPU and the GPU, and an
+/// allocation is only backed when first written, so two models loaded at once
+/// do not fail at allocation: they take the machine down when the second one
+/// fills. Each test here loads a checkpoint of about 50 GB, and the harness
+/// runs the tests of one binary on parallel threads, so the exclusion is the
+/// tests' own.
+static ONE_MODEL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes [`ONE_MODEL`], whether or not a failed test poisoned it: the lock
+/// guards a resource, not data.
+fn one_model() -> std::sync::MutexGuard<'static, ()> {
+    ONE_MODEL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Prints the skip notice; the caller returns immediately afterwards.
 #[expect(clippy::print_stdout, reason = "the skip report is a test's output")]
 fn skip(why: &str) {
@@ -183,6 +201,7 @@ fn prefill_from(
 #[test]
 #[ignore = "needs a CUDA device and a checkpoint of this family"]
 fn a_prompt_cut_anywhere_on_the_grid_leaves_the_bits_one_pass_leaves() {
+    let _alone = one_model();
     let Some(path) = file_from("SHISO_TEST_MODEL_QWEN4EXP") else {
         skip("no checkpoint named by SHISO_TEST_MODEL_QWEN4EXP");
         return;
@@ -216,6 +235,7 @@ fn a_prompt_cut_anywhere_on_the_grid_leaves_the_bits_one_pass_leaves() {
 #[test]
 #[ignore = "needs a CUDA device and a checkpoint of this family"]
 fn a_longer_prompt_continued_from_a_stored_prompt_leaves_the_bits_a_cold_one_leaves() {
+    let _alone = one_model();
     // The first prompt ends thirty positions past a grid point, so its final
     // pass files its checkpoint at that grid point, from inside the pass. A
     // longer prompt that resumes there and prefills the rest must end up where

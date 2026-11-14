@@ -175,3 +175,50 @@ fn a_resident_nvfp4_bank_holds_every_slot_back_to_back() {
         .expect_err("40 is not whole groups of sixteen");
     assert_eq!(field(&err), "nvfp4 contraction width");
 }
+
+#[test]
+fn a_latent_bank_plans_its_widths_and_checks_one_label_an_expert() {
+    use super::{ExpertBank, LatentBank, LatentDesc, WeightDesc};
+
+    let be = backend();
+    let mx = |in_dim: u32, out_dim: u32| {
+        let (codes, scales) = mxfp8_bytes(in_dim, out_dim).expect("whole groups");
+        Weight::mxfp8(in_dim, out_dim, [buf(&be, codes), buf(&be, scales)]).expect("lengths")
+    };
+    let latent = |label_bytes| LatentBank {
+        down: mx(64, 128),
+        up: mx(128, 64),
+        labels: buf(&be, label_bytes),
+        groups: 2,
+        width: 64,
+    };
+    let bank = |latent| ExpertBank {
+        router: mx(64, 8),
+        gate: mx(64, 32),
+        up: mx(64, 32),
+        down: mx(32, 64),
+        shared_router: mx(64, 32),
+        shared_gate: mx(64, 32),
+        shared_up: mx(64, 32),
+        shared_down: mx(32, 64),
+        latent,
+    };
+    assert_eq!(bank(None).desc().latent, None);
+    let desc = bank(Some(latent(32))).desc();
+    assert_eq!(
+        desc.latent,
+        Some(LatentDesc {
+            down: WeightDesc::new(DType::Mxfp8E4M3G32, 64, 128),
+            up: WeightDesc::new(DType::Mxfp8E4M3G32, 128, 64),
+            groups: 2,
+            width: 64,
+        })
+    );
+    latent(32)
+        .check_labels(8)
+        .expect("eight experts, four bytes each");
+    for bytes in [28, 36] {
+        let err = latent(bytes).check_labels(8).expect_err("not eight labels");
+        assert_eq!(field(&err), "latent expert labels");
+    }
+}

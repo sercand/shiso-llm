@@ -56,6 +56,10 @@ pub enum DType {
     IQ2_S = 22,
     /// 4-bit i-quant, extra-small, 256 elements per block.
     IQ4_XS = 23,
+    /// 8-bit signed integer tensor: raw bytes a reader interprets itself, as
+    /// the n-gram table of a container that stores its rows as one byte a
+    /// weight.
+    I8 = 24,
     /// 32-bit signed integer tensor (vocabulary and index maps).
     I32 = 26,
     /// 1-bit i-quant, medium, 256 elements per block.
@@ -201,11 +205,12 @@ impl DType {
             21 => Some(Self::IQ3_S),
             22 => Some(Self::IQ2_S),
             23 => Some(Self::IQ4_XS),
-            42 => Some(Self::Q2_0),
+            24 => Some(Self::I8),
             26 => Some(Self::I32),
             29 => Some(Self::IQ1_M),
             30 => Some(Self::BF16),
             39 => Some(Self::MXFP4),
+            42 => Some(Self::Q2_0),
             68 => Some(Self::Exl3K4),
             69 => Some(Self::Exl3K5),
             70 => Some(Self::Exl3K6),
@@ -251,6 +256,7 @@ impl DType {
             Self::IQ3_S => "iq3_s",
             Self::IQ2_S => "iq2_s",
             Self::IQ4_XS => "iq4_xs",
+            Self::I8 => "i8",
             Self::I32 => "i32",
             Self::IQ1_M => "iq1_m",
             Self::BF16 => "bf16",
@@ -284,6 +290,7 @@ impl DType {
             Self::F32
             | Self::F16
             | Self::BF16
+            | Self::I8
             | Self::I32
             | Self::Fp8E4M3
             | Self::Fp8E4M3Block128 => 1,
@@ -330,7 +337,7 @@ impl DType {
     #[must_use]
     pub const fn block_bytes(self) -> NonZeroU32 {
         let bytes = match self {
-            Self::Fp8E4M3 | Self::Fp8E4M3Block128 => 1,
+            Self::I8 | Self::Fp8E4M3 | Self::Fp8E4M3Block128 => 1,
             Self::F16 | Self::BF16 => 2,
             Self::F32 | Self::I32 => 4,
             Self::Q4_0 | Self::IQ4_NL | Self::Q2_0 => 18,

@@ -935,7 +935,7 @@ impl SparseStack {
         ngram: Option<ple::NgramTable>,
     ) -> CoreResult<Self> {
         shape.validate()?;
-        check_layers(&shape, &weights)?;
+        check_layers(backend.as_ref(), &shape, &weights)?;
         check_prefill_rows(opts.prefill_rows)?;
         crate::sparse::capture::check_kv_elem(backend.as_ref(), opts.engine.kv_elem)?;
         // Everything resident so far is weights: the ledger's second mark.
@@ -958,6 +958,7 @@ impl SparseStack {
             opts.engine.ctx,
             opts.block_draft
                 .map_or(0, |fp| u32::try_from(fp.taps().len()).unwrap_or(u32::MAX)),
+            weights.latent_columns(),
         )?;
         // The suppress list starts empty: the count is the buffer's first
         // word, and a fresh allocation's first word is whatever was there.
@@ -1006,6 +1007,7 @@ impl SparseStack {
             prefill_activations: opts.prefill_activations,
             route_sort: opts.route_sort,
             normed: crate::sparse::matmul::NormedStreams::Stored,
+            latent_kernels: crate::sparse::capture::latent_kernels(backend.as_ref()),
         };
         let desc = weights.desc(ngram.as_ref().map(|tier| tier.table().row()));
         log_resident(&shape, &opts, &kv, planes, geometry.ckpt_bytes);
@@ -1975,8 +1977,18 @@ impl Drop for SparseStack {
 /// Separate from the constructor because it is a different kind of statement:
 /// the constructor allocates, this one refuses. A slot whose kind disagrees
 /// would otherwise run one block family's kernels over another's tensors and
-/// produce finite numbers.
-fn check_layers(shape: &SparseShape, weights: &SparseWeights) -> CoreResult<()> {
+/// produce finite numbers. The device is asked for what the weights need of it
+/// in the same place, for the same reason.
+fn check_layers(
+    backend: &dyn Backend,
+    shape: &SparseShape,
+    weights: &SparseWeights,
+) -> CoreResult<()> {
+    // Before the first pass, not partway into it: a latent stage's launches
+    // would otherwise fail after the router had already run.
+    if weights.latent_columns() > 0 {
+        crate::sparse::capture::check_latent_kernels(backend)?;
+    }
     let slots = u64::try_from(weights.layers.len()).unwrap_or(u64::MAX);
     if slots != u64::from(shape.n_layers()) {
         return Err(CoreError::ShapeMismatch {
@@ -2009,6 +2021,21 @@ fn check_layers(shape: &SparseShape, weights: &SparseWeights) -> CoreResult<()> 
                 value: format!("slot {slot} disagrees with the geometry about the n-gram block"),
             });
         }
+        if let Some(latent) = &layer.experts.latent {
+            latent.check_labels(shape.moe.experts)?;
+        }
+    }
+    // A draft head's experts are resident and read the residual width; the
+    // latent stage's labels and scratch are a target layer's.
+    if weights
+        .draft
+        .as_ref()
+        .is_some_and(|head| head.layer.experts.latent.is_some())
+    {
+        return Err(CoreError::Unsupported {
+            what: "a draft head whose experts have a latent stage",
+            backend: "engine",
+        });
     }
     Ok(())
 }

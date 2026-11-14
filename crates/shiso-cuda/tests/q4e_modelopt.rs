@@ -15,7 +15,7 @@ use std::sync::Arc;
 use shiso_core::Backend;
 use shiso_cuda::{CudaBackend, CudaOptions};
 use shiso_kerneltest::Gpu;
-use shiso_kerneltest::qwen4exp::{fp8, nvfp4, ple_nvfp4};
+use shiso_kerneltest::qwen4exp::{fp8, latent, nvfp4, ple_nvfp4};
 
 /// Opens device 0, or says on stderr why the cases did not run.
 #[expect(
@@ -140,4 +140,46 @@ fn nvfp4_ple_row_decode_equals_host_decode() {
 fn an_nvfp4_ple_row_under_the_nan_scale_decodes_to_nan() {
     let Some(gpu) = open() else { return };
     ple_nvfp4::an_nvfp4_ple_row_under_the_nan_scale_decodes_to_nan(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn latent_gate_up_act_matches_host() {
+    let Some(gpu) = open() else { return };
+    latent::latent_gate_up_act_matches_host(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn latent_gate_up_act_held_matches_host() {
+    let Some(gpu) = open() else { return };
+    latent::latent_gate_up_act_held_matches_host(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn latent_gemm_gate_up_matches_host() {
+    let Some(gpu) = open() else { return };
+    latent::latent_gemm_gate_up_matches_host(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn latent_labels_zero_equals_plain() {
+    let Some(gpu) = open() else { return };
+    latent::latent_labels_zero_equals_plain(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn latent_combine_matches_host() {
+    let Some(gpu) = open() else { return };
+    latent::latent_combine_matches_host(&gpu);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn latent_step_projections_skip_unused_groups() {
+    let Some(gpu) = open() else { return };
+    latent::latent_step_projections_skip_unused_groups(&gpu);
 }

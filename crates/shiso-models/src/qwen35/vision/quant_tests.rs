@@ -92,6 +92,9 @@ fn decoded(
         dims: native.dims,
         prefix: native.prefix,
         tensors,
+        // The manifest above covers the main tree only, so any taps the
+        // export carries stay as loaded.
+        deepstack: native.deepstack,
     }
 }
 

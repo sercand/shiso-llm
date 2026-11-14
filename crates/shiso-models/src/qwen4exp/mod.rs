@@ -23,6 +23,9 @@ mod config;
 pub mod exl3;
 pub mod fp8;
 pub mod gguf_experts;
+pub mod latent;
+mod latent_draft;
+mod latent_load;
 pub mod mlx;
 mod model;
 pub mod modelopt_mixed;
@@ -31,9 +34,9 @@ pub mod ple_nvfp4;
 
 pub use binding::{
     AttnRoles, BlockRoles, BoundLayer, ExpertRoles, MixRoles, ModelBinding, NGRAM_BIAS,
-    NGRAM_TABLE, NgramRoles, RecurrentRoles, bind_qwen4exp,
+    NGRAM_TABLE, NgramRoles, RecurrentRoles, bind_qwen4exp, bind_skeleton,
 };
-pub use ckpt::{QWEN4EXP_MODEL_ID, quant_bits_of};
+pub use ckpt::{QWEN4EXP_LATENT_MODEL_ID, QWEN4EXP_MODEL_ID, quant_bits_of};
 pub use config::{
     ARCH, EXPERT_INTERMEDIATE, EXPERTS, EXPERTS_SHARED, EXPERTS_USED, FULL_ATTENTION_INTERVAL,
     GDN_CONV, GDN_HEAD_DIM, GDN_QK_HEADS, GDN_V_HEADS, HEAD_DIM, HIDDEN, INDEXER_COMPRESS,
