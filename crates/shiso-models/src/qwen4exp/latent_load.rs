@@ -8,7 +8,8 @@
 //! # What is copied and what is not
 //!
 //! Nothing is widened. `D` is the stored bytes of a `Q8_0` tensor of dims
-//! `[2560, 14336]`; `U` is the same blocks laid out as one `[14336, 2560]`
+//! `[2560, 14336]` (or of a `Q4_0` one, when the directory carries the
+//! four-bit file instead); `U` is the same blocks laid out as one `[14336, 2560]`
 //! matrix ([`interleave_up`]), the only byte movement in the load. Both are
 //! read through [`open_uncached`], which asks the OS to bypass the page cache
 //! where it can (on Linux it is a plain open, so the cache is not bypassed
@@ -33,7 +34,7 @@ use shiso_ple::{PleRowType, PleStream};
 use crate::qwen4exp::config::{
     EXPERT_INTERMEDIATE, EXPERTS, EXPERTS_USED, HIDDEN, N_LAYERS, PLE_HEAD_DIM, Qwen4ExpConfig,
 };
-use crate::qwen4exp::latent::{LatentExperts, LatentPack, interleave_up};
+use crate::qwen4exp::latent::{LatentExperts, LatentPack, ProjectionCodec, interleave_up};
 use crate::qwen4exp::mlx::upload;
 
 /// The pack's n-gram container.
@@ -181,18 +182,22 @@ impl LatentProjections {
         self.file
             .read_exact_at(&mut stored, down_at)
             .map_err(CoreError::Io)?;
-        let down = Weight::uploaded(backend, DType::Q8_0, hidden, rows, 1, stored)?;
+        let dtype = match pack.codec {
+            ProjectionCodec::Q8 => DType::Q8_0,
+            ProjectionCodec::Q4 => DType::Q4_0,
+        };
+        let down = Weight::uploaded(backend, dtype, hidden, rows, 1, stored)?;
         let mut stored = vec![0u8; len];
         self.file
             .read_exact_at(&mut stored, up_at)
             .map_err(CoreError::Io)?;
         let up = Weight::uploaded(
             backend,
-            DType::Q8_0,
+            dtype,
             rows,
             hidden,
             1,
-            interleave_up(&stored, groups, hidden, width),
+            interleave_up(&stored, groups, hidden, width, pack.codec),
         )?;
         let at = layer as usize * EXPERTS as usize;
         let mine = pack

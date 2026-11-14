@@ -127,7 +127,7 @@ pub const LOWP_ENTRIES: [(&str, &str); 7] = [
 /// lacks any of them cannot run a latent bank. The last five are a step
 /// pass's: the groups its rows use, and the two projections that leave the
 /// other groups out.
-pub const LATENT_ENTRIES: [(&str, &str); 9] = [
+pub const LATENT_ENTRIES: [(&str, &str); 14] = [
     (MOD_MODELOPT, "q4e_nvfp4_latent_gate_up_act_kernel"),
     (MOD_MODELOPT, "q4e_nvfp4_latent_gate_up_act_held_kernel"),
     (MOD_MODELOPT, "q4e_nvfp4_latent_gemm_gate_up_kernel"),
@@ -137,6 +137,11 @@ pub const LATENT_ENTRIES: [(&str, &str); 9] = [
     (MOD_GGML, "q4e_g_step_latent_down4_q8_0_kernel"),
     (MOD_GGML, "q4e_g_step_latent_up_q8_0_kernel"),
     (MOD_GGML, "q4e_g_step_latent_up4_q8_0_kernel"),
+    (MOD_GGML, "q4e_g_step_latent_down_q4_0_kernel"),
+    (MOD_GGML, "q4e_g_step_latent_down4_q4_0_kernel"),
+    (MOD_GGML, "q4e_g_step_latent_up_q4_0_kernel"),
+    (MOD_GGML, "q4e_g_step_latent_up4_q4_0_kernel"),
+    (MOD_GGML, "q4e_g_gemm_q4_0_kernel"),
 ];
 
 /// Dense projections over a brain-float weight, read as stored, on a device

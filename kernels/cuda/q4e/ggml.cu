@@ -28,6 +28,9 @@
 #define Q4E_G_Q6_K 14
 #define Q4E_G_IQ3_XXS 18
 #define Q4E_G_IQ4_NL 20
+/* `Q4_0`: no plain matvec, routed or embedding entries, only the prompt and
+ * step projections a latent stage's 4-bit projections take. */
+#define Q4E_G_Q4_0 2
 #define Q4E_G_IQ2_S 22
 #define Q4E_G_IQ4_XS 23
 #define Q4E_G_Q2_0 42
@@ -44,6 +47,7 @@ __device__ __forceinline__ uint64_t q4e_g_row_bytes(uint32_t n) {
         case Q4E_G_F32: return (uint64_t) n * 4ull;
         case Q4E_G_Q8_0: return (uint64_t) (n / 32u) * 34ull;
         case Q4E_G_IQ4_NL: return (uint64_t) (n / 32u) * 18ull;
+        case Q4E_G_Q4_0: return (uint64_t) (n / 32u) * 18ull;
         case Q4E_G_Q2_0: return (uint64_t) (n / 64u) * 18ull;
         case Q4E_G_Q6_K: return (uint64_t) (n / 256u) * 210ull;
         case Q4E_G_IQ2_S: return (uint64_t) (n / 256u) * 82ull;
@@ -495,7 +499,7 @@ __device__ __forceinline__ void q4e_gg_fetch(const uint8_t *row, uint32_t t, q4e
         const uint8_t *b = row + (uint64_t) (t / 2u) * 34ull;
         r.w[5] = *(const uint16_t *) b;
         r.odd = q4e_gg_fetch16(b + 2 + (t & 1u) * 16u, r.w);
-    } else if (T == Q4E_G_IQ4_NL) {
+    } else if (T == Q4E_G_IQ4_NL || T == Q4E_G_Q4_0) {
         const uint8_t *b = row + (uint64_t) (t / 2u) * 18ull;
         r.w[5] = *(const uint16_t *) b;
         r.odd = q4e_gg_fetch16(b + 2, r.w);
@@ -564,6 +568,16 @@ __device__ __forceinline__ float q4e_gg_decode(const q4e_gg_raw &r, uint32_t t, 
         const uint32_t sh = (t & 1u) * 4u;
 #pragma unroll
         for (int i = 0; i < 4; ++i) q[i] = q4e_gg_nl4((raw[i] >> sh) & 0x0F0F0F0Fu);
+    } else if (T == Q4E_G_Q4_0) {
+        /* The block's first sixteen weights are its bytes' low nibbles, the
+         * last sixteen the high ones, as `IQ4_NL`'s; a code is its nibble
+         * less eight. */
+        scale = q4e_gg_h16(r.w[5]);
+        uint32_t raw[4];
+        q4e_gg_take16(r.w, r.odd, raw);
+        const uint32_t sh = (t & 1u) * 4u;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) q[i] = __vsub4((raw[i] >> sh) & 0x0F0F0F0Fu, 0x08080808u);
     } else if (T == Q4E_G_Q2_0) {
         scale = q4e_gg_h16(r.w[5]);
         const uint32_t w = q4e_gg_take4(r.w, r.odd);
@@ -1032,6 +1046,7 @@ Q4E_GG_INSTANTIATE(Q4E_G_IQ4_NL, iq4_nl)
 Q4E_GG_INSTANTIATE(Q4E_G_IQ2_S, iq2_s)
 Q4E_GG_INSTANTIATE(Q4E_G_IQ4_XS, iq4_xs)
 Q4E_GG_INSTANTIATE(Q4E_G_Q2_0, q2_0)
+Q4E_GG_INSTANTIATE(Q4E_G_Q4_0, q4_0)
 
 /* ---------------------------------------------------------------------------
  * Step passes (a decode step or a verify) on CUDA.
@@ -1407,30 +1422,22 @@ __device__ __forceinline__ void q4e_gs_down(
  * `q4e_latent_groups_kernel` writes it. `width` is a multiple of 16 and of
  * the unit's rows. Arguments: the plain entries', then `masks, width`.
  * ------------------------------------------------------------------------ */
-extern "C" __global__ void __launch_bounds__(32u * Q4E_GS_WARPS)
-q4e_g_step_latent_down_q8_0_kernel(float *out, const uint8_t *w, const float *x, uint32_t in_dim,
-                                   uint32_t out_dim, uint32_t rows, uint32_t lpr,
-                                   const uint32_t *masks, uint32_t width) {
-    q4e_gs_matvec<Q4E_G_Q8_0, 1u, Q4E_GS_SKIP_OUT>(out, w, x, in_dim, out_dim, rows, lpr, masks, width);
-}
-extern "C" __global__ void __launch_bounds__(32u * Q4E_GS_WARPS)
-q4e_g_step_latent_down4_q8_0_kernel(float *out, const uint8_t *w, const float *x, uint32_t in_dim,
-                                    uint32_t out_dim, uint32_t rows, uint32_t lpr,
-                                    const uint32_t *masks, uint32_t width) {
-    q4e_gs_matvec<Q4E_G_Q8_0, 4u, Q4E_GS_SKIP_OUT>(out, w, x, in_dim, out_dim, rows, lpr, masks, width);
-}
-extern "C" __global__ void __launch_bounds__(32u * Q4E_GS_WARPS)
-q4e_g_step_latent_up_q8_0_kernel(float *out, const uint8_t *w, const float *x, uint32_t in_dim,
-                                 uint32_t out_dim, uint32_t rows, uint32_t lpr,
-                                 const uint32_t *masks, uint32_t width) {
-    q4e_gs_matvec<Q4E_G_Q8_0, 1u, Q4E_GS_SKIP_IN>(out, w, x, in_dim, out_dim, rows, lpr, masks, width);
-}
-extern "C" __global__ void __launch_bounds__(32u * Q4E_GS_WARPS)
-q4e_g_step_latent_up4_q8_0_kernel(float *out, const uint8_t *w, const float *x, uint32_t in_dim,
-                                  uint32_t out_dim, uint32_t rows, uint32_t lpr,
-                                  const uint32_t *masks, uint32_t width) {
-    q4e_gs_matvec<Q4E_G_Q8_0, 4u, Q4E_GS_SKIP_IN>(out, w, x, in_dim, out_dim, rows, lpr, masks, width);
-}
+#define Q4E_GS_LATENT(T, NAME, SIDE, SKIP, R, FOUR)                                             \
+    extern "C" __global__ void __launch_bounds__(32u * Q4E_GS_WARPS)                            \
+    q4e_g_step_latent_##SIDE##FOUR##_##NAME##_kernel(float *out, const uint8_t *w,              \
+                                                     const float *x, uint32_t in_dim,           \
+                                                     uint32_t out_dim, uint32_t rows,           \
+                                                     uint32_t lpr, const uint32_t *masks,       \
+                                                     uint32_t width) {                          \
+        q4e_gs_matvec<T, R, SKIP>(out, w, x, in_dim, out_dim, rows, lpr, masks, width);         \
+    }
+#define Q4E_GS_LATENT_INSTANTIATE(T, NAME)                                                      \
+    Q4E_GS_LATENT(T, NAME, down, Q4E_GS_SKIP_OUT, 1u, )                                         \
+    Q4E_GS_LATENT(T, NAME, down, Q4E_GS_SKIP_OUT, 4u, 4)                                        \
+    Q4E_GS_LATENT(T, NAME, up, Q4E_GS_SKIP_IN, 1u, )                                            \
+    Q4E_GS_LATENT(T, NAME, up, Q4E_GS_SKIP_IN, 4u, 4)
+Q4E_GS_LATENT_INSTANTIATE(Q4E_G_Q8_0, q8_0)
+Q4E_GS_LATENT_INSTANTIATE(Q4E_G_Q4_0, q4_0)
 
 extern "C" __global__ void __launch_bounds__(32u * Q4E_GS_WARPS)
 q4e_g_step_matvec_f32_kernel(float *out, const uint8_t *w, const float *x, uint32_t in_dim,
@@ -1449,6 +1456,7 @@ Q4E_GS_INSTANTIATE(Q4E_G_IQ4_NL, iq4_nl)
 Q4E_GS_INSTANTIATE(Q4E_G_IQ2_S, iq2_s)
 Q4E_GS_INSTANTIATE(Q4E_G_IQ4_XS, iq4_xs)
 Q4E_GS_INSTANTIATE(Q4E_G_Q2_0, q2_0)
+Q4E_GS_INSTANTIATE(Q4E_G_Q4_0, q4_0)
 
 /* A prompt pass's routed activation into halves, for the down stage's tensor
  * cores: `out[i] = silu(gate[i]) * up[i]` in single precision as

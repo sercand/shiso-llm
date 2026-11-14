@@ -20,8 +20,8 @@ use shiso_engine::sparse::weights::nvfp4_bytes;
 use shiso_modelfile::nvfp4::{Nvfp4Layout, dequant_nvfp4};
 
 use super::{
-    Geometry, LatentExperts, LatentPack, interleave_up, is_latent_pack, record_bytes, repack_codes,
-    split_scales,
+    Geometry, LatentExperts, LatentPack, ProjectionCodec, interleave_up, is_latent_pack,
+    record_bytes, repack_codes, split_scales,
 };
 
 /// A small pack shape: two layers, four experts, a 64-wide latent, 64 inner
@@ -192,7 +192,13 @@ fn interleave_up_moves_rows() {
             src[at + 2] = h as u8;
         }
     }
-    let out = interleave_up(&src, GROUPS as u32, HIDDEN as u32, 1792);
+    let out = interleave_up(
+        &src,
+        GROUPS as u32,
+        HIDDEN as u32,
+        1792,
+        ProjectionCodec::Q8,
+    );
     assert_eq!(out.len(), 2560 * 15232);
     for h in [0, 1, 777, 2559] {
         for g in 0..GROUPS {
@@ -364,8 +370,11 @@ fn open_refuses_projection_size() {
     );
 }
 
+/// A directory with only the four-bit file is served from it: the same
+/// groups, at 18 bytes a block. Eight-bit bytes under the four-bit name are
+/// not a whole number of groups, and are refused by that name.
 #[test]
-fn open_refuses_a_pack_with_only_the_q4_projections() {
+fn a_pack_with_only_the_q4_projections_opens_at_four_bits() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_pack(dir.path(), &small_experts(), |_| 0);
     fs::rename(
@@ -377,6 +386,44 @@ fn open_refuses_a_pack_with_only_the_q4_projections() {
         &open(dir.path()).expect_err("refused"),
         "latent_dense_q4.bin",
     );
+    let per_matrix = 2 * 64 * 4 * 18;
+    fs::write(
+        dir.path().join("latent_dense_q4.bin"),
+        vec![0u8; SMALL.layers as usize * 2 * per_matrix],
+    )
+    .expect("writes");
+    let pack = open(dir.path()).expect("opens");
+    assert_eq!(pack.codec, ProjectionCodec::Q4);
+    assert_eq!(pack.groups, 2);
+    assert_eq!(pack.projection_bytes(), per_matrix as u64);
+    // With both files present the eight-bit one is read.
+    fs::write(
+        dir.path().join("latent_dense_q8.bin"),
+        vec![0u8; SMALL.layers as usize * 2 * 2 * 64 * 4 * 34],
+    )
+    .expect("writes");
+    assert_eq!(open(dir.path()).expect("opens").codec, ProjectionCodec::Q8);
+}
+
+/// The four-bit rows move as whole 18-byte blocks.
+#[test]
+fn interleave_up_moves_four_bit_rows() {
+    let (groups, hidden, width) = (2usize, 3usize, 64usize);
+    let row = width / 32 * 18;
+    let src: Vec<u8> = (0..groups * hidden * row)
+        .map(|i| (i / row) as u8)
+        .collect();
+    let out = interleave_up(&src, 2, 3, 64, ProjectionCodec::Q4);
+    assert_eq!(out.len(), src.len());
+    for h in 0..hidden {
+        for g in 0..groups {
+            let got = &out[(h * groups + g) * row..][..row];
+            assert!(
+                got.iter().all(|&b| b as usize == g * hidden + h),
+                "row {h} group {g}"
+            );
+        }
+    }
 }
 
 #[test]

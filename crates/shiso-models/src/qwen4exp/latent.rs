@@ -52,7 +52,7 @@ const EXPERTS_FILE: &str = "experts.bin";
 const LABELS: &str = "labels.bin";
 /// The dense latent projections, `Q8_0`.
 const PROJECTIONS_Q8: &str = "latent_dense_q8.bin";
-/// The same projections at four bits, which this reader does not take.
+/// The same projections at four bits, read when the eight-bit file is absent.
 const PROJECTIONS_Q4: &str = "latent_dense_q4.bin";
 /// The pack's non-expert tensors.
 pub(crate) const SKELETON: &str = "model-skeleton.gguf";
@@ -67,10 +67,40 @@ const BLOCK_BYTES: usize = 36;
 const BLOCK_SCALES: usize = 4;
 /// Code bytes in a block, which is also the pairwise bytes of 64 weights.
 const BLOCK_CODES: usize = 32;
-/// Weights one `Q8_0` block covers.
+/// Weights one block of the dense projections covers, at either width.
 const Q8_WEIGHTS: u32 = 32;
-/// Bytes of one `Q8_0` block: an `f16` scale and 32 `i8`.
-const Q8_BLOCK_BYTES: usize = 34;
+
+/// How the pack's dense projections are stored: the publisher ships both, as
+/// separate files of the same rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionCodec {
+    /// `Q8_0` blocks: an `f16` scale and 32 `i8`.
+    Q8,
+    /// `Q4_0` blocks: an `f16` scale and 16 bytes, a block's first sixteen
+    /// weights in their low nibbles and its last sixteen in the high ones,
+    /// each code its nibble less eight. Half the bytes a token streams, at
+    /// the precision the publisher's four-bit file has.
+    Q4,
+}
+
+impl ProjectionCodec {
+    /// Bytes of one 32-weight block.
+    #[must_use]
+    pub const fn block_bytes(self) -> usize {
+        match self {
+            Self::Q8 => 34,
+            Self::Q4 => 18,
+        }
+    }
+
+    /// The file that holds the projections in this codec.
+    const fn file(self) -> &'static str {
+        match self {
+            Self::Q8 => PROJECTIONS_Q8,
+            Self::Q4 => PROJECTIONS_Q4,
+        }
+    }
+}
 /// Bytes of the record's tail: three `f32` global scales and a zero.
 const TAIL_BYTES: u64 = 16;
 /// Bytes of one global scale.
@@ -190,8 +220,10 @@ pub struct LatentPack {
     /// Width of one latent group: the contraction of gate and up, the output
     /// of down.
     pub width: u32,
-    /// Latent groups, which `latent_dense_q8.bin`'s size fixes.
+    /// Latent groups, which the dense projections file's size fixes.
     pub groups: u32,
+    /// How the dense projections are stored.
+    pub codec: ProjectionCodec,
     /// Bytes of one expert's record.
     pub record_bytes: u64,
     geometry: Geometry,
@@ -226,11 +258,12 @@ impl LatentPack {
                 format_args!("{experts_len} bytes, the index describes {want}"),
             ));
         }
-        let (groups, projections) = projection_groups(dir, geometry, width)?;
+        let (groups, projections, codec) = projection_groups(dir, geometry, width)?;
         let labels = parse_labels(dir, geometry, groups)?;
         Ok(Self {
             width,
             groups,
+            codec,
             record_bytes: record,
             geometry,
             experts: dir.join(EXPERTS_FILE),
@@ -260,7 +293,7 @@ impl LatentPack {
     /// Bytes of one dense projection, down or up, of one layer.
     #[must_use]
     pub fn projection_bytes(&self) -> u64 {
-        projection_bytes(self.groups, self.width, self.geometry.hidden)
+        projection_bytes(self.groups, self.width, self.geometry.hidden, self.codec)
     }
 
     /// Where layer `layer`'s down and up projections start in the dense
@@ -275,10 +308,13 @@ impl LatentPack {
     }
 }
 
-/// Bytes of one layer's down (or up) projection: `groups * width` `Q8_0` rows
-/// of `hidden` inputs, or the same count of bytes laid out the other way.
-fn projection_bytes(groups: u32, width: u32, hidden: u32) -> u64 {
-    u64::from(groups) * u64::from(width) * u64::from(hidden / Q8_WEIGHTS) * Q8_BLOCK_BYTES as u64
+/// Bytes of one layer's down (or up) projection: `groups * width` rows of
+/// `hidden` inputs, or the same count of bytes laid out the other way.
+fn projection_bytes(groups: u32, width: u32, hidden: u32, codec: ProjectionCodec) -> u64 {
+    u64::from(groups)
+        * u64::from(width)
+        * u64::from(hidden / Q8_WEIGHTS)
+        * codec.block_bytes() as u64
 }
 
 /// Parses `native_experts.txt`: the latent width from its header, and one
@@ -361,39 +397,46 @@ fn parse_index(dir: &Path, geometry: Geometry) -> CoreResult<(u32, u64)> {
     Ok((width, record))
 }
 
-/// The group count the dense projections file's size implies, and its path.
+/// The group count the dense projections file's size implies, its path and
+/// its codec.
 ///
-/// Only the `Q8_0` file is read; a pack that ships the four-bit one alone is
-/// refused by its name rather than reported as missing a file it was never
-/// meant to have.
-fn projection_groups(dir: &Path, geometry: Geometry, width: u32) -> CoreResult<(u32, PathBuf)> {
-    if !dir.join(PROJECTIONS_Q8).is_file() && dir.join(PROJECTIONS_Q4).is_file() {
-        return Err(refuse(
-            PROJECTIONS_Q4,
-            "only the Q8_0 projections are supported",
-        ));
-    }
+/// The eight-bit file is read when the directory has it; a directory that
+/// holds only the four-bit one is served from that. Which of the two a
+/// directory carries is the operator's choice of what to install, so there is
+/// no flag that could name a file the directory lacks.
+fn projection_groups(
+    dir: &Path,
+    geometry: Geometry,
+    width: u32,
+) -> CoreResult<(u32, PathBuf, ProjectionCodec)> {
+    let codec = if !dir.join(PROJECTIONS_Q8).is_file() && dir.join(PROJECTIONS_Q4).is_file() {
+        ProjectionCodec::Q4
+    } else {
+        ProjectionCodec::Q8
+    };
+    let name = codec.file();
     if !geometry.hidden.is_multiple_of(Q8_WEIGHTS) {
         return Err(refuse(
-            PROJECTIONS_Q8,
-            format_args!("hidden size {} is not whole Q8_0 blocks", geometry.hidden),
+            name,
+            format_args!("hidden size {} is not whole blocks", geometry.hidden),
         ));
     }
-    let len = file_len(dir, PROJECTIONS_Q8)?;
-    let per_group = 2 * u64::from(geometry.layers) * projection_bytes(1, width, geometry.hidden);
+    let len = file_len(dir, name)?;
+    let per_group =
+        2 * u64::from(geometry.layers) * projection_bytes(1, width, geometry.hidden, codec);
     let groups = len / per_group;
     if groups == 0 || groups * per_group != len {
         return Err(refuse(
-            PROJECTIONS_Q8,
+            name,
             format_args!(
                 "{len} bytes is not a whole number of groups ({per_group} bytes each, \
                  down and up, every layer)"
             ),
         ));
     }
-    let groups = u32::try_from(groups)
-        .map_err(|_| refuse(PROJECTIONS_Q8, format_args!("{groups} groups")))?;
-    Ok((groups, dir.join(PROJECTIONS_Q8)))
+    let groups =
+        u32::try_from(groups).map_err(|_| refuse(name, format_args!("{groups} groups")))?;
+    Ok((groups, dir.join(name), codec))
 }
 
 /// Parses `labels.bin`: one little-endian `i32` per expert, each a group.
@@ -515,22 +558,28 @@ pub fn split_scales(src: &[u8], in_dim: u32, dst: &mut [u8]) -> CoreResult<()> {
 
 /// Lays the up projection out as one matrix.
 ///
-/// `src` is `groups` blocks of `hidden` `Q8_0` rows of `width` inputs each, the
+/// `src` is `groups` blocks of `hidden` rows of `width` inputs each, the
 /// stored order; the result is `hidden` rows of `groups * width` inputs, row
-/// `h` the `groups` rows `h` end to end, group 0 first. Whole `Q8_0` blocks are
-/// moved, so no weight changes.
+/// `h` the `groups` rows `h` end to end, group 0 first. Whole blocks of
+/// `codec` are moved, so no weight changes.
 ///
 /// # Panics
 ///
-/// When `width` is not whole `Q8_0` blocks or `src` is not the size the three
-/// counts imply.
+/// When `width` is not whole blocks or `src` is not the size the counts
+/// imply.
 #[must_use]
-pub fn interleave_up(src: &[u8], groups: u32, hidden: u32, width: u32) -> Vec<u8> {
+pub fn interleave_up(
+    src: &[u8],
+    groups: u32,
+    hidden: u32,
+    width: u32,
+    codec: ProjectionCodec,
+) -> Vec<u8> {
     assert!(
         width.is_multiple_of(Q8_WEIGHTS),
-        "a Q8_0 row is whole blocks of {Q8_WEIGHTS}, got {width}"
+        "a row is whole blocks of {Q8_WEIGHTS}, got {width}"
     );
-    let row = (width / Q8_WEIGHTS) as usize * Q8_BLOCK_BYTES;
+    let row = (width / Q8_WEIGHTS) as usize * codec.block_bytes();
     let (groups, hidden) = (groups as usize, hidden as usize);
     assert_eq!(
         src.len(),

@@ -471,16 +471,26 @@ const GGML_MODULE: &str = "q4e_ggml";
 /// Activation rows one block of a step projection carries.
 const STEP_COLS: usize = 8;
 
-/// Random `Q8_0` rows: `in_dim / 32` blocks of a half-precision scale and 32
-/// signed codes a row, every scale finite and small.
-fn q8_rows(out_dim: usize, in_dim: usize, seed: u64) -> Vec<u8> {
+/// How a test's dense projection rows are stored.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Codec {
+    /// `Q8_0`: a half-precision scale and 32 signed codes a block.
+    Q8,
+    /// `Q4_0`: a half-precision scale and 16 bytes of nibbles a block.
+    Q4,
+}
+
+/// Random block rows of `codec`: `in_dim / 32` blocks a row, every scale
+/// finite and small.
+fn block_rows(codec: Codec, out_dim: usize, in_dim: usize, seed: u64) -> Vec<u8> {
+    let payload = if codec == Codec::Q8 { 32 } else { 16 };
     let mut state = seed | 1;
-    let mut bytes = Vec::with_capacity(out_dim * (in_dim / 32) * 34);
+    let mut bytes = Vec::with_capacity(out_dim * (in_dim / 32) * (2 + payload));
     for _ in 0..out_dim * (in_dim / 32) {
         // 0x2c00..0x2fff: positive, between 2^-4 and 2^-3.
         let scale = 0x2c00u16 | (xorshift(&mut state) & 0x3ff) as u16;
         bytes.extend(scale.to_le_bytes());
-        bytes.extend((0..32).map(|_| xorshift(&mut state) as u8));
+        bytes.extend((0..payload).map(|_| xorshift(&mut state) as u8));
     }
     bytes
 }
@@ -499,7 +509,7 @@ enum Side {
 /// activation rows.
 fn step_projection(
     gpu: &Gpu,
-    side: Option<Side>,
+    entry: (Codec, Option<Side>),
     dims: (usize, usize, usize),
     buffers: (&DeviceBuffer, &DeviceBuffer, &DeviceBuffer),
     masks: Option<(&DeviceBuffer, usize)>,
@@ -508,13 +518,19 @@ fn step_projection(
     let (out, w, x) = buffers;
     let lanes: u32 = if in_dim / 16 <= 32 { 32 } else { 128 };
     let unit: u32 = if rows > 2 { 4 } else { 1 };
-    let name = match (side, unit == 4) {
-        (None, false) => "q4e_g_step_matvec_q8_0_kernel",
-        (None, true) => "q4e_g_step_matvec4_q8_0_kernel",
-        (Some(Side::Down), false) => "q4e_g_step_latent_down_q8_0_kernel",
-        (Some(Side::Down), true) => "q4e_g_step_latent_down4_q8_0_kernel",
-        (Some(Side::Up), false) => "q4e_g_step_latent_up_q8_0_kernel",
-        (Some(Side::Up), true) => "q4e_g_step_latent_up4_q8_0_kernel",
+    let name = match (entry.0, entry.1, unit == 4) {
+        (Codec::Q8, None, false) => "q4e_g_step_matvec_q8_0_kernel",
+        (Codec::Q8, None, true) => "q4e_g_step_matvec4_q8_0_kernel",
+        (Codec::Q8, Some(Side::Down), false) => "q4e_g_step_latent_down_q8_0_kernel",
+        (Codec::Q8, Some(Side::Down), true) => "q4e_g_step_latent_down4_q8_0_kernel",
+        (Codec::Q8, Some(Side::Up), false) => "q4e_g_step_latent_up_q8_0_kernel",
+        (Codec::Q8, Some(Side::Up), true) => "q4e_g_step_latent_up4_q8_0_kernel",
+        (Codec::Q4, None, false) => "q4e_g_step_matvec_q4_0_kernel",
+        (Codec::Q4, None, true) => "q4e_g_step_matvec4_q4_0_kernel",
+        (Codec::Q4, Some(Side::Down), false) => "q4e_g_step_latent_down_q4_0_kernel",
+        (Codec::Q4, Some(Side::Down), true) => "q4e_g_step_latent_down4_q4_0_kernel",
+        (Codec::Q4, Some(Side::Up), false) => "q4e_g_step_latent_up_q4_0_kernel",
+        (Codec::Q4, Some(Side::Up), true) => "q4e_g_step_latent_up4_q4_0_kernel",
     };
     let mut args = vec![
         KernelArg::Buffer(out.view()),
@@ -592,7 +608,14 @@ fn group_masks(gpu: &Gpu, ids: &[i32], labels: &[u32]) -> (DeviceBuffer, Vec<u32
 }
 
 /// One shape and routing of [`latent_step_projections_skip_unused_groups`].
-fn masked_case(gpu: &Gpu, hidden: usize, width: usize, ids: &[i32], labels: &[u32], seed: u64) {
+fn masked_case(
+    gpu: &Gpu,
+    codec: Codec,
+    (hidden, width): (usize, usize),
+    ids: &[i32],
+    labels: &[u32],
+    seed: u64,
+) {
     let n_tok = ids.len() / USED;
     let span = GROUPS * width;
     let used = |t: usize| used_groups(ids, labels, t);
@@ -600,20 +623,20 @@ fn masked_case(gpu: &Gpu, hidden: usize, width: usize, ids: &[i32], labels: &[u3
 
     // Down: `hidden` in, `span` out. A used group's rows are the plain
     // entry's; an unused group's are left as they were.
-    let down_w = gpu.upload(&q8_rows(span, hidden, seed));
+    let down_w = gpu.upload(&block_rows(codec, span, hidden, seed));
     let x = gpu.upload(&f32_bytes(&signal(n_tok * hidden, 1501)));
     let plain = gpu.upload(&f32_bytes(&vec![f32::NAN; n_tok * span]));
     let masked = gpu.upload(&f32_bytes(&vec![f32::NAN; n_tok * span]));
     step_projection(
         gpu,
-        None,
+        (codec, None),
         (hidden, span, n_tok),
         (&plain, &down_w, &x),
         None,
     );
     step_projection(
         gpu,
-        Some(Side::Down),
+        (codec, Some(Side::Down)),
         (hidden, span, n_tok),
         (&masked, &down_w, &x),
         Some((&masks, width)),
@@ -654,20 +677,20 @@ fn masked_case(gpu: &Gpu, hidden: usize, width: usize, ids: &[i32], labels: &[u3
             }
         }
     }
-    let up_w = gpu.upload(&q8_rows(hidden, span, seed + 1));
+    let up_w = gpu.upload(&block_rows(codec, hidden, span, seed + 1));
     let sums = gpu.upload(&f32_bytes(&sums));
     let plain = gpu.upload(&f32_bytes(&vec![f32::NAN; n_tok * hidden]));
     let masked = gpu.upload(&f32_bytes(&vec![f32::NAN; n_tok * hidden]));
     step_projection(
         gpu,
-        None,
+        (codec, None),
         (span, hidden, n_tok),
         (&plain, &up_w, &sums),
         None,
     );
     step_projection(
         gpu,
-        Some(Side::Up),
+        (codec, Some(Side::Up)),
         (span, hidden, n_tok),
         (&masked, &up_w, &sums),
         Some((&masks, width)),
@@ -705,13 +728,13 @@ fn disjoint_routing(n_tok: usize) -> Vec<i32> {
 /// disjoint routing, in passes of two, five and eleven rows, each row's down
 /// rows (the groups it uses) and its up output equal a one-row launch of that
 /// row with its own mask, bit for bit.
-fn block_invariance_case(gpu: &Gpu, hidden: usize, width: usize, n_tok: usize) {
+fn block_invariance_case(gpu: &Gpu, codec: Codec, (hidden, width): (usize, usize), n_tok: usize) {
     let labels = disjoint_labels();
     let ids = disjoint_routing(n_tok);
     let span = GROUPS * width;
     let (masks, _) = group_masks(gpu, &ids, &labels);
-    let down_w = gpu.upload(&q8_rows(span, hidden, 301));
-    let up_w = gpu.upload(&q8_rows(hidden, span, 302));
+    let down_w = gpu.upload(&block_rows(codec, span, hidden, 301));
+    let up_w = gpu.upload(&block_rows(codec, hidden, span, 302));
     let xs = signal(n_tok * hidden, 1601);
     let mut sums = signal(n_tok * span, 1602);
     for t in 0..n_tok {
@@ -726,14 +749,14 @@ fn block_invariance_case(gpu: &Gpu, hidden: usize, width: usize, n_tok: usize) {
     let (x_dev, sums_dev) = (gpu.upload(&f32_bytes(&xs)), gpu.upload(&f32_bytes(&sums)));
     step_projection(
         gpu,
-        Some(Side::Down),
+        (codec, Some(Side::Down)),
         (hidden, span, n_tok),
         (&down, &down_w, &x_dev),
         Some((&masks, width)),
     );
     step_projection(
         gpu,
-        Some(Side::Up),
+        (codec, Some(Side::Up)),
         (span, hidden, n_tok),
         (&up, &up_w, &sums_dev),
         Some((&masks, width)),
@@ -746,14 +769,14 @@ fn block_invariance_case(gpu: &Gpu, hidden: usize, width: usize, n_tok: usize) {
         let (down_one, up_one) = (nan(span), nan(hidden));
         step_projection(
             gpu,
-            Some(Side::Down),
+            (codec, Some(Side::Down)),
             (hidden, span, 1),
             (&down_one, &down_w, &x_one),
             Some((&own, width)),
         );
         step_projection(
             gpu,
-            Some(Side::Up),
+            (codec, Some(Side::Up)),
             (span, hidden, 1),
             (&up_one, &up_w, &sums_one),
             Some((&own, width)),
@@ -790,6 +813,14 @@ fn block_invariance_case(gpu: &Gpu, hidden: usize, width: usize, n_tok: usize) {
 /// When a mask, a used group's row or an up output differs, an unused group
 /// is written, or the device refuses a launch or a read.
 pub fn latent_step_projections_skip_unused_groups(gpu: &Gpu) {
+    for codec in [Codec::Q8, Codec::Q4] {
+        skip_unused_groups(gpu, codec);
+    }
+}
+
+/// [`latent_step_projections_skip_unused_groups`] over projections stored as
+/// `codec`.
+fn skip_unused_groups(gpu: &Gpu, codec: Codec) {
     // Experts land in groups 0 to 4 only, so 5 to 7 are never used.
     let edge: Vec<u32> = (0..EXPERTS as u32).map(|e| e % 5).collect();
     // Three groups in all.
@@ -798,17 +829,31 @@ pub fn latent_step_projections_skip_unused_groups(gpu: &Gpu) {
         .collect();
     for (hidden, width) in [(2560, 128), (256, 32)] {
         for (n_tok, seed) in [(1, 201), (5, 202), (11, 203)] {
-            masked_case(gpu, hidden, width, &routing(n_tok, seed), &edge, seed);
-            masked_case(gpu, hidden, width, &routing(n_tok, seed + 50), &few, seed);
+            masked_case(
+                gpu,
+                codec,
+                (hidden, width),
+                &routing(n_tok, seed),
+                &edge,
+                seed,
+            );
+            masked_case(
+                gpu,
+                codec,
+                (hidden, width),
+                &routing(n_tok, seed + 50),
+                &few,
+                seed,
+            );
         }
         // Slots the router left empty set no bit and leave nothing to compute.
         let mut sparse = routing(11, 204);
         for slot in [3, 14, 15, 60, 109] {
             sparse[slot] = -1;
         }
-        masked_case(gpu, hidden, width, &sparse, &edge, 204);
+        masked_case(gpu, codec, (hidden, width), &sparse, &edge, 204);
         for n_tok in [2, 5, 11] {
-            block_invariance_case(gpu, hidden, width, n_tok);
+            block_invariance_case(gpu, codec, (hidden, width), n_tok);
         }
     }
 }
