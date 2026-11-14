@@ -65,10 +65,11 @@ const STREAMED_SLOTS: u32 = 2_048;
 ///   max 0.724, mean 0.0783, top-5 overlap 4, same top-1;
 /// - this pack: max 0.324, mean 0.0492, top-5 overlap 5, same top-1.
 ///
-/// The bounds are 1.5 times the larger of the two (the GGUF arm's), rounded
-/// up, and top-5 overlap is the smaller (4), so the pack is held to what an
-/// arm already in service shows rather than to a number picked after the
-/// fact. The difference is expected where a prompt pass and a step differ in
+/// The bounds hold the pack to its own measurement with a margin: 0.5 is
+/// about 1.5 times its max (0.324) and 0.08 about 1.6 times its mean (0.0492),
+/// both under the GGUF arm's own (0.724, 0.0783), from which this test's
+/// earlier bounds of 1.1 and 0.12 were derived. Top-5 overlap is the smaller
+/// of the two arms' (4). The difference is expected where a prompt pass and a step differ in
 /// the kernels they run: the pass's dense projections and routed stages take
 /// activations rounded to half precision into tensor-core tiles
 /// (`kernels/cuda/q4e/ggml.cu`, "Prompt passes on tensor cores"; the routed
@@ -78,9 +79,9 @@ const STREAMED_SLOTS: u32 = 2_048;
 /// pack's difference is below the GGUF arm's.
 const MIN_TOP5: usize = 4;
 /// Mean absolute logit difference bound.
-const MEAN_BOUND: f64 = 0.12;
+const MEAN_BOUND: f64 = 0.08;
 /// Widest absolute logit difference bound.
-const MAX_BOUND: f64 = 1.1;
+const MAX_BOUND: f64 = 0.5;
 
 /// `count` events in `seconds`, as a rate.
 fn per_second(count: usize, seconds: f64) -> f64 {

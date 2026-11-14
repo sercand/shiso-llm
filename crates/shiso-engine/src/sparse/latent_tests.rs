@@ -497,7 +497,7 @@ fn scratch(rows: u32, latent_columns: u32) -> Scratch {
 #[test]
 fn scratch_latent_zero_without_latent_layers() {
     let scratch = scratch(512, 0);
-    for buf in [Buf::Latent, Buf::LatentSum] {
+    for buf in [Buf::Latent, Buf::LatentSum, Buf::LatentMask] {
         assert_eq!(scratch.view(buf).expect("allocated").len(), 0, "{buf:?}");
     }
     // The other buffers are as before.
@@ -515,6 +515,12 @@ fn scratch_latent_sized() {
         for buf in [Buf::Latent, Buf::LatentSum] {
             assert_eq!(scratch.view(buf).expect("allocated").len(), want, "{buf:?}");
         }
+        // One mask word per block of eight rows.
+        assert_eq!(
+            scratch.view(Buf::LatentMask).expect("allocated").len(),
+            u64::from(rows.div_ceil(8)) * 4,
+            "mask words for {rows} rows"
+        );
     }
     // The ledger's tag and the zero the shape-only sizing answers.
     assert_eq!(Buf::Latent.bytes(&sparse_shape(), 512, 8, 0), 0);

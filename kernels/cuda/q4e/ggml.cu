@@ -1399,7 +1399,8 @@ __device__ __forceinline__ void q4e_gs_down(
  * the down entries leave those output rows unwritten and the up entries skip
  * those runs - a third of the two weights' bytes on a single token - and
  * every value that is read is the plain entries' value, bit for bit: a
- * skipped run added a signed zero to a sum that is never negative zero.
+ * skipped run added a signed zero, so the only value that can differ is the
+ * sign of an output that is exactly zero.
  *
  * `masks[b]` has bit `g` set when one of block column `b`'s activation rows
  * (`Q4E_GS_COLS` a block) routes an expert of group `g`;

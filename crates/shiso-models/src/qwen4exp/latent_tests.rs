@@ -252,6 +252,17 @@ fn names(err: &CoreError, file: &str) {
 }
 
 #[test]
+fn a_width_the_prompt_kernels_cannot_stride_is_refused_at_load() {
+    assert!(super::check_prompt_width(1792, 640).is_ok());
+    for (width, inter) in [(64, 640), (1792, 704), (1856, 640)] {
+        names(
+            &super::check_prompt_width(width, inter).expect_err("refused"),
+            "native_experts.txt",
+        );
+    }
+}
+
+#[test]
 fn open_parses_index() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_pack(dir.path(), &small_experts(), |i| (i % 2) as i32);

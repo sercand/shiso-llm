@@ -34,7 +34,7 @@ back to the kernel it belongs to.
 | Registry key | Unit | Plain entries | Template instantiations |
 |---|---|---|---|
 | `q4e_hc` | `hc.cu` | 4 | 6 |
-| `q4e_moe` | `moe.cu` | 10 | 4 |
+| `q4e_moe` | `moe.cu` | 11 | 4 |
 | `q4e_gdn` | `gdn.cu` | 8 | 0 |
 | `q4e_gdn_tc` | `gdn_tc.cu` | 4 | 0 |
 | `q4e_ple` | `ple.cu` | 5 | 0 |
@@ -52,8 +52,8 @@ back to the kernel it belongs to.
 | `q4e_bf16` | `bf16.cu` | 12 | 0 |
 | `q4e_gdn_fused` | `gdn_fused.cu` | 2 | 0 |
 | `q4e_ffn` | `ffn.cu` | 3 | 0 |
-| `q4e_ggml` | `ggml.cu` | 84 | 0 |
-| **total** | 20 units | **196** | **105** |
+| `q4e_ggml` | `ggml.cu` | 88 | 0 |
+| **total** | 20 units | **201** | **105** |
 
 ## Plain entries, by module
 

@@ -3,13 +3,14 @@
 //! The latent pack's loader seams on synthetic files: the n-gram container's
 //! refusals, the half-precision widening, and the skeleton binding.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use shiso_core::TokenId;
 use shiso_core::error::CoreError;
 use shiso_modelfile::GgufFile;
 
-use super::{ROW_ROUNDING, check_rows, read_table, widen_half};
+use super::{PoolRoom, ROW_ROUNDING, check_rows, pool_slots, read_table, widen_half};
 use crate::qwen4exp::config::{FULL_ATTENTION_INTERVAL, N_LAYERS, shape};
 use crate::qwen4exp::{NgramHash, Qwen4ExpConfig, bind_qwen4exp, bind_skeleton};
 use crate::test_gguf::{Kv, Tensor, write_gguf};
@@ -33,10 +34,24 @@ fn table(ggml_type: u32, width: u64, rows: u64) -> Tensor {
 
 fn good_kvs() -> Vec<(&'static str, Kv)> {
     vec![
-        ("general.architecture", Kv::Str("strata-ple")),
-        ("strata.ple.format", Kv::Str("f8_e4m3")),
-        ("strata.ple.scale", Kv::F32(0.5)),
+        ("general.architecture", Kv::Str("ngram-table")),
+        ("writer.ple.format", Kv::Str("f8_e4m3")),
+        ("writer.ple.scale", Kv::F32(0.5)),
     ]
+}
+
+/// Asserts the refusal's chain of messages names the table's file.
+fn assert_names_file(err: &CoreError) {
+    let mut chain = format!("{err}");
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        write!(chain, ": {cause}").expect("a string takes text");
+        source = cause.source();
+    }
+    assert!(
+        chain.contains(FILE),
+        "the refusal does not name {FILE}: {chain}"
+    );
 }
 
 fn open(dir: &Path) -> Result<(), CoreError> {
@@ -109,7 +124,7 @@ fn a_table_the_reader_cannot_decode_is_refused_by_name() {
     ));
     // No file at all.
     std::fs::remove_file(dir.path().join(FILE)).expect("removed");
-    assert!(open(dir.path()).is_err());
+    assert_names_file(&open(dir.path()).expect_err("no file is refused"));
 }
 
 #[test]
@@ -125,7 +140,7 @@ fn a_table_shorter_than_its_rows_is_refused() {
         .expect("open")
         .set_len(whole - 160)
         .expect("truncated");
-    assert!(open(dir.path()).is_err(), "the table is refused");
+    assert_names_file(&open(dir.path()).expect_err("the table is refused"));
 }
 
 #[test]
@@ -335,4 +350,74 @@ fn a_skeleton_binds_without_banks_and_everything_else_is_still_required() {
             other => panic!("{gone}: {:?}", other.map(|_| ())),
         }
     }
+}
+
+/// A room of 100 slots' worth of total memory with nothing held back.
+fn room(host_available: Option<u64>) -> PoolRoom {
+    PoolRoom {
+        total: 100_000,
+        host_available,
+        rest: 10_000,
+        reserve: 5_000,
+        slot_bytes: 10,
+        all: 6_000,
+    }
+}
+
+#[test]
+fn the_pool_is_held_to_what_the_host_has_available() {
+    // Total memory alone: 85,000 bytes of room, 8,500 slots, capped at `all`.
+    assert_eq!(pool_slots(&room(None)).expect("fits"), 6_000);
+    // A host with plenty available is no tighter.
+    assert_eq!(pool_slots(&room(Some(1_000_000))).expect("fits"), 6_000);
+    // Another process holds most of it: 40,000 available, 25,000 of room.
+    assert_eq!(pool_slots(&room(Some(40_000))).expect("fits"), 2_500);
+}
+
+#[test]
+fn a_host_with_no_room_for_one_layer_refuses() {
+    // 15,000 held back leaves nothing of 15,000 available.
+    let err = pool_slots(&room(Some(15_000))).expect_err("no room");
+    assert!(matches!(err, CoreError::Unsupported { .. }), "{err:?}");
+}
+
+/// A backend without the latent entries is refused before the pack's files
+/// are looked at: an empty directory would otherwise fail on its first
+/// missing file, and the refusal that matters is the device's.
+#[test]
+fn a_device_without_latent_kernels_is_refused_before_any_file_is_read() {
+    use std::sync::Arc;
+
+    use shiso_core::backend::Backend;
+    use shiso_core::config::HfConfig;
+    use shiso_cpu::{CpuBackend, CpuOptions};
+    use shiso_engine::sparse::stack::SparseOptions;
+
+    use crate::qwen4exp::{Qwen4ExpModel, StreamedLoad};
+
+    let dir = tempfile::TempDir::new().expect("a directory");
+    let backend: Arc<dyn Backend> = CpuBackend::new(CpuOptions::default()).expect("cpu device");
+    let hf =
+        HfConfig::from_json_str(r#"{"model_type": "qwen4exp"}"#).expect("an empty config parses");
+    let load = StreamedLoad {
+        slots: None,
+        reserve: 0,
+        draft: false,
+        counts: None,
+    };
+    let Err(err) =
+        Qwen4ExpModel::load_latent(&backend, dir.path(), &hf, SparseOptions::default(), &load)
+    else {
+        panic!("a device without the latent kernels was accepted");
+    };
+    assert!(
+        matches!(
+            err,
+            CoreError::Unsupported {
+                backend: "engine",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }

@@ -10,8 +10,9 @@
 //! Nothing is widened. `D` is the stored bytes of a `Q8_0` tensor of dims
 //! `[2560, 14336]`; `U` is the same blocks laid out as one `[14336, 2560]`
 //! matrix ([`interleave_up`]), the only byte movement in the load. Both are
-//! read with the page cache bypassed (3.7 GB that is then resident on the
-//! device would otherwise be cached a second time) and uploaded.
+//! read through [`open_uncached`], which asks the OS to bypass the page cache
+//! where it can (on Linux it is a plain open, so the cache is not bypassed
+//! there) and uploaded.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -45,6 +46,56 @@ const FORMAT_SUFFIX: &str = ".ple.format";
 const SCALE_SUFFIX: &str = ".ple.scale";
 /// The codec name the table must state.
 const FORMAT_FP8: &str = "f8_e4m3";
+
+/// What the pool's size is decided from.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PoolRoom {
+    /// The device's total working memory.
+    pub total: u64,
+    /// What the host could give without paging, where the device shares it
+    /// and reports it.
+    pub host_available: Option<u64>,
+    /// Bytes the dense weights, projections and draft head take first.
+    pub rest: u64,
+    /// Bytes the caller keeps back for everything else.
+    pub reserve: u64,
+    /// Bytes one expert's slot occupies.
+    pub slot_bytes: u64,
+    /// Every expert of every layer.
+    pub all: u32,
+}
+
+/// Slots the pool starts at when the caller named none: as many as fit in the
+/// device's total, and no more than fit in what the host has available now,
+/// less `rest` and `reserve`, so that a pool preloaded whole is never larger
+/// than the memory the machine can still give (it shares that memory with
+/// whatever else it runs).
+///
+/// # Errors
+///
+/// [`CoreError::Unsupported`] when not even one layer's experts fit.
+pub(super) fn pool_slots(room: &PoolRoom) -> CoreResult<u32> {
+    let held = room.rest.saturating_add(room.reserve);
+    let by = |memory: u64| {
+        u32::try_from(memory.saturating_sub(held) / room.slot_bytes.max(1)).unwrap_or(u32::MAX)
+    };
+    let fit = by(room.total).min(room.host_available.map_or(u32::MAX, by));
+    if fit < EXPERTS {
+        tracing::error!(
+            total_gib = room.total >> 30,
+            host_available_gib = room.host_available.map(|bytes| bytes >> 30),
+            held_gib = held >> 30,
+            slot_mib = room.slot_bytes >> 20,
+            "the latent pack's pool does not fit"
+        );
+        return Err(CoreError::Unsupported {
+            what: "a device whose working set, or whose free host memory, cannot hold one \
+                   layer's routed experts beside the dense weights",
+            backend: "qwen4exp",
+        });
+    }
+    Ok(fit.min(room.all))
+}
 
 /// Bytes one expert occupies in the pool: its nine arrays.
 #[must_use]
@@ -279,7 +330,8 @@ pub(super) fn read_table(dir: &Path) -> CoreResult<NgramFile> {
     let file = GgufFile::open_shared(&path).map_err(|source| CoreError::Backend {
         backend: "qwen4exp",
         op: "open the n-gram table",
-        source: Box::new(source),
+        // The container's own message does not say which file it was reading.
+        source: format!("{NGRAM_FILE}: {source}").into(),
     })?;
     let meta = file.metadata();
     let by_suffix = |suffix: &str| {

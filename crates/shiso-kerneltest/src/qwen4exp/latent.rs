@@ -402,7 +402,7 @@ fn combine_case(gpu: &Gpu, ids: &[i32], labels: &[u32], width: usize, grid_x: u3
                 let mut acc = 0f32;
                 for j in 0..n_used {
                     let col = t * n_used + j;
-                    if labels[ids[col] as usize] as usize == g {
+                    if ids[col] >= 0 && labels[ids[col] as usize] as usize == g {
                         acc = weights[col].mul_add(down[col * width + i], acc);
                     }
                 }
@@ -441,7 +441,8 @@ fn combine_case(gpu: &Gpu, ids: &[i32], labels: &[u32], width: usize, grid_x: u3
 }
 
 /// The latent combine over a routing built to hit its edges - a token with
-/// three experts in one group, groups no expert is in - and over a random one,
+/// three experts in one group, groups no expert is in, a slot with no expert -
+/// and over a random one,
 /// each at a full grid over the token's `GROUPS * width` elements and at a grid
 /// narrower than that, so the stride is run.
 ///
@@ -455,6 +456,8 @@ pub fn latent_combine_matches_host(gpu: &Gpu) {
     let edge_labels: Vec<u32> = (0..EXPERTS as u32).map(|e| e % 5).collect();
     let mut ids = vec![0, 5, 10, 1, 2, 3, 4, 6, 7, 8];
     ids.extend(routing(2, 77));
+    // A slot the router left empty adds nothing to any group.
+    ids[13] = -1;
     for grid_x in [(GROUPS * width).div_ceil(256) as u32, 2] {
         combine_case(gpu, &ids, &edge_labels, width, grid_x);
         let labels = random_labels(GROUPS, 91);
@@ -547,6 +550,7 @@ fn step_projection(
 fn used_groups(ids: &[i32], labels: &[u32], t: usize) -> u32 {
     ids[t * USED..(t + 1) * USED]
         .iter()
+        .filter(|&&e| e >= 0)
         .fold(0u32, |m, &e| m | 1 << labels[e as usize])
 }
 
@@ -671,6 +675,107 @@ fn masked_case(gpu: &Gpu, hidden: usize, width: usize, ids: &[i32], labels: &[u3
     same_bits("latent up", &gpu.read_f32(&masked), &gpu.read_f32(&plain));
 }
 
+/// Experts 0 to 9 in group 0, 10 to 12 in group 3, 13 to 15 in group 6.
+fn disjoint_labels() -> Vec<u32> {
+    (0..EXPERTS as u32)
+        .map(|e| match e {
+            0..=9 => 0,
+            10..=12 => 3,
+            _ => 6,
+        })
+        .collect()
+}
+
+/// Token `t`'s experts in the disjoint routing: A uses group 0 alone, B groups
+/// 0 and 3, C groups 0 and 6, so a block mixing them has a mask wider than most
+/// of its rows' own.
+fn disjoint_routing(n_tok: usize) -> Vec<i32> {
+    let mut ids = Vec::with_capacity(n_tok * USED);
+    for t in 0..n_tok {
+        match t % 3 {
+            0 => ids.extend(0..10),
+            1 => ids.extend((0..7).chain(10..13)),
+            _ => ids.extend((0..7).chain(13..16)),
+        }
+    }
+    ids
+}
+
+/// A row's result does not depend on which rows share its block: over the
+/// disjoint routing, in passes of two, five and eleven rows, each row's down
+/// rows (the groups it uses) and its up output equal a one-row launch of that
+/// row with its own mask, bit for bit.
+fn block_invariance_case(gpu: &Gpu, hidden: usize, width: usize, n_tok: usize) {
+    let labels = disjoint_labels();
+    let ids = disjoint_routing(n_tok);
+    let span = GROUPS * width;
+    let (masks, _) = group_masks(gpu, &ids, &labels);
+    let down_w = gpu.upload(&q8_rows(span, hidden, 301));
+    let up_w = gpu.upload(&q8_rows(hidden, span, 302));
+    let xs = signal(n_tok * hidden, 1601);
+    let mut sums = signal(n_tok * span, 1602);
+    for t in 0..n_tok {
+        for g in 0..GROUPS {
+            if used_groups(&ids, &labels, t) >> g & 1 == 0 {
+                sums[(t * GROUPS + g) * width..][..width].fill(0.0);
+            }
+        }
+    }
+    let nan = |n: usize| gpu.upload(&f32_bytes(&vec![f32::NAN; n]));
+    let (down, up) = (nan(n_tok * span), nan(n_tok * hidden));
+    let (x_dev, sums_dev) = (gpu.upload(&f32_bytes(&xs)), gpu.upload(&f32_bytes(&sums)));
+    step_projection(
+        gpu,
+        Some(Side::Down),
+        (hidden, span, n_tok),
+        (&down, &down_w, &x_dev),
+        Some((&masks, width)),
+    );
+    step_projection(
+        gpu,
+        Some(Side::Up),
+        (span, hidden, n_tok),
+        (&up, &up_w, &sums_dev),
+        Some((&masks, width)),
+    );
+    let (down, up) = (gpu.read_f32(&down), gpu.read_f32(&up));
+    for t in 0..n_tok {
+        let (own, _) = group_masks(gpu, &ids[t * USED..(t + 1) * USED], &labels);
+        let x_one = gpu.upload(&f32_bytes(&xs[t * hidden..(t + 1) * hidden]));
+        let sums_one = gpu.upload(&f32_bytes(&sums[t * span..(t + 1) * span]));
+        let (down_one, up_one) = (nan(span), nan(hidden));
+        step_projection(
+            gpu,
+            Some(Side::Down),
+            (hidden, span, 1),
+            (&down_one, &down_w, &x_one),
+            Some((&own, width)),
+        );
+        step_projection(
+            gpu,
+            Some(Side::Up),
+            (span, hidden, 1),
+            (&up_one, &up_w, &sums_one),
+            Some((&own, width)),
+        );
+        let down_one = gpu.read_f32(&down_one);
+        for g in 0..GROUPS {
+            if used_groups(&ids, &labels, t) >> g & 1 == 1 {
+                same_bits(
+                    "a row's used down rows, alone and in a block",
+                    &down[(t * GROUPS + g) * width..][..width],
+                    &down_one[g * width..][..width],
+                );
+            }
+        }
+        same_bits(
+            "a row's up output, alone and in a block",
+            &up[t * hidden..(t + 1) * hidden],
+            &gpu.read_f32(&up_one),
+        );
+    }
+}
+
 /// A step pass's two latent projections against the plain step entries on the
 /// same inputs, bit for bit, with the group masks checked against a host
 /// fold: the down entry writes exactly the groups a block of rows uses, and
@@ -695,6 +800,15 @@ pub fn latent_step_projections_skip_unused_groups(gpu: &Gpu) {
         for (n_tok, seed) in [(1, 201), (5, 202), (11, 203)] {
             masked_case(gpu, hidden, width, &routing(n_tok, seed), &edge, seed);
             masked_case(gpu, hidden, width, &routing(n_tok, seed + 50), &few, seed);
+        }
+        // Slots the router left empty set no bit and leave nothing to compute.
+        let mut sparse = routing(11, 204);
+        for slot in [3, 14, 15, 60, 109] {
+            sparse[slot] = -1;
+        }
+        masked_case(gpu, hidden, width, &sparse, &edge, 204);
+        for n_tok in [2, 5, 11] {
+            block_invariance_case(gpu, hidden, width, n_tok);
         }
     }
 }

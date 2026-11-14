@@ -124,6 +124,30 @@ pub fn is_latent_pack(dir: &Path) -> bool {
         .all(|name| dir.join(name).is_file())
 }
 
+/// Contraction widths the tensor-core prompt kernels stride in: the latent
+/// width and the expert's inner width must both be whole multiples of it.
+const GEMM_K_ALIGN: u32 = 128;
+
+/// Refuses, at load, a latent width the prompt kernels cannot stride, rather
+/// than at the first prompt plan, after the weights have been read.
+///
+/// # Errors
+///
+/// [`CoreError::InvalidValue`] naming `native_experts.txt` when `width` or
+/// `inter` is not a multiple of 128.
+pub fn check_prompt_width(width: u32, inter: u32) -> CoreResult<()> {
+    if width.is_multiple_of(GEMM_K_ALIGN) && inter.is_multiple_of(GEMM_K_ALIGN) {
+        return Ok(());
+    }
+    Err(refuse(
+        INDEX,
+        format_args!(
+            "expert_embd {width} and expert_ff {inter} must be multiples of {GEMM_K_ALIGN}, \
+             the width the prompt kernels stride"
+        ),
+    ))
+}
+
 /// One refusal, naming the file it is about.
 fn refuse(file: &'static str, why: impl std::fmt::Display) -> CoreError {
     CoreError::InvalidValue {
@@ -183,9 +207,12 @@ impl LatentPack {
     ///
     /// [`CoreError::ConfigMissing`] naming an absent file, and
     /// [`CoreError::InvalidValue`] naming the file whose contents or size
-    /// disagree with the index or the family's shape.
+    /// disagree with the index or the family's shape, or whose latent width
+    /// the prompt kernels cannot stride ([`check_prompt_width`]).
     pub fn open(dir: &Path) -> CoreResult<Self> {
-        Self::open_with(dir, FAMILY)
+        let pack = Self::open_with(dir, FAMILY)?;
+        check_prompt_width(pack.width, FAMILY.inter)?;
+        Ok(pack)
     }
 
     /// [`Self::open`] against `geometry`.

@@ -531,6 +531,10 @@ impl Qwen4ExpModel {
         load: &StreamedLoad<'_>,
     ) -> CoreResult<Self> {
         use crate::qwen4exp::config::{EXPERTS, N_LAYERS};
+        // Before any file is opened or byte moved: a device without the latent
+        // entries is refused here and not after the pool has been read; the
+        // pack's open refuses a width the prompt kernels cannot stride.
+        shiso_engine::sparse::capture::check_latent_kernels(backend.as_ref())?;
         let pack = latent::LatentPack::open(dir)?;
         let skeleton = dir.join(latent::SKELETON);
         let config = Qwen4ExpConfig::from_hf(hf, &skeleton)?;
@@ -563,16 +567,14 @@ impl Qwen4ExpModel {
                 .saturating_mul(2)
                 .saturating_add(latent_load::projection_resident_bytes(&pack))
                 .saturating_add(head);
-            let room = total.saturating_sub(rest.saturating_add(load.reserve));
-            let fit = u32::try_from(room / slot_bytes).unwrap_or(u32::MAX);
-            if fit < EXPERTS {
-                return Err(CoreError::Unsupported {
-                    what: "a device whose working set cannot hold one layer's routed experts \
-                           beside the dense weights",
-                    backend: "qwen4exp",
-                });
-            }
-            fit.min(all)
+            latent_load::pool_slots(&latent_load::PoolRoom {
+                total,
+                host_available: backend.host_available(),
+                rest,
+                reserve: load.reserve,
+                slot_bytes,
+                all,
+            })?
         };
         tracing::info!(slots, all, "routed expert pool of the latent pack");
         let mut weights = import(
@@ -1647,9 +1649,10 @@ fn release(
     Ok(())
 }
 
-/// Imports one weight vector: plain `f32`, or the half-precision one the
-/// latent pack's skeleton stores its n-gram convolution kernel in, widened on
-/// the way in (exact, and a tensor of a few hundred kilobytes).
+/// Imports one weight vector: plain `f32`, or half precision (the latent
+/// pack's skeleton stores its n-gram convolution kernel so, and any arm's
+/// vectors stored so take the same path), widened on the way in (exact, and a
+/// tensor of a few hundred kilobytes).
 fn vector(
     backend: &Arc<dyn Backend>,
     file: &GgufFile,
