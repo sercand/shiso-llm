@@ -68,15 +68,35 @@ enum Side {
     Up,
 }
 
+/// The block format both projections are stored in, when it is one the
+/// latent step entries are instantiated for.
+fn step_dtype(latent: &LatentDesc) -> Option<DType> {
+    (latent.down.dtype == latent.up.dtype && matches!(latent.down.dtype, DType::Q8_0 | DType::Q4_0))
+        .then_some(latent.down.dtype)
+}
+
 /// Whether this pass's two projections take the entries that skip unused
-/// groups: a step or verify pass over `Q8_0` projections on the lanes-a-row
-/// step kernels, with few enough groups for a mask word.
+/// groups: a step or verify pass over `Q8_0` or `Q4_0` projections on the
+/// lanes-a-row step kernels, with few enough groups for a mask word.
 fn masks(latent: &LatentDesc, n_tok: u32, device: Device) -> bool {
     latent.groups <= LATENT_MASK_GROUPS
-        && latent.down.dtype == DType::Q8_0
-        && latent.up.dtype == DType::Q8_0
+        && step_dtype(latent).is_some()
         && matches!(matmul::step_tier(device), ggml::StepTier::Runs)
         && matmul::ggml_step(DType::Q8_0, ggml::step_stage(n_tok).0, device).is_some()
+}
+
+/// The masked step entry for `side` of a projection stored as `dtype`.
+const fn masked_entry(dtype: DType, side: Side, four: bool) -> &'static str {
+    match (matches!(dtype, DType::Q4_0), side, four) {
+        (false, Side::Down, false) => "q4e_g_step_latent_down_q8_0_kernel",
+        (false, Side::Down, true) => "q4e_g_step_latent_down4_q8_0_kernel",
+        (false, Side::Up, false) => "q4e_g_step_latent_up_q8_0_kernel",
+        (false, Side::Up, true) => "q4e_g_step_latent_up4_q8_0_kernel",
+        (true, Side::Down, false) => "q4e_g_step_latent_down_q4_0_kernel",
+        (true, Side::Down, true) => "q4e_g_step_latent_down4_q4_0_kernel",
+        (true, Side::Up, false) => "q4e_g_step_latent_up_q4_0_kernel",
+        (true, Side::Up, true) => "q4e_g_step_latent_up4_q4_0_kernel",
+    }
 }
 
 /// One of the stage's two projections: the plain projection, or on a pass
@@ -85,6 +105,11 @@ fn masks(latent: &LatentDesc, n_tok: u32, device: Device) -> bool {
 /// The masked entries are the plain step entries with two more arguments
 /// (`out, w, x, in_dim, out_dim, rows, lanes, masks, width`), on the plain
 /// launch.
+///
+/// A four-bit projection has those step entries and the tensor-core prompt
+/// entry and nothing else: it is no general block format here, because only
+/// this stage's two weights are ever stored that way. A pass that would take
+/// any other kernel for it is refused.
 ///
 /// Measured on a GB10 serving a 48-layer pack with eight groups of 1792,
 /// whose two projections are 78 MB of the 190 MB a layer streams a token:
@@ -101,18 +126,34 @@ fn projection(
 ) -> CoreResult<()> {
     let (n_tok, device) = pass;
     if !masks(latent, n_tok, device) {
-        return matmul::project(plan, weight, bound, n_tok, device);
+        if weight.dtype != DType::Q4_0 {
+            return matmul::project(plan, weight, bound, n_tok, device);
+        }
+        // The prompt entry, as `matmul::project` launches a block format's:
+        // `out, w, x, in_dim, out_dim, rows`.
+        if matmul::ggml_prompt(DType::Q8_0, ggml::Stage::Gemm, device).is_none() {
+            return Err(refuse(
+                "a latent stage's four-bit projections on a pass with no entry for them",
+            ));
+        }
+        plan.launch(
+            Entry::plain(MOD_GGML, "q4e_g_gemm_q4_0_kernel"),
+            ggml::gemm_rows_launch(weight.out_dim, n_tok),
+            Args::of(&[
+                bound.dst,
+                Operand::Weight(bound.weight),
+                bound.src,
+                Operand::U32(weight.in_dim),
+                Operand::U32(weight.out_dim),
+                Operand::U32(n_tok),
+            ]),
+        );
+        return Ok(());
     }
     let four = ggml::step_stage(n_tok).1 == 4;
-    let name = match (side, four) {
-        (Side::Down, false) => "q4e_g_step_latent_down_q8_0_kernel",
-        (Side::Down, true) => "q4e_g_step_latent_down4_q8_0_kernel",
-        (Side::Up, false) => "q4e_g_step_latent_up_q8_0_kernel",
-        (Side::Up, true) => "q4e_g_step_latent_up4_q8_0_kernel",
-    };
     let lanes = ggml::step_lanes(weight.in_dim, matmul::step_tier(device));
     plan.launch(
-        Entry::plain(MOD_GGML, name),
+        Entry::plain(MOD_GGML, masked_entry(weight.dtype, side, four)),
         ggml::step_launch(weight.out_dim, n_tok, lanes),
         Args::of(&[
             bound.dst,
