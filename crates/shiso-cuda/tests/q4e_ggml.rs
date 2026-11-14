@@ -82,3 +82,10 @@ fn the_lane_step_entries_match_the_host_in_every_block_format() {
     let Some(gpu) = open() else { return };
     cases::the_lane_step_entries_match_the_host_in_every_block_format(&gpu);
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_four_bit_projection_entries_match_the_host() {
+    let Some(gpu) = open() else { return };
+    cases::the_four_bit_projection_entries_match_the_host(&gpu);
+}

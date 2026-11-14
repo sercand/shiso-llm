@@ -334,6 +334,14 @@ entry takes its step twin's arguments; a step entry takes them and `lpr` last.
 - `q4e_g_step_latent_up_q8_0_kernel`, `q4e_g_step_latent_up4_q8_0_kernel` - its
   up projection: the same sums with the runs of such a group, which multiply
   zeros, left out.
+- `q4e_g_step_latent_{down,down4,up,up4}_q4_0_kernel` - the same four over
+  projections stored as `Q4_0` (a half scale and 16 bytes of nibbles a block,
+  each code its nibble less eight).
+- `q4e_g_gemm_q4_0_kernel`, `q4e_g_step_matvec_q4_0_kernel`,
+  `q4e_g_step_matvec4_q4_0_kernel` - `Q4_0`'s prompt and plain step
+  projections. The format has no plain matvec, embedding or routed entries
+  that anything launches: only a latent stage's two projections are stored
+  this way.
 - `q4e_g_step_matvec_f32_kernel`
 - `q4e_g_step_matvec_q8_0_kernel`
 - `q4e_g_step_matvec_q6_k_kernel`
@@ -988,6 +996,7 @@ the table; the block-quantized entry does not, so its caller owns the range.
 | `q4e_g_step_matvec4_*` | `(ceil(out_dim / (4 * Q4E_GS_WARPS * 32 / lpr)), ceil(n_tok / Q4E_GS_COLS))` | `32 * Q4E_GS_WARPS` | `0` |
 | `q4e_g_step_latent_{down,up}_q8_0_kernel` | as `q4e_g_step_matvec_*` | `32 * Q4E_GS_WARPS` | `0` |
 | `q4e_g_step_latent_{down,up}4_q8_0_kernel` | as `q4e_g_step_matvec4_*` | `32 * Q4E_GS_WARPS` | `0` |
+| `q4e_g_step_latent_{down,up}{,4}_q4_0_kernel` | as the `q8_0` ones | `32 * Q4E_GS_WARPS` | `0` |
 | `q4e_g_step_gate_up_*` | `(ceil(out_dim / (Q4E_GS_WARPS * 16 / lpr)), min(n_tok * n_used, n_expert))` | `32 * Q4E_GS_WARPS` | `0` |
 | `q4e_g_step_down_*` | `(ceil(out_dim / (Q4E_GS_WARPS * 32 / lpr)), min(n_tok * n_used, n_expert))` | `32 * Q4E_GS_WARPS` | `0` |
 
