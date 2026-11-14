@@ -551,7 +551,18 @@ impl Qwen4ExpModel {
         let slots = if let Some(slots) = load.slots {
             slots
         } else {
-            let total = backend.memory_info().map_or(u64::MAX, |info| info.total);
+            let info = backend.memory_info();
+            let total = info.as_ref().map_or(u64::MAX, |info| info.total);
+            // What the machine can still give. A backend that shares its
+            // memory with the host and says how much of it is available is
+            // asked; one that does not is held to its free device memory,
+            // which on such a device is already the host's own estimate of
+            // what a new allocation can get. Without this a pool that fits
+            // the device's total is preloaded whole beside whatever else the
+            // machine is running, and the machine pays for it later.
+            let available = backend
+                .host_available()
+                .or(info.as_ref().map(|info| info.free));
             let stored: u64 = file.tensors().iter().map(|desc| desc.bytes).sum();
             // The projections are uploaded, not wrapped file pages, so they
             // count once; the skeleton's wrapped pages count twice, as the
@@ -569,7 +580,7 @@ impl Qwen4ExpModel {
                 .saturating_add(head);
             latent_load::pool_slots(&latent_load::PoolRoom {
                 total,
-                host_available: backend.host_available(),
+                host_available: available,
                 rest,
                 reserve: load.reserve,
                 slot_bytes,
