@@ -121,6 +121,24 @@ pub const LOWP_ENTRIES: [(&str, &str); 7] = [
     (MOD_MXFP8_A8, "q4e_mxfp8_a8_gemm_kernel"),
 ];
 
+/// The entries a latent routed stage launches beyond the ones every NVFP4
+/// bank does, as (module, entry): gate and up reading a per-expert group of
+/// the activation rows, and the per-group combine. CUDA only; a device that
+/// lacks any of them cannot run a latent bank. The last five are a step
+/// pass's: the groups its rows use, and the two projections that leave the
+/// other groups out.
+pub const LATENT_ENTRIES: [(&str, &str); 9] = [
+    (MOD_MODELOPT, "q4e_nvfp4_latent_gate_up_act_kernel"),
+    (MOD_MODELOPT, "q4e_nvfp4_latent_gate_up_act_held_kernel"),
+    (MOD_MODELOPT, "q4e_nvfp4_latent_gemm_gate_up_kernel"),
+    (MOD_MOE, "q4e_latent_combine_kernel"),
+    (MOD_MOE, "q4e_latent_groups_kernel"),
+    (MOD_GGML, "q4e_g_step_latent_down_q8_0_kernel"),
+    (MOD_GGML, "q4e_g_step_latent_down4_q8_0_kernel"),
+    (MOD_GGML, "q4e_g_step_latent_up_q8_0_kernel"),
+    (MOD_GGML, "q4e_g_step_latent_up4_q8_0_kernel"),
+];
+
 /// Dense projections over a brain-float weight, read as stored, on a device
 /// with tensor cores: split step kernels that sum a row one way whatever the
 /// pass width, and the tensor-core prompt GEMM. Not an upstream unit, for the
@@ -837,6 +855,37 @@ pub fn moe_combine(hidden: u32, n_tok: u32) -> Launch {
     Launch::new(
         Extent3::new(
             blocks_for(u64::from(hidden), u64::from(BLOCK_LINEAR)),
+            n_tok,
+            1,
+        ),
+        BLOCK_LINEAR,
+        0,
+    )
+}
+
+/// The latent stage's group masks on a step pass: a warp for every
+/// [`crate::sparse::ggml::STEP_COLS`] rows, the rows one block of a step
+/// projection carries.
+#[must_use]
+pub fn latent_groups(n_tok: u32) -> Launch {
+    Launch::new(
+        Extent3::new(n_tok.div_ceil(crate::sparse::ggml::STEP_COLS), 1, 1),
+        32,
+        0,
+    )
+}
+
+/// The latent combine: a block of [`BLOCK_LINEAR`] threads a slice of a
+/// token's `groups * width` outputs, and one grid row a token. The token is
+/// alone on the second axis, which a launch caps at 65535 rows.
+#[must_use]
+pub fn latent_combine(width: u32, groups: u32, n_tok: u32) -> Launch {
+    Launch::new(
+        Extent3::new(
+            blocks_for(
+                u64::from(width) * u64::from(groups),
+                u64::from(BLOCK_LINEAR),
+            ),
             n_tok,
             1,
         ),

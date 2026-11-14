@@ -34,7 +34,7 @@ no Python runtime.
 | Qwen 3.5 (dense hybrid) | Qwen3.5-4B | GGUF, MLX |
 | Qwen 3.6 MoE | Qwen3.6-35B-A3B | GGUF, NVFP4, Splash |
 | Gemma 4 | Gemma 4 E4B | GGUF, MLX |
-| Qwen4Exp (MoE) | - | EXL3 |
+| Qwen4Exp (MoE) | - | EXL3, latent pack (NVFP4 experts, own draft head) |
 | Nemotron-H (hybrid state-space MoE) | Nemotron 3.5 Lightning 30B-A3B | MLX 4-bit |
 | EmbeddingGemma 2 (embeddings) | embeddinggemma-2 | GGUF (BF16, Q8_0) |
 

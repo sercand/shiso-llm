@@ -1053,6 +1053,12 @@ Q4E_GG_INSTANTIATE(Q4E_G_Q2_0, q2_0)
 #define Q4E_GS_COLS 8u
 /* Warps a step block runs. */
 #define Q4E_GS_WARPS 4u
+/* What a step projection leaves out (a latent stage's two projections, see
+ * the entries at the end of this section): nothing; the output rows of a
+ * group no activation row of the block uses; the runs of such a group. */
+#define Q4E_GS_SKIP_NONE 0u
+#define Q4E_GS_SKIP_OUT 1u
+#define Q4E_GS_SKIP_IN 2u
 
 /* A signed code byte `k` of `w`, exactly, as a float. */
 __device__ __forceinline__ float q4e_gs_f(uint32_t u, uint32_t sel) {
@@ -1113,12 +1119,14 @@ __device__ __forceinline__ float q4e_gs_run(const uint8_t *row, uint32_t t, floa
 /* One unit's share of `acc[c] = row . x_c` for up to `Q4E_GS_COLS` columns:
  * the runs `j, j + lpr, ...` of a row of `runs` runs, each decoded once for
  * every column. */
-template <int T>
+template <int T, uint32_t M = 0u>
 __device__ __forceinline__ void q4e_gs_row(const uint8_t *row, uint32_t runs, uint32_t j,
                                            uint32_t lpr, const float *x, const uint64_t *xoff,
-                                           uint32_t n_cols, float *acc) {
+                                           uint32_t n_cols, float *acc, uint32_t mask = 0u,
+                                           uint32_t gruns = 1u) {
 #pragma unroll 2
     for (uint32_t t = j; t < runs; t += lpr) {
+        if (M == Q4E_GS_SKIP_IN && !((mask >> (t / gruns)) & 1u)) continue;
         float v[16];
         const float scale = q4e_gs_run<T>(row, t, v);
 #pragma unroll
@@ -1141,19 +1149,23 @@ __device__ __forceinline__ float q4e_gs_fold(float v, uint32_t lpr) {
  * Q4E_GS_WARPS` threads. */
 /* `R` consecutive rows from `o0` at once: each run's activations are read
  * once for all of them. A row's sum is the one-row sum, in the same order. */
-template <int T, uint32_t R>
+template <int T, uint32_t R, uint32_t M = 0u>
 __device__ __forceinline__ void q4e_gs_rows(const uint8_t *w, uint64_t row_bytes, uint32_t o0,
                                             uint32_t out_dim, uint32_t runs, uint32_t j,
                                             uint32_t lpr, const float *x, const uint64_t *xoff,
-                                            uint32_t n_cols, float (*acc)[Q4E_GS_COLS]) {
+                                            uint32_t n_cols, float (*acc)[Q4E_GS_COLS],
+                                            uint32_t mask = 0u, uint32_t gruns = 1u) {
     if (R == 1u) {
-        if (o0 < out_dim) q4e_gs_row<T>(w + (uint64_t) o0 * row_bytes, runs, j, lpr, x, xoff, n_cols, acc[0]);
+        if (o0 < out_dim)
+            q4e_gs_row<T, M>(w + (uint64_t) o0 * row_bytes, runs, j, lpr, x, xoff, n_cols, acc[0],
+                             mask, gruns);
         return;
     }
     const uint8_t *row[R];
 #pragma unroll
     for (uint32_t r = 0; r < R; ++r) row[r] = w + (uint64_t) min(o0 + r, out_dim - 1u) * row_bytes;
     for (uint32_t t = j; t < runs; t += lpr) {
+        if (M == Q4E_GS_SKIP_IN && !((mask >> (t / gruns)) & 1u)) continue;
         float v[R][16];
         float scale[R];
 #pragma unroll
@@ -1183,10 +1195,15 @@ __device__ __forceinline__ void q4e_gs_rows(const uint8_t *w, uint64_t row_bytes
     }
 }
 
-template <int T, uint32_t R>
+template <int T, uint32_t R, uint32_t M = 0u>
 __device__ __forceinline__ void q4e_gs_matvec(float *out, const uint8_t *w, const float *x,
                                               uint32_t in_dim, uint32_t out_dim, uint32_t rows,
-                                              uint32_t lpr) {
+                                              uint32_t lpr, const uint32_t *masks = nullptr,
+                                              uint32_t width = 1u) {
+    /* The groups this block's activation rows use (see the latent entries
+     * below); a plain entry compiles every use of it away. */
+    const uint32_t mask = M != 0u ? masks[blockIdx.y] : 0u;
+    const uint32_t gruns = width / 16u;
     if (lpr > 32u) {
         /* `lpr / 32` warps a row, `Q4E_GS_WARPS * 32 / lpr` rows a block: a
          * narrow output over a wide contraction (the stream mixes' 320-row
@@ -1210,7 +1227,11 @@ __device__ __forceinline__ void q4e_gs_matvec(float *out, const uint8_t *w, cons
         for (uint32_t r = 0; r < R; ++r)
 #pragma unroll
             for (uint32_t c = 0; c < Q4E_GS_COLS; ++c) acc[r][c] = 0.0f;
-        q4e_gs_rows<T, R>(w, rb, o0, out_dim, in_dim / 16u, j, lpr, x, xoff, n_cols, acc);
+        /* A unit's `R` rows share a group: `width` is a multiple of `R`. */
+        const bool live = M != Q4E_GS_SKIP_OUT || ((mask >> (min(o0, out_dim - 1u) / width)) & 1u);
+        if (live)
+            q4e_gs_rows<T, R, M>(w, rb, o0, out_dim, in_dim / 16u, j, lpr, x, xoff, n_cols, acc,
+                                 mask, gruns);
 #pragma unroll
         for (uint32_t r = 0; r < R; ++r)
 #pragma unroll
@@ -1219,7 +1240,7 @@ __device__ __forceinline__ void q4e_gs_matvec(float *out, const uint8_t *w, cons
                 if (lane == 0u) rpart[r][warp][c] = v;
             }
         __syncthreads();
-        if (warp % wpr == 0u && lane < n_cols) {
+        if (live && warp % wpr == 0u && lane < n_cols) {
 #pragma unroll
             for (uint32_t r = 0; r < R; ++r) {
                 if (o0 + r < out_dim) {
@@ -1245,14 +1266,17 @@ __device__ __forceinline__ void q4e_gs_matvec(float *out, const uint8_t *w, cons
     for (uint32_t r = 0; r < R; ++r)
 #pragma unroll
         for (uint32_t c = 0; c < Q4E_GS_COLS; ++c) acc[r][c] = 0.0f;
-    q4e_gs_rows<T, R>(w, q4e_g_row_bytes<T>(in_dim), o0, out_dim, in_dim / 16u, j, lpr, x, xoff,
-                      n_cols, acc);
+    const bool live = M != Q4E_GS_SKIP_OUT || ((mask >> (min(o0, out_dim - 1u) / width)) & 1u);
+    if (live)
+        q4e_gs_rows<T, R, M>(w, q4e_g_row_bytes<T>(in_dim), o0, out_dim, in_dim / 16u, j, lpr, x,
+                             xoff, n_cols, acc, mask, gruns);
 #pragma unroll
     for (uint32_t r = 0; r < R; ++r)
 #pragma unroll
         for (uint32_t c = 0; c < Q4E_GS_COLS; ++c) {
             const float v = q4e_gs_fold(acc[r][c], lpr);
-            if (o0 + r < out_dim && j == 0u && c < n_cols) out[(uint64_t) (r0 + c) * out_dim + o0 + r] = v;
+            if (live && o0 + r < out_dim && j == 0u && c < n_cols)
+                out[(uint64_t) (r0 + c) * out_dim + o0 + r] = v;
         }
 }
 
@@ -1362,6 +1386,51 @@ __device__ __forceinline__ void q4e_gs_down(
         q4e_gs_down<T>(out, down_w, mid, sorted, bounds, active, map, in_dim, out_dim,          \
                        n_expert, stride, lpr);                                                  \
     }
+
+/* ---------------------------------------------------------------------------
+ * A latent routed stage's two projections on a step or verify pass.
+ *
+ * The stage projects a token down to `n_groups` latent rows of `width`, runs
+ * each routed expert on its own group's row, sums the outputs per group, and
+ * projects the `n_groups * width` sum back up. A token's experts cover a
+ * few of the groups, and nothing reads the rest: the down projection's rows
+ * for an unused group are never an expert's input, and the up projection's
+ * runs over an unused group multiply the zeros the combine left there. So
+ * the down entries leave those output rows unwritten and the up entries skip
+ * those runs - a third of the two weights' bytes on a single token - and
+ * every value that is read is the plain entries' value, bit for bit: a
+ * skipped run added a signed zero, so the only value that can differ is the
+ * sign of an output that is exactly zero.
+ *
+ * `masks[b]` has bit `g` set when one of block column `b`'s activation rows
+ * (`Q4E_GS_COLS` a block) routes an expert of group `g`;
+ * `q4e_latent_groups_kernel` writes it. `width` is a multiple of 16 and of
+ * the unit's rows. Arguments: the plain entries', then `masks, width`.
+ * ------------------------------------------------------------------------ */
+extern "C" __global__ void __launch_bounds__(32u * Q4E_GS_WARPS)
+q4e_g_step_latent_down_q8_0_kernel(float *out, const uint8_t *w, const float *x, uint32_t in_dim,
+                                   uint32_t out_dim, uint32_t rows, uint32_t lpr,
+                                   const uint32_t *masks, uint32_t width) {
+    q4e_gs_matvec<Q4E_G_Q8_0, 1u, Q4E_GS_SKIP_OUT>(out, w, x, in_dim, out_dim, rows, lpr, masks, width);
+}
+extern "C" __global__ void __launch_bounds__(32u * Q4E_GS_WARPS)
+q4e_g_step_latent_down4_q8_0_kernel(float *out, const uint8_t *w, const float *x, uint32_t in_dim,
+                                    uint32_t out_dim, uint32_t rows, uint32_t lpr,
+                                    const uint32_t *masks, uint32_t width) {
+    q4e_gs_matvec<Q4E_G_Q8_0, 4u, Q4E_GS_SKIP_OUT>(out, w, x, in_dim, out_dim, rows, lpr, masks, width);
+}
+extern "C" __global__ void __launch_bounds__(32u * Q4E_GS_WARPS)
+q4e_g_step_latent_up_q8_0_kernel(float *out, const uint8_t *w, const float *x, uint32_t in_dim,
+                                 uint32_t out_dim, uint32_t rows, uint32_t lpr,
+                                 const uint32_t *masks, uint32_t width) {
+    q4e_gs_matvec<Q4E_G_Q8_0, 1u, Q4E_GS_SKIP_IN>(out, w, x, in_dim, out_dim, rows, lpr, masks, width);
+}
+extern "C" __global__ void __launch_bounds__(32u * Q4E_GS_WARPS)
+q4e_g_step_latent_up4_q8_0_kernel(float *out, const uint8_t *w, const float *x, uint32_t in_dim,
+                                  uint32_t out_dim, uint32_t rows, uint32_t lpr,
+                                  const uint32_t *masks, uint32_t width) {
+    q4e_gs_matvec<Q4E_G_Q8_0, 4u, Q4E_GS_SKIP_IN>(out, w, x, in_dim, out_dim, rows, lpr, masks, width);
+}
 
 extern "C" __global__ void __launch_bounds__(32u * Q4E_GS_WARPS)
 q4e_g_step_matvec_f32_kernel(float *out, const uint8_t *w, const float *x, uint32_t in_dim,

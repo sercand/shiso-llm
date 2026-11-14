@@ -141,6 +141,12 @@ pub enum Role {
     ExpertUp,
     /// The routed experts' stacked down projection.
     ExpertDown,
+    /// The latent stage's projection from the residual width to the latent
+    /// rows.
+    LatentDown,
+    /// The latent stage's projection from the latent rows back to the
+    /// residual width.
+    LatentUp,
     /// The shared expert's scalar gate.
     SharedRouter,
     /// The shared expert's gate projection.
@@ -493,6 +499,13 @@ pub enum Operand {
     /// reading a streamed target layer's map against them would send every
     /// column to the slot some other layer's expert sits at.
     ResidentExpertMap,
+    /// The group each expert of one target layer reads its latent row from:
+    /// one `u32` per expert, by expert id.
+    ///
+    /// Not slot-indexed, so it is never redirected to the stream: the kernels
+    /// look it up with the active list's expert ids, and a labels table is
+    /// small enough that every layer's stays resident.
+    ExpertLabels(u32),
     /// Bytes between consecutive slots of one routed bank of a target
     /// layer, as an unsigned 32-bit scalar: `natural` - one expert's own
     /// bytes - while the banks are resident, and the stream's slot width for
@@ -575,6 +588,7 @@ impl Operand {
                 | Self::CoopStaging(_)
                 | Self::ExpertMap(_)
                 | Self::ResidentExpertMap
+                | Self::ExpertLabels(_)
                 | Self::Null
         )
     }
@@ -1104,6 +1118,18 @@ impl<'a> Binder<'a> {
                     })?
                     .view(),
             ),
+            Operand::ExpertLabels(layer) => KernelArg::Buffer(
+                usize::try_from(layer)
+                    .ok()
+                    .and_then(|index| self.weights.layers.get(index))
+                    .and_then(|layer| layer.experts.latent.as_ref())
+                    .ok_or(CoreError::Unsupported {
+                        what: "the expert labels of a layer that has no latent stage",
+                        backend: "engine",
+                    })?
+                    .labels
+                    .view(),
+            ),
             Operand::CoopLocks => KernelArg::Buffer(self.coop_at(0)?),
             Operand::CoopStaging(offset) => {
                 KernelArg::Buffer(self.coop_at(crate::sparse::exl3::STAGING_BASE + offset)?)
@@ -1274,6 +1300,11 @@ impl<'a> Binder<'a> {
     /// different routes - the target's through a layer index, the draft head's
     /// through the head - and a second copy of the role table would be a second
     /// place for the two to disagree.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per role, and every per-layer role has one: the length \
+                  is the role count"
+    )]
     fn layer_weight(
         layer: &'a crate::sparse::weights::SparseLayer,
         reference: WeightRef,
@@ -1306,6 +1337,11 @@ impl<'a> Binder<'a> {
             SparseBlock::Attn(_) => Err(missing(
                 "a recurrent tensor of a slot that holds the attention block",
             )),
+        };
+        let latent = || {
+            layer.experts.latent.as_ref().ok_or_else(|| {
+                missing("a latent tensor of a layer whose experts have no latent stage")
+            })
         };
         let ngram = || {
             layer
@@ -1355,6 +1391,8 @@ impl<'a> Binder<'a> {
             Role::ExpertGate => layer.experts.gate.part(part),
             Role::ExpertUp => layer.experts.up.part(part),
             Role::ExpertDown => layer.experts.down.part(part),
+            Role::LatentDown => latent()?.down.part(part),
+            Role::LatentUp => latent()?.up.part(part),
             Role::SharedRouter => layer.experts.shared_router.part(part),
             Role::SharedGate => layer.experts.shared_gate.part(part),
             Role::SharedUp => layer.experts.shared_up.part(part),

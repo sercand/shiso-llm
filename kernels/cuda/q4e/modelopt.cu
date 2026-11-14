@@ -232,12 +232,26 @@ __device__ __forceinline__ void q4e_mo_store_row(
     }
 }
 
-template <uint32_t M, uint32_t R, uint32_t P, uint32_t G, bool ACT = false>
+/* The activation row column `col` reads. Plain: its token's, `col / div`.
+ * `LAT`: the token's `n_groups` rows sit together and the column's expert
+ * reads the one its label names, `grp` - a latent expert contracts over its
+ * own group's slice of the token's latent activation. The plain
+ * instantiations never see `grp` or `n_groups`, so they compile as before. */
+template <bool LAT>
+__device__ __forceinline__ uint32_t q4e_mo_act_row(
+        uint32_t col, uint32_t div, uint32_t grp, uint32_t n_groups) {
+    if (LAT) {
+        return (col / div) * n_groups + grp;
+    }
+    return col / div;
+}
+
+template <uint32_t M, uint32_t R, uint32_t P, uint32_t G, bool ACT = false, bool LAT = false>
 __device__ __forceinline__ void q4e_mo_nvfp4_step_rows(
         float *const *out, const uint8_t *const *w, const uint8_t *const *s,
         const float *global, const float *__restrict__ x, const int *__restrict__ sorted,
         int c0, int c1, uint32_t div, uint32_t row, uint32_t rows, uint32_t in_dim,
-        uint32_t out_dim, uint32_t lane) {
+        uint32_t out_dim, uint32_t lane, uint32_t grp = 0u, uint32_t n_groups = 1u) {
     const uint32_t groups = in_dim / Q4E_NVFP4_GROUP;
     const uint64_t packed = in_dim / 2u;
     if (groups > 32u * G || (groups & 3u) != 0u) {
@@ -245,7 +259,8 @@ __device__ __forceinline__ void q4e_mo_nvfp4_step_rows(
          * order, from the cache. */
         for (int c = c0; c < c1; ++c) {
             const uint32_t col = (uint32_t) sorted[c];
-            const float *xr = x + (uint64_t) (col / div) * in_dim;
+            const float *xr =
+                    x + (uint64_t) q4e_mo_act_row<LAT>(col, div, grp, n_groups) * in_dim;
 #pragma unroll
             for (uint32_t r = 0; r < R; ++r) {
                 if (r < rows) {
@@ -316,7 +331,8 @@ __device__ __forceinline__ void q4e_mo_nvfp4_step_rows(
         }
         for (int c = c0; c < c1; ++c) {
             const uint32_t col = (uint32_t) sorted[c];
-            const float *xr = x + (uint64_t) (col / div) * in_dim;
+            const float *xr =
+                    x + (uint64_t) q4e_mo_act_row<LAT>(col, div, grp, n_groups) * in_dim;
             float acc[M][P];
 #pragma unroll
             for (uint32_t m = 0; m < M; ++m) {
@@ -549,14 +565,14 @@ __device__ __forceinline__ void q4e_mo_nvfp4_down_packed(
  * each a warp: the body of both gate-and-up entries. `out[0]` and `out[1]`
  * are the gate and up outputs, or with `ACT` `out[0]` is the activated
  * intermediate. */
-template <uint32_t G, bool ACT>
+template <uint32_t G, bool ACT, bool LAT = false>
 __device__ __forceinline__ void q4e_mo_nvfp4_gate_up(
         float *const *out,
         const uint8_t *gate_w, const uint8_t *gate_s, const float *gate_g,
         const uint8_t *up_w, const uint8_t *up_s, const float *up_g,
         const float *x, const int *sorted, const int *bounds, const int *active,
         const uint32_t *map, uint32_t in_dim, uint32_t out_dim, uint32_t n_expert,
-        uint32_t n_used) {
+        uint32_t n_used, const uint32_t *labels = nullptr, uint32_t n_groups = 1u) {
     /* Both reads at once: the count and this block's entry are independent. */
     const int n_active = active[n_expert];
     const int expert = active[blockIdx.y];
@@ -576,9 +592,11 @@ __device__ __forceinline__ void q4e_mo_nvfp4_gate_up(
     const uint8_t *s[2] = {gate_s + first * (in_dim / Q4E_NVFP4_GROUP),
                            up_s + first * (in_dim / Q4E_NVFP4_GROUP)};
     const float g[2] = {gate_g[slot], up_g[slot]};
-    q4e_mo_nvfp4_step_rows<2u, Q4E_NVFP4_GU_ROWS, 1u, G, ACT>(
+    /* The expert's group is fixed for its whole span of columns. */
+    const uint32_t grp = LAT ? labels[expert] : 0u;
+    q4e_mo_nvfp4_step_rows<2u, Q4E_NVFP4_GU_ROWS, 1u, G, ACT, LAT>(
             out, w, s, g, x, sorted, c0, c1, n_used, row,
-            min(Q4E_NVFP4_GU_ROWS, out_dim - row), in_dim, out_dim, lane);
+            min(Q4E_NVFP4_GU_ROWS, out_dim - row), in_dim, out_dim, lane, grp, n_groups);
 }
 
 /* Gate and up for one active expert's columns: `Q4E_NVFP4_GU_ROWS` rows of
@@ -644,6 +662,48 @@ extern "C" __global__ void __launch_bounds__(32u * Q4E_NVFP4_WARPS) q4e_nvfp4_ex
     q4e_mo_nvfp4_gate_up<Q4E_NVFP4_HELD_GROUPS, true>(
             out, gate_w, gate_s, gate_g, up_w, up_s, up_g, x, sorted, bounds, active, map,
             in_dim, out_dim, n_expert, n_used);
+}
+
+/* The latent experts' activated gate and up: `q4e_nvfp4_experts_gate_up_act_kernel`
+ * with each expert contracting over one group's slice of its token's latent
+ * activation. `x` holds `n_groups` rows of `in_dim` a token, and column `col`
+ * of expert `e` reads row `(col / n_used) * n_groups + labels[e]`; everything
+ * else - the sums, their order, the activation - is the plain entry's, so with
+ * one group and every label zero the bits are the plain entry's.
+ *
+ * Buffers: out_mid (f32), gate_w (u8), gate_s (u8), gate_g (f32), up_w, up_s,
+ * up_g, x (f32, `[n_tok * n_groups, in_dim]`), sorted (i32), bounds (i32),
+ * active (i32), map (u32), in_dim, out_dim, n_expert, n_used, labels (u32,
+ * one a expert, each below `n_groups`), n_groups. Grid and block as the plain
+ * entry's. */
+extern "C" __global__ void __launch_bounds__(32u * Q4E_NVFP4_WARPS) q4e_nvfp4_latent_gate_up_act_kernel(
+        float *out_mid,
+        const uint8_t *gate_w, const uint8_t *gate_s, const float *gate_g,
+        const uint8_t *up_w, const uint8_t *up_s, const float *up_g,
+        const float *x, const int *sorted, const int *bounds, const int *active,
+        const uint32_t *map, uint32_t in_dim, uint32_t out_dim, uint32_t n_expert,
+        uint32_t n_used, const uint32_t *labels, uint32_t n_groups) {
+    float *const out[2] = {out_mid, out_mid};
+    q4e_mo_nvfp4_gate_up<Q4E_NVFP4_LANE_GROUPS, true, true>(
+            out, gate_w, gate_s, gate_g, up_w, up_s, up_g, x, sorted, bounds, active, map,
+            in_dim, out_dim, n_expert, n_used, labels, n_groups);
+}
+
+/* `q4e_nvfp4_latent_gate_up_act_kernel` with the activation row held in
+ * registers across an expert's columns, as `q4e_nvfp4_experts_gate_up_act_held_kernel`
+ * does for the plain one: a verify's entry. Arguments and grid as the
+ * latent entry above. */
+extern "C" __global__ void __launch_bounds__(32u * Q4E_NVFP4_WARPS) q4e_nvfp4_latent_gate_up_act_held_kernel(
+        float *out_mid,
+        const uint8_t *gate_w, const uint8_t *gate_s, const float *gate_g,
+        const uint8_t *up_w, const uint8_t *up_s, const float *up_g,
+        const float *x, const int *sorted, const int *bounds, const int *active,
+        const uint32_t *map, uint32_t in_dim, uint32_t out_dim, uint32_t n_expert,
+        uint32_t n_used, const uint32_t *labels, uint32_t n_groups) {
+    float *const out[2] = {out_mid, out_mid};
+    q4e_mo_nvfp4_gate_up<Q4E_NVFP4_HELD_GROUPS, true, true>(
+            out, gate_w, gate_s, gate_g, up_w, up_s, up_g, x, sorted, bounds, active, map,
+            in_dim, out_dim, n_expert, n_used, labels, n_groups);
 }
 
 /* The routed down projection over an NVFP4 bank: each column reads its own row
@@ -850,10 +910,12 @@ struct q4e_mo_gemm_smem {
 /* One block's work: rows `h[0].row0 ..+HALF` of one matrix and
  * `h[1].row0 ..+HALF` of another (or the same), every `Q4E_MG_SPLIT`th
  * 64-column tile of the expert's columns `c0 .. c1` starting at tile `z`. `x`
- * is read at row `col / div`. `in_dim` is a multiple of 128. */
+ * is read at row `col / div`, or with `LAT` at `(col / div) * n_groups + grp`. `in_dim` is a multiple of 128. */
+template <bool LAT = false>
 __device__ __forceinline__ void q4e_mo_nvfp4_gemm_block(
         const q4e_mo_half *h, const float *__restrict__ x, const int *__restrict__ sorted,
-        int c0, int c1, uint32_t div, uint32_t in_dim, uint32_t out_dim, uint32_t z) {
+        int c0, int c1, uint32_t div, uint32_t in_dim, uint32_t out_dim, uint32_t z,
+        uint32_t grp = 0u, uint32_t n_groups = 1u) {
     extern __shared__ __align__(16) uint8_t q4e_mo_dyn_smem[];
     q4e_mo_gemm_smem &sm = *reinterpret_cast<q4e_mo_gemm_smem *>(q4e_mo_dyn_smem);
 
@@ -946,7 +1008,9 @@ __device__ __forceinline__ void q4e_mo_nvfp4_gemm_block(
 #pragma unroll
         for (uint32_t i = 0; i < 2u; ++i) {
             const int col = sm.cols[b_c + 32u * i];
-            b_src[i] = col >= 0 ? x + (uint64_t) ((uint32_t) col / div) * in_dim + b_q * 4u
+            b_src[i] = col >= 0 ? x + (uint64_t) q4e_mo_act_row<LAT>((uint32_t) col, div, grp,
+                                                                      n_groups)
+                                          * in_dim + b_q * 4u
                                 : nullptr;
         }
 
@@ -1139,6 +1203,47 @@ extern "C" __global__ void __launch_bounds__(Q4E_MG_THREADS, 1) q4e_nvfp4_expert
              up_g[slot], out_up, row0},
     };
     q4e_mo_nvfp4_gemm_block(h, x, sorted, c0, c1, n_used, in_dim, out_dim, z);
+}
+
+/* Gate and up of a prompt pass over latent experts: the plain entry with each
+ * expert reading its label's row of the token's `n_groups` latent rows
+ * (`(col / n_used) * n_groups + labels[expert]`), as
+ * `q4e_nvfp4_latent_gate_up_act_kernel` does for the step. Activations are
+ * rounded to halves exactly as in the plain entry.
+ *
+ * Buffers: out_gate, out_up, gate_w, gate_s, gate_g, up_w, up_s, up_g, x (f32,
+ * `[n_tok * n_groups, in_dim]`), sorted, bounds, active, map, in_dim, out_dim,
+ * n_expert, n_used, labels (u32, one a expert), n_groups. Grid, block and
+ * shared memory as the plain entry's; `in_dim` a multiple of 128. */
+extern "C" __global__ void __launch_bounds__(Q4E_MG_THREADS, 1) q4e_nvfp4_latent_gemm_gate_up_kernel(
+        float *out_gate, float *out_up,
+        const uint8_t *gate_w, const uint8_t *gate_s, const float *gate_g,
+        const uint8_t *up_w, const uint8_t *up_s, const float *up_g,
+        const float *x, const int *sorted, const int *bounds, const int *active,
+        const uint32_t *map, uint32_t in_dim, uint32_t out_dim, uint32_t n_expert,
+        uint32_t n_used, const uint32_t *labels, uint32_t n_groups) {
+    const int n_active = active[n_expert];
+    const int expert = active[blockIdx.y];
+    if ((int) blockIdx.y >= n_active) {
+        return;
+    }
+    const int c0 = bounds[expert];
+    const int c1 = bounds[expert + 1];
+    const uint32_t z = blockIdx.x % Q4E_MG_SPLIT;
+    if (c1 - c0 <= (int) (z * Q4E_MG_BN)) {
+        return;
+    }
+    const uint32_t row0 = (blockIdx.x / Q4E_MG_SPLIT) * Q4E_MG_HALF;
+    const uint64_t slot = map[expert];
+    const uint64_t first = slot * out_dim;
+    const q4e_mo_half h[2] = {
+            {gate_w + first * (in_dim / 2u), gate_s + first * (in_dim / Q4E_NVFP4_GROUP),
+             gate_g[slot], out_gate, row0},
+            {up_w + first * (in_dim / 2u), up_s + first * (in_dim / Q4E_NVFP4_GROUP),
+             up_g[slot], out_up, row0},
+    };
+    q4e_mo_nvfp4_gemm_block<true>(h, x, sorted, c0, c1, n_used, in_dim, out_dim, z,
+                                  labels[expert], n_groups);
 }
 
 /* The routed down projection of a prompt pass over an NVFP4 bank: 128 rows a

@@ -831,6 +831,7 @@ impl Loader<'_> {
                 None,
                 Move::InPlace,
             )?,
+            latent: None,
         })
     }
 

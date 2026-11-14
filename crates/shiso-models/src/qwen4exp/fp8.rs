@@ -574,6 +574,7 @@ impl Loader<'_> {
                 EXPERT_INTERMEDIATE,
                 HIDDEN,
             )?,
+            latent: None,
         })
     }
 
@@ -702,6 +703,7 @@ impl Loader<'_> {
                 EXPERT_INTERMEDIATE,
                 HIDDEN,
             )?,
+            latent: None,
         })
     }
 

@@ -1315,7 +1315,7 @@ const NVFP4_GEMM_SMEM: u32 = 92_416;
 
 /// Contraction widths the NVFP4 prompt kernels take: whole multiples of
 /// their two activation steps of 64.
-const NVFP4_GEMM_K_ALIGN: u32 = 128;
+pub(crate) const NVFP4_GEMM_K_ALIGN: u32 = 128;
 
 /// Weight rows one block of the W4A4 prompt kernels covers (`LP_A4_BW`): 128
 /// of down, or the same 64 of gate and of up.
@@ -1527,6 +1527,49 @@ pub const fn affine_down_rows(in_dim: u32) -> u32 {
     }
 }
 
+/// The grids of an NVFP4 bank's gate-and-up and down launches over `groups`
+/// active-expert blocks, for experts of inner width `inter` whose down
+/// projection has `out_dim` rows.
+///
+/// The prompt grid: a gate-and-up block covers half the rows a down block
+/// does, of both matrices, and every row tile is split over `NVFP4_GEMM_SPLIT`
+/// blocks. The step grid: rows a block, one block per active expert on the
+/// second axis either way. Neither reads the width a gate reads, which is why
+/// a stage whose gate contracts over something other than the residual width
+/// shares them.
+pub(crate) fn nvfp4_grids(
+    gemm: bool,
+    inter: u32,
+    out_dim: u32,
+    groups: u32,
+) -> (kernels::Launch, kernels::Launch) {
+    if gemm {
+        let tiles = |rows: u32| {
+            kernels::Launch::new(
+                shiso_core::Extent3::new(NVFP4_GEMM_SPLIT * rows, groups, 1),
+                NVFP4_GEMM_THREADS,
+                NVFP4_GEMM_SMEM,
+            )
+        };
+        (
+            tiles(inter.div_ceil(NVFP4_GEMM_ROWS / 2)),
+            tiles(out_dim.div_ceil(NVFP4_GEMM_ROWS)),
+        )
+    } else {
+        let rows = |out_dim: u32, per: u32| {
+            kernels::Launch::new(
+                shiso_core::Extent3::new(out_dim.div_ceil(per), groups, 1),
+                NVFP4_STEP_THREADS,
+                0,
+            )
+        };
+        (
+            rows(inter, NVFP4_STEP_GATE_UP_ROWS),
+            rows(out_dim, NVFP4_STEP_DOWN_ROWS),
+        )
+    }
+}
+
 /// The expert stages over an affine, a block-scaled FP8 or an NVFP4 bank: gate and up in
 /// one launch over the sorted columns, the activation, and the down
 /// projection, every stage reaching an expert's matrices through the layer's
@@ -1644,35 +1687,7 @@ pub fn affine_experts(
                 "q4e_nvfp4_experts_down_kernel",
             )
         };
-        // The prompt grid: a gate-and-up block covers half the rows a down
-        // block does, of both matrices, and every row tile is split over
-        // `NVFP4_GEMM_SPLIT` blocks. The step grid: rows a block, one block
-        // per active expert on the second axis either way.
-        let (gate_up_launch, down_launch) = if gemm {
-            let tiles = |rows: u32| {
-                kernels::Launch::new(
-                    shiso_core::Extent3::new(NVFP4_GEMM_SPLIT * rows, groups, 1),
-                    NVFP4_GEMM_THREADS,
-                    NVFP4_GEMM_SMEM,
-                )
-            };
-            (
-                tiles(inter.div_ceil(NVFP4_GEMM_ROWS / 2)),
-                tiles(hidden.div_ceil(NVFP4_GEMM_ROWS)),
-            )
-        } else {
-            let rows = |out_dim: u32, per: u32| {
-                kernels::Launch::new(
-                    shiso_core::Extent3::new(out_dim.div_ceil(per), groups, 1),
-                    NVFP4_STEP_THREADS,
-                    0,
-                )
-            };
-            (
-                rows(inter, NVFP4_STEP_GATE_UP_ROWS),
-                rows(hidden, NVFP4_STEP_DOWN_ROWS),
-            )
-        };
+        let (gate_up_launch, down_launch) = nvfp4_grids(gemm, inter, hidden, groups);
         // `out_gate, out_up, gate_w, gate_s, gate_g, up_w, up_s, up_g, x,
         //  sorted, bounds, active, map, in_dim, out_dim, n_expert, n_used`,
         // and on a step the one output `out_mid` in place of the first two.
@@ -2415,7 +2430,7 @@ pub fn shared_add(shape: &SparseShape, n_tok: u32) -> Plan {
 /// block). Only when neither side carves per-stream scratch, which the two
 /// would share. Its gate logit and the add stay after the join, in the order
 /// the serial plan has them, so no value moves.
-fn with_shared(
+pub(crate) fn with_shared(
     shape: &SparseShape,
     desc: &ExpertDesc,
     layer: LayerRef,
@@ -2457,7 +2472,12 @@ pub fn block(
     n_tok: u32,
     device: Device,
 ) -> CoreResult<Plan> {
-    if ggml::is_block(desc.gate.dtype) {
+    // First, whatever the gate's format: a latent bank in a format the latent
+    // stage refuses must be refused there, not planned by a stage that reads
+    // the residual width.
+    if desc.latent.is_some() {
+        crate::sparse::latent::block(shape, desc, layer, n_tok, device)
+    } else if ggml::is_block(desc.gate.dtype) {
         ggml_block(shape, desc, layer, n_tok, device)
     } else {
         staged_block(shape, desc, layer, n_tok, device)
@@ -2638,6 +2658,7 @@ mod tests {
             shared_gate: w(DType::Mxfp8E4M3G32, 2_560, 640),
             shared_up: w(DType::Mxfp8E4M3G32, 2_560, 640),
             shared_down: w(DType::Mxfp8E4M3G32, 640, 2_560),
+            latent: None,
         }
     }
 

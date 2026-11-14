@@ -1389,7 +1389,11 @@ fn load_qwen4exp_dir(
     opts: EngineOptions,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
-    if shiso_models::qwen4exp::exl3::is_exl3_dir(path) {
+    if shiso_models::qwen4exp::latent::is_latent_pack(path) {
+        // First: the pack is a skeleton container beside flat files, and none
+        // of the arms below would recognise it.
+        load_qwen4exp_latent(backend, path, config, args, opts, defaults)
+    } else if shiso_models::qwen4exp::exl3::is_exl3_dir(path) {
         load_qwen4exp_exl3(backend, path, config, args, opts, defaults)
     } else if shiso_models::qwen4exp::modelopt_mixed::is_export(path) {
         // Asked before both arms below, whose tests this directory may also
@@ -1403,6 +1407,83 @@ fn load_qwen4exp_dir(
     } else {
         load_qwen4exp_mlx(backend, path, config, args, opts, defaults)
     }
+}
+
+/// The sparse family's latent pack: a skeleton container, flat expert records
+/// and dense latent projections, the experts always streamed.
+///
+/// Refused here rather than inside the engine, where the refusal would name a
+/// plan instead of the flag: a second draft head beside the pack's own, and
+/// low-precision prompt activations, which the latent stage does not take.
+fn load_qwen4exp_latent(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    config: &HfConfig,
+    args: &ServeOptions,
+    opts: EngineOptions,
+    defaults: FamilyDefaults,
+) -> Result<Loaded, FactoryError> {
+    refuse_latent_flags(path, args).map_err(FactoryError::Load)?;
+    let slots = match args.expert_residency {
+        crate::options::ExpertResidencyChoice::Resident => {
+            Some(shiso_models::qwen4exp::EXPERTS * shiso_models::qwen4exp::N_LAYERS)
+        }
+        _ if args.expert_slots > 0 => Some(args.expert_slots),
+        _ => None,
+    };
+    let model = Qwen4ExpModel::load_latent(
+        backend,
+        path,
+        config,
+        sparse_options(args, opts, backend)?,
+        &shiso_models::qwen4exp::StreamedLoad {
+            slots,
+            reserve: args.expert_reserve_gb.saturating_mul(1 << 30),
+            draft: args.spec_k > 0,
+            counts: draft_vocab_of(args),
+        },
+    )
+    .map_err(FactoryError::Load)?;
+    Ok(Loaded {
+        model: Box::new(model),
+        open_tower: open_qwen35_tower,
+        open_audio: no_audio_tower,
+        placement: Qwen35Tower::PLACEMENT,
+        defaults,
+        speech: None,
+    })
+}
+
+/// The flags a latent pack cannot honour, refused by name before any weight
+/// moves: a second draft head beside the pack's own, prompt activations other
+/// than half precision (the latent stage reads those only, and the dense
+/// projections' low-precision path is not exercised against the pack). A
+/// speculation depth is not refused: the pack's head loads from `mtp/`.
+///
+/// # Errors
+///
+/// [`CoreError::InvalidValue`] naming the flag.
+fn refuse_latent_flags(path: &Path, args: &ServeOptions) -> Result<(), CoreError> {
+    use crate::options::PrefillActivations;
+    if args.draft_model.is_some() {
+        return Err(CoreError::InvalidValue {
+            key: "--draft-model",
+            value: format!(
+                "{} carries its own draft head under mtp/; drop --draft-model",
+                path.display()
+            ),
+        });
+    }
+    if args.prefill_activations != PrefillActivations::A16 {
+        return Err(CoreError::InvalidValue {
+            key: "--prefill-activations",
+            value: format!(
+                "{:?}: the latent pack reads half-precision prompt activations only",
+                args.prefill_activations
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// NVIDIA's two `modelopt` exports of the sparse family, both with NVFP4
@@ -1658,6 +1739,43 @@ mod tests {
     fn document(model_type: &str) -> HfConfig {
         HfConfig::from_json_str(&format!(r#"{{"model_type":"{model_type}"}}"#))
             .expect("the document parses")
+    }
+
+    #[test]
+    fn a_latent_pack_refuses_what_it_cannot_honour() {
+        use super::refuse_latent_flags;
+        use crate::options::{PrefillActivations, ServeOptions};
+        let path = std::path::Path::new("/pack");
+        assert!(refuse_latent_flags(path, &ServeOptions::default()).is_ok());
+        // The pack carries its own head, so a speculation depth is honoured.
+        let spec = ServeOptions {
+            spec_k: 3,
+            ..ServeOptions::default()
+        };
+        assert!(refuse_latent_flags(path, &spec).is_ok());
+        let base = ServeOptions::default;
+        let draft = ServeOptions {
+            draft_model: Some("/head.gguf".into()),
+            ..base()
+        };
+        let lowp = ServeOptions {
+            prefill_activations: PrefillActivations::Lowp,
+            ..base()
+        };
+        let dense8 = ServeOptions {
+            prefill_activations: PrefillActivations::Dense8,
+            ..base()
+        };
+        for (args, key) in [
+            (draft, "--draft-model"),
+            (lowp, "--prefill-activations"),
+            (dense8, "--prefill-activations"),
+        ] {
+            match refuse_latent_flags(path, &args) {
+                Err(CoreError::InvalidValue { key: got, .. }) => assert_eq!(got, key),
+                other => panic!("{key}: {other:?}"),
+            }
+        }
     }
 
     #[test]

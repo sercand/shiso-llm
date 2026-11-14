@@ -39,6 +39,8 @@ use crate::sparse::kernels::{
     IDX_WIDTH, ROW_TOP,
 };
 use crate::sparse::shape::SparseShape;
+#[cfg(doc)]
+use crate::sparse::weights::SparseWeights;
 
 /// Floats the shared contraction-split partial slab holds.
 ///
@@ -276,6 +278,21 @@ pub enum Buf {
     /// [`Buf::bytes`] answers zero for it and [`Scratch::new`] sizes it; a stack
     /// with no drafter holds it empty.
     BlockTaps,
+    /// A latent routed stage's projected block input: `groups` rows of the
+    /// latent width a token, `f32`, which the experts' gate and up read in
+    /// place of the block input.
+    ///
+    /// Sized by the latent stage's extent, which the shape does not carry, so
+    /// [`Buf::bytes`] answers zero for it and [`Scratch::new`] sizes it, as it
+    /// does [`Buf::BlockTaps`]; a stack with no latent stage holds it empty.
+    Latent,
+    /// The same extent: each group's routed outputs summed over a token's
+    /// columns, which the latent stage's up projection reads.
+    LatentSum,
+    /// One word for every eight rows of a step pass: the latent groups those
+    /// rows route to, which the stage's two step projections leave the rest
+    /// of out by. Sized with [`Buf::Latent`].
+    LatentMask,
     /// The token ids no pick may land on, as `[count, id...]` with room for
     /// [`SUPPRESS_CAPACITY`] ids.
     ///
@@ -317,7 +334,7 @@ fn fused_qk_bytes(shape: &SparseShape, run_rows: u64) -> u64 {
 
 impl Buf {
     /// Every buffer, in allocation order.
-    pub const ALL: [Self; 82] = [
+    pub const ALL: [Self; 85] = [
         Self::Ids,
         Self::Positions,
         Self::Mrope,
@@ -397,6 +414,9 @@ impl Buf {
         Self::Argmax,
         Self::RowTop,
         Self::BlockTaps,
+        Self::Latent,
+        Self::LatentSum,
+        Self::LatentMask,
         Self::Suppress,
         Self::HalfActivation,
         Self::ProjectionPartial,
@@ -547,7 +567,7 @@ impl Buf {
             Self::Argmax => u64::from(logit_rows) * I32_BYTES,
             Self::RowTop => u64::from(logit_rows) * u64::from(ROW_TOP) * 2 * F32_BYTES,
             Self::Suppress => (u64::from(SUPPRESS_CAPACITY) + 1) * I32_BYTES,
-            Self::BlockTaps => 0,
+            Self::BlockTaps | Self::Latent | Self::LatentSum | Self::LatentMask => 0,
             // The two split projections bound their own partial sets: the
             // single-precision one keeps the output width times the split at or
             // below 512 floats, and the half-precision one at or below the
@@ -598,7 +618,10 @@ impl Buf {
             | Self::SharedUp
             | Self::SharedMid
             | Self::SharedOut
-            | Self::SharedLogit => MemTag::MoeScratch,
+            | Self::SharedLogit
+            | Self::Latent
+            | Self::LatentSum
+            | Self::LatentMask => MemTag::MoeScratch,
             _ => MemTag::Activations,
         }
     }
@@ -687,6 +710,10 @@ impl Scratch {
     /// `block_taps` is how many layers a block drafter beside the stack taps,
     /// zero for none: [`Buf::BlockTaps`] holds that many residual rows a token.
     ///
+    /// `latent_columns` is the widest `groups * width` of any layer's latent
+    /// routed stage ([`SparseWeights::latent_columns`]), zero for none:
+    /// [`Buf::Latent`] and [`Buf::LatentSum`] hold that many `f32` a token.
+    ///
     /// # Errors
     ///
     /// [`CoreError::Backend`] when an allocation fails.
@@ -697,6 +724,7 @@ impl Scratch {
         logit_rows: u32,
         ctx: u32,
         block_taps: u32,
+        latent_columns: u32,
     ) -> CoreResult<Self> {
         let buffers = Buf::ALL
             .iter()
@@ -705,6 +733,14 @@ impl Scratch {
                     0
                 } else if *buf == Buf::BlockTaps {
                     u64::from(rows) * u64::from(block_taps) * u64::from(shape.hidden) * F32_BYTES
+                } else if matches!(buf, Buf::Latent | Buf::LatentSum) {
+                    u64::from(rows) * u64::from(latent_columns) * F32_BYTES
+                } else if *buf == Buf::LatentMask {
+                    if latent_columns == 0 {
+                        0
+                    } else {
+                        u64::from(rows.div_ceil(crate::sparse::ggml::STEP_COLS)) * I32_BYTES
+                    }
                 } else {
                     buf.bytes(shape, rows, logit_rows, ctx)
                 };
