@@ -363,7 +363,8 @@ a.s-card:hover, a.s-card:focus-visible { box-shadow: var(--shiso-shadow), 0 0 0 
 .wrap { max-width: 1120px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
 .s-topbar.wrap { padding-block: var(--shiso-space-4); }
 .brand, .brand:hover { display: flex; align-items: center; gap: 8px; font-weight: var(--shiso-weight-bold); font-size: var(--shiso-text-lg); color: var(--shiso-text); text-decoration: none; }
-.leaf { width: 18px; height: 18px; border-radius: 0 60% 0 60%; background: var(--shiso-primary); display: inline-block; transform: rotate(-8deg); }
+.brand .logo { height: 22px; width: auto; }
+.brand .leaf { color: var(--shiso-primary); }
 
 .hero { display: grid; gap: var(--shiso-space-3); justify-items: start; padding: var(--shiso-space-8) 0 var(--shiso-space-5); }
 .hero h1 { font-size: var(--shiso-text-3xl); }
