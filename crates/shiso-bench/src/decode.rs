@@ -272,18 +272,36 @@ impl Rig {
         // read by the family dispatcher below like any container, so the
         // codec map is what tells the two apart - not the directory itself.
         let model: Box<dyn Model> = if path.join("hf_quant_config.json").is_file() {
-            let family = Qwen35MoeConfig::from_dir(path).map_err(|source| RigError::Load {
-                path: path.to_path_buf(),
-                detail: source.to_string(),
+            let document = HfConfig::from_file(config).map_err(|source| RigError::Profile {
+                path: config.to_path_buf(),
+                source,
             })?;
-            Box::new(
-                Qwen35MoeModel::load(&backend, path, &family, opts).map_err(|source| {
-                    RigError::Load {
+            if shiso_models::inkling2::Inkling2Config::describes_type(document.model_type()) {
+                Box::new(
+                    shiso_models::inkling2::Inkling2Model::load(
+                        Arc::clone(&backend),
+                        path,
+                        opts.ctx,
+                    )
+                    .map_err(|source| RigError::Load {
                         path: path.to_path_buf(),
                         detail: source.to_string(),
-                    }
-                })?,
-            )
+                    })?,
+                )
+            } else {
+                let family = Qwen35MoeConfig::from_dir(path).map_err(|source| RigError::Load {
+                    path: path.to_path_buf(),
+                    detail: source.to_string(),
+                })?;
+                Box::new(
+                    Qwen35MoeModel::load(&backend, path, &family, opts).map_err(|source| {
+                        RigError::Load {
+                            path: path.to_path_buf(),
+                            detail: source.to_string(),
+                        }
+                    })?,
+                )
+            }
         } else {
             let document = HfConfig::from_file(config).map_err(|source| RigError::Profile {
                 path: config.to_path_buf(),

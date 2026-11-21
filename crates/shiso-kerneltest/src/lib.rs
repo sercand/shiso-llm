@@ -29,6 +29,7 @@ pub mod dense;
 pub mod diffusion;
 pub mod generic;
 pub mod harness;
+pub mod inkling2;
 pub mod oracle;
 pub mod qwen35;
 pub mod qwen35moe;

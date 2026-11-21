@@ -28,6 +28,7 @@ pub mod idol;
 pub mod image_registry;
 #[cfg(test)]
 mod image_registry_tests;
+pub mod inkling2;
 pub mod lfm2;
 pub mod llama;
 pub mod nemotron_asr;
@@ -61,6 +62,7 @@ pub fn family_catalog() -> &'static [FamilyFacts] {
         flux3::FACTS,
         qwen_image21::FACTS,
         embedding_gemma2::FACTS,
+        inkling2::FACTS,
         lfm2::FACTS,
         llama::FACTS,
     ]

@@ -49,6 +49,7 @@ use shiso_models::clef::ClefBackbone;
 use shiso_models::gemma4::{
     Gemma4AudioTower, Gemma4Config, Gemma4Model, Gemma4Tower, PleOptions, holds_audio_tower,
 };
+use shiso_models::inkling2::{Inkling2Config, Inkling2Model, Inkling2VisionTower};
 use shiso_models::lfm2::{Lfm2Config, Lfm2Model, Lfm2Tower};
 use shiso_models::llama::{LlamaConfig, LlamaModel};
 use shiso_models::nemotron_h::{GgufResidency, NemotronHConfig, NemotronHModel};
@@ -315,6 +316,15 @@ impl FamilyDefaults {
         speculates: false,
     };
 
+    /// Family defaults for Inkling-2 looped multimodal `MoE` models.
+    pub const INKLING2: Self = Self {
+        reasoning: ReasoningScheme::Inkling2,
+        tools: ToolCallScheme::Inkling2,
+        thinking_default: true,
+        effort: EffortSpelling::STANDARD,
+        speculates: true,
+    };
+
     /// Resolves the family defaults for the architecture described by `config`.
     ///
     /// This is the one table, and [`load_model`] reads it rather than naming a
@@ -359,6 +369,9 @@ impl FamilyDefaults {
         }
         if LlamaConfig::describes(config) {
             return Ok(Self::LLAMA);
+        }
+        if Inkling2Config::describes_type(config.model_type()) {
+            return Ok(Self::INKLING2);
         }
         Err(FactoryError::UnknownArchitecture {
             model_type: config.model_type().to_owned(),
@@ -512,6 +525,68 @@ fn open_gemma4_tower(
     Ok(Box::new(Gemma4Tower::open(backend, path)?))
 }
 
+/// The Inkling-2 family's vision tower opener (loads `model.visual.*` from the checkpoint dir).
+fn open_inkling2_tower(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+) -> Result<Box<dyn VisionTower>, VisionError> {
+    let dir = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    let cfg = Inkling2Config::from_dir(dir).map_err(|source| VisionError::Encode {
+        step: "reading inkling2 config.json",
+        source,
+    })?;
+    let vis_cfg = cfg.vision.ok_or(VisionError::Unsupported {
+        what: "inkling2 checkpoint has no vision_config",
+    })?;
+    let st_dir =
+        shiso_models::inkling2::weights::SafetensorsDir::open_model(dir).map_err(|source| {
+            VisionError::Encode {
+                step: "opening inkling2 safetensors",
+                source,
+            }
+        })?;
+    let tower = Inkling2VisionTower::load(backend, &st_dir, vis_cfg).map_err(|source| {
+        VisionError::Encode {
+            step: "loading inkling2 vision tower",
+            source,
+        }
+    })?;
+    Ok(Box::new(tower))
+}
+
+/// Loads an Inkling-2 checkpoint directory with optional MTP speculative drafter.
+fn load_inkling2(
+    backend: &Arc<dyn Backend>,
+    path: &Path,
+    ctx: u32,
+    enable_mtp: bool,
+    defaults: FamilyDefaults,
+) -> Result<Loaded, FactoryError> {
+    if !path.is_dir() {
+        return Err(FactoryError::Load(CoreError::InvalidValue {
+            key: "model",
+            value: format!(
+                "inkling2 requires a checkpoint directory, got {}",
+                path.display()
+            ),
+        }));
+    }
+    let model = Inkling2Model::load_with_options(Arc::clone(backend), path, ctx, enable_mtp)
+        .map_err(FactoryError::Load)?;
+    Ok(Loaded {
+        model: Box::new(model),
+        open_tower: open_inkling2_tower,
+        open_audio: no_audio_tower,
+        placement: MediaPlacement::INKLING2,
+        defaults,
+        speech: None,
+    })
+}
+
 /// Loads the checkpoint at `path` as whichever family `config` describes.
 ///
 /// Takes `&ServeOptions` whole rather than a merged options struct: the factory
@@ -611,6 +686,10 @@ pub fn load_model(
     // anything; see [`load_qwen35moe`].
     if Qwen35MoeConfig::describes(config) {
         return load_qwen35moe(backend, path, args, defaults);
+    }
+
+    if Inkling2Config::describes_type(config.model_type()) {
+        return load_inkling2(backend, path, opts.ctx, args.spec_k > 0, defaults);
     }
 
     // The sparse family's directory containers - MLX shards, the reference

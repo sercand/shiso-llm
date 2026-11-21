@@ -20,6 +20,8 @@ pub enum ReasoningScheme {
     Gemma4,
     /// Qwen 3 reasoning tags: `<think>` … `</think>`.
     Qwen3,
+    /// Inkling-2 reasoning block: `<|content_thinking|>` … `<|end_message|>`.
+    Inkling2,
 }
 
 /// Which tool-call tags a stream carries.
@@ -34,6 +36,8 @@ pub enum ToolCallScheme {
     /// Qwen 3.5 tool calling: the same brackets around an XML body,
     /// `<function=NAME>` wrapping one `<parameter=KEY>` block per argument.
     Qwen35,
+    /// Inkling-2 tool calling: `<|content_invoke_tool_json|>{"name": ..., "args": ...}<|end_message|>`.
+    Inkling2,
 }
 
 /// A stateful parser over decoded text.
@@ -88,6 +92,7 @@ const fn reasoning_tags(reasoning: ReasoningScheme) -> (&'static str, &'static s
         ReasoningScheme::None => ("", ""),
         ReasoningScheme::Gemma4 => ("<|channel>thought\n", "<channel|>"),
         ReasoningScheme::Qwen3 => ("<think>", "</think>"),
+        ReasoningScheme::Inkling2 => ("<|content_thinking|>", "<|end_message|>"),
     }
 }
 
@@ -98,6 +103,11 @@ const fn tool_tags(tools: ToolCallScheme) -> (&'static str, &'static str, ToolBo
         ToolCallScheme::Gemma4 => ("<|tool_call>", "<tool_call|>", ToolBody::GemmaCall),
         ToolCallScheme::Qwen3 => ("<tool_call>", "</tool_call>", ToolBody::Json),
         ToolCallScheme::Qwen35 => ("<tool_call>", "</tool_call>", ToolBody::QwenXml),
+        ToolCallScheme::Inkling2 => (
+            "<|content_invoke_tool_json|>",
+            "<|end_message|>",
+            ToolBody::Json,
+        ),
     }
 }
 
@@ -117,10 +127,15 @@ pub fn generated_tags(reasoning: ReasoningScheme, tools: ToolCallScheme) -> Vec<
         ToolBody::GemmaCall => crate::gemma_dict::STRING_QUOTE,
         _ => "",
     };
-    [think_open, think_close, tool_open, tool_close, quote]
+    let mut tags: Vec<&'static str> = [think_open, think_close, tool_open, tool_close, quote]
         .into_iter()
         .filter(|tag| !tag.is_empty())
-        .collect()
+        .collect();
+    if reasoning == ReasoningScheme::Inkling2 {
+        tags.push("<|message_model|>");
+        tags.push("<|content_text|>");
+    }
+    tags
 }
 
 /// Whether `prompt` leaves a reasoning block open, so that the turn continuing
@@ -226,10 +241,105 @@ fn build(
         in_thinking,
         strings,
     });
-    if trim_prose {
+    let inner: Box<dyn StreamParser> = if trim_prose {
         Box::new(TrimmedProse::new(tags))
     } else {
         Box::new(tags)
+    };
+    if reasoning == ReasoningScheme::Inkling2 {
+        Box::new(StripEnvelope::new(inner))
+    } else {
+        inner
+    }
+}
+
+/// Strips Inkling-2 message envelope control tokens (`<|message_model|>`,
+/// `<|content_text|>`, `<|end_message|>`) from emitted prose text segments.
+#[derive(Debug)]
+struct StripEnvelope {
+    inner: Box<dyn StreamParser>,
+    pending: String,
+}
+
+impl StripEnvelope {
+    const TAGS: &'static [&'static str] =
+        &["<|message_model|>", "<|content_text|>", "<|end_message|>"];
+
+    const fn new(inner: Box<dyn StreamParser>) -> Self {
+        Self {
+            inner,
+            pending: String::new(),
+        }
+    }
+
+    fn drain_text(&mut self, incoming: &str, flush: bool) -> String {
+        self.pending.push_str(incoming);
+        for tag in Self::TAGS {
+            if self.pending.contains(tag) {
+                self.pending = self.pending.replace(tag, "");
+            }
+        }
+        if flush {
+            return std::mem::take(&mut self.pending);
+        }
+        // Hold back any trailing prefix that could start one of Self::TAGS.
+        let mut hold = 0usize;
+        let bytes = self.pending.as_bytes();
+        let max_len = Self::TAGS.iter().map(|t| t.len()).max().unwrap_or(0);
+        let check_from = bytes.len().saturating_sub(max_len);
+        for (i, &b) in bytes.iter().enumerate().skip(check_from) {
+            if b == b'<' {
+                let tail = &self.pending[i..];
+                if Self::TAGS.iter().any(|t| t.starts_with(tail)) {
+                    hold = tail.len();
+                    break;
+                }
+            }
+        }
+        let emit_len = self.pending.len() - hold;
+        let out = self.pending[..emit_len].to_owned();
+        self.pending.drain(..emit_len);
+        out
+    }
+
+    fn filter_segments(&mut self, segs: Vec<Segment>, flush: bool) -> Vec<Segment> {
+        let mut out = Vec::with_capacity(segs.len());
+        for seg in segs {
+            match seg {
+                Segment::Text(t) => {
+                    let cleaned = self.drain_text(&t, false);
+                    if !cleaned.is_empty() {
+                        out.push(Segment::Text(cleaned));
+                    }
+                }
+                other => {
+                    let tail = self.drain_text("", true);
+                    if !tail.is_empty() {
+                        out.push(Segment::Text(tail));
+                    }
+                    out.push(other);
+                }
+            }
+        }
+        if flush {
+            let tail = self.drain_text("", true);
+            if !tail.is_empty() {
+                out.push(Segment::Text(tail));
+            }
+        }
+        out
+    }
+}
+
+impl StreamParser for StripEnvelope {
+    fn push(&mut self, piece: &str) -> Vec<Segment> {
+        let segs = self.inner.push(piece);
+        self.filter_segments(segs, false)
+    }
+
+    fn finish(&mut self) -> Vec<Segment> {
+        let segs = self.inner.finish();
+        self.filter_segments(segs, true)
     }
 }
 

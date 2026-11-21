@@ -25,6 +25,7 @@ the name "ds4" for the host project.
 | `crates/shiso-kvstore` | Marconi (hybrid-model prefix caching) | eviction policy follows the paper's utility scoring |
 | `crates/shiso-engine` | - | original to this repository |
 | `crates/shiso-models` | Hugging Face `transformers`, MLX, llama.cpp; the Splash package format | per-family configs and tensor names follow the reference exports |
+| `crates/shiso-models/src/inkling2`, `kernels/metal/inkling2`, `kernels/cuda/inkling2`, `crates/shiso-kerneltest/src/inkling2.rs` | [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (`config.json`, `hf_quant_config.json`, `processor_config.json`, model card and reference modeling), Apache-2.0 | original; the looped MoE backbone, NVFP4/MXFP8 routed expert kernels, fused QKVR+gate+sink projection, relative-bias attention with per-query sinks, block attention residuals, static/dynamic short convolutions, native ViT vision encoder, and MTP/DSpark block drafter are written from scratch for Metal and CUDA to match the checkpoint's tensor layouts and math; nothing is vendored. CUDA kernels are written as an entry-for-entry twin of the Metal unit and await device testing on CUDA hardware |
 | `crates/shiso-ir` | - | original; shaped after the OpenAI Responses and Anthropic Messages APIs |
 | `crates/shiso-parsers` | - | original; tag formats are the model families' own |
 | `crates/shiso-vision` | Hugging Face `transformers`, mlx-vlm | preprocessing matches the reference processors |
