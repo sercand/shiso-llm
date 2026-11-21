@@ -105,6 +105,17 @@ impl MediaPlacement {
         audio_marker: None,
         wrap_audio: None,
     };
+
+    /// Inkling-2's placement: one `<|unused_200054|>` per 40×40 image patch,
+    /// repeated `pad_count` times with no extra wrapper tokens (the chat
+    /// template already emits `<|content_image|>` and `<|end_message|>`).
+    pub const INKLING2: Self = Self {
+        image_marker: "<|unused_200054|>",
+        video_marker: None,
+        wrap_image: None,
+        audio_marker: None,
+        wrap_audio: None,
+    };
 }
 
 /// One request's encoder output, in the single block a splice can address.

@@ -36,6 +36,8 @@ mod dense_vision;
 mod dit_kernels;
 #[path = "generic_q8.rs"]
 mod generic_q8;
+#[path = "inkling2_kernels.rs"]
+mod inkling2_kernels;
 #[path = "metal_kernels.rs"]
 mod metal_kernels;
 #[path = "q35_attn.rs"]
