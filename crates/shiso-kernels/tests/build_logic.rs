@@ -171,6 +171,7 @@ fn the_real_manifest_tree_parses() {
             "exl3",
             "generic",
             "ggml_stubs",
+            "inkling2",
             "mmid",
             "mmq",
             "mmq_d2r",

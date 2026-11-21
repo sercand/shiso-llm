@@ -8,7 +8,6 @@
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::similar_names,
-    clippy::many_single_char_names,
     clippy::missing_panics_doc,
     clippy::doc_markdown,
     reason = "kernel oracle tests compute synthetic reference fixtures over small shapes"
@@ -29,27 +28,34 @@ pub const ENTRIES: &[&str] = &[
     "kernel_inkling2_linear_bf16",
     "kernel_inkling2_qkvr_gate_sink_bf16",
     "kernel_inkling2_lm_head_softcap",
-    "kernel_inkling2_attn_res",
+    "kernel_inkling2_attn_res_stats",
+    "kernel_inkling2_attn_res_mix",
     "kernel_inkling2_loop_control",
     "kernel_inkling2_loop_ctrl_down",
     "kernel_inkling2_loop_ctrl_apply",
     "kernel_inkling2_short_conv_static",
     "kernel_inkling2_short_conv_dynamic",
+    "kernel_inkling2_sconv_commit",
     "kernel_inkling2_qkvr_prep_store",
     "kernel_inkling2_rel_bias_bf16",
     "kernel_inkling2_rel_attn",
+    "kernel_inkling2_rel_attn_tile",
     "kernel_inkling2_rel_attn_splitk",
     "kernel_inkling2_rel_attn_reduce",
     "kernel_inkling2_route_topk",
     "kernel_inkling2_moe_nvfp4_w13_swiglu",
-    "kernel_inkling2_moe_nvfp4_w2_accum",
+    "kernel_inkling2_moe_nvfp4_w2_cols",
     "kernel_inkling2_moe_mxfp8_w13_swiglu",
-    "kernel_inkling2_moe_mxfp8_w2_accum",
-    "kernel_inkling2_moe_bucket",
+    "kernel_inkling2_moe_mxfp8_w2_cols",
+    "kernel_inkling2_moe_plan",
     "kernel_inkling2_moe_nvfp4_w13_grouped",
     "kernel_inkling2_moe_nvfp4_w2_grouped",
     "kernel_inkling2_moe_mxfp8_w13_grouped",
     "kernel_inkling2_moe_mxfp8_w2_grouped",
+    "kernel_inkling2_moe_nvfp4_w13_tile",
+    "kernel_inkling2_moe_nvfp4_w2_tile",
+    "kernel_inkling2_moe_mxfp8_w13_tile",
+    "kernel_inkling2_moe_mxfp8_w2_tile",
     "kernel_inkling2_moe_reduce_topk",
     "kernel_inkling2_add2_f32",
     "kernel_inkling2_add3_f32",
@@ -62,6 +68,7 @@ pub const ENTRIES: &[&str] = &[
     "kernel_inkling2_mtp_mix_rmsnorm",
     "kernel_inkling2_mtp_qk_norm_rope",
     "kernel_inkling2_mtp_block_attn",
+    "kernel_inkling2_mtp_store_f16",
     "kernel_inkling2_mtp_swiglu_mul",
     "kernel_inkling2_mtp_rnn_step",
 ];
@@ -159,6 +166,15 @@ struct LinearArgs {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct LmHeadArgs {
+    rows: u32,
+    hidden: u32,
+    vocab: u32,
+    softcap: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct AttnResArgs {
     rows: u32,
     hidden: u32,
@@ -184,6 +200,7 @@ struct SconvStaticArgs {
     channels: u32,
     kernel_size: u32,
     scale: f32,
+    defer_state: u32,
 }
 
 #[repr(C)]
@@ -194,6 +211,27 @@ struct SconvDynamicArgs {
     head_dim: u32,
     kernel_size: u32,
     scale: f32,
+    defer_state: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SconvCommitArgs {
+    total: u32,
+    kv_dim: u32,
+    hidden: u32,
+    lags: u32,
+    hist_rows: u32,
+    keep: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MoePlanArgs {
+    rows: u32,
+    top_k: u32,
+    n_experts: u32,
+    batch: u32,
 }
 
 #[repr(C)]
@@ -334,11 +372,13 @@ pub fn attn_res_matches_oracle(gpu: &Gpu) {
         eps,
         has_addend: 1,
     };
+    // The sources' sums over four slices of the width, then the mix.
+    let d_stats = alloc(gpu.device(), (rows * 16 * 4 * 5 * 4) as u64).expect("alloc stats");
     run(
         gpu,
-        KernelRef::new(MODULE, "kernel_inkling2_attn_res"),
+        KernelRef::new(MODULE, "kernel_inkling2_attn_res_stats"),
         &LaunchArgs::new(
-            Extent3::linear(rows as u32),
+            Extent3::new((n_blocks as u32 + 1) * 4, rows as u32, 1),
             Extent3::linear(256),
             &[
                 KernelArg::Bytes(bytes_of(&args)),
@@ -346,6 +386,22 @@ pub fn attn_res_matches_oracle(gpu: &Gpu) {
                 KernelArg::Buffer(d_partial.view()),
                 KernelArg::Buffer(d_addend.view()),
                 KernelArg::Buffer(d_queries.view()),
+                KernelArg::Buffer(d_stats.view()),
+            ],
+        ),
+    );
+    run(
+        gpu,
+        KernelRef::new(MODULE, "kernel_inkling2_attn_res_mix"),
+        &LaunchArgs::new(
+            Extent3::new((hidden as u32).div_ceil(256), rows as u32, 1),
+            Extent3::linear(256),
+            &[
+                KernelArg::Bytes(bytes_of(&args)),
+                KernelArg::Buffer(d_blocks.view()),
+                KernelArg::Buffer(d_partial.view()),
+                KernelArg::Buffer(d_addend.view()),
+                KernelArg::Buffer(d_stats.view()),
                 KernelArg::Buffer(d_out.view()),
             ],
         ),
@@ -481,6 +537,7 @@ pub fn short_convs_match_oracle(gpu: &Gpu) {
         channels: channels as u32,
         kernel_size: k as u32,
         scale,
+        defer_state: 0,
     };
     run(
         gpu,
@@ -542,6 +599,7 @@ pub fn short_convs_match_oracle(gpu: &Gpu) {
         head_dim: head_dim as u32,
         kernel_size: k as u32,
         scale: dyn_scale,
+        defer_state: 0,
     };
     run(
         gpu,
@@ -563,12 +621,62 @@ pub fn short_convs_match_oracle(gpu: &Gpu) {
     assert_close(&gpu.read_f32(&d_out2), &want_dyn, 1e-5, "sconv_dynamic");
 }
 
-/// Verifies NVFP4 and MXFP8 routed MoE W13 (interleaved softcapped SwiGLU) + W2 accum.
+/// One codec's routed-expert weights for [`moe_nvfp4_and_mxfp8_match_oracle`].
+struct MoeCodec<'a> {
+    /// `nvfp4` or `mxfp8`: the entry names' middle.
+    name: &'static str,
+    w13: &'a [u8],
+    s13: &'a [u8],
+    w2: &'a [u8],
+    s2: &'a [u8],
+    /// NVFP4's per-expert `amax` and scalar `denom`, for W13 and W2.
+    outer: Option<[&'a [f32]; 4]>,
+    /// Bytes a weight row of `dim` inputs takes, and its scale row.
+    w_row: fn(usize) -> usize,
+    s_row: fn(usize) -> usize,
+    dot: fn(&[u8], &[u8], &[f32]) -> f32,
+    tol: (f32, f32),
+}
+
+fn nvfp4_row_dot(w: &[u8], s: &[u8], xv: &[f32]) -> f32 {
+    let mut acc = 0.0_f32;
+    for (g, &sb) in s.iter().enumerate() {
+        let mut part = 0.0_f32;
+        for b in 0..8 {
+            let byte = w[g * 8 + b];
+            part += E2M1_LUT[(byte & 0xF) as usize] * xv[g * 16 + b * 2];
+            part += E2M1_LUT[(byte >> 4) as usize] * xv[g * 16 + b * 2 + 1];
+        }
+        acc += e4m3_to_f32(sb) * part;
+    }
+    acc
+}
+
+fn mxfp8_row_dot(w: &[u8], s: &[u8], xv: &[f32]) -> f32 {
+    let mut acc = 0.0_f32;
+    for (g, &sb) in s.iter().enumerate() {
+        let mut part = 0.0_f32;
+        for i in 0..32 {
+            part += e4m3_to_f32(w[g * 32 + i]) * xv[g * 32 + i];
+        }
+        acc += ue8m0_to_f32(sb) * part;
+    }
+    acc
+}
+
+/// The routed experts, both codecs, by every path a pass can take: the direct
+/// entries a short pass reads each column through, the batched entries over a
+/// plan of eight columns an item, and the tiled entries over a plan of 64.
+/// Each is held to the oracle, and the direct and batched paths to each other
+/// bit for bit: a verify row has to compute what a decode row computes.
+///
+/// 100 rows route 80 columns to expert 0, so its plan is two tile items (64
+/// and 16 columns) and ten batched ones; `out_dim` is 72, a ragged tile.
 pub fn moe_nvfp4_and_mxfp8_match_oracle(gpu: &Gpu) {
-    let rows = 2usize;
+    let rows = 100usize;
     let in_dim = 64usize;
     let inter_dim = 32usize;
-    let out_dim = 64usize;
+    let out_dim = 72usize;
     let n_experts = 4usize;
     let top_k = 2usize;
     let gate_cap = 4.0_f32;
@@ -577,8 +685,19 @@ pub fn moe_nvfp4_and_mxfp8_match_oracle(gpu: &Gpu) {
     let x: Vec<f32> = (0..rows * in_dim)
         .map(|i| ((i as f32) * 0.17).sin() * 0.5)
         .collect();
-    let expert_ids: Vec<u32> = vec![1, 3, 0, 2];
-    let expert_weights: Vec<f32> = vec![4.5, 3.5, 5.0, 3.0];
+    let mut expert_ids = Vec::with_capacity(rows * top_k);
+    for r in 0..rows {
+        let (first, second): (usize, usize) = if r % 5 == 0 {
+            (1, 2 + r % 2)
+        } else {
+            (0, 1 + r % 3)
+        };
+        expert_ids.push(first as u32);
+        expert_ids.push(second as u32);
+    }
+    let expert_weights: Vec<f32> = (0..rows * top_k)
+        .map(|i| 3.0 + ((i as f32) * 0.37).cos())
+        .collect();
 
     let w13_packed: Vec<u8> = (0..n_experts * 2 * inter_dim * (in_dim / 2))
         .map(|i| (((i * 7 + 3) & 0xF) | (((i * 11 + 5) & 0xF) << 4)) as u8)
@@ -588,7 +707,6 @@ pub fn moe_nvfp4_and_mxfp8_match_oracle(gpu: &Gpu) {
         .collect();
     let w13_amax: Vec<f32> = vec![1.2, 0.8, 1.5, 0.9];
     let w13_denom: Vec<f32> = vec![2.5];
-
     let w2_packed: Vec<u8> = (0..n_experts * out_dim * (inter_dim / 2))
         .map(|i| (((i * 5 + 1) & 0xF) | (((i * 9 + 2) & 0xF) << 4)) as u8)
         .collect();
@@ -598,74 +716,50 @@ pub fn moe_nvfp4_and_mxfp8_match_oracle(gpu: &Gpu) {
     let w2_amax: Vec<f32> = vec![0.7, 1.1, 0.9, 1.3];
     let w2_denom: Vec<f32> = vec![2.0];
 
-    let nvfp4_dot = |w: &[u8], s: &[u8], xv: &[f32]| -> f32 {
-        let mut acc = 0.0_f32;
-        for (g, &sb) in s.iter().enumerate() {
-            let gs = e4m3_to_f32(sb);
-            let mut part = 0.0_f32;
-            for b in 0..8 {
-                let byte = w[g * 8 + b];
-                part += E2M1_LUT[(byte & 0xF) as usize] * xv[g * 16 + b * 2];
-                part += E2M1_LUT[(byte >> 4) as usize] * xv[g * 16 + b * 2 + 1];
-            }
-            acc += gs * part;
-        }
-        acc
-    };
+    let mx_w13: Vec<u8> = (0..n_experts * 2 * inter_dim * in_dim)
+        .map(|i| (((i * 13 + 7) % 64) | usize::from(i % 3 == 0) << 7) as u8)
+        .collect();
+    let mx_s13: Vec<u8> = (0..n_experts * 2 * inter_dim * (in_dim / 32))
+        .map(|i| 125 + (i % 4) as u8)
+        .collect();
+    let mx_w2: Vec<u8> = (0..n_experts * out_dim * inter_dim)
+        .map(|i| (((i * 17 + 3) % 64) | usize::from(i % 5 == 0) << 7) as u8)
+        .collect();
+    let mx_s2: Vec<u8> = (0..n_experts * out_dim * (inter_dim / 32))
+        .map(|i| 125 + (i % 4) as u8)
+        .collect();
 
-    let mut want_act = vec![0.0_f32; rows * top_k * inter_dim];
-    for col in 0..rows * top_k {
-        let r = col / top_k;
-        let e = expert_ids[col] as usize;
-        let outer = w13_amax[e] / w13_denom[0];
-        let rw = expert_weights[col];
-        let xr = &x[r * in_dim..(r + 1) * in_dim];
-        for j in 0..inter_dim {
-            let gr = e * 2 * inter_dim + 2 * j;
-            let ur = gr + 1;
-            let g = nvfp4_dot(
-                &w13_packed[gr * (in_dim / 2)..(gr + 1) * (in_dim / 2)],
-                &w13_scale[gr * (in_dim / 16)..(gr + 1) * (in_dim / 16)],
-                xr,
-            ) * outer;
-            let u = nvfp4_dot(
-                &w13_packed[ur * (in_dim / 2)..(ur + 1) * (in_dim / 2)],
-                &w13_scale[ur * (in_dim / 16)..(ur + 1) * (in_dim / 16)],
-                xr,
-            ) * outer;
-            want_act[col * inter_dim + j] =
-                softcap(g, gate_cap) * sigmoid(g) * softcap(u, up_cap) * rw;
-        }
-    }
-
-    let mut want_out = vec![0.0_f32; rows * out_dim];
-    for r in 0..rows {
-        for o in 0..out_dim {
-            let mut sum = 0.0_f32;
-            for slot in 0..top_k {
-                let col = r * top_k + slot;
-                let e = expert_ids[col] as usize;
-                let outer = w2_amax[e] / w2_denom[0];
-                let row_idx = e * out_dim + o;
-                sum += nvfp4_dot(
-                    &w2_packed[row_idx * (inter_dim / 2)..(row_idx + 1) * (inter_dim / 2)],
-                    &w2_scale[row_idx * (inter_dim / 16)..(row_idx + 1) * (inter_dim / 16)],
-                    &want_act[col * inter_dim..(col + 1) * inter_dim],
-                ) * outer;
-            }
-            want_out[r * out_dim + o] = sum;
-        }
-    }
+    let codecs = [
+        MoeCodec {
+            name: "nvfp4",
+            w13: &w13_packed,
+            s13: &w13_scale,
+            w2: &w2_packed,
+            s2: &w2_scale,
+            outer: Some([&w13_amax, &w13_denom, &w2_amax, &w2_denom]),
+            w_row: |dim| dim / 2,
+            s_row: |dim| dim / 16,
+            dot: nvfp4_row_dot,
+            tol: (1e-3, 1e-2),
+        },
+        MoeCodec {
+            name: "mxfp8",
+            w13: &mx_w13,
+            s13: &mx_s13,
+            w2: &mx_w2,
+            s2: &mx_s2,
+            outer: None,
+            w_row: |dim| dim,
+            s_row: |dim| dim / 32,
+            dot: mxfp8_row_dot,
+            tol: (1e-2, 5e-2),
+        },
+    ];
 
     let d_x = upload_bytes(gpu, &f32_bytes(&x));
     let d_ids = upload_bytes(gpu, cast_slice(&expert_ids));
     let d_wts = upload_bytes(gpu, &f32_bytes(&expert_weights));
-    let d_w13 = upload_bytes(gpu, &w13_packed);
-    let d_s13 = upload_bytes(gpu, &w13_scale);
-    let d_a13 = upload_bytes(gpu, &f32_bytes(&w13_amax));
-    let d_d13 = upload_bytes(gpu, &f32_bytes(&w13_denom));
-    let d_act = alloc(gpu.device(), (want_act.len() * 4) as u64).expect("alloc act");
-
+    let total = rows * top_k;
     let args13 = MoeW13Args {
         rows: rows as u32,
         in_dim: in_dim as u32,
@@ -674,189 +768,223 @@ pub fn moe_nvfp4_and_mxfp8_match_oracle(gpu: &Gpu) {
         gate_cap,
         up_cap,
     };
-    run(
-        gpu,
-        KernelRef::new(MODULE, "kernel_inkling2_moe_nvfp4_w13_swiglu"),
-        &LaunchArgs::new(
-            Extent3::new((inter_dim as u32).div_ceil(4), (rows * top_k) as u32, 1),
-            Extent3::linear(128),
-            &[
-                KernelArg::Bytes(bytes_of(&args13)),
-                KernelArg::Buffer(d_x.view()),
-                KernelArg::Buffer(d_w13.view()),
-                KernelArg::Buffer(d_s13.view()),
-                KernelArg::Buffer(d_a13.view()),
-                KernelArg::Buffer(d_d13.view()),
-                KernelArg::Buffer(d_ids.view()),
-                KernelArg::Buffer(d_wts.view()),
-                KernelArg::Buffer(d_act.view()),
-            ],
-        ),
-    );
-    drain(gpu);
-    assert_close(&gpu.read_f32(&d_act), &want_act, 1e-3, "moe_nvfp4_w13");
-
-    let d_w2 = upload_bytes(gpu, &w2_packed);
-    let d_s2 = upload_bytes(gpu, &w2_scale);
-    let d_a2 = upload_bytes(gpu, &f32_bytes(&w2_amax));
-    let d_d2 = upload_bytes(gpu, &f32_bytes(&w2_denom));
-    let d_out = alloc(gpu.device(), (want_out.len() * 4) as u64).expect("alloc out");
     let args2 = MoeW2Args {
         rows: rows as u32,
         inter_dim: inter_dim as u32,
         out_dim: out_dim as u32,
         top_k: top_k as u32,
     };
-    run(
-        gpu,
-        KernelRef::new(MODULE, "kernel_inkling2_moe_nvfp4_w2_accum"),
-        &LaunchArgs::new(
-            Extent3::new((out_dim as u32).div_ceil(4), rows as u32, 1),
-            Extent3::linear(128),
-            &[
+
+    for codec in &codecs {
+        let (w13_row, s13_row) = ((codec.w_row)(in_dim), (codec.s_row)(in_dim));
+        let (w2_row, s2_row) = ((codec.w_row)(inter_dim), (codec.s_row)(inter_dim));
+        let outer = |which: usize, e: usize| {
+            codec
+                .outer
+                .map_or(1.0, |o| o[which * 2][e] / o[which * 2 + 1][0])
+        };
+        let mut want_act = vec![0.0_f32; total * inter_dim];
+        for col in 0..total {
+            let e = expert_ids[col] as usize;
+            let xr = &x[(col / top_k) * in_dim..(col / top_k + 1) * in_dim];
+            for j in 0..inter_dim {
+                let gr = e * 2 * inter_dim + 2 * j;
+                let dot = |row: usize| {
+                    (codec.dot)(
+                        &codec.w13[row * w13_row..(row + 1) * w13_row],
+                        &codec.s13[row * s13_row..(row + 1) * s13_row],
+                        xr,
+                    ) * outer(0, e)
+                };
+                let (g, u) = (dot(gr), dot(gr + 1));
+                want_act[col * inter_dim + j] =
+                    softcap(g, gate_cap) * sigmoid(g) * softcap(u, up_cap) * expert_weights[col];
+            }
+        }
+        let mut want_out = vec![0.0_f32; rows * out_dim];
+        for r in 0..rows {
+            for o in 0..out_dim {
+                let mut sum = 0.0_f32;
+                for slot in 0..top_k {
+                    let col = r * top_k + slot;
+                    let e = expert_ids[col] as usize;
+                    let row = e * out_dim + o;
+                    sum += (codec.dot)(
+                        &codec.w2[row * w2_row..(row + 1) * w2_row],
+                        &codec.s2[row * s2_row..(row + 1) * s2_row],
+                        &want_act[col * inter_dim..(col + 1) * inter_dim],
+                    ) * outer(1, e);
+                }
+                want_out[r * out_dim + o] = sum;
+            }
+        }
+
+        let d_w13 = upload_bytes(gpu, codec.w13);
+        let d_s13 = upload_bytes(gpu, codec.s13);
+        let d_w2 = upload_bytes(gpu, codec.w2);
+        let d_s2 = upload_bytes(gpu, codec.s2);
+        let d_outer: Option<Vec<DeviceBuffer>> = codec.outer.map(|o| {
+            o.iter()
+                .map(|values| upload_bytes(gpu, &f32_bytes(values)))
+                .collect()
+        });
+        let d_cols = alloc(gpu.device(), (n_experts * rows * 4) as u64).expect("alloc cols");
+        let d_items = alloc(gpu.device(), ((1 + 2 * total) * 4) as u64).expect("alloc items");
+
+        // (label, plan batch, W13 entry suffix, W2 entry suffix, weight rows a threadgroup)
+        let paths = [
+            ("direct", 0u32, "swiglu", "cols", 16u32, 16u32),
+            ("batched", 8, "grouped", "grouped", 8, 8),
+            ("tiled", 64, "tile", "tile", 64, 64),
+        ];
+        let mut direct: Option<(Vec<f32>, Vec<f32>)> = None;
+        for (label, batch, w13_entry, w2_entry, w13_tg, w2_tg) in paths {
+            let d_act = alloc(gpu.device(), (want_act.len() * 4) as u64).expect("alloc act");
+            let d_slots = alloc(gpu.device(), (total * out_dim * 4) as u64).expect("alloc slots");
+            let d_out = alloc(gpu.device(), (want_out.len() * 4) as u64).expect("alloc out");
+            let grid_y = if batch == 0 {
+                total as u32
+            } else {
+                let plan = MoePlanArgs {
+                    rows: rows as u32,
+                    top_k: top_k as u32,
+                    n_experts: n_experts as u32,
+                    batch,
+                };
+                run(
+                    gpu,
+                    KernelRef::new(MODULE, "kernel_inkling2_moe_plan"),
+                    &LaunchArgs::new(
+                        Extent3::linear(1),
+                        Extent3::linear(256),
+                        &[
+                            KernelArg::Bytes(bytes_of(&plan)),
+                            KernelArg::Buffer(d_ids.view()),
+                            KernelArg::Buffer(d_cols.view()),
+                            KernelArg::Buffer(d_items.view()),
+                        ],
+                    ),
+                );
+                (total as u32).min(n_experts as u32 + total as u32 / batch)
+            };
+            // Bind order: args, input, weight, scale, [amax, denom], then the
+            // routing (ids and route weights, or route weights, columns and
+            // items), then the output.
+            let mut b13 = vec![
+                KernelArg::Bytes(bytes_of(&args13)),
+                KernelArg::Buffer(d_x.view()),
+                KernelArg::Buffer(d_w13.view()),
+                KernelArg::Buffer(d_s13.view()),
+            ];
+            let mut b2 = vec![
                 KernelArg::Bytes(bytes_of(&args2)),
                 KernelArg::Buffer(d_act.view()),
                 KernelArg::Buffer(d_w2.view()),
                 KernelArg::Buffer(d_s2.view()),
-                KernelArg::Buffer(d_a2.view()),
-                KernelArg::Buffer(d_d2.view()),
-                KernelArg::Buffer(d_ids.view()),
-                KernelArg::Buffer(d_out.view()),
-            ],
-        ),
-    );
-    drain(gpu);
-    assert_close(&gpu.read_f32(&d_out), &want_out, 1e-2, "moe_nvfp4_w2");
-
-    // --- MXFP8 ---
-    let mx_w13: Vec<u8> = (0..n_experts * 2 * inter_dim * in_dim)
-        .map(|i| ((i * 13 + 7) % 120) as u8)
-        .collect();
-    let mx_s13: Vec<u8> = (0..n_experts * 2 * inter_dim * (in_dim / 32))
-        .map(|i| 125 + (i % 4) as u8)
-        .collect();
-    let mx_w2: Vec<u8> = (0..n_experts * out_dim * inter_dim)
-        .map(|i| ((i * 17 + 3) % 120) as u8)
-        .collect();
-    let mx_s2: Vec<u8> = (0..n_experts * out_dim * (inter_dim / 32))
-        .map(|i| 125 + (i % 4) as u8)
-        .collect();
-
-    let mxfp8_dot = |w: &[u8], s: &[u8], xv: &[f32]| -> f32 {
-        let mut acc = 0.0_f32;
-        for (g, &sb) in s.iter().enumerate() {
-            let gs = ue8m0_to_f32(sb);
-            let mut part = 0.0_f32;
-            for i in 0..32 {
-                part += e4m3_to_f32(w[g * 32 + i]) * xv[g * 32 + i];
+            ];
+            if let Some(o) = &d_outer {
+                b13.push(KernelArg::Buffer(o[0].view()));
+                b13.push(KernelArg::Buffer(o[1].view()));
+                b2.push(KernelArg::Buffer(o[2].view()));
+                b2.push(KernelArg::Buffer(o[3].view()));
             }
-            acc += gs * part;
-        }
-        acc
-    };
-
-    let mut want_mx_act = vec![0.0_f32; rows * top_k * inter_dim];
-    for col in 0..rows * top_k {
-        let r = col / top_k;
-        let e = expert_ids[col] as usize;
-        let rw = expert_weights[col];
-        let xr = &x[r * in_dim..(r + 1) * in_dim];
-        for j in 0..inter_dim {
-            let gr = e * 2 * inter_dim + 2 * j;
-            let ur = gr + 1;
-            let g = mxfp8_dot(
-                &mx_w13[gr * in_dim..(gr + 1) * in_dim],
-                &mx_s13[gr * (in_dim / 32)..(gr + 1) * (in_dim / 32)],
-                xr,
+            if batch == 0 {
+                b13.push(KernelArg::Buffer(d_ids.view()));
+                b13.push(KernelArg::Buffer(d_wts.view()));
+                b2.push(KernelArg::Buffer(d_ids.view()));
+            } else {
+                b13.push(KernelArg::Buffer(d_wts.view()));
+                b13.push(KernelArg::Buffer(d_cols.view()));
+                b13.push(KernelArg::Buffer(d_items.view()));
+                b2.push(KernelArg::Buffer(d_cols.view()));
+                b2.push(KernelArg::Buffer(d_items.view()));
+            }
+            b13.push(KernelArg::Buffer(d_act.view()));
+            b2.push(KernelArg::Buffer(d_slots.view()));
+            let w13_name = format!("kernel_inkling2_moe_{}_w13_{w13_entry}", codec.name);
+            let w2_name = format!("kernel_inkling2_moe_{}_w2_{w2_entry}", codec.name);
+            run(
+                gpu,
+                KernelRef::new(MODULE, entry_name(&w13_name)),
+                &LaunchArgs::new(
+                    Extent3::new((2 * inter_dim as u32).div_ceil(w13_tg), grid_y, 1),
+                    Extent3::linear(128),
+                    &b13,
+                ),
             );
-            let u = mxfp8_dot(
-                &mx_w13[ur * in_dim..(ur + 1) * in_dim],
-                &mx_s13[ur * (in_dim / 32)..(ur + 1) * (in_dim / 32)],
-                xr,
+            run(
+                gpu,
+                KernelRef::new(MODULE, entry_name(&w2_name)),
+                &LaunchArgs::new(
+                    Extent3::new((out_dim as u32).div_ceil(w2_tg), grid_y, 1),
+                    Extent3::linear(128),
+                    &b2,
+                ),
             );
-            want_mx_act[col * inter_dim + j] =
-                softcap(g, gate_cap) * sigmoid(g) * softcap(u, up_cap) * rw;
+            run(
+                gpu,
+                KernelRef::new(MODULE, "kernel_inkling2_moe_reduce_topk"),
+                &LaunchArgs::new(
+                    Extent3::linear(((rows * out_dim) as u32).div_ceil(256)),
+                    Extent3::linear(256),
+                    &[
+                        KernelArg::Bytes(bytes_of(&args2)),
+                        KernelArg::Buffer(d_slots.view()),
+                        KernelArg::Buffer(d_out.view()),
+                    ],
+                ),
+            );
+            drain(gpu);
+            let (act, out) = (gpu.read_f32(&d_act), gpu.read_f32(&d_out));
+            assert_close(
+                &act,
+                &want_act,
+                codec.tol.0,
+                &format!("moe_{}_w13 {label}", codec.name),
+            );
+            assert_close(
+                &out,
+                &want_out,
+                codec.tol.1,
+                &format!("moe_{}_w2 {label}", codec.name),
+            );
+            match (&direct, label) {
+                (None, _) => direct = Some((act, out)),
+                (Some((direct_act, direct_out)), "batched") => {
+                    assert!(
+                        act.iter()
+                            .zip(direct_act)
+                            .chain(out.iter().zip(direct_out))
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "moe_{}: a batched row differs from the direct row",
+                        codec.name
+                    );
+                }
+                _ => {}
+            }
         }
     }
-    let mut want_mx_out = vec![0.0_f32; rows * out_dim];
-    for r in 0..rows {
-        for o in 0..out_dim {
-            let mut sum = 0.0_f32;
-            for slot in 0..top_k {
-                let col = r * top_k + slot;
-                let e = expert_ids[col] as usize;
-                let row_idx = e * out_dim + o;
-                sum += mxfp8_dot(
-                    &mx_w2[row_idx * inter_dim..(row_idx + 1) * inter_dim],
-                    &mx_s2[row_idx * (inter_dim / 32)..(row_idx + 1) * (inter_dim / 32)],
-                    &want_mx_act[col * inter_dim..(col + 1) * inter_dim],
-                );
-            }
-            want_mx_out[r * out_dim + o] = sum;
-        }
-    }
+}
 
-    let d_mx_w13 = upload_bytes(gpu, &mx_w13);
-    let d_mx_s13 = upload_bytes(gpu, &mx_s13);
-    let d_mx_w2 = upload_bytes(gpu, &mx_w2);
-    let d_mx_s2 = upload_bytes(gpu, &mx_s2);
-    let d_mx_act = alloc(gpu.device(), (want_mx_act.len() * 4) as u64).expect("alloc");
-    let d_mx_out = alloc(gpu.device(), (want_mx_out.len() * 4) as u64).expect("alloc");
-
-    run(
-        gpu,
-        KernelRef::new(MODULE, "kernel_inkling2_moe_mxfp8_w13_swiglu"),
-        &LaunchArgs::new(
-            Extent3::new((inter_dim as u32).div_ceil(4), (rows * top_k) as u32, 1),
-            Extent3::linear(128),
-            &[
-                KernelArg::Bytes(bytes_of(&args13)),
-                KernelArg::Buffer(d_x.view()),
-                KernelArg::Buffer(d_mx_w13.view()),
-                KernelArg::Buffer(d_mx_s13.view()),
-                KernelArg::Buffer(d_ids.view()),
-                KernelArg::Buffer(d_wts.view()),
-                KernelArg::Buffer(d_mx_act.view()),
-            ],
-        ),
-    );
-    drain(gpu);
-    assert_close(
-        &gpu.read_f32(&d_mx_act),
-        &want_mx_act,
-        1e-2,
-        "moe_mxfp8_w13",
-    );
-
-    run(
-        gpu,
-        KernelRef::new(MODULE, "kernel_inkling2_moe_mxfp8_w2_accum"),
-        &LaunchArgs::new(
-            Extent3::new((out_dim as u32).div_ceil(4), rows as u32, 1),
-            Extent3::linear(128),
-            &[
-                KernelArg::Bytes(bytes_of(&args2)),
-                KernelArg::Buffer(d_mx_act.view()),
-                KernelArg::Buffer(d_mx_w2.view()),
-                KernelArg::Buffer(d_mx_s2.view()),
-                KernelArg::Buffer(d_ids.view()),
-                KernelArg::Buffer(d_mx_out.view()),
-            ],
-        ),
-    );
-    drain(gpu);
-    assert_close(&gpu.read_f32(&d_mx_out), &want_mx_out, 5e-2, "moe_mxfp8_w2");
+/// The `'static` entry name equal to `name`: a [`KernelRef`] borrows one.
+fn entry_name(name: &str) -> &'static str {
+    ENTRIES
+        .iter()
+        .copied()
+        .find(|entry| *entry == name)
+        .unwrap_or_else(|| panic!("{name} is not an inkling2 entry"))
 }
 
 /// Verifies QKVR prep + KV cache store + relative-bias sink gated attention.
 pub fn rel_attn_with_sink_matches_oracle(gpu: &Gpu) {
-    let rows = 4usize;
+    let rows = 70usize;
+    let window = 24usize;
     let n_head = 4usize;
     let n_head_kv = 2usize;
     let head_dim = 128usize;
     let d_rel = 16usize;
     let rel_extent = 8usize;
-    let kv_cap = 16usize;
+    let kv_cap = 128usize;
     let eps = 1e-6_f32;
     let qk_clip = 22.627_417_f32;
     let rel_clip = 8.0_f32;
@@ -919,7 +1047,8 @@ pub fn rel_attn_with_sink_matches_oracle(gpu: &Gpu) {
             let rb = &rel_bias[(r * n_head + h) * rel_extent..][..rel_extent];
             let sink = sinks[r * n_head + h];
             let mut scores = Vec::new();
-            for kp in 0..=r {
+            let lo = (r + 1).saturating_sub(window);
+            for kp in lo..=r {
                 let kv = &k_prepped[(kp * n_head_kv + kvh) * head_dim..][..head_dim];
                 let dot: f32 = qv.iter().zip(kv).map(|(a, b)| a * b).sum::<f32>() * attn_scale;
                 let dist = r - kp;
@@ -931,8 +1060,8 @@ pub fn rel_attn_with_sink_matches_oracle(gpu: &Gpu) {
             let denom = exps.iter().sum::<f32>() + (sink - mx).exp();
             for d in 0..head_dim {
                 let mut acc = 0.0_f32;
-                for (kp, &e) in exps.iter().enumerate() {
-                    acc += (e / denom) * v_prepped[(kp * n_head_kv + kvh) * head_dim + d];
+                for (i, &e) in exps.iter().enumerate() {
+                    acc += (e / denom) * v_prepped[((lo + i) * n_head_kv + kvh) * head_dim + d];
                 }
                 let idx = (r * n_head + h) * head_dim + d;
                 want[idx] = acc * sigmoid(gate[idx]);
@@ -998,30 +1127,89 @@ pub fn rel_attn_with_sink_matches_oracle(gpu: &Gpu) {
         rel_extent: rel_extent as u32,
         pos0: 0,
         kv_cap: kv_cap as u32,
-        window_size: 1024,
+        window_size: window as u32,
         is_swa: 1,
         scale: attn_scale,
     };
+    let binds = [
+        KernelArg::Bytes(bytes_of(&attn_args)),
+        KernelArg::Buffer(d_q.view()),
+        KernelArg::Buffer(d_rb.view()),
+        KernelArg::Buffer(d_sinks.view()),
+        KernelArg::Buffer(d_gate.view()),
+        KernelArg::Buffer(d_kcache.view()),
+        KernelArg::Buffer(d_vcache.view()),
+        KernelArg::Buffer(d_out.view()),
+    ];
+    // One simdgroup a (head, row).
     run(
         gpu,
         KernelRef::new(MODULE, "kernel_inkling2_rel_attn"),
         &LaunchArgs::new(
             Extent3::new(n_head as u32, (rows as u32).div_ceil(4), 1),
             Extent3::linear(128),
+            &binds,
+        ),
+    );
+    drain(gpu);
+    assert_close(&gpu.read_f32(&d_out), &want, 5e-3, "rel_attn_sink");
+
+    // The long pass's tile: 64 query rows a threadgroup, so two here, the
+    // second ragged.
+    gpu.device().fill_zero(d_out.view()).expect("clear");
+    run(
+        gpu,
+        KernelRef::new(MODULE, "kernel_inkling2_rel_attn_tile"),
+        &LaunchArgs::new(
+            Extent3::new((rows as u32).div_ceil(64), n_head as u32, 1),
+            Extent3::linear(256),
+            &binds,
+        ),
+    );
+    drain(gpu);
+    assert_close(&gpu.read_f32(&d_out), &want, 5e-3, "rel_attn_tile");
+
+    // The short pass's runs and their merge: at most 24 keys a row is four
+    // runs, one threadgroup of the first stage.
+    gpu.device().fill_zero(d_out.view()).expect("clear");
+    let runs = rows * n_head * 64;
+    let d_ml = alloc(gpu.device(), (runs * 2 * 4) as u64).expect("alloc");
+    let d_parts = alloc(gpu.device(), (runs * head_dim * 4) as u64).expect("alloc");
+    run(
+        gpu,
+        KernelRef::new(MODULE, "kernel_inkling2_rel_attn_splitk"),
+        &LaunchArgs::new(
+            Extent3::new(n_head as u32, 1, rows as u32),
+            Extent3::linear(128),
             &[
                 KernelArg::Bytes(bytes_of(&attn_args)),
                 KernelArg::Buffer(d_q.view()),
                 KernelArg::Buffer(d_rb.view()),
                 KernelArg::Buffer(d_sinks.view()),
-                KernelArg::Buffer(d_gate.view()),
                 KernelArg::Buffer(d_kcache.view()),
                 KernelArg::Buffer(d_vcache.view()),
+                KernelArg::Buffer(d_ml.view()),
+                KernelArg::Buffer(d_parts.view()),
+            ],
+        ),
+    );
+    run(
+        gpu,
+        KernelRef::new(MODULE, "kernel_inkling2_rel_attn_reduce"),
+        &LaunchArgs::new(
+            Extent3::new(n_head as u32, rows as u32, 1),
+            Extent3::linear(32),
+            &[
+                KernelArg::Bytes(bytes_of(&attn_args)),
+                KernelArg::Buffer(d_ml.view()),
+                KernelArg::Buffer(d_parts.view()),
+                KernelArg::Buffer(d_gate.view()),
                 KernelArg::Buffer(d_out.view()),
             ],
         ),
     );
     drain(gpu);
-    assert_close(&gpu.read_f32(&d_out), &want, 5e-3, "rel_attn_sink");
+    assert_close(&gpu.read_f32(&d_out), &want, 5e-3, "rel_attn_splitk");
 }
 
 /// Verifies top-k sigmoid router with correction bias and route_scale.
@@ -1577,4 +1765,196 @@ pub fn mtp_kernels_match_oracle(gpu: &Gpu) {
         1e-5,
         "mtp_rnn_latent",
     );
+}
+
+/// The vocabulary head over one row and over nine (a full batch of eight and
+/// a ragged one): each against the oracle, and a row's logits the same bits
+/// whether it is alone or shares the weight read.
+pub fn lm_head_matches_oracle(gpu: &Gpu) {
+    let rows = 9usize;
+    let hidden = 96usize;
+    let vocab = 37usize;
+    let softcap_v = 30.0_f32;
+    let x: Vec<f32> = (0..rows * hidden)
+        .map(|i| ((i as f32) * 0.29).sin() * 2.0)
+        .collect();
+    let w: Vec<u16> = (0..vocab * hidden)
+        .map(|i| f32_to_bf16(((i as f32) * 0.41).cos()))
+        .collect();
+    let mut want = vec![0.0_f32; rows * vocab];
+    for r in 0..rows {
+        for o in 0..vocab {
+            let dot: f32 = (0..hidden)
+                .map(|k| x[r * hidden + k] * bf16_to_f32(w[o * hidden + k]))
+                .sum();
+            want[r * vocab + o] = softcap(dot, softcap_v);
+        }
+    }
+    let d_x = upload_bytes(gpu, &f32_bytes(&x));
+    let d_w = upload_bytes(gpu, cast_slice(&w));
+    let launch = |n: usize, x_view, out: &DeviceBuffer| {
+        let args = LmHeadArgs {
+            rows: n as u32,
+            hidden: hidden as u32,
+            vocab: vocab as u32,
+            softcap: softcap_v,
+        };
+        run(
+            gpu,
+            KernelRef::new(MODULE, "kernel_inkling2_lm_head_softcap"),
+            &LaunchArgs::new(
+                Extent3::new((vocab as u32).div_ceil(4), (n as u32).div_ceil(8), 1),
+                Extent3::linear(128),
+                &[
+                    KernelArg::Bytes(bytes_of(&args)),
+                    KernelArg::Buffer(x_view),
+                    KernelArg::Buffer(d_w.view()),
+                    KernelArg::Buffer(out.view()),
+                ],
+            ),
+        );
+    };
+    let d_all = alloc(gpu.device(), (rows * vocab * 4) as u64).expect("alloc");
+    launch(rows, d_x.view(), &d_all);
+    drain(gpu);
+    let all = gpu.read_f32(&d_all);
+    assert_close(&all, &want, 1e-3, "lm_head rows");
+    for r in [0usize, 5, 8] {
+        let d_one = alloc(gpu.device(), (vocab * 4) as u64).expect("alloc");
+        let row = d_x
+            .view()
+            .slice((r * hidden * 4) as u64, (hidden * 4) as u64)
+            .expect("row");
+        launch(1, row, &d_one);
+        drain(gpu);
+        let one = gpu.read_f32(&d_one);
+        assert!(
+            one.iter()
+                .zip(&all[r * vocab..(r + 1) * vocab])
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "lm_head: row {r} alone differs from row {r} among {rows}"
+        );
+    }
+}
+
+/// A deferring short convolution leaves its lags as found and its inputs
+/// behind them, and the commit moves the lags that end at the last kept row
+/// to the front - for every layer's four states, which is the layout the
+/// commit walks.
+pub fn sconv_defer_and_commit_match_oracle(gpu: &Gpu) {
+    let (kv_dim, hidden, layers) = (8usize, 12usize, 2usize);
+    let (k, hist_rows, rows, keep) = (4usize, 16usize, 6usize, 2usize);
+    let lags = k - 1;
+    let state_rows = lags + hist_rows;
+    let per = 2 * (kv_dim + hidden);
+    // Layer 1's post-attention state: channels `hidden`, after its K and V.
+    let seg = (per + 2 * kv_dim) * state_rows;
+    let mut state = vec![0.0_f32; layers * per * state_rows];
+    for (i, v) in state.iter_mut().enumerate() {
+        *v = ((i as f32) * 0.013).sin();
+    }
+    let before = state.clone();
+    let x: Vec<f32> = (0..rows * hidden)
+        .map(|i| ((i as f32) * 0.21).cos())
+        .collect();
+    let w: Vec<u16> = (0..hidden * k)
+        .map(|i| f32_to_bf16(((i as f32) * 0.31).cos() * 0.5))
+        .collect();
+    let scale = 1.0 / ((k + 1) as f32).sqrt();
+    let mut want_out = vec![0.0_f32; rows * hidden];
+    for c in 0..hidden {
+        let mut hist: Vec<f32> = (0..lags).map(|l| before[seg + l * hidden + c]).collect();
+        for t in 0..rows {
+            let cur = x[t * hidden + c];
+            let mut acc = cur * bf16_to_f32(w[c * k + lags]);
+            for l in 0..lags {
+                acc += hist[l] * bf16_to_f32(w[c * k + l]);
+            }
+            want_out[t * hidden + c] = (acc + cur) * scale;
+            hist.remove(0);
+            hist.push(cur);
+        }
+    }
+    let d_state = upload_bytes(gpu, &f32_bytes(&state));
+    let d_x = upload_bytes(gpu, &f32_bytes(&x));
+    let d_w = upload_bytes(gpu, cast_slice(&w));
+    let d_out = alloc(gpu.device(), (want_out.len() * 4) as u64).expect("alloc");
+    let args = SconvStaticArgs {
+        rows: rows as u32,
+        channels: hidden as u32,
+        kernel_size: k as u32,
+        scale,
+        defer_state: 1,
+    };
+    let seg_view = d_state
+        .view()
+        .slice((seg * 4) as u64, (hidden * state_rows * 4) as u64)
+        .expect("segment");
+    run(
+        gpu,
+        KernelRef::new(MODULE, "kernel_inkling2_short_conv_static"),
+        &LaunchArgs::new(
+            Extent3::linear(1),
+            Extent3::linear(256),
+            &[
+                KernelArg::Bytes(bytes_of(&args)),
+                KernelArg::Buffer(d_x.view()),
+                KernelArg::Buffer(d_w.view()),
+                KernelArg::Buffer(seg_view),
+                KernelArg::Buffer(d_out.view()),
+            ],
+        ),
+    );
+    drain(gpu);
+    assert_close(&gpu.read_f32(&d_out), &want_out, 1e-4, "sconv deferred out");
+    // Deferred: the lags untouched, the inputs behind them.
+    let mut want_state = before.clone();
+    for t in 0..rows {
+        for c in 0..hidden {
+            want_state[seg + (lags + t) * hidden + c] = x[t * hidden + c];
+        }
+    }
+    assert_close(
+        &gpu.read_f32(&d_state),
+        &want_state,
+        0.0,
+        "sconv deferred state",
+    );
+
+    let commit = SconvCommitArgs {
+        total: (layers * per) as u32,
+        kv_dim: kv_dim as u32,
+        hidden: hidden as u32,
+        lags: lags as u32,
+        hist_rows: hist_rows as u32,
+        keep: keep as u32,
+    };
+    run(
+        gpu,
+        KernelRef::new(MODULE, "kernel_inkling2_sconv_commit"),
+        &LaunchArgs::new(
+            Extent3::linear(((layers * per) as u32).div_ceil(256)),
+            Extent3::linear(256),
+            &[
+                KernelArg::Bytes(bytes_of(&commit)),
+                KernelArg::Buffer(d_state.view()),
+            ],
+        ),
+    );
+    drain(gpu);
+    // Every state's front becomes its rows `keep .. keep + lags`.
+    let mut committed = want_state.clone();
+    let widths = [kv_dim, kv_dim, hidden, hidden];
+    for layer in 0..layers {
+        let mut base = layer * per * state_rows;
+        for width in widths {
+            for l in 0..lags {
+                for c in 0..width {
+                    committed[base + l * width + c] = want_state[base + (keep + l) * width + c];
+                }
+            }
+            base += width * state_rows;
+        }
+    }
+    assert_close(&gpu.read_f32(&d_state), &committed, 0.0, "sconv commit");
 }

@@ -7,7 +7,11 @@
 )]
 
 use bytemuck::{Pod, Zeroable, bytes_of};
-use shiso_core::{Backend, CoreResult, DeviceView, Extent3, KernelArg, KernelRef, LaunchArgs};
+
+use crate::audio_ops::{GemmType, Ops};
+use shiso_core::{
+    Backend, CoreError, CoreResult, DeviceView, Extent3, KernelArg, KernelRef, LaunchArgs,
+};
 
 /// Kernel registry module name shared by Metal and CUDA.
 pub const MODULE: &str = "inkling2";
@@ -147,6 +151,10 @@ pub struct SconvStaticArgs {
     pub kernel_size: u32,
     /// Output scale (`1 / sqrt(k + 1)`).
     pub scale: f32,
+    /// Non-zero for a pass whose rows are not all kept: the lags are left as
+    /// found and the pass's inputs are written behind them for
+    /// [`sconv_commit`].
+    pub defer_state: u32,
 }
 
 /// Arguments for `kernel_inkling2_short_conv_dynamic`.
@@ -163,7 +171,30 @@ pub struct SconvDynamicArgs {
     pub kernel_size: u32,
     /// Output scale (`1 / sqrt(2*k + 1)`).
     pub scale: f32,
+    /// As [`SconvStaticArgs::defer_state`].
+    pub defer_state: u32,
 }
+
+/// Arguments for `kernel_inkling2_sconv_commit`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct SconvCommitArgs {
+    /// Channels across every layer's four states: `layers * 2 * (kv_dim + hidden)`.
+    pub total: u32,
+    /// Width of the K and V states.
+    pub kv_dim: u32,
+    /// Width of the post-attention and post-MLP states.
+    pub hidden: u32,
+    /// Lag rows a state carries (`k - 1`).
+    pub lags: u32,
+    /// Rows a deferring pass may write behind the lags.
+    pub hist_rows: u32,
+    /// Rows of the deferring pass that were kept.
+    pub keep: u32,
+}
+const _: () = assert!(size_of::<SconvStaticArgs>() == 20);
+const _: () = assert!(size_of::<SconvDynamicArgs>() == 24);
+const _: () = assert!(size_of::<SconvCommitArgs>() == 24);
 
 /// Arguments for `kernel_inkling2_qkvr_prep_store`.
 #[repr(C)]
@@ -277,6 +308,95 @@ pub struct MoeW2Args {
 pub struct AddArgs {
     /// Element count.
     pub count: u32,
+}
+
+/// Fewest rows a BF16 projection takes the tiled GEMM at.
+///
+/// Below it the per-row kernels stream each weight row once for up to eight
+/// rows; above it the 64-row simdgroup-matrix tile of the shared GEMM set
+/// multiplies. A prefill pass of 256 rows spent 18.5 ms a layer in the fused
+/// attention projections on the per-row kernel (M1 Max).
+pub const GEMM_MIN_ROWS: u32 = 33;
+
+/// `out[rows, out_dim] = x[rows, in_dim] @ w[out_dim, in_dim]^T` over BF16
+/// weights: [`linear_bf16`] for a few rows, the tiled GEMM for a long pass.
+///
+/// The two sum in different orders, so a row's bits differ between a pass of
+/// fewer than [`GEMM_MIN_ROWS`] rows and a longer one, and not otherwise.
+///
+/// # Errors
+///
+/// Whatever the launch reports.
+pub fn linear_bf16_rows(
+    gemm: &Ops,
+    args: LinearArgs,
+    x: DeviceView<'_>,
+    w: DeviceView<'_>,
+    out: DeviceView<'_>,
+) -> CoreResult<()> {
+    if args.rows >= GEMM_MIN_ROWS && args.in_dim.is_multiple_of(16) {
+        return gemm.gemm(
+            GemmType::Bf16,
+            out,
+            x,
+            w,
+            None,
+            (
+                args.rows as usize,
+                args.out_dim as usize,
+                args.in_dim as usize,
+            ),
+        );
+    }
+    linear_bf16(gemm.backend().as_ref(), args, x, w, out)
+}
+
+/// The relative-position bias projection `[rows * n_head, d_rel] ->
+/// [rows * n_head, rel_extent]`: [`rel_bias_bf16`] for a few rows, the tiled
+/// GEMM for a long pass.
+///
+/// # Errors
+///
+/// Whatever the launch reports.
+pub fn rel_bias_rows(
+    gemm: &Ops,
+    token_rows: u32,
+    args: LinearArgs,
+    r_in: DeviceView<'_>,
+    w: DeviceView<'_>,
+    out: DeviceView<'_>,
+) -> CoreResult<()> {
+    if token_rows >= GEMM_MIN_ROWS {
+        return linear_bf16_rows(gemm, args, r_in, w, out);
+    }
+    rel_bias_bf16(gemm.backend().as_ref(), args, r_in, w, out)
+}
+
+/// The six attention input projections: one fused launch for a few rows
+/// ([`qkvr_gate_sink_bf16`]), six tiled GEMMs for a long pass.
+///
+/// # Errors
+///
+/// Whatever the launches report.
+pub fn qkvr_gate_sink_rows(
+    gemm: &Ops,
+    args: QkvrGateSinkArgs,
+    v: &QkvrGateSinkViews<'_>,
+) -> CoreResult<()> {
+    if args.rows < GEMM_MIN_ROWS || !args.in_dim.is_multiple_of(16) {
+        return qkvr_gate_sink_bf16(gemm.backend().as_ref(), args, v);
+    }
+    let lin = |out_dim: u32| LinearArgs {
+        rows: args.rows,
+        in_dim: args.in_dim,
+        out_dim,
+    };
+    linear_bf16_rows(gemm, lin(args.q_dim), v.x_q, v.wq, v.out_q)?;
+    linear_bf16_rows(gemm, lin(args.kv_dim), v.x_k, v.wk, v.out_k)?;
+    linear_bf16_rows(gemm, lin(args.kv_dim), v.x_v, v.wv, v.out_v)?;
+    linear_bf16_rows(gemm, lin(args.r_dim), v.x_q, v.wr, v.out_r)?;
+    linear_bf16_rows(gemm, lin(args.q_dim), v.x_q, v.wgate, v.out_gate)?;
+    linear_bf16_rows(gemm, lin(args.n_head), v.x_q, v.wsink, v.out_sink)
 }
 
 /// Launches fused BF16 embedding lookup + RMSNorm.
@@ -395,7 +515,7 @@ pub fn lm_head_softcap(
     backend.run(
         KernelRef::new(MODULE, "kernel_inkling2_lm_head_softcap"),
         &LaunchArgs::new(
-            Extent3::new(args.vocab.div_ceil(4), args.rows, 1),
+            Extent3::new(args.vocab.div_ceil(4), args.rows.div_ceil(8), 1),
             Extent3::linear(128),
             &[
                 KernelArg::Bytes(bytes_of(&args)),
@@ -407,28 +527,79 @@ pub fn lm_head_softcap(
     )
 }
 
-/// Launches block attention residual mixing.
-pub fn attn_res(
-    backend: &dyn Backend,
-    args: AttnResArgs,
-    blocks: DeviceView<'_>,
-    partial: DeviceView<'_>,
-    addend: DeviceView<'_>,
-    queries: DeviceView<'_>,
-    out: DeviceView<'_>,
-) -> CoreResult<()> {
+/// Device buffers for [`attn_res`].
+#[derive(Debug)]
+pub struct AttnResViews<'a> {
+    /// Completed blocks `[n_blocks, rows, hidden]`.
+    pub blocks: DeviceView<'a>,
+    /// The current partial stream `[rows, hidden]`.
+    pub partial: DeviceView<'a>,
+    /// Added to `partial` when [`AttnResArgs::has_addend`] is set.
+    pub addend: DeviceView<'a>,
+    /// Queries `[n_queries, hidden]`.
+    pub queries: DeviceView<'a>,
+    /// Scratch for the sources' sums: [`attn_res_stats_bytes`] bytes.
+    pub stats: DeviceView<'a>,
+    /// Mixed outputs `[n_queries, rows, hidden]`.
+    pub out: DeviceView<'a>,
+}
+
+/// Most sources (completed blocks and the partial stream) one mix reads.
+pub const ATTN_RES_MAX_SOURCES: u32 = 16;
+/// Slices of the width a source's sums are taken over.
+const ATTN_RES_SLICES: u32 = 4;
+/// Sums per slice: the squares, and the dot with each of up to four queries.
+const ATTN_RES_STATS: u32 = 5;
+
+/// Bytes of [`AttnResViews::stats`] a pass of `rows` rows needs.
+#[must_use]
+pub const fn attn_res_stats_bytes(rows: u32) -> u64 {
+    rows as u64 * ATTN_RES_MAX_SOURCES as u64 * ATTN_RES_SLICES as u64 * ATTN_RES_STATS as u64 * 4
+}
+
+/// Launches block attention residual mixing: the sources' sums, then the mix.
+///
+/// # Errors
+///
+/// [`CoreError::InvalidValue`] for more sources or queries than the kernels
+/// carry, and whatever the device reports.
+pub fn attn_res(backend: &dyn Backend, args: AttnResArgs, v: &AttnResViews<'_>) -> CoreResult<()> {
+    if args.n_blocks + 1 > ATTN_RES_MAX_SOURCES || args.n_queries > 4 {
+        return Err(CoreError::InvalidValue {
+            key: "attn_res",
+            value: format!(
+                "{} blocks and {} queries exceed the kernels' {} sources and 4 queries",
+                args.n_blocks, args.n_queries, ATTN_RES_MAX_SOURCES
+            ),
+        });
+    }
     backend.run(
-        KernelRef::new(MODULE, "kernel_inkling2_attn_res"),
+        KernelRef::new(MODULE, "kernel_inkling2_attn_res_stats"),
         &LaunchArgs::new(
-            Extent3::linear(args.rows),
+            Extent3::new((args.n_blocks + 1) * ATTN_RES_SLICES, args.rows, 1),
             Extent3::linear(256),
             &[
                 KernelArg::Bytes(bytes_of(&args)),
-                KernelArg::Buffer(blocks),
-                KernelArg::Buffer(partial),
-                KernelArg::Buffer(addend),
-                KernelArg::Buffer(queries),
-                KernelArg::Buffer(out),
+                KernelArg::Buffer(v.blocks),
+                KernelArg::Buffer(v.partial),
+                KernelArg::Buffer(v.addend),
+                KernelArg::Buffer(v.queries),
+                KernelArg::Buffer(v.stats),
+            ],
+        ),
+    )?;
+    backend.run(
+        KernelRef::new(MODULE, "kernel_inkling2_attn_res_mix"),
+        &LaunchArgs::new(
+            Extent3::new(args.hidden.div_ceil(256), args.rows, 1),
+            Extent3::linear(256),
+            &[
+                KernelArg::Bytes(bytes_of(&args)),
+                KernelArg::Buffer(v.blocks),
+                KernelArg::Buffer(v.partial),
+                KernelArg::Buffer(v.addend),
+                KernelArg::Buffer(v.stats),
+                KernelArg::Buffer(v.out),
             ],
         ),
     )
@@ -544,6 +715,27 @@ pub fn short_conv_dynamic(
     )
 }
 
+/// Moves every short-convolution state of a session to where a pass that kept
+/// `args.keep` of its rows leaves it, after that pass ran deferring.
+///
+/// # Errors
+///
+/// Whatever the device reports.
+pub fn sconv_commit(
+    backend: &dyn Backend,
+    args: SconvCommitArgs,
+    state: DeviceView<'_>,
+) -> CoreResult<()> {
+    backend.run(
+        KernelRef::new(MODULE, "kernel_inkling2_sconv_commit"),
+        &LaunchArgs::new(
+            Extent3::linear(args.total.div_ceil(256)),
+            Extent3::linear(256),
+            &[KernelArg::Bytes(bytes_of(&args)), KernelArg::Buffer(state)],
+        ),
+    )
+}
+
 /// Buffers for [`qkvr_prep_store`].
 #[derive(Debug)]
 pub struct QkvrPrepViews<'a> {
@@ -608,6 +800,10 @@ pub struct RelAttnViews<'a> {
     pub v_cache: DeviceView<'a>,
     /// Output buffer `[rows, n_head, head_dim]`.
     pub out: DeviceView<'a>,
+    /// A short pass's per-run maximum and sum; see [`rel_attn_split_bytes`].
+    pub split_ml: DeviceView<'a>,
+    /// A short pass's per-run partial outputs.
+    pub split_out: DeviceView<'a>,
 }
 
 /// Launches fast small-`in_dim` (`d_rel = 8`) relative-bias BF16 projection.
@@ -633,59 +829,63 @@ pub fn rel_bias_bf16(
     )
 }
 
-/// Launches relative-bias + per-query sink + output-gated attention (zero-barrier).
+/// Fewest rows a pass takes the attention tile at: half of its 64 query rows.
+pub const REL_ATTN_TILE_MIN_ROWS: u32 = 32;
+
+/// Launches relative-bias + per-query sink + output-gated attention.
+///
+/// Three kernels compute it, chosen by shape alone: a pass of
+/// [`REL_ATTN_TILE_MIN_ROWS`] rows or more multiplies on simdgroup matrices,
+/// 64 query rows a threadgroup; a shorter pass of 128-wide heads cuts each
+/// row's keys into runs, a simdgroup each, and merges them; any other head
+/// width walks its keys in one simdgroup. A decode step and a verify pass are
+/// both short passes, so a position is summed the same way in either.
+///
+/// # Errors
+///
+/// Whatever the device reports.
 pub fn rel_attn(backend: &dyn Backend, args: RelAttnArgs, v: &RelAttnViews<'_>) -> CoreResult<()> {
-    backend.run(
-        KernelRef::new(MODULE, "kernel_inkling2_rel_attn"),
-        &LaunchArgs::new(
-            Extent3::new(args.n_head, args.rows.div_ceil(4), 1),
-            Extent3::linear(128),
-            &[
-                KernelArg::Bytes(bytes_of(&args)),
-                KernelArg::Buffer(v.q),
-                KernelArg::Buffer(v.rel_bias),
-                KernelArg::Buffer(v.sinks),
-                KernelArg::Buffer(v.gate),
-                KernelArg::Buffer(v.k_cache),
-                KernelArg::Buffer(v.v_cache),
-                KernelArg::Buffer(v.out),
-            ],
-        ),
-    )
-}
-
-/// Arguments for split-K Flash-Decoding `rel_attn` (long-context decode).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub struct RelAttnSplitKArgs {
-    /// Query heads.
-    pub n_head: u32,
-    /// KV heads.
-    pub n_head_kv: u32,
-    /// Head width (128).
-    pub head_dim: u32,
-    /// Relative position extent.
-    pub rel_extent: u32,
-    /// Query position.
-    pub pos: u32,
-    /// Number of KV splits (`16`).
-    pub n_splits: u32,
-    /// Attention scale (`1 / sqrt(head_dim)`).
-    pub scale: f32,
-}
-
-/// Launches split-K Flash-Decoding stage 1 + stage 2 for long-context decode.
-pub fn rel_attn_splitk(
-    backend: &dyn Backend,
-    args: RelAttnSplitKArgs,
-    v: &RelAttnViews<'_>,
-    split_ml: DeviceView<'_>,
-    split_out: DeviceView<'_>,
-) -> CoreResult<()> {
+    let binds = [
+        KernelArg::Bytes(bytes_of(&args)),
+        KernelArg::Buffer(v.q),
+        KernelArg::Buffer(v.rel_bias),
+        KernelArg::Buffer(v.sinks),
+        KernelArg::Buffer(v.gate),
+        KernelArg::Buffer(v.k_cache),
+        KernelArg::Buffer(v.v_cache),
+        KernelArg::Buffer(v.out),
+    ];
+    if args.head_dim != 128 {
+        return backend.run(
+            KernelRef::new(MODULE, "kernel_inkling2_rel_attn"),
+            &LaunchArgs::new(
+                Extent3::new(args.n_head, args.rows.div_ceil(4), 1),
+                Extent3::linear(128),
+                &binds,
+            ),
+        );
+    }
+    if args.rows >= REL_ATTN_TILE_MIN_ROWS {
+        return backend.run(
+            KernelRef::new(MODULE, "kernel_inkling2_rel_attn_tile"),
+            &LaunchArgs::new(
+                Extent3::new(args.rows.div_ceil(64), args.n_head, 1),
+                Extent3::linear(256),
+                &binds,
+            ),
+        );
+    }
+    // The pass's last row has the most keys, a full layer's the whole prefix.
+    let last = args.pos0 + args.rows - 1;
+    let keys = if args.is_swa != 0 {
+        (last + 1).min(args.window_size)
+    } else {
+        last + 1
+    };
     backend.run(
         KernelRef::new(MODULE, "kernel_inkling2_rel_attn_splitk"),
         &LaunchArgs::new(
-            Extent3::new(args.n_head, args.n_splits.div_ceil(4), 1),
+            Extent3::new(args.n_head, rel_attn_splits(keys) / 4, args.rows),
             Extent3::linear(128),
             &[
                 KernelArg::Bytes(bytes_of(&args)),
@@ -694,25 +894,46 @@ pub fn rel_attn_splitk(
                 KernelArg::Buffer(v.sinks),
                 KernelArg::Buffer(v.k_cache),
                 KernelArg::Buffer(v.v_cache),
-                KernelArg::Buffer(split_ml),
-                KernelArg::Buffer(split_out),
+                KernelArg::Buffer(v.split_ml),
+                KernelArg::Buffer(v.split_out),
             ],
         ),
     )?;
     backend.run(
         KernelRef::new(MODULE, "kernel_inkling2_rel_attn_reduce"),
         &LaunchArgs::new(
-            Extent3::linear(args.n_head),
+            Extent3::new(args.n_head, args.rows, 1),
             Extent3::linear(32),
             &[
                 KernelArg::Bytes(bytes_of(&args)),
-                KernelArg::Buffer(split_ml),
-                KernelArg::Buffer(split_out),
+                KernelArg::Buffer(v.split_ml),
+                KernelArg::Buffer(v.split_out),
                 KernelArg::Buffer(v.gate),
                 KernelArg::Buffer(v.out),
             ],
         ),
     )
+}
+
+/// Most runs a short pass's row is cut into, and so what a row of the split
+/// scratch holds (`INK2_ATTN_MAX_SPLITS`).
+pub const REL_ATTN_MAX_SPLITS: u32 = 64;
+
+/// Runs for a row attending to `keys` keys (`ink2_attn_splits`): about 128
+/// keys a run, a multiple of four. A function of the key count alone, so a
+/// position splits the same way in a decode step and in a verify pass.
+#[must_use]
+pub fn rel_attn_splits(keys: u32) -> u32 {
+    keys.div_ceil(128)
+        .next_multiple_of(4)
+        .clamp(4, REL_ATTN_MAX_SPLITS)
+}
+
+/// Bytes of [`RelAttnViews::split_ml`] and [`RelAttnViews::split_out`].
+#[must_use]
+pub const fn rel_attn_split_bytes(n_head: u32, head_dim: u32) -> (u64, u64) {
+    let runs = REL_ATTN_TILE_MIN_ROWS as u64 * n_head as u64 * REL_ATTN_MAX_SPLITS as u64;
+    (runs * 2 * 4, runs * head_dim as u64 * 4)
 }
 
 /// Launches parallel top-k sigmoid router with correction bias.
@@ -766,7 +987,7 @@ pub fn moe_nvfp4_w13_swiglu(
     backend.run(
         KernelRef::new(MODULE, "kernel_inkling2_moe_nvfp4_w13_swiglu"),
         &LaunchArgs::new(
-            Extent3::new(args.inter_dim.div_ceil(4), args.rows * args.top_k, 1),
+            Extent3::new(args.inter_dim.div_ceil(8), args.rows * args.top_k, 1),
             Extent3::linear(128),
             &[
                 KernelArg::Bytes(bytes_of(&args)),
@@ -784,7 +1005,7 @@ pub fn moe_nvfp4_w13_swiglu(
 }
 
 /// Launches NVFP4 MoE W2 + expert accumulation.
-pub fn moe_nvfp4_w2_accum(
+pub fn moe_nvfp4_w2_cols(
     backend: &dyn Backend,
     args: MoeW2Args,
     act: DeviceView<'_>,
@@ -793,9 +1014,9 @@ pub fn moe_nvfp4_w2_accum(
     out: DeviceView<'_>,
 ) -> CoreResult<()> {
     backend.run(
-        KernelRef::new(MODULE, "kernel_inkling2_moe_nvfp4_w2_accum"),
+        KernelRef::new(MODULE, "kernel_inkling2_moe_nvfp4_w2_cols"),
         &LaunchArgs::new(
-            Extent3::new(args.out_dim.div_ceil(4), args.rows, 1),
+            Extent3::new(args.out_dim.div_ceil(16), args.rows * args.top_k, 1),
             Extent3::linear(128),
             &[
                 KernelArg::Bytes(bytes_of(&args)),
@@ -833,7 +1054,7 @@ pub fn moe_mxfp8_w13_swiglu(
     backend.run(
         KernelRef::new(MODULE, "kernel_inkling2_moe_mxfp8_w13_swiglu"),
         &LaunchArgs::new(
-            Extent3::new(args.inter_dim.div_ceil(4), args.rows * args.top_k, 1),
+            Extent3::new(args.inter_dim.div_ceil(8), args.rows * args.top_k, 1),
             Extent3::linear(128),
             &[
                 KernelArg::Bytes(bytes_of(&args)),
@@ -849,7 +1070,7 @@ pub fn moe_mxfp8_w13_swiglu(
 }
 
 /// Launches MXFP8 MoE W2 + expert accumulation.
-pub fn moe_mxfp8_w2_accum(
+pub fn moe_mxfp8_w2_cols(
     backend: &dyn Backend,
     args: MoeW2Args,
     act: DeviceView<'_>,
@@ -858,9 +1079,9 @@ pub fn moe_mxfp8_w2_accum(
     out: DeviceView<'_>,
 ) -> CoreResult<()> {
     backend.run(
-        KernelRef::new(MODULE, "kernel_inkling2_moe_mxfp8_w2_accum"),
+        KernelRef::new(MODULE, "kernel_inkling2_moe_mxfp8_w2_cols"),
         &LaunchArgs::new(
-            Extent3::new(args.out_dim.div_ceil(4), args.rows, 1),
+            Extent3::new(args.out_dim.div_ceil(16), args.rows * args.top_k, 1),
             Extent3::linear(128),
             &[
                 KernelArg::Bytes(bytes_of(&args)),
@@ -874,50 +1095,70 @@ pub fn moe_mxfp8_w2_accum(
     )
 }
 
-/// Arguments for `kernel_inkling2_moe_bucket`.
+/// Arguments for `kernel_inkling2_moe_plan`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub struct MoeBucketArgs {
+pub struct MoePlanArgs {
     /// Batch rows.
     pub rows: u32,
     /// Experts per token.
     pub top_k: u32,
-    /// Total routed experts.
+    /// Total routed experts (at most 256).
     pub n_experts: u32,
+    /// Most routed columns one work item carries.
+    pub batch: u32,
 }
 
-/// Buckets routed token-expert slots by expert id on GPU for grouped prefill.
-pub fn moe_bucket(
+impl MoePlanArgs {
+    /// The most work items a pass of this shape can plan: every expert's
+    /// partial batch, and the full ones the columns can fill. The batched
+    /// entries' grid is sized for it.
+    #[must_use]
+    pub const fn max_items(&self) -> u32 {
+        let total = self.rows * self.top_k;
+        let bound = self.n_experts + total / self.batch;
+        if total < bound { total } else { bound }
+    }
+}
+
+/// Plans a multi-row pass's routed experts into work items of up to
+/// `args.batch` columns sharing one expert (`kernel_inkling2_moe_plan`).
+///
+/// # Errors
+///
+/// Whatever the device reports.
+pub fn moe_plan(
     backend: &dyn Backend,
-    args: MoeBucketArgs,
+    args: MoePlanArgs,
     expert_ids: DeviceView<'_>,
-    expert_counts: DeviceView<'_>,
-    expert_cols: DeviceView<'_>,
+    cols: DeviceView<'_>,
+    items: DeviceView<'_>,
 ) -> CoreResult<()> {
     backend.run(
-        KernelRef::new(MODULE, "kernel_inkling2_moe_bucket"),
+        KernelRef::new(MODULE, "kernel_inkling2_moe_plan"),
         &LaunchArgs::new(
-            Extent3::linear(args.n_experts),
+            Extent3::linear(1),
             Extent3::linear(256),
             &[
                 KernelArg::Bytes(bytes_of(&args)),
                 KernelArg::Buffer(expert_ids),
-                KernelArg::Buffer(expert_counts),
-                KernelArg::Buffer(expert_cols),
+                KernelArg::Buffer(cols),
+                KernelArg::Buffer(items),
             ],
         ),
     )
 }
 
-/// Grouping buffers for grouped MoE prefill kernels.
+/// The plan the batched expert entries walk, as [`moe_plan`] wrote it.
 #[derive(Debug)]
 pub struct MoeGroupViews<'a> {
-    /// Per-expert token count `[n_experts]` (`u32`).
-    pub counts: DeviceView<'a>,
-    /// Per-expert routed slot indices `[n_experts, rows]` (`u32`).
+    /// Per-expert routed columns `[n_experts, rows]` (`u32`), ascending.
     pub cols: DeviceView<'a>,
-    /// Total number of routed experts.
-    pub n_experts: u32,
+    /// Work items `[1 + 2 * max_items]` (`u32`): the count, then
+    /// `(expert, first | count << 24)` each.
+    pub items: DeviceView<'a>,
+    /// [`MoePlanArgs::max_items`] of the pass: the grid's height.
+    pub max_items: u32,
 }
 
 /// Launches grouped NVFP4 MoE W13 + softcapped SwiGLU (8-row weight reuse per expert).
@@ -933,7 +1174,7 @@ pub fn moe_nvfp4_w13_grouped(
     backend.run(
         KernelRef::new(MODULE, "kernel_inkling2_moe_nvfp4_w13_grouped"),
         &LaunchArgs::new(
-            Extent3::new(args.inter_dim.div_ceil(4), grp.n_experts, 1),
+            Extent3::new(args.inter_dim.div_ceil(4), grp.max_items, 1),
             Extent3::linear(128),
             &[
                 KernelArg::Bytes(bytes_of(&args)),
@@ -943,8 +1184,8 @@ pub fn moe_nvfp4_w13_grouped(
                 KernelArg::Buffer(w.amax),
                 KernelArg::Buffer(w.denom),
                 KernelArg::Buffer(expert_weights),
-                KernelArg::Buffer(grp.counts),
                 KernelArg::Buffer(grp.cols),
+                KernelArg::Buffer(grp.items),
                 KernelArg::Buffer(out),
             ],
         ),
@@ -963,7 +1204,7 @@ pub fn moe_nvfp4_w2_grouped(
     backend.run(
         KernelRef::new(MODULE, "kernel_inkling2_moe_nvfp4_w2_grouped"),
         &LaunchArgs::new(
-            Extent3::new(args.out_dim.div_ceil(4), grp.n_experts, 1),
+            Extent3::new(args.out_dim.div_ceil(8), grp.max_items, 1),
             Extent3::linear(128),
             &[
                 KernelArg::Bytes(bytes_of(&args)),
@@ -972,8 +1213,8 @@ pub fn moe_nvfp4_w2_grouped(
                 KernelArg::Buffer(w.scale),
                 KernelArg::Buffer(w.amax),
                 KernelArg::Buffer(w.denom),
-                KernelArg::Buffer(grp.counts),
                 KernelArg::Buffer(grp.cols),
+                KernelArg::Buffer(grp.items),
                 KernelArg::Buffer(slots_out),
             ],
         ),
@@ -993,7 +1234,7 @@ pub fn moe_mxfp8_w13_grouped(
     backend.run(
         KernelRef::new(MODULE, "kernel_inkling2_moe_mxfp8_w13_grouped"),
         &LaunchArgs::new(
-            Extent3::new(args.inter_dim.div_ceil(4), grp.n_experts, 1),
+            Extent3::new(args.inter_dim.div_ceil(4), grp.max_items, 1),
             Extent3::linear(128),
             &[
                 KernelArg::Bytes(bytes_of(&args)),
@@ -1001,8 +1242,8 @@ pub fn moe_mxfp8_w13_grouped(
                 KernelArg::Buffer(w.weight),
                 KernelArg::Buffer(w.scale),
                 KernelArg::Buffer(expert_weights),
-                KernelArg::Buffer(grp.counts),
                 KernelArg::Buffer(grp.cols),
+                KernelArg::Buffer(grp.items),
                 KernelArg::Buffer(out),
             ],
         ),
@@ -1021,15 +1262,154 @@ pub fn moe_mxfp8_w2_grouped(
     backend.run(
         KernelRef::new(MODULE, "kernel_inkling2_moe_mxfp8_w2_grouped"),
         &LaunchArgs::new(
-            Extent3::new(args.out_dim.div_ceil(4), grp.n_experts, 1),
+            Extent3::new(args.out_dim.div_ceil(8), grp.max_items, 1),
             Extent3::linear(128),
             &[
                 KernelArg::Bytes(bytes_of(&args)),
                 KernelArg::Buffer(act),
                 KernelArg::Buffer(w.weight),
                 KernelArg::Buffer(w.scale),
-                KernelArg::Buffer(grp.counts),
                 KernelArg::Buffer(grp.cols),
+                KernelArg::Buffer(grp.items),
+                KernelArg::Buffer(slots_out),
+            ],
+        ),
+    )
+}
+
+/// Columns a tiled work item carries: the tile's width.
+pub const MOE_TILE_BATCH: u32 = 64;
+
+/// Launches `kernel_inkling2_moe_nvfp4_w13_tile`: [`moe_nvfp4_w13_grouped`] as a
+/// simdgroup-matrix GEMM over work items of up to [`MOE_TILE_BATCH`] columns.
+///
+/// # Errors
+///
+/// Whatever the device reports.
+pub fn moe_nvfp4_w13_tile(
+    backend: &dyn Backend,
+    args: MoeW13Args,
+    x: DeviceView<'_>,
+    w: &Nvfp4Views<'_>,
+    expert_weights: DeviceView<'_>,
+    grp: &MoeGroupViews<'_>,
+    out: DeviceView<'_>,
+) -> CoreResult<()> {
+    backend.run(
+        KernelRef::new(MODULE, "kernel_inkling2_moe_nvfp4_w13_tile"),
+        &LaunchArgs::new(
+            Extent3::new((2 * args.inter_dim).div_ceil(64), grp.max_items, 1),
+            Extent3::linear(128),
+            &[
+                KernelArg::Bytes(bytes_of(&args)),
+                KernelArg::Buffer(x),
+                KernelArg::Buffer(w.weight),
+                KernelArg::Buffer(w.scale),
+                KernelArg::Buffer(w.amax),
+                KernelArg::Buffer(w.denom),
+                KernelArg::Buffer(expert_weights),
+                KernelArg::Buffer(grp.cols),
+                KernelArg::Buffer(grp.items),
+                KernelArg::Buffer(out),
+            ],
+        ),
+    )
+}
+
+/// Launches `kernel_inkling2_moe_nvfp4_w2_tile`: [`moe_nvfp4_w2_grouped`] as a
+/// simdgroup-matrix GEMM over work items of up to [`MOE_TILE_BATCH`] columns.
+///
+/// # Errors
+///
+/// Whatever the device reports.
+pub fn moe_nvfp4_w2_tile(
+    backend: &dyn Backend,
+    args: MoeW2Args,
+    act: DeviceView<'_>,
+    w: &Nvfp4Views<'_>,
+    grp: &MoeGroupViews<'_>,
+    slots_out: DeviceView<'_>,
+) -> CoreResult<()> {
+    backend.run(
+        KernelRef::new(MODULE, "kernel_inkling2_moe_nvfp4_w2_tile"),
+        &LaunchArgs::new(
+            Extent3::new((args.out_dim).div_ceil(64), grp.max_items, 1),
+            Extent3::linear(128),
+            &[
+                KernelArg::Bytes(bytes_of(&args)),
+                KernelArg::Buffer(act),
+                KernelArg::Buffer(w.weight),
+                KernelArg::Buffer(w.scale),
+                KernelArg::Buffer(w.amax),
+                KernelArg::Buffer(w.denom),
+                KernelArg::Buffer(grp.cols),
+                KernelArg::Buffer(grp.items),
+                KernelArg::Buffer(slots_out),
+            ],
+        ),
+    )
+}
+
+/// Launches `kernel_inkling2_moe_mxfp8_w13_tile`: [`moe_mxfp8_w13_grouped`] as a
+/// simdgroup-matrix GEMM over work items of up to [`MOE_TILE_BATCH`] columns.
+///
+/// # Errors
+///
+/// Whatever the device reports.
+pub fn moe_mxfp8_w13_tile(
+    backend: &dyn Backend,
+    args: MoeW13Args,
+    x: DeviceView<'_>,
+    w: &Mxfp8Views<'_>,
+    expert_weights: DeviceView<'_>,
+    grp: &MoeGroupViews<'_>,
+    out: DeviceView<'_>,
+) -> CoreResult<()> {
+    backend.run(
+        KernelRef::new(MODULE, "kernel_inkling2_moe_mxfp8_w13_tile"),
+        &LaunchArgs::new(
+            Extent3::new((2 * args.inter_dim).div_ceil(64), grp.max_items, 1),
+            Extent3::linear(128),
+            &[
+                KernelArg::Bytes(bytes_of(&args)),
+                KernelArg::Buffer(x),
+                KernelArg::Buffer(w.weight),
+                KernelArg::Buffer(w.scale),
+                KernelArg::Buffer(expert_weights),
+                KernelArg::Buffer(grp.cols),
+                KernelArg::Buffer(grp.items),
+                KernelArg::Buffer(out),
+            ],
+        ),
+    )
+}
+
+/// Launches `kernel_inkling2_moe_mxfp8_w2_tile`: [`moe_mxfp8_w2_grouped`] as a
+/// simdgroup-matrix GEMM over work items of up to [`MOE_TILE_BATCH`] columns.
+///
+/// # Errors
+///
+/// Whatever the device reports.
+pub fn moe_mxfp8_w2_tile(
+    backend: &dyn Backend,
+    args: MoeW2Args,
+    act: DeviceView<'_>,
+    w: &Mxfp8Views<'_>,
+    grp: &MoeGroupViews<'_>,
+    slots_out: DeviceView<'_>,
+) -> CoreResult<()> {
+    backend.run(
+        KernelRef::new(MODULE, "kernel_inkling2_moe_mxfp8_w2_tile"),
+        &LaunchArgs::new(
+            Extent3::new((args.out_dim).div_ceil(64), grp.max_items, 1),
+            Extent3::linear(128),
+            &[
+                KernelArg::Bytes(bytes_of(&args)),
+                KernelArg::Buffer(act),
+                KernelArg::Buffer(w.weight),
+                KernelArg::Buffer(w.scale),
+                KernelArg::Buffer(grp.cols),
+                KernelArg::Buffer(grp.items),
                 KernelArg::Buffer(slots_out),
             ],
         ),

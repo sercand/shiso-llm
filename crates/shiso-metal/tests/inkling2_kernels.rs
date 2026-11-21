@@ -59,4 +59,6 @@ inkling2_cases!(
     qkvr_gate_sink_matches_oracle,
     vit_kernels_match_oracle,
     mtp_kernels_match_oracle,
+    lm_head_matches_oracle,
+    sconv_defer_and_commit_match_oracle,
 );

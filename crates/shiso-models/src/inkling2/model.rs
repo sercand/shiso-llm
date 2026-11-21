@@ -31,7 +31,34 @@ use super::weights::{
     load_text_weights,
 };
 
-/// Per-logical-layer KV cache and short-convolution state for one session.
+/// Most rows one pass carries.
+///
+/// A sliding-window layer keeps its keys in a ring, and every row of a pass
+/// writes its key before any row attends. A ring exactly one window wide would
+/// have a pass's later rows overwrite keys its earlier rows still read, so the
+/// ring is this much wider than the window and no pass is longer than this.
+const MAX_PASS_ROWS: u32 = 1024;
+
+/// Fewest rows a pass batches its routed experts at.
+///
+/// Neighbouring tokens share few experts: an 8-row verify pass planned into
+/// items found 64 columns in nearly 64 items and took 1329 + 791 us a layer
+/// (two weight rows a simdgroup) against 8 x (147 + 90) for the direct entries
+/// (four), on an M1 Max. Batching pays once an expert sees several rows.
+const MOE_BATCH_MIN_ROWS: u32 = 32;
+
+/// Fewest rows a pass multiplies its routed experts as tiled GEMMs at.
+///
+/// A tile is 64 columns of one expert, and a pass of `rows` rows gives an
+/// expert `rows / 16` of them on average, so a short pass would pay for tiles
+/// that are mostly padding.
+const MOE_TILE_MIN_ROWS: u32 = 128;
+
+/// Most rows a deferring (speculative verify) pass carries: how many input
+/// rows a short-convolution state keeps behind its lags.
+const SPEC_HIST_ROWS: u32 = 16;
+
+/// Per-logical-layer KV cache for one session.
 #[derive(Debug)]
 struct LayerState {
     /// Key cache (`F16 [kv_cap, n_head_kv, head_dim]`).
@@ -40,14 +67,49 @@ struct LayerState {
     v_cache: DeviceBuffer,
     /// Slot capacity of `k_cache` / `v_cache`.
     kv_cap: u32,
-    /// K short-conv lag state (`F32 [k - 1, kv_dim]`).
-    k_conv_state: DeviceBuffer,
-    /// V short-conv lag state (`F32 [k - 1, kv_dim]`).
-    v_conv_state: DeviceBuffer,
-    /// Post-attention short-conv lag state (`F32 [k - 1, H]`).
-    attn_conv_state: DeviceBuffer,
-    /// Post-MLP short-conv lag state (`F32 [k - 1, H]`).
-    mlp_conv_state: DeviceBuffer,
+}
+
+/// Where one layer's four short-convolution states lie in a session's
+/// `conv_state`: the layout `kernel_inkling2_sconv_commit` walks.
+#[derive(Debug, Clone, Copy)]
+struct ConvLayout {
+    kv_dim: u64,
+    hidden: u64,
+    /// Rows of one state: the lags, then a deferring pass's inputs.
+    rows: u64,
+}
+
+impl ConvLayout {
+    fn of(t: &super::config::TextConfig) -> Self {
+        Self {
+            kv_dim: u64::from(t.num_key_value_heads) * u64::from(t.head_dim),
+            hidden: u64::from(t.hidden_size),
+            rows: u64::from(t.sconv_kernel_size.saturating_sub(1)) + u64::from(SPEC_HIST_ROWS),
+        }
+    }
+
+    /// Bytes one layer's four states take.
+    const fn layer_bytes(self) -> u64 {
+        2 * (self.kv_dim + self.hidden) * self.rows * 4
+    }
+
+    /// The K, V, post-attention and post-MLP states of `layer`.
+    fn views(
+        self,
+        state: &DeviceBuffer,
+        layer: usize,
+    ) -> CoreResult<[shiso_core::DeviceView<'_>; 4]> {
+        let base = layer as u64 * self.layer_bytes();
+        let kv = self.kv_dim * self.rows * 4;
+        let hid = self.hidden * self.rows * 4;
+        let view = state.view();
+        Ok([
+            view.slice(base, kv)?,
+            view.slice(base + kv, kv)?,
+            view.slice(base + 2 * kv, hid)?,
+            view.slice(base + 2 * kv + hid, hid)?,
+        ])
+    }
 }
 
 /// Active session state.
@@ -57,6 +119,8 @@ struct SessionState {
     pos: u32,
     /// One state slot per logical layer (`0..num_logical_layers`).
     layers: Vec<LayerState>,
+    /// Every layer's short-convolution states (`F32`, see [`ConvLayout`]).
+    conv_state: DeviceBuffer,
 }
 
 /// Reusable scratch buffers grown on demand for a given batch/chunk `rows`.
@@ -98,7 +162,7 @@ struct Scratch {
     gate: DeviceBuffer,
     sinks: DeviceBuffer,
     attn_out: DeviceBuffer,
-    /// Split-K Flash-Decoding partials for long-context full-attention decode (`[n_head, 16, 2]` and `[n_head, 16, head_dim]`).
+    /// A short pass's split-K partials; see [`ops::rel_attn_split_bytes`].
     split_ml: DeviceBuffer,
     split_out: DeviceBuffer,
     wo_out: DeviceBuffer,
@@ -110,12 +174,15 @@ struct Scratch {
     router_logits: DeviceBuffer,
     expert_ids: DeviceBuffer,
     expert_weights: DeviceBuffer,
-    expert_counts: DeviceBuffer,
+    /// Per-expert routed columns and the work items planned over them.
     expert_cols: DeviceBuffer,
+    moe_items: DeviceBuffer,
     moe_act: DeviceBuffer,
     moe_w2_slots: DeviceBuffer,
     moe_out: DeviceBuffer,
     mlp_sconv_out: DeviceBuffer,
+    /// The block attention residual's per-source sums.
+    attn_res_stats: DeviceBuffer,
     /// Scratch bottleneck buffer for parallel loop controller (`F32 [cap_rows, rank]`).
     ctrl_z: DeviceBuffer,
     /// Final hidden & output logits (`F32 [cap_rows, unpadded_vocab]`).
@@ -181,10 +248,13 @@ impl Scratch {
             gate: alloc(backend, r * q_dim * f32b)?,
             sinks: alloc(backend, r * u64::from(t.num_attention_heads) * f32b)?,
             attn_out: alloc(backend, r * q_dim * f32b)?,
-            split_ml: alloc(backend, u64::from(t.num_attention_heads) * 16 * 2 * f32b)?,
+            split_ml: alloc(
+                backend,
+                ops::rel_attn_split_bytes(t.num_attention_heads, t.head_dim).0,
+            )?,
             split_out: alloc(
                 backend,
-                u64::from(t.num_attention_heads) * 16 * u64::from(t.head_dim) * f32b,
+                ops::rel_attn_split_bytes(t.num_attention_heads, t.head_dim).1,
             )?,
             wo_out: alloc(backend, r * h * f32b)?,
             attn_sconv_out: alloc(backend, r * h * f32b)?,
@@ -194,8 +264,11 @@ impl Scratch {
             router_logits: alloc(backend, r * u64::from(t.n_routed_experts) * f32b)?,
             expert_ids: alloc(backend, r * u64::from(t.num_experts_per_tok) * 4)?,
             expert_weights: alloc(backend, r * u64::from(t.num_experts_per_tok) * f32b)?,
-            expert_counts: alloc(backend, u64::from(t.n_routed_experts) * 4)?,
             expert_cols: alloc(backend, u64::from(t.n_routed_experts) * r * 4)?,
+            moe_items: alloc(
+                backend,
+                (1 + 2 * (r * u64::from(t.num_experts_per_tok))) * 4,
+            )?,
             moe_act: alloc(
                 backend,
                 r * u64::from(t.num_experts_per_tok) * u64::from(t.intermediate_size) * f32b,
@@ -203,6 +276,7 @@ impl Scratch {
             moe_w2_slots: alloc(backend, r * u64::from(t.num_experts_per_tok) * h * f32b)?,
             moe_out: alloc(backend, r * h * f32b)?,
             mlp_sconv_out: alloc(backend, r * h * f32b)?,
+            attn_res_stats: alloc(backend, ops::attn_res_stats_bytes(cap_rows))?,
             ctrl_z: alloc(
                 backend,
                 r * u64::from(t.loop_config.map_or(64, |lc| lc.gate_rank)) * f32b,
@@ -221,6 +295,8 @@ impl Scratch {
 #[derive(Debug)]
 pub struct Inkling2Model {
     backend: Arc<dyn Backend>,
+    /// The shared tiled GEMM set, for the BF16 projections of a long pass.
+    gemm: crate::audio_ops::Ops,
     config: Inkling2Config,
     info: ModelInfo,
     schedule: Vec<LogicalLayer>,
@@ -232,6 +308,8 @@ pub struct Inkling2Model {
     tap_layers: Vec<u32>,
     /// Optional DSpark / MTP block drafter (`mtp.safetensors`).
     mtp: Option<Inkling2MtpDrafter>,
+    /// Tokens a speculative step drafts behind the committed one.
+    draft_depth: u32,
 }
 
 impl Inkling2Model {
@@ -265,6 +343,25 @@ impl Inkling2Model {
         } else {
             context_capacity.min(config.text.model_max_length)
         };
+        // The routed-expert entries take four weight rows a simdgroup and the
+        // packed codecs group 16 or 32 weights; the vocabulary head and the
+        // projections read four values a lane. A width outside these is
+        // refused here rather than read past a row.
+        let t = &config.text;
+        if !t.hidden_size.is_multiple_of(32)
+            || !t.intermediate_size.is_multiple_of(32)
+            || t.n_routed_experts > 256
+            || t.num_experts_per_tok > 16
+        {
+            return Err(CoreError::InvalidValue {
+                key: "text_config",
+                value: format!(
+                    "hidden {} and intermediate {} must be multiples of 32, with at most 256 \
+                     experts and 16 a token (got {} and {})",
+                    t.hidden_size, t.intermediate_size, t.n_routed_experts, t.num_experts_per_tok
+                ),
+            });
+        }
         let st_dir = SafetensorsDir::open_model(dir)?;
         let weights = load_text_weights(&backend, &st_dir, &config)?;
         let schedule = config.text.schedule();
@@ -301,6 +398,7 @@ impl Inkling2Model {
         };
         let scratch = Scratch::alloc_for(&backend, &config, 16, tap_layers.len() as u32)?;
         Ok(Self {
+            gemm: crate::audio_ops::Ops::new(Arc::clone(&backend)),
             backend,
             config,
             info,
@@ -310,8 +408,34 @@ impl Inkling2Model {
             next_session_id: NonZeroU64::MIN,
             scratch,
             tap_layers,
+            draft_depth: mtp.as_ref().map_or(0, |m| m.block_size().saturating_sub(1)),
             mtp,
         })
+    }
+
+    /// Sets how many tokens a speculative step drafts, at most the drafter's
+    /// block less the committed token.
+    ///
+    /// A verify row costs nearly what a decode row does here - neighbouring
+    /// tokens share few routed experts, so each row reads its own - which
+    /// makes the depth that pays a small one: see the family's notes.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::InvalidValue`] for a zero depth or one past the block.
+    pub fn with_draft_depth(mut self, depth: u32) -> CoreResult<Self> {
+        let most = self
+            .mtp
+            .as_ref()
+            .map_or(0, |m| m.block_size().saturating_sub(1));
+        if depth == 0 || depth > most {
+            return Err(CoreError::InvalidValue {
+                key: "draft_depth",
+                value: format!("{depth} is outside 1..={most}"),
+            });
+        }
+        self.draft_depth = depth;
+        Ok(self)
     }
 
     /// Returns the parsed configuration.
@@ -389,6 +513,21 @@ impl Inkling2Model {
                 cap: self.info.context_capacity,
             });
         }
+        // A verify pass keeps only some of its rows, so it defers the
+        // short-convolution states to `sconv_commit`.
+        let defer_state = u32::from(all_rows_logits);
+        let row_limit = if all_rows_logits {
+            SPEC_HIST_ROWS
+        } else {
+            MAX_PASS_ROWS
+        };
+        if rows > row_limit {
+            return Err(CoreError::InvalidValue {
+                key: "rows",
+                value: format!("a pass of {rows} rows exceeds its limit of {row_limit}"),
+            });
+        }
+        let conv_layout = ConvLayout::of(&self.config.text);
 
         let pos0 = sess.pos;
         let t = &self.config.text;
@@ -410,6 +549,8 @@ impl Inkling2Model {
             let l_idx = ll.logical_idx as usize;
             let lw = &self.weights.layers[p];
             let ls = &sess.layers[l_idx];
+            let [k_conv_state, v_conv_state, attn_conv_state, mlp_conv_state] =
+                conv_layout.views(&sess.conv_state, l_idx)?;
 
             // Capture MTP tap BEFORE layer `ll.logical_idx` (matches reference `for i, layer in enumerate(layers): if i in layers_to_capture: capture(partial)`)
             if let Some(taps_buf) = &self.scratch.mtp_taps
@@ -521,11 +662,14 @@ impl Inkling2Model {
                             eps: t.rms_norm_eps,
                             has_addend: 0,
                         },
-                        self.scratch.bank_blocks.view(),
-                        self.scratch.bank_last.view(),
-                        self.scratch.bank_last.view(),
-                        cp_q,
-                        self.scratch.msg_attn_mlp.view(),
+                        &ops::AttnResViews {
+                            blocks: self.scratch.bank_blocks.view(),
+                            partial: self.scratch.bank_last.view(),
+                            addend: self.scratch.bank_last.view(),
+                            queries: cp_q,
+                            stats: self.scratch.attn_res_stats.view(),
+                            out: self.scratch.msg_attn_mlp.view(),
+                        },
                     )?;
                     ops::attn_res(
                         backend,
@@ -537,11 +681,14 @@ impl Inkling2Model {
                             eps: t.rms_norm_eps,
                             has_addend: 0,
                         },
-                        self.scratch.bank_blocks.view(),
-                        self.scratch.bank_last.view(),
-                        self.scratch.bank_last.view(),
-                        cp_kv_q,
-                        self.scratch.msg_kv.view(),
+                        &ops::AttnResViews {
+                            blocks: self.scratch.bank_blocks.view(),
+                            partial: self.scratch.bank_last.view(),
+                            addend: self.scratch.bank_last.view(),
+                            queries: cp_kv_q,
+                            stats: self.scratch.attn_res_stats.view(),
+                            out: self.scratch.msg_kv.view(),
+                        },
                     )?;
                 }
             }
@@ -582,11 +729,14 @@ impl Inkling2Model {
                         eps: t.rms_norm_eps,
                         has_addend: 0,
                     },
-                    self.scratch.blocks.view(),
-                    self.scratch.partial.view(),
-                    self.scratch.partial.view(),
-                    q_view,
-                    self.scratch.attn_in.view(),
+                    &ops::AttnResViews {
+                        blocks: self.scratch.blocks.view(),
+                        partial: self.scratch.partial.view(),
+                        addend: self.scratch.partial.view(),
+                        queries: q_view,
+                        stats: self.scratch.attn_res_stats.view(),
+                        out: self.scratch.attn_in.view(),
+                    },
                 )?;
             }
 
@@ -776,8 +926,8 @@ impl Inkling2Model {
             let q_dim = t.num_attention_heads * t.head_dim;
             let kv_dim = t.num_key_value_heads * t.head_dim;
             let r_dim = t.num_attention_heads * t.d_rel;
-            ops::qkvr_gate_sink_bf16(
-                backend,
+            ops::qkvr_gate_sink_rows(
+                &self.gemm,
                 ops::QkvrGateSinkArgs {
                     rows,
                     in_dim: h,
@@ -813,13 +963,14 @@ impl Inkling2Model {
                         channels: kv_dim,
                         kernel_size: t.sconv_kernel_size,
                         scale: sconv_static_scale,
+                        defer_state,
                     };
                     ops::short_conv_static(
                         backend,
                         sargs,
                         self.scratch.k.view(),
                         k.view(),
-                        ls.k_conv_state.view(),
+                        k_conv_state,
                         self.scratch.k_conv.view(),
                     )?;
                     ops::short_conv_static(
@@ -827,7 +978,7 @@ impl Inkling2Model {
                         sargs,
                         self.scratch.v.view(),
                         v.view(),
-                        ls.v_conv_state.view(),
+                        v_conv_state,
                         self.scratch.v_conv.view(),
                     )?;
                 }
@@ -838,8 +989,8 @@ impl Inkling2Model {
                     v_proj,
                 } => {
                     let dyn_out = t.num_key_value_heads * t.sconv_kernel_size;
-                    ops::linear_bf16(
-                        backend,
+                    ops::linear_bf16_rows(
+                        &self.gemm,
                         LinearArgs {
                             rows,
                             in_dim: h,
@@ -849,8 +1000,8 @@ impl Inkling2Model {
                         k_proj.view(),
                         self.scratch.k_dyn_w.view(),
                     )?;
-                    ops::linear_bf16(
-                        backend,
+                    ops::linear_bf16_rows(
+                        &self.gemm,
                         LinearArgs {
                             rows,
                             in_dim: h,
@@ -866,6 +1017,7 @@ impl Inkling2Model {
                         head_dim: t.head_dim,
                         kernel_size: t.sconv_kernel_size,
                         scale: sconv_dyn_scale,
+                        defer_state,
                     };
                     ops::short_conv_dynamic(
                         backend,
@@ -873,7 +1025,7 @@ impl Inkling2Model {
                         self.scratch.k.view(),
                         self.scratch.k_dyn_w.view(),
                         k_static.view(),
-                        ls.k_conv_state.view(),
+                        k_conv_state,
                         self.scratch.k_conv.view(),
                     )?;
                     ops::short_conv_dynamic(
@@ -882,7 +1034,7 @@ impl Inkling2Model {
                         self.scratch.v.view(),
                         self.scratch.v_dyn_w.view(),
                         v_static.view(),
-                        ls.v_conv_state.view(),
+                        v_conv_state,
                         self.scratch.v_conv.view(),
                     )?;
                 }
@@ -920,8 +1072,9 @@ impl Inkling2Model {
             )?;
 
             // Relative bias: R [rows * n_head, d_rel] @ rel_logits_proj_t^T [rel_extent, d_rel] -> [rows * n_head, rel_extent]
-            ops::rel_bias_bf16(
-                backend,
+            ops::rel_bias_rows(
+                &self.gemm,
+                rows,
                 LinearArgs {
                     rows: rows * t.num_attention_heads,
                     in_dim: t.d_rel,
@@ -933,7 +1086,6 @@ impl Inkling2Model {
             )?;
 
             // Relative-bias + per-query sink + output-gated attention
-            // Use 16-way split-K Flash-Decoding for long-context full-attention decode.
             let attn_views = RelAttnViews {
                 q: self.scratch.q.view(),
                 rel_bias: self.scratch.rel_bias.view(),
@@ -942,45 +1094,29 @@ impl Inkling2Model {
                 k_cache: ls.k_cache.view(),
                 v_cache: ls.v_cache.view(),
                 out: self.scratch.attn_out.view(),
+                split_ml: self.scratch.split_ml.view(),
+                split_out: self.scratch.split_out.view(),
             };
-            if rows == 1 && !ll.is_local && pos0 >= 256 {
-                ops::rel_attn_splitk(
-                    backend,
-                    ops::RelAttnSplitKArgs {
-                        n_head: t.num_attention_heads,
-                        n_head_kv: t.num_key_value_heads,
-                        head_dim: t.head_dim,
-                        rel_extent: t.rel_extent,
-                        pos: pos0,
-                        n_splits: 16,
-                        scale: attn_scale,
-                    },
-                    &attn_views,
-                    self.scratch.split_ml.view(),
-                    self.scratch.split_out.view(),
-                )?;
-            } else {
-                ops::rel_attn(
-                    backend,
-                    RelAttnArgs {
-                        rows,
-                        n_head: t.num_attention_heads,
-                        n_head_kv: t.num_key_value_heads,
-                        head_dim: t.head_dim,
-                        rel_extent: t.rel_extent,
-                        pos0,
-                        kv_cap: ls.kv_cap,
-                        window_size: t.sliding_window_size,
-                        is_swa: u32::from(ll.is_local),
-                        scale: attn_scale,
-                    },
-                    &attn_views,
-                )?;
-            }
+            ops::rel_attn(
+                backend,
+                RelAttnArgs {
+                    rows,
+                    n_head: t.num_attention_heads,
+                    n_head_kv: t.num_key_value_heads,
+                    head_dim: t.head_dim,
+                    rel_extent: t.rel_extent,
+                    pos0,
+                    kv_cap: ls.kv_cap,
+                    window_size: t.sliding_window_size,
+                    is_swa: u32::from(ll.is_local),
+                    scale: attn_scale,
+                },
+                &attn_views,
+            )?;
 
             // Output projection + post-attention short conv
-            ops::linear_bf16(
-                backend,
+            ops::linear_bf16_rows(
+                &self.gemm,
                 LinearArgs {
                     rows,
                     in_dim: q_dim,
@@ -997,10 +1133,11 @@ impl Inkling2Model {
                     channels: h,
                     kernel_size: t.sconv_kernel_size,
                     scale: sconv_static_scale,
+                    defer_state,
                 },
                 self.scratch.wo_out.view(),
                 lw.attn_sconv.view(),
-                ls.attn_conv_state.view(),
+                attn_conv_state,
                 self.scratch.attn_sconv_out.view(),
             )?;
 
@@ -1040,11 +1177,14 @@ impl Inkling2Model {
                     eps: t.rms_norm_eps,
                     has_addend: 0,
                 },
-                self.scratch.blocks.view(),
-                self.scratch.partial.view(),
-                self.scratch.partial.view(),
-                lw.mlp_res_query.view(),
-                self.scratch.mlp_in.view(),
+                &ops::AttnResViews {
+                    blocks: self.scratch.blocks.view(),
+                    partial: self.scratch.partial.view(),
+                    addend: self.scratch.partial.view(),
+                    queries: lw.mlp_res_query.view(),
+                    stats: self.scratch.attn_res_stats.view(),
+                    out: self.scratch.mlp_in.view(),
+                },
             )?;
 
             let mlp_pre_norm = if has_messages {
@@ -1091,8 +1231,8 @@ impl Inkling2Model {
             )?;
 
             // Router + Top-K
-            ops::linear_bf16(
-                backend,
+            ops::linear_bf16_rows(
+                &self.gemm,
                 LinearArgs {
                     rows,
                     in_dim: h,
@@ -1132,26 +1272,41 @@ impl Inkling2Model {
                 out_dim: h,
                 top_k: t.num_experts_per_tok,
             };
-            if rows >= 32 {
-                ops::moe_bucket(
+            // A short pass reads each routed column's expert directly. A
+            // long one is planned into (expert, up to eight columns) items so
+            // an expert its rows share is streamed once. Both compute a row's
+            // bits the same way, so where the switch sits is only a matter of
+            // speed.
+            let tiled = rows >= MOE_TILE_MIN_ROWS
+                && h.is_multiple_of(16)
+                && t.intermediate_size.is_multiple_of(16);
+            if rows >= MOE_BATCH_MIN_ROWS {
+                let plan = ops::MoePlanArgs {
+                    rows,
+                    top_k: t.num_experts_per_tok,
+                    n_experts: t.n_routed_experts,
+                    batch: if tiled { ops::MOE_TILE_BATCH } else { 8 },
+                };
+                ops::moe_plan(
                     backend,
-                    ops::MoeBucketArgs {
-                        rows,
-                        top_k: t.num_experts_per_tok,
-                        n_experts: t.n_routed_experts,
-                    },
+                    plan,
                     self.scratch.expert_ids.view(),
-                    self.scratch.expert_counts.view(),
                     self.scratch.expert_cols.view(),
+                    self.scratch.moe_items.view(),
                 )?;
                 let grp = ops::MoeGroupViews {
-                    counts: self.scratch.expert_counts.view(),
                     cols: self.scratch.expert_cols.view(),
-                    n_experts: t.n_routed_experts,
+                    items: self.scratch.moe_items.view(),
+                    max_items: plan.max_items(),
                 };
                 match &lw.experts {
                     ExpertWeights::Nvfp4(nv) => {
-                        ops::moe_nvfp4_w13_grouped(
+                        let w13 = if tiled {
+                            ops::moe_nvfp4_w13_tile
+                        } else {
+                            ops::moe_nvfp4_w13_grouped
+                        };
+                        w13(
                             backend,
                             w13_args,
                             self.scratch.mlp_norm.view(),
@@ -1165,7 +1320,12 @@ impl Inkling2Model {
                             &grp,
                             self.scratch.moe_act.view(),
                         )?;
-                        ops::moe_nvfp4_w2_grouped(
+                        let w2 = if tiled {
+                            ops::moe_nvfp4_w2_tile
+                        } else {
+                            ops::moe_nvfp4_w2_grouped
+                        };
+                        w2(
                             backend,
                             w2_args,
                             self.scratch.moe_act.view(),
@@ -1180,7 +1340,12 @@ impl Inkling2Model {
                         )?;
                     }
                     ExpertWeights::Mxfp8(mx) => {
-                        ops::moe_mxfp8_w13_grouped(
+                        let w13 = if tiled {
+                            ops::moe_mxfp8_w13_tile
+                        } else {
+                            ops::moe_mxfp8_w13_grouped
+                        };
+                        w13(
                             backend,
                             w13_args,
                             self.scratch.mlp_norm.view(),
@@ -1192,7 +1357,12 @@ impl Inkling2Model {
                             &grp,
                             self.scratch.moe_act.view(),
                         )?;
-                        ops::moe_mxfp8_w2_grouped(
+                        let w2 = if tiled {
+                            ops::moe_mxfp8_w2_tile
+                        } else {
+                            ops::moe_mxfp8_w2_grouped
+                        };
+                        w2(
                             backend,
                             w2_args,
                             self.scratch.moe_act.view(),
@@ -1205,12 +1375,6 @@ impl Inkling2Model {
                         )?;
                     }
                 }
-                ops::moe_reduce_topk(
-                    backend,
-                    w2_args,
-                    self.scratch.moe_w2_slots.view(),
-                    self.scratch.moe_out.view(),
-                )?;
             } else {
                 match &lw.experts {
                     ExpertWeights::Nvfp4(nv) => {
@@ -1228,7 +1392,7 @@ impl Inkling2Model {
                             self.scratch.expert_weights.view(),
                             self.scratch.moe_act.view(),
                         )?;
-                        ops::moe_nvfp4_w2_accum(
+                        ops::moe_nvfp4_w2_cols(
                             backend,
                             w2_args,
                             self.scratch.moe_act.view(),
@@ -1239,7 +1403,7 @@ impl Inkling2Model {
                                 denom: nv.w2_denom.view(),
                             },
                             self.scratch.expert_ids.view(),
-                            self.scratch.moe_out.view(),
+                            self.scratch.moe_w2_slots.view(),
                         )?;
                     }
                     ExpertWeights::Mxfp8(mx) => {
@@ -1255,7 +1419,7 @@ impl Inkling2Model {
                             self.scratch.expert_weights.view(),
                             self.scratch.moe_act.view(),
                         )?;
-                        ops::moe_mxfp8_w2_accum(
+                        ops::moe_mxfp8_w2_cols(
                             backend,
                             w2_args,
                             self.scratch.moe_act.view(),
@@ -1264,11 +1428,18 @@ impl Inkling2Model {
                                 scale: mx.w2_scale.view(),
                             },
                             self.scratch.expert_ids.view(),
-                            self.scratch.moe_out.view(),
+                            self.scratch.moe_w2_slots.view(),
                         )?;
                     }
                 }
             }
+
+            ops::moe_reduce_topk(
+                backend,
+                w2_args,
+                self.scratch.moe_w2_slots.view(),
+                self.scratch.moe_out.view(),
+            )?;
 
             // Post-MLP short conv + residual add into partial
             ops::short_conv_static(
@@ -1278,10 +1449,11 @@ impl Inkling2Model {
                     channels: h,
                     kernel_size: t.sconv_kernel_size,
                     scale: sconv_static_scale,
+                    defer_state,
                 },
                 self.scratch.moe_out.view(),
                 lw.mlp_sconv.view(),
-                ls.mlp_conv_state.view(),
+                mlp_conv_state,
                 self.scratch.mlp_sconv_out.view(),
             )?;
             ops::add2_f32(
@@ -1304,11 +1476,14 @@ impl Inkling2Model {
                 eps: t.rms_norm_eps,
                 has_addend: 0,
             },
-            self.scratch.blocks.view(),
-            self.scratch.partial.view(),
-            self.scratch.partial.view(),
-            self.weights.output_res_query.view(),
-            self.scratch.final_hidden.view(),
+            &ops::AttnResViews {
+                blocks: self.scratch.blocks.view(),
+                partial: self.scratch.partial.view(),
+                addend: self.scratch.partial.view(),
+                queries: self.weights.output_res_query.view(),
+                stats: self.scratch.attn_res_stats.view(),
+                out: self.scratch.final_hidden.view(),
+            },
         )?;
         ops::rmsnorm_bf16(
             backend,
@@ -1387,45 +1562,43 @@ impl Model for Inkling2Model {
     fn open_session(&mut self) -> CoreResult<SessionId> {
         let t = &self.config.text;
         let kv_dim = u64::from(t.num_key_value_heads) * u64::from(t.head_dim);
-        let lags = u64::from(t.sconv_kernel_size.saturating_sub(1));
-        let h = u64::from(t.hidden_size);
         let backend = &self.backend;
 
         let mut layers = Vec::with_capacity(self.schedule.len());
         for &ll in &self.schedule {
             let kv_cap = if ll.is_local {
-                t.sliding_window_size
+                t.sliding_window_size + MAX_PASS_ROWS
             } else {
                 self.info.context_capacity
             };
             let kv_bytes = u64::from(kv_cap) * kv_dim * 2;
             let k_cache = alloc(backend, kv_bytes)?;
             let v_cache = alloc(backend, kv_bytes)?;
-            let k_conv_state = alloc(backend, (lags * kv_dim * 4).max(4))?;
-            let v_conv_state = alloc(backend, (lags * kv_dim * 4).max(4))?;
-            let attn_conv_state = alloc(backend, (lags * h * 4).max(4))?;
-            let mlp_conv_state = alloc(backend, (lags * h * 4).max(4))?;
-            backend.fill_zero(k_conv_state.view())?;
-            backend.fill_zero(v_conv_state.view())?;
-            backend.fill_zero(attn_conv_state.view())?;
-            backend.fill_zero(mlp_conv_state.view())?;
             layers.push(LayerState {
                 k_cache,
                 v_cache,
                 kv_cap,
-                k_conv_state,
-                v_conv_state,
-                attn_conv_state,
-                mlp_conv_state,
             });
         }
+        let conv_state = alloc(
+            backend,
+            ConvLayout::of(t).layer_bytes() * self.schedule.len() as u64,
+        )?;
+        backend.fill_zero(conv_state.view())?;
 
         let id =
             SessionId::next(&mut self.next_session_id).ok_or_else(|| CoreError::InvalidValue {
                 key: "session_id",
                 value: "session id space exhausted".to_owned(),
             })?;
-        self.sessions.insert(id, SessionState { pos: 0, layers });
+        self.sessions.insert(
+            id,
+            SessionState {
+                pos: 0,
+                layers,
+                conv_state,
+            },
+        );
         if let Some(mtp) = &mut self.mtp {
             mtp.open_session(id, self.info.context_capacity)?;
         }
@@ -1455,7 +1628,7 @@ impl Model for Inkling2Model {
     }
 
     fn prefill_chunk(&mut self, session: SessionId, tokens: &[TokenId]) -> CoreResult<()> {
-        const MAX_CHUNK: usize = 256;
+        const MAX_CHUNK: usize = MAX_PASS_ROWS as usize;
         for chunk in tokens.chunks(MAX_CHUNK) {
             self.forward_tokens(session, chunk, false)?;
         }
@@ -1463,7 +1636,7 @@ impl Model for Inkling2Model {
     }
 
     fn prefill_last(&mut self, session: SessionId, tokens: &[TokenId]) -> CoreResult<Logits<'_>> {
-        const MAX_CHUNK: usize = 256;
+        const MAX_CHUNK: usize = MAX_PASS_ROWS as usize;
         if tokens.len() > MAX_CHUNK {
             let split = tokens.len() - MAX_CHUNK;
             for chunk in tokens[..split].chunks(MAX_CHUNK) {
@@ -1564,14 +1737,15 @@ impl MediaModel for Inkling2Model {
                 got: pad_positions.len() as u64,
             });
         }
-        self.ensure_scratch(rows)?;
         let h = self.config.text.hidden_size;
         let row_bytes = u64::from(h) * 4;
+        // The prompt is embedded and spliced whole, then walked a pass at a
+        // time like any other prefill.
+        let embedded = alloc(&self.backend, u64::from(rows) * row_bytes)?;
+        let tokens_dev = alloc(&self.backend, u64::from(rows) * 4)?;
         let raw_ids: Vec<u32> = tokens.iter().map(|tok| tok.get()).collect();
-        self.backend.copy_h2d(
-            self.scratch.tokens.view().slice(0, u64::from(rows) * 4)?,
-            cast_slice(&raw_ids),
-        )?;
+        self.backend
+            .copy_h2d(tokens_dev.view(), cast_slice(&raw_ids))?;
         ops::embed_rmsnorm_bf16(
             self.backend.as_ref(),
             NormArgs {
@@ -1579,23 +1753,34 @@ impl MediaModel for Inkling2Model {
                 hidden: h,
                 eps: self.config.text.rms_norm_eps,
             },
-            self.scratch.tokens.view(),
+            tokens_dev.view(),
             self.weights.embed.view(),
             self.weights.embed_norm.view(),
-            self.scratch.partial.view(),
+            embedded.view(),
         )?;
         // Splice encoded image rows into placeholder positions
         for (src_idx, &tok_pos) in pad_positions.iter().enumerate() {
             let src = media.rows().slice(src_idx as u64 * row_bytes, row_bytes)?;
-            let dst = self
-                .scratch
-                .partial
+            let dst = embedded
                 .view()
                 .slice(tok_pos as u64 * row_bytes, row_bytes)?;
             self.backend.copy_d2d(dst, src)?;
         }
-        // Run the 48-layer forward pass on the spliced embeddings
-        self.forward_already_embedded(session, rows, true, false)?;
+        self.ensure_scratch(rows.min(MAX_PASS_ROWS))?;
+        let mut done = 0u32;
+        while done < rows {
+            let pass = (rows - done).min(MAX_PASS_ROWS);
+            let bytes = u64::from(pass) * row_bytes;
+            self.backend.copy_d2d(
+                self.scratch.partial.view().slice(0, bytes)?,
+                embedded.view().slice(u64::from(done) * row_bytes, bytes)?,
+            )?;
+            done += pass;
+            self.forward_already_embedded(session, pass, done == rows, false)?;
+        }
+        // The scratch the passes read outlives them; the staging buffers are
+        // only safe to drop once the device has run what reads them.
+        self.backend.sync()?;
         let logits_bytes = self.info.logits_row_bytes();
         Logits::new(
             self.scratch.logits.view().slice(0, logits_bytes)?,
@@ -1616,6 +1801,7 @@ impl Speculating for Inkling2Model {
         let drafts = mtp.draft_block(
             session,
             first,
+            self.draft_depth,
             self.weights.embed.view(),
             self.weights.embed_norm.view(),
             self.weights.unembed.view(),
@@ -1690,9 +1876,27 @@ impl Speculating for Inkling2Model {
             }
         }
 
-        // Rewind session position to committed prefix `pos0 + 1 + accepted`
+        // Rewind the session to the committed prefix `pos0 + 1 + accepted`: its
+        // position, and the short-convolution lags the verify pass deferred.
+        // The keys the rejected rows wrote lie past the position, in slots no
+        // kept row reads before its own pass rewrites them.
         if let Some(sess) = self.sessions.get_mut(&session) {
             sess.pos = pos0 + 1 + accepted;
+            let t = &self.config.text;
+            let layout = ConvLayout::of(t);
+            let per = 2 * (layout.kv_dim + layout.hidden) * self.schedule.len() as u64;
+            ops::sconv_commit(
+                self.backend.as_ref(),
+                ops::SconvCommitArgs {
+                    total: per as u32,
+                    kv_dim: layout.kv_dim as u32,
+                    hidden: layout.hidden as u32,
+                    lags: t.sconv_kernel_size.saturating_sub(1),
+                    hist_rows: SPEC_HIST_ROWS,
+                    keep: 1 + accepted,
+                },
+                sess.conv_state.view(),
+            )?;
         }
         if let (Some(mtp), Some(taps)) = (&mut self.mtp, &self.scratch.mtp_taps) {
             mtp.absorb_taps(session, taps.view(), block_len, 1 + accepted, pos0)?;

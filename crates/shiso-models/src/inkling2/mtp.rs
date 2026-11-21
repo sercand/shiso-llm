@@ -71,6 +71,16 @@ struct MtpAttnArgs {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct MtpStoreArgs {
+    rows: u32,
+    width: u32,
+    pos0: u32,
+    kv_cap: u32,
+    is_swa: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct MtpRnnArgs {
     rows: u32,
     rank: u32,
@@ -103,12 +113,25 @@ struct MtpLayerKv {
     kv_cap: u32,
 }
 
+/// The rows an absorb mixes and projects through, kept with the session so
+/// nothing a queued launch reads is dropped under it.
+#[derive(Debug)]
+struct AbsorbScratch {
+    cap_rows: u32,
+    mixed: DeviceBuffer,
+    k: DeviceBuffer,
+    v: DeviceBuffer,
+}
+
 #[derive(Debug)]
 struct MtpSessionState {
     ctx_len: u32,
     kv: Vec<MtpLayerKv>,
-    /// Last committed `f_rnn` vector (`[hidden]`, F32 on host for fast sequential Markov step).
-    f_rnn: Vec<f32>,
+    /// Last committed `f_rnn` vector (`[hidden]`, F32), on the device: a draft
+    /// reads it back beside its hidden rows, so absorbing never waits on the
+    /// device.
+    f_rnn: DeviceBuffer,
+    scratch: Option<AbsorbScratch>,
 }
 
 /// Loaded Inkling-2 MTP / DSpark drafter on a [`Backend`].
@@ -338,7 +361,12 @@ impl Inkling2MtpDrafter {
             MtpSessionState {
                 ctx_len: 0,
                 kv,
-                f_rnn: vec![0.0; self.config.hidden_size as usize],
+                f_rnn: {
+                    let buf = alloc(&self.backend, u64::from(self.config.hidden_size) * 4)?;
+                    self.backend.fill_zero(buf.view())?;
+                    buf
+                },
+                scratch: None,
             },
         );
         Ok(())
@@ -369,9 +397,17 @@ impl Inkling2MtpDrafter {
         let h = self.config.hidden_size;
         let kv_dim = self.config.num_key_value_heads * self.config.head_dim;
         let n_taps = self.config.target_layer_ids.len() as u32;
-        let d_mixed = alloc(&self.backend, u64::from(rows) * u64::from(h) * 4)?;
-        let d_k = alloc(&self.backend, u64::from(rows) * u64::from(kv_dim) * 4)?;
-        let d_v = alloc(&self.backend, u64::from(rows) * u64::from(kv_dim) * 4)?;
+        if sess.scratch.as_ref().is_none_or(|sc| sc.cap_rows < rows) {
+            let cap = rows.next_power_of_two();
+            sess.scratch = Some(AbsorbScratch {
+                cap_rows: cap,
+                mixed: alloc(&self.backend, u64::from(cap) * u64::from(h) * 4)?,
+                k: alloc(&self.backend, u64::from(cap) * u64::from(kv_dim) * 4)?,
+                v: alloc(&self.backend, u64::from(cap) * u64::from(kv_dim) * 4)?,
+            });
+        }
+        let scratch = sess.scratch.as_ref().expect("sized above");
+        let (d_mixed, d_k, d_v) = (&scratch.mixed, &scratch.k, &scratch.v);
         let backend = self.backend.as_ref();
 
         let mix_args = MtpMixArgs {
@@ -443,27 +479,26 @@ impl Inkling2MtpDrafter {
                     ],
                 ),
             )?;
-            // Copy V to F16 cache slot on host/device: for simplicity write each row into F16.
-            let mut host_v = vec![0u8; (u64::from(rows) * u64::from(kv_dim) * 4) as usize];
-            backend.sync()?;
-            backend.copy_d2h(d_v.view(), &mut host_v)?;
-            let v_f32: &[f32] = cast_slice(&host_v);
-            for r in 0..rows {
-                let slot = if lw.is_local {
-                    (pos0 + r) % kv.kv_cap
-                } else {
-                    pos0 + r
-                };
-                let row_f16: Vec<u16> = v_f32[(r * kv_dim) as usize..((r + 1) * kv_dim) as usize]
-                    .iter()
-                    .map(|&val| half::f16::from_f32(val).to_bits())
-                    .collect();
-                let dst = kv.v_ctx.view().slice(
-                    u64::from(slot) * u64::from(kv_dim) * 2,
-                    u64::from(kv_dim) * 2,
-                )?;
-                backend.copy_h2d(dst, cast_slice(&row_f16))?;
-            }
+            // The values go to the cache as they are, narrowed on the device.
+            let store = MtpStoreArgs {
+                rows,
+                width: kv_dim,
+                pos0,
+                kv_cap: kv.kv_cap,
+                is_swa: u32::from(lw.is_local),
+            };
+            backend.run(
+                KernelRef::new(MODULE, "kernel_inkling2_mtp_store_f16"),
+                &LaunchArgs::new(
+                    Extent3::linear((rows * kv_dim).div_ceil(256)),
+                    Extent3::linear(256),
+                    &[
+                        KernelArg::Bytes(bytes_of(&store)),
+                        KernelArg::Buffer(d_v.view()),
+                        KernelArg::Buffer(kv.v_ctx.view()),
+                    ],
+                ),
+            )?;
         }
 
         // Compute `f_rnn` for row `rows - 1`
@@ -482,20 +517,20 @@ impl Inkling2MtpDrafter {
                 ],
             ),
         )?;
-        backend.sync()?;
         let last_off = u64::from(rows - 1) * u64::from(h) * 4;
-        let mut f_rnn_bytes = vec![0u8; (h * 4) as usize];
-        backend.copy_d2h(
+        backend.copy_d2d(
+            sess.f_rnn.view(),
             d_mixed.view().slice(last_off, u64::from(h) * 4)?,
-            &mut f_rnn_bytes,
         )?;
-        sess.f_rnn = cast_slice::<u8, f32>(&f_rnn_bytes).to_vec();
         sess.ctx_len = pos0 + rows;
         Ok(())
     }
 
-    /// Proposes `block_size - 1` draft tokens behind `anchor` using the 3-layer parallel
-    /// block backbone + sequential `rnn_hidden` Markov head.
+    /// Proposes `depth` draft tokens (at most `block_size - 1`) behind `anchor`
+    /// using the 3-layer parallel block backbone + sequential `rnn_hidden`
+    /// Markov head. The backbone always runs the whole block - its positions
+    /// attend to one another - and only the head's left-to-right refinement
+    /// stops at `depth`.
     ///
     /// # Errors
     ///
@@ -504,6 +539,7 @@ impl Inkling2MtpDrafter {
         &self,
         session: SessionId,
         anchor: TokenId,
+        depth: u32,
         embed_w: DeviceView<'_>,
         embed_norm_w: DeviceView<'_>,
         unembed_w: DeviceView<'_>,
@@ -777,6 +813,9 @@ impl Inkling2MtpDrafter {
         let mut hidden_bytes = vec![0u8; (u64::from(bs) * u64::from(h) * 4) as usize];
         backend.copy_d2h(d_hidden.view(), &mut hidden_bytes)?;
         let hidden_f32: &[f32] = cast_slice(&hidden_bytes);
+        let mut f_rnn_bytes = vec![0u8; (h * 4) as usize];
+        backend.copy_d2h(sess.f_rnn.view(), &mut f_rnn_bytes)?;
+        let f_rnn: &[f32] = cast_slice(&f_rnn_bytes);
 
         // Sequential RNN-hidden Markov refinement over positions 1..bs:
         // At each step, add `hidden_out(latent)` into the hidden vector BEFORE projecting
@@ -794,7 +833,7 @@ impl Inkling2MtpDrafter {
         let d_step_logits = alloc(&self.backend, u64::from(vocab) * 4)?;
         let mut logits_bytes = vec![0u8; (vocab * 4) as usize];
 
-        for pos in 1..bs as usize {
+        for pos in 1..=depth.min(bs - 1) as usize {
             let h_pos = &hidden_f32[pos * hs..(pos + 1) * hs];
             // Build rnn input: [state, markov_w1[prev_tok], h_pos, f_rnn]
             let mut inp = Vec::with_capacity(in_rnn_w);
@@ -804,7 +843,7 @@ impl Inkling2MtpDrafter {
                 inp.push(bf16_to_f32(self.markov_w1_bf16[emb_off + r]));
             }
             inp.extend_from_slice(h_pos);
-            inp.extend_from_slice(&sess.f_rnn);
+            inp.extend_from_slice(f_rnn);
 
             let mut proj = self.rnn_proj_b.clone();
             for (o, p_out) in proj.iter_mut().enumerate() {

@@ -558,12 +558,13 @@ fn open_inkling2_tower(
     Ok(Box::new(tower))
 }
 
-/// Loads an Inkling-2 checkpoint directory with optional MTP speculative drafter.
+/// Loads an Inkling-2 checkpoint directory; `spec_k` above zero loads its MTP
+/// drafter and is the number of tokens a speculative step drafts.
 fn load_inkling2(
     backend: &Arc<dyn Backend>,
     path: &Path,
     ctx: u32,
-    enable_mtp: bool,
+    spec_k: u32,
     defaults: FamilyDefaults,
 ) -> Result<Loaded, FactoryError> {
     if !path.is_dir() {
@@ -575,8 +576,14 @@ fn load_inkling2(
             ),
         }));
     }
-    let model = Inkling2Model::load_with_options(Arc::clone(backend), path, ctx, enable_mtp)
+    let model = Inkling2Model::load_with_options(Arc::clone(backend), path, ctx, spec_k > 0)
         .map_err(FactoryError::Load)?;
+    // `--spec-k` is the draft depth; the drafter's block bounds it.
+    let model = if spec_k > 0 {
+        model.with_draft_depth(spec_k).map_err(FactoryError::Load)?
+    } else {
+        model
+    };
     Ok(Loaded {
         model: Box::new(model),
         open_tower: open_inkling2_tower,
@@ -689,7 +696,7 @@ pub fn load_model(
     }
 
     if Inkling2Config::describes_type(config.model_type()) {
-        return load_inkling2(backend, path, opts.ctx, args.spec_k > 0, defaults);
+        return load_inkling2(backend, path, opts.ctx, args.spec_k, defaults);
     }
 
     // The sparse family's directory containers - MLX shards, the reference

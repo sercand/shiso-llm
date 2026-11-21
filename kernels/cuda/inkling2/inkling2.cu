@@ -140,8 +140,9 @@ struct ink2_args_sconv_static {
     u32 channels;
     u32 kernel_size;
     float scale;
+    u32 defer_state;
 };
-static_assert(sizeof(ink2_args_sconv_static) == 16, "ink2_args_sconv_static layout");
+static_assert(sizeof(ink2_args_sconv_static) == 20, "ink2_args_sconv_static layout");
 
 struct ink2_args_sconv_dynamic {
     u32 rows;
@@ -149,8 +150,19 @@ struct ink2_args_sconv_dynamic {
     u32 head_dim;
     u32 kernel_size;
     float scale;
+    u32 defer_state;
 };
-static_assert(sizeof(ink2_args_sconv_dynamic) == 20, "ink2_args_sconv_dynamic layout");
+static_assert(sizeof(ink2_args_sconv_dynamic) == 24, "ink2_args_sconv_dynamic layout");
+
+struct ink2_args_sconv_commit {
+    u32 total;
+    u32 kv_dim;
+    u32 hidden;
+    u32 lags;
+    u32 hist_rows;
+    u32 keep;
+};
+static_assert(sizeof(ink2_args_sconv_commit) == 24, "ink2_args_sconv_commit layout");
 
 struct ink2_args_qkvr_prep {
     u32 rows;
@@ -498,6 +510,16 @@ extern "C" __global__ void kernel_inkling2_qkvr_gate_sink_bf16(
 }
 
 // ---- 4. LM Head BF16 + Softcap ---------------------------------------------
+// Grid: (ceil(vocab / 4), ceil(rows / 8), 1), block 128. A warp owns one
+// vocabulary row against up to eight hidden rows, so a pass's rows share one
+// read of the head. `hidden % 4 == 0`.
+
+__device__ __forceinline__ float ink2_bf16_dot4_acc(float acc, float4 x, ushort4 w) {
+    const float part = fmaf(x.x, ink2_bf16_to_f32(w.x),
+                       fmaf(x.y, ink2_bf16_to_f32(w.y),
+                       fmaf(x.z, ink2_bf16_to_f32(w.z), x.w * ink2_bf16_to_f32(w.w))));
+    return acc + part;
+}
 
 extern "C" __global__ void kernel_inkling2_lm_head_softcap(
         const ink2_args_lm_head args,
@@ -507,136 +529,171 @@ extern "C" __global__ void kernel_inkling2_lm_head_softcap(
     const u32 lane = threadIdx.x & 31u;
     const u32 sg = threadIdx.x >> 5u;
     const u32 o = blockIdx.x * INK2_MV_SG + sg;
-    const u32 r = blockIdx.y;
-    if (o >= args.vocab || r >= args.rows) {
+    const u32 r0 = blockIdx.y * 8u;
+    if (o >= args.vocab || r0 >= args.rows) {
         return;
     }
+    const u32 n_r = (args.rows - r0) < 8u ? (args.rows - r0) : 8u;
     const u32 H = args.hidden;
-    const float* xr = x + u64(r) * H;
     const u16* wr = w + u64(o) * H;
 
-    float acc = 0.0f;
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (u32 k = lane * 4u; k + 3u < H; k += 128u) {
-        const float4 xv = *reinterpret_cast<const float4*>(xr + k);
         const ushort4 wv = *reinterpret_cast<const ushort4*>(wr + k);
-        acc += xv.x * ink2_bf16_to_f32(wv.x) +
-               xv.y * ink2_bf16_to_f32(wv.y) +
-               xv.z * ink2_bf16_to_f32(wv.z) +
-               xv.w * ink2_bf16_to_f32(wv.w);
+        for (u32 rr = 0u; rr < n_r; ++rr) {
+            acc[rr] = ink2_bf16_dot4_acc(
+                acc[rr], *reinterpret_cast<const float4*>(x + u64(r0 + rr) * H + k), wv);
+        }
     }
-    acc = ink2_warp_sum(acc);
-    if (lane == 0u) {
-        out[u64(r) * args.vocab + o] = ink2_softcap(acc, args.softcap);
+    for (u32 rr = 0u; rr < n_r; ++rr) {
+        const float sum = ink2_warp_sum(acc[rr]);
+        if (lane == 0u) {
+            out[u64(r0 + rr) * args.vocab + o] = ink2_softcap(sum, args.softcap);
+        }
     }
 }
 
 // ---- 5. Block Attention Residual -------------------------------------------
+// See the Metal twin. `attn_res_stats` reads every source once, a block per
+// (source, slice of the width), and writes its sum of squares and its dot with
+// every query; `attn_res_mix` adds a source's slices in slice order, takes the
+// softmax and mixes.
+// stats: grid (n_src * INK2_ATTN_RES_SLICES, rows, 1), block 256
+//        -> stats[row][source][slice][1 + INK2_MAX_ATTN_RES_Q]
+// mix:   grid (ceil(hidden / 256), rows, 1), block 256
 
-extern "C" __global__ void kernel_inkling2_attn_res(
+#define INK2_MAX_ATTN_RES_Q 4u
+#define INK2_ATTN_RES_SLICES 4u
+#define INK2_ATTN_RES_STATS (1u + INK2_MAX_ATTN_RES_Q)
+
+__device__ __forceinline__ float ink2_attn_res_src(
+        const float* blocks, const float* partial, const float* addend,
+        u32 has_addend, u32 s, u32 n_blocks, u64 block_stride, u64 idx) {
+    if (s < n_blocks) {
+        return blocks[u64(s) * block_stride + idx];
+    }
+    return partial[idx] + (has_addend != 0u ? addend[idx] : 0.0f);
+}
+
+extern "C" __global__ void kernel_inkling2_attn_res_stats(
         const ink2_args_attn_res args,
         const float* blocks,
         const float* partial,
         const float* addend,
         const float* queries,
-        float* out) {
-    const u32 gid = blockIdx.x;
-    if (gid >= args.rows) {
-        return;
-    }
+        float* stats) {
     const u32 tid = threadIdx.x;
     const u32 lane = tid & 31u;
     const u32 sg = tid >> 5u;
     const u32 H = args.hidden;
-    const u32 n_blocks = args.n_blocks;
+    const u32 n_blocks = args.n_blocks < INK2_MAX_ATTN_RES_SRC - 1u ? args.n_blocks
+                                                                   : INK2_MAX_ATTN_RES_SRC - 1u;
     const u32 n_src = n_blocks + 1u;
-    const u32 n_q = args.n_queries;
-    const u64 row_off = u64(gid) * H;
+    const u32 n_q = args.n_queries < INK2_MAX_ATTN_RES_Q ? args.n_queries : INK2_MAX_ATTN_RES_Q;
+    const u32 s = blockIdx.x / INK2_ATTN_RES_SLICES;
+    const u32 slice = blockIdx.x % INK2_ATTN_RES_SLICES;
+    const u32 row = blockIdx.y;
+    if (s >= n_src || row >= args.rows) {
+        return;
+    }
+    const u32 span = (H + INK2_ATTN_RES_SLICES - 1u) / INK2_ATTN_RES_SLICES;
+    const u32 lo = slice * span < H ? slice * span : H;
+    const u32 hi = lo + span < H ? lo + span : H;
+    const u64 row_off = u64(row) * H;
     const u64 block_stride = u64(args.rows) * H;
-    const float scale = rsqrtf(float(H));
 
-    __shared__ float partials[8];
-    __shared__ float inv_rms[INK2_MAX_ATTN_RES_SRC];
-    __shared__ float weights[4][INK2_MAX_ATTN_RES_SRC];
-
-    for (u32 s = 0u; s < n_src; ++s) {
-        float sq = 0.0f;
-        for (u32 i = tid; i < H; i += INK2_BLOCK) {
-            float v = (s < n_blocks)
-                          ? blocks[u64(s) * block_stride + row_off + i]
-                          : (partial[row_off + i] + (args.has_addend ? addend[row_off + i] : 0.0f));
-            sq += v * v;
-        }
-        sq = ink2_warp_sum(sq);
-        if (lane == 0u) {
-            partials[sg] = sq;
-        }
-        __syncthreads();
-        if (tid == 0u) {
-            float tot = 0.0f;
-            for (u32 k = 0u; k < 8u; ++k) {
-                tot += partials[k];
-            }
-            inv_rms[s] = rsqrtf(tot / float(H) + args.eps);
-        }
-        __syncthreads();
-
-        const float inv = inv_rms[s];
+    float sums[INK2_ATTN_RES_STATS] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (u32 i = lo + tid; i < hi; i += INK2_BLOCK) {
+        const float v = ink2_attn_res_src(blocks, partial, addend, args.has_addend,
+                                          s, n_blocks, block_stride, row_off + i);
+        sums[0] += v * v;
         for (u32 q = 0u; q < n_q; ++q) {
-            const float* qr = queries + u64(q) * H;
-            float dot = 0.0f;
-            for (u32 i = tid; i < H; i += INK2_BLOCK) {
-                float v = (s < n_blocks)
-                              ? blocks[u64(s) * block_stride + row_off + i]
-                              : (partial[row_off + i] + (args.has_addend ? addend[row_off + i] : 0.0f));
-                dot += qr[i] * (v * inv);
-            }
-            dot = ink2_warp_sum(dot);
-            if (lane == 0u) {
-                partials[sg] = dot;
-            }
-            __syncthreads();
-            if (tid == 0u) {
-                float tot = 0.0f;
-                for (u32 k = 0u; k < 8u; ++k) {
-                    tot += partials[k];
-                }
-                weights[q][s] = tot * scale;
-            }
-            __syncthreads();
+            sums[1u + q] += queries[u64(q) * H + i] * v;
         }
     }
+    __shared__ float parts[8][INK2_ATTN_RES_STATS];
+    for (u32 c = 0u; c < INK2_ATTN_RES_STATS; ++c) {
+        const float total = ink2_warp_sum(sums[c]);
+        if (lane == 0u) {
+            parts[sg][c] = total;
+        }
+    }
+    __syncthreads();
+    if (tid < INK2_ATTN_RES_STATS) {
+        float tot = 0.0f;
+        for (u32 k = 0u; k < 8u; ++k) {
+            tot += parts[k][tid];
+        }
+        stats[((u64(row) * n_src + s) * INK2_ATTN_RES_SLICES + slice) * INK2_ATTN_RES_STATS + tid] = tot;
+    }
+}
 
-    if (tid == 0u) {
-        for (u32 q = 0u; q < n_q; ++q) {
-            float mx = weights[q][0];
-            for (u32 s = 1u; s < n_src; ++s) {
-                mx = fmaxf(mx, weights[q][s]);
+extern "C" __global__ void kernel_inkling2_attn_res_mix(
+        const ink2_args_attn_res args,
+        const float* blocks,
+        const float* partial,
+        const float* addend,
+        const float* stats,
+        float* out) {
+    const u32 tid = threadIdx.x;
+    const u32 H = args.hidden;
+    const u32 n_blocks = args.n_blocks < INK2_MAX_ATTN_RES_SRC - 1u ? args.n_blocks
+                                                                   : INK2_MAX_ATTN_RES_SRC - 1u;
+    const u32 n_src = n_blocks + 1u;
+    const u32 n_q = args.n_queries < INK2_MAX_ATTN_RES_Q ? args.n_queries : INK2_MAX_ATTN_RES_Q;
+    const u32 row = blockIdx.y;
+    if (row >= args.rows) {
+        return;
+    }
+    const u64 row_off = u64(row) * H;
+    const u64 block_stride = u64(args.rows) * H;
+
+    // weights[q][s], the source's 1 / rms folded in.
+    __shared__ float weights[INK2_MAX_ATTN_RES_Q][INK2_MAX_ATTN_RES_SRC];
+    if (tid < n_q) {
+        const u32 q = tid;
+        const float scale = rsqrtf(float(H));
+        float raw[INK2_MAX_ATTN_RES_SRC];
+        float inv[INK2_MAX_ATTN_RES_SRC];
+        float mx = -1e30f;
+        for (u32 s = 0u; s < n_src; ++s) {
+            const float* st = stats + (u64(row) * n_src + s) * INK2_ATTN_RES_SLICES * INK2_ATTN_RES_STATS;
+            float sq = 0.0f;
+            float d = 0.0f;
+            for (u32 sl = 0u; sl < INK2_ATTN_RES_SLICES; ++sl) {
+                sq += st[sl * INK2_ATTN_RES_STATS];
+                d += st[sl * INK2_ATTN_RES_STATS + 1u + q];
             }
-            float denom = 0.0f;
-            for (u32 s = 0u; s < n_src; ++s) {
-                weights[q][s] = expf(weights[q][s] - mx);
-                denom += weights[q][s];
-            }
-            const float inv_d = 1.0f / denom;
-            for (u32 s = 0u; s < n_src; ++s) {
-                weights[q][s] *= inv_d;
-            }
+            inv[s] = rsqrtf(sq / float(H) + args.eps);
+            raw[s] = d * inv[s] * scale;
+            mx = fmaxf(mx, raw[s]);
+        }
+        float denom = 0.0f;
+        for (u32 s = 0u; s < n_src; ++s) {
+            raw[s] = expf(raw[s] - mx);
+            denom += raw[s];
+        }
+        const float inv_d = 1.0f / denom;
+        for (u32 s = 0u; s < n_src; ++s) {
+            weights[q][s] = raw[s] * inv_d * inv[s];
         }
     }
     __syncthreads();
 
-    for (u32 q = 0u; q < n_q; ++q) {
-        float* dst = out + u64(q) * block_stride + row_off;
-        for (u32 i = tid; i < H; i += INK2_BLOCK) {
-            float acc = 0.0f;
-            for (u32 s = 0u; s < n_src; ++s) {
-                float v = (s < n_blocks)
-                              ? blocks[u64(s) * block_stride + row_off + i]
-                              : (partial[row_off + i] + (args.has_addend ? addend[row_off + i] : 0.0f));
-                acc += weights[q][s] * (v * inv_rms[s]);
-            }
-            dst[i] = acc;
+    const u32 i = blockIdx.x * INK2_BLOCK + tid;
+    if (i >= H) {
+        return;
+    }
+    float acc[INK2_MAX_ATTN_RES_Q] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (u32 s = 0u; s < n_src; ++s) {
+        const float v = ink2_attn_res_src(blocks, partial, addend, args.has_addend,
+                                          s, n_blocks, block_stride, row_off + i);
+        for (u32 q = 0u; q < n_q; ++q) {
+            acc[q] += weights[q][s] * v;
         }
+    }
+    for (u32 q = 0u; q < n_q; ++q) {
+        out[u64(q) * block_stride + row_off + i] = acc[q];
     }
 }
 
@@ -874,12 +931,18 @@ extern "C" __global__ void kernel_inkling2_short_conv_static(
             acc += hist[l] * wt[l];
         }
         out[u64(t) * C + c] = (acc + cur) * args.scale;
+        if (args.defer_state != 0u) {
+            state[u64(lags + t) * C + c] = cur;
+        }
         for (u32 l = 0u; l + 1u < lags; ++l) {
             hist[l] = hist[l + 1u];
         }
         if (lags > 0u) {
             hist[lags - 1u] = cur;
         }
+    }
+    if (args.defer_state != 0u) {
+        return;
     }
     for (u32 l = 0u; l < lags; ++l) {
         state[u64(l) * C + c] = hist[l];
@@ -920,6 +983,9 @@ extern "C" __global__ void kernel_inkling2_short_conv_dynamic(
             acc += prev * (sw[lag] + dw[lag]);
         }
         out[u64(t) * C + c] = (acc + cur) * args.scale;
+        if (args.defer_state != 0u) {
+            state[u64(lags + t) * C + c] = cur;
+        }
         for (u32 l = 0u; l + 1u < lags; ++l) {
             hist[l] = hist[l + 1u];
         }
@@ -927,8 +993,59 @@ extern "C" __global__ void kernel_inkling2_short_conv_dynamic(
             hist[lags - 1u] = cur;
         }
     }
+    if (args.defer_state != 0u) {
+        return;
+    }
     for (u32 l = 0u; l < lags; ++l) {
         state[u64(l) * C + c] = hist[l];
+    }
+}
+
+// ---- 8b. Short-convolution state commit after a deferring pass -------------
+// See the Metal twin: one buffer holds every layer's four states, per layer
+// `[k | v | attn | mlp]`, each `[lags + hist_rows, C]`. A deferring conv launch
+// wrote the pass's inputs at rows `lags + t`; this moves the `lags` rows that
+// start at `keep` to the front, through registers so the ranges may overlap.
+// Grid: (ceil(total / 256), 1, 1), block 256.
+
+extern "C" __global__ void kernel_inkling2_sconv_commit(
+        const ink2_args_sconv_commit args,
+        float* state) {
+    const u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= args.total) {
+        return;
+    }
+    const u32 per = 2u * (args.kv_dim + args.hidden);
+    const u32 rows = args.lags + args.hist_rows;
+    const u32 layer = tid / per;
+    const u32 rem = tid % per;
+    u32 C;
+    u32 c;
+    u32 before;
+    if (rem < args.kv_dim) {
+        C = args.kv_dim;
+        c = rem;
+        before = 0u;
+    } else if (rem < 2u * args.kv_dim) {
+        C = args.kv_dim;
+        c = rem - args.kv_dim;
+        before = args.kv_dim;
+    } else if (rem < 2u * args.kv_dim + args.hidden) {
+        C = args.hidden;
+        c = rem - 2u * args.kv_dim;
+        before = 2u * args.kv_dim;
+    } else {
+        C = args.hidden;
+        c = rem - 2u * args.kv_dim - args.hidden;
+        before = 2u * args.kv_dim + args.hidden;
+    }
+    float* seg = state + (u64(layer) * per + before) * rows;
+    float hist[INK2_MAX_CONV_K];
+    for (u32 l = 0u; l < args.lags; ++l) {
+        hist[l] = seg[u64(args.keep + l) * C + c];
+    }
+    for (u32 l = 0u; l < args.lags; ++l) {
+        seg[u64(l) * C + c] = hist[l];
     }
 }
 
@@ -1174,21 +1291,65 @@ extern "C" __global__ void kernel_inkling2_rel_attn(
     if (lane + 96u < D) out[q_base + lane + 96u] = (a3 * inv_l) * ink2_sigmoid(gate[q_base + lane + 96u]);
 }
 
-// ---- 10b. Split-K Flash-Decoding for Long-Context Full Attention -----------
+// ---- 10b. Split-K attention for a short pass --------------------------------
+// See the Metal twin: `rel_attn`'s contract for `head_dim == 128`, each row's
+// keys `[window edge, position]` cut into runs, a warp each, and the runs
+// merged afterwards in run order. A row's run count is a function of its key
+// count alone, so a position is summed the same way in a decode step and in a
+// verify pass.
+// Stage 1: grid (n_head, ceil(max_splits / 4), rows), block 128.
+// Stage 2: grid (n_head, rows, 1), block 32.
 
-struct ink2_args_rel_attn_splitk {
-    u32 n_head;
-    u32 n_head_kv;
-    u32 head_dim;
-    u32 rel_extent;
-    u32 pos;
-    u32 n_splits;
-    float scale;
-};
-static_assert(sizeof(ink2_args_rel_attn_splitk) == 28, "ink2_args_rel_attn_splitk layout");
+#define INK2_ATTN_MAX_SPLITS 64u
+
+__device__ __forceinline__ u32 ink2_attn_splits(u32 keys) {
+    const u32 want = ((keys + 127u) / 128u + 3u) & ~3u;
+    return want < 4u ? 4u : (want > INK2_ATTN_MAX_SPLITS ? INK2_ATTN_MAX_SPLITS : want);
+}
+
+// The key walk shared by the split and the tiled entries (a lane owns four
+// dims): eight keys' scores, then one maximum, then the eight weights.
+// `a` is the lane's four partial outputs.
+__device__ __forceinline__ void ink2_rel_attn_keys(
+        const ink2_args_rel_attn& args, u32 first, u32 end, u32 q_pos, u32 kvh, u32 d0,
+        float4 qv, const float* rb, const __half* k_cache, const __half* v_cache,
+        float& m_max, float& l_sum, float* a) {
+    for (u32 k0 = first; k0 < end; k0 += 8u) {
+        const u32 n_k = (end - k0) < 8u ? (end - k0) : 8u;
+        float sc[8];
+        float b_max = m_max;
+        for (u32 i = 0u; i < n_k; ++i) {
+            const u32 k_pos = k0 + i;
+            const u32 slot = args.is_swa != 0u ? (k_pos % args.kv_cap) : k_pos;
+            const u64 off = (u64(slot) * args.n_head_kv + kvh) * 128u + d0;
+            const float dot = ink2_warp_sum_all(
+                qv.x * __half2float(k_cache[off]) + qv.y * __half2float(k_cache[off + 1u]) +
+                qv.z * __half2float(k_cache[off + 2u]) + qv.w * __half2float(k_cache[off + 3u])) * args.scale;
+            const u32 dist = q_pos - k_pos;
+            sc[i] = dot + ((dist < args.rel_extent) ? rb[dist] : 0.0f);
+            b_max = fmaxf(b_max, sc[i]);
+        }
+        const float exp_old = (l_sum > 0.0f) ? expf(m_max - b_max) : 0.0f;
+        l_sum *= exp_old;
+        for (u32 c = 0u; c < 4u; ++c) {
+            a[c] *= exp_old;
+        }
+        for (u32 i = 0u; i < n_k; ++i) {
+            const u32 k_pos = k0 + i;
+            const u32 slot = args.is_swa != 0u ? (k_pos % args.kv_cap) : k_pos;
+            const u64 off = (u64(slot) * args.n_head_kv + kvh) * 128u + d0;
+            const float e = expf(sc[i] - b_max);
+            l_sum += e;
+            for (u32 c = 0u; c < 4u; ++c) {
+                a[c] += e * __half2float(v_cache[off + c]);
+            }
+        }
+        m_max = b_max;
+    }
+}
 
 extern "C" __global__ void kernel_inkling2_rel_attn_splitk(
-        const ink2_args_rel_attn_splitk args,
+        const ink2_args_rel_attn args,
         const float* q,
         const float* rel_bias,
         const float* sinks,
@@ -1200,75 +1361,69 @@ extern "C" __global__ void kernel_inkling2_rel_attn_splitk(
     const u32 sg = threadIdx.x >> 5u;
     const u32 h = blockIdx.x;
     const u32 s = blockIdx.y * 4u + sg;
-    if (h >= args.n_head || s >= args.n_splits) {
+    const u32 row = blockIdx.z;
+    if (h >= args.n_head || row >= args.rows) {
         return;
     }
     const u32 kvh = h / (args.n_head / args.n_head_kv);
-    const u32 q_pos = args.pos;
-    const u32 total_kv = q_pos + 1u;
-    const u32 chunk = (total_kv + args.n_splits - 1u) / args.n_splits;
-    const u32 start_pos = s * chunk;
-    const u32 end_pos = (start_pos + chunk < total_kv) ? (start_pos + chunk) : total_kv;
+    const u32 q_pos = args.pos0 + row;
+    const u32 start_pos = (args.is_swa != 0u && q_pos + 1u > args.window_size)
+                              ? (q_pos + 1u - args.window_size)
+                              : 0u;
+    const u32 total_kv = q_pos + 1u - start_pos;
+    const u32 n_splits = ink2_attn_splits(total_kv);
+    if (s >= n_splits) {
+        return;
+    }
+    const u32 chunk = (total_kv + n_splits - 1u) / n_splits;
+    const u32 first = start_pos + (s * chunk < total_kv ? s * chunk : total_kv);
+    const u32 end_pos = (first + chunk < q_pos + 1u) ? (first + chunk) : (q_pos + 1u);
 
     const u32 d0 = lane * 4u;
-    const u64 q_base = u64(h) * 128u;
-    const float4 qv = *reinterpret_cast<const float4*>(q + q_base + d0);
-    const float* rb = rel_bias + u64(h) * args.rel_extent;
+    const u64 head_row = u64(row) * args.n_head + h;
+    const float4 qv = *reinterpret_cast<const float4*>(q + head_row * 128u + d0);
+    const float* rb = rel_bias + head_row * args.rel_extent;
 
-    float m_max = (s == 0u) ? sinks[h] : -1e30f;
+    float m_max = (s == 0u) ? sinks[head_row] : -1e30f;
     float l_sum = (s == 0u) ? 1.0f : 0.0f;
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    ink2_rel_attn_keys(args, first, end_pos, q_pos, kvh, d0, qv, rb, k_cache, v_cache, m_max, l_sum, a);
 
-    for (u32 k_pos = start_pos; k_pos < end_pos; ++k_pos) {
-        const u64 kv_off = (u64(k_pos) * args.n_head_kv + kvh) * 128u + d0;
-        const float k0 = __half2float(k_cache[kv_off + 0u]);
-        const float k1 = __half2float(k_cache[kv_off + 1u]);
-        const float k2 = __half2float(k_cache[kv_off + 2u]);
-        const float k3 = __half2float(k_cache[kv_off + 3u]);
-        float dot = ink2_warp_sum(qv.x * k0 + qv.y * k1 + qv.z * k2 + qv.w * k3) * args.scale;
-        const u32 dist = q_pos - k_pos;
-        const float bias = (dist < args.rel_extent) ? rb[dist] : 0.0f;
-        const float score = dot + bias;
-
-        const float new_max = fmaxf(m_max, score);
-        const float exp_old = (l_sum > 0.0f) ? expf(m_max - new_max) : 0.0f;
-        const float exp_new = expf(score - new_max);
-        l_sum = l_sum * exp_old + exp_new;
-        a0 = a0 * exp_old + exp_new * __half2float(v_cache[kv_off + 0u]);
-        a1 = a1 * exp_old + exp_new * __half2float(v_cache[kv_off + 1u]);
-        a2 = a2 * exp_old + exp_new * __half2float(v_cache[kv_off + 2u]);
-        a3 = a3 * exp_old + exp_new * __half2float(v_cache[kv_off + 3u]);
-        m_max = new_max;
-    }
-
-    const u64 s_idx = u64(h) * args.n_splits + s;
+    const u64 s_idx = head_row * INK2_ATTN_MAX_SPLITS + s;
     if (lane == 0u) {
         split_ml[s_idx * 2u] = m_max;
         split_ml[s_idx * 2u + 1u] = l_sum;
     }
     float4 out4;
-    out4.x = a0; out4.y = a1; out4.z = a2; out4.w = a3;
+    out4.x = a[0]; out4.y = a[1]; out4.z = a[2]; out4.w = a[3];
     *reinterpret_cast<float4*>(split_out + s_idx * 128u + d0) = out4;
 }
 
 extern "C" __global__ void kernel_inkling2_rel_attn_reduce(
-        const ink2_args_rel_attn_splitk args,
+        const ink2_args_rel_attn args,
         const float* split_ml,
         const float* split_out,
         const float* gate,
         float* out) {
     const u32 h = blockIdx.x;
+    const u32 row = blockIdx.y;
     const u32 lane = threadIdx.x & 31u;
-    if (h >= args.n_head) {
+    if (h >= args.n_head || row >= args.rows) {
         return;
     }
+    const u32 q_pos = args.pos0 + row;
+    const u32 start_pos = (args.is_swa != 0u && q_pos + 1u > args.window_size)
+                              ? (q_pos + 1u - args.window_size)
+                              : 0u;
+    const u32 n_splits = ink2_attn_splits(q_pos + 1u - start_pos);
+    const u64 head_row = u64(row) * args.n_head + h;
     const u32 d0 = lane * 4u;
     float m_max = -1e30f;
     float l_sum = 0.0f;
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
 
-    for (u32 s = 0u; s < args.n_splits; ++s) {
-        const u64 s_idx = u64(h) * args.n_splits + s;
+    for (u32 s = 0u; s < n_splits; ++s) {
+        const u64 s_idx = head_row * INK2_ATTN_MAX_SPLITS + s;
         const float ms = split_ml[s_idx * 2u];
         const float ls = split_ml[s_idx * 2u + 1u];
         if (ls <= 0.0f) {
@@ -1287,7 +1442,7 @@ extern "C" __global__ void kernel_inkling2_rel_attn_reduce(
     }
 
     const float inv_l = 1.0f / l_sum;
-    const u64 base = u64(h) * 128u + d0;
+    const u64 base = head_row * 128u + d0;
     const float4 gv = *reinterpret_cast<const float4*>(gate + base);
     float4 res;
     res.x = (a0 * inv_l) * ink2_sigmoid(gv.x);
@@ -1295,6 +1450,59 @@ extern "C" __global__ void kernel_inkling2_rel_attn_reduce(
     res.z = (a2 * inv_l) * ink2_sigmoid(gv.z);
     res.w = (a3 * inv_l) * ink2_sigmoid(gv.w);
     *reinterpret_cast<float4*>(out + base) = res;
+}
+
+// ---- 10c. Attention for a long pass -----------------------------------------
+// The Metal twin multiplies 64 query rows of one head a threadgroup on
+// simdgroup matrices. This twin keeps that contract - `rel_attn`'s bindings,
+// `head_dim == 128` - and walks it with the per-row key walk: a warp owns
+// eight of the block's rows and takes them one after another. It has not been
+// tuned on a device.
+// Grid: (ceil(rows / 64), n_head, 1), block 256.
+
+extern "C" __global__ void kernel_inkling2_rel_attn_tile(
+        const ink2_args_rel_attn args,
+        const float* q,
+        const float* rel_bias,
+        const float* sinks,
+        const float* gate,
+        const __half* k_cache,
+        const __half* v_cache,
+        float* out) {
+    const u32 lane = threadIdx.x & 31u;
+    const u32 sg = threadIdx.x >> 5u;
+    const u32 h = blockIdx.y;
+    if (h >= args.n_head) {
+        return;
+    }
+    const u32 kvh = h / (args.n_head / args.n_head_kv);
+    const u32 d0 = lane * 4u;
+    for (u32 r = 0u; r < 8u; ++r) {
+        const u32 row = blockIdx.x * 64u + sg * 8u + r;
+        if (row >= args.rows) {
+            break;
+        }
+        const u32 q_pos = args.pos0 + row;
+        const u32 start_pos = (args.is_swa != 0u && q_pos + 1u > args.window_size)
+                                  ? (q_pos + 1u - args.window_size)
+                                  : 0u;
+        const u64 head_row = u64(row) * args.n_head + h;
+        const float4 qv = *reinterpret_cast<const float4*>(q + head_row * 128u + d0);
+        const float* rb = rel_bias + head_row * args.rel_extent;
+        float m_max = sinks[head_row];
+        float l_sum = 1.0f;
+        float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        ink2_rel_attn_keys(args, start_pos, q_pos + 1u, q_pos, kvh, d0, qv, rb, k_cache, v_cache,
+                           m_max, l_sum, a);
+        const float inv_l = 1.0f / l_sum;
+        const float4 gv = *reinterpret_cast<const float4*>(gate + head_row * 128u + d0);
+        float4 res;
+        res.x = (a[0] * inv_l) * ink2_sigmoid(gv.x);
+        res.y = (a[1] * inv_l) * ink2_sigmoid(gv.y);
+        res.z = (a[2] * inv_l) * ink2_sigmoid(gv.z);
+        res.w = (a[3] * inv_l) * ink2_sigmoid(gv.w);
+        *reinterpret_cast<float4*>(out + head_row * 128u + d0) = res;
+    }
 }
 
 // ---- 11. Top-K Sigmoid Router (parallel 128-thread block) ------------------
@@ -1373,46 +1581,118 @@ extern "C" __global__ void kernel_inkling2_route_topk(
     }
 }
 
-// ---- 12. NVFP4 MoE W13 + Softcapped SwiGLU (shared E4M3 LUT + vectorized) --
+// ---- 12. Routed MoE experts (NVFP4 and MXFP8) ------------------------------
+//
+// See the Metal twin for the layout and what it was measured against. An
+// expert's W13 is `[2 * inter, in]` with gate row `2j` and up row `2j + 1`;
+// its W2 is `[out, inter]`. One inner body per codec serves the one-row
+// entries, the batched entries and the tiled entries, each (weight row,
+// activation row) sum taken in the same order whichever entry asked for it.
 
-__device__ __forceinline__ void ink2_fill_e4m3_lut(float* lut, u32 tid) {
-    lut[tid] = ink2_e4m3_to_f32(tid);
-    lut[tid + 128u] = ink2_e4m3_to_f32(tid + 128u);
-    __syncthreads();
+__device__ __forceinline__ float ink2_swiglu_capped(float g, float u, float gate_cap, float up_cap, float rw) {
+    return ((ink2_softcap(g, gate_cap) * ink2_sigmoid(g)) * ink2_softcap(u, up_cap)) * rw;
 }
 
-__device__ __forceinline__ float ink2_nvfp4_row_dot_lut(
-        const u8* w_row,
-        const u8* s_row,
-        const float* x,
-        const float* e4m3_lut,
-        u32 in_dim,
-        u32 lane) {
-    float acc = 0.0f;
+// 16-term sum in the Metal twin's order: four chains of four, then pairwise.
+__device__ __forceinline__ float ink2_dot16(const float* w, const float* x) {
+    float c[4];
+    for (u32 q = 0u; q < 4u; ++q) {
+        const float* wq = w + 4u * q;
+        const float* xq = x + 4u * q;
+        c[q] = fmaf(wq[0], xq[0], fmaf(wq[1], xq[1], fmaf(wq[2], xq[2], wq[3] * xq[3])));
+    }
+    return (c[0] + c[1]) + (c[2] + c[3]);
+}
+
+// WR consecutive NVFP4 weight rows (starting at `w` / `sc`, `w_stride` and
+// `s_stride` bytes apart) against up to NR activation rows. `out[wr * NR + rr]`
+// is the warp-reduced dot of weight row `wr` with activation row `r_ids[rr]`,
+// valid on lane 0.
+template <u32 WR, u32 NR>
+__device__ __forceinline__ void ink2_nvfp4_block(
+        const u8* w, u64 w_stride,
+        const u8* sc, u64 s_stride,
+        const float* x, u32 in_dim,
+        const u32* r_ids, u32 n_r, u32 lane,
+        float* out) {
+    float acc[WR * NR];
+    for (u32 i = 0u; i < WR * NR; ++i) {
+        acc[i] = 0.0f;
+    }
     const u32 n_groups = in_dim / 16u;
     for (u32 g = lane; g < n_groups; g += 32u) {
-        const float gs = e4m3_lut[u32(s_row[g])];
-        const uchar4* wp4 = reinterpret_cast<const uchar4*>(w_row + g * 8u);
-        const float4* xp4 = reinterpret_cast<const float4*>(x + g * 16u);
-        const uchar4 b0 = wp4[0];
-        const uchar4 b1 = wp4[1];
-        const float4 x0 = xp4[0];
-        const float4 x1 = xp4[1];
-        const float4 x2 = xp4[2];
-        const float4 x3 = xp4[3];
-        float part =
-            ink2_e2m1_to_f32(b0.x & 0xFu) * x0.x + ink2_e2m1_to_f32(b0.x >> 4u) * x0.y +
-            ink2_e2m1_to_f32(b0.y & 0xFu) * x0.z + ink2_e2m1_to_f32(b0.y >> 4u) * x0.w +
-            ink2_e2m1_to_f32(b0.z & 0xFu) * x1.x + ink2_e2m1_to_f32(b0.z >> 4u) * x1.y +
-            ink2_e2m1_to_f32(b0.w & 0xFu) * x1.z + ink2_e2m1_to_f32(b0.w >> 4u) * x1.w +
-            ink2_e2m1_to_f32(b1.x & 0xFu) * x2.x + ink2_e2m1_to_f32(b1.x >> 4u) * x2.y +
-            ink2_e2m1_to_f32(b1.y & 0xFu) * x2.z + ink2_e2m1_to_f32(b1.y >> 4u) * x2.w +
-            ink2_e2m1_to_f32(b1.z & 0xFu) * x3.x + ink2_e2m1_to_f32(b1.z >> 4u) * x3.y +
-            ink2_e2m1_to_f32(b1.w & 0xFu) * x3.z + ink2_e2m1_to_f32(b1.w >> 4u) * x3.w;
-        acc += gs * part;
+        float scale[WR];
+        float wv[WR][16];
+        for (u32 wr = 0u; wr < WR; ++wr) {
+            scale[wr] = ink2_e4m3_to_f32(u32(sc[wr * s_stride + g]));
+            const u8* p = w + wr * w_stride + g * 8u;
+            for (u32 b = 0u; b < 8u; ++b) {
+                wv[wr][2u * b] = ink2_e2m1_to_f32(u32(p[b]) & 0xFu);
+                wv[wr][2u * b + 1u] = ink2_e2m1_to_f32(u32(p[b]) >> 4u);
+            }
+        }
+        for (u32 rr = 0u; rr < NR; ++rr) {
+            if (rr < n_r) {
+                const float* xp = x + u64(r_ids[rr]) * in_dim + g * 16u;
+                for (u32 wr = 0u; wr < WR; ++wr) {
+                    acc[wr * NR + rr] = fmaf(scale[wr], ink2_dot16(wv[wr], xp), acc[wr * NR + rr]);
+                }
+            }
+        }
     }
-    return ink2_warp_sum(acc);
+    for (u32 i = 0u; i < WR * NR; ++i) {
+        out[i] = ink2_warp_sum(acc[i]);
+    }
 }
+
+// The MXFP8 twin of `ink2_nvfp4_block`: a 32-weight group is two 16-term sums,
+// each added under the group's scale.
+template <u32 WR, u32 NR>
+__device__ __forceinline__ void ink2_mxfp8_block(
+        const u8* w, u64 w_stride,
+        const u8* sc, u64 s_stride,
+        const float* x, u32 in_dim,
+        const u32* r_ids, u32 n_r, u32 lane,
+        float* out) {
+    float acc[WR * NR];
+    for (u32 i = 0u; i < WR * NR; ++i) {
+        acc[i] = 0.0f;
+    }
+    const u32 n_groups = in_dim / 32u;
+    for (u32 g = lane; g < n_groups; g += 32u) {
+        float scale[WR];
+        for (u32 wr = 0u; wr < WR; ++wr) {
+            scale[wr] = ink2_ue8m0_to_f32(u32(sc[wr * s_stride + g]));
+        }
+        for (u32 h = 0u; h < 2u; ++h) {
+            float wv[WR][16];
+            for (u32 wr = 0u; wr < WR; ++wr) {
+                const u8* p = w + wr * w_stride + g * 32u + h * 16u;
+                for (u32 i = 0u; i < 16u; ++i) {
+                    wv[wr][i] = ink2_e4m3_to_f32(u32(p[i]));
+                }
+            }
+            for (u32 rr = 0u; rr < NR; ++rr) {
+                if (rr < n_r) {
+                    const float* xp = x + u64(r_ids[rr]) * in_dim + g * 32u + h * 16u;
+                    for (u32 wr = 0u; wr < WR; ++wr) {
+                        acc[wr * NR + rr] = fmaf(scale[wr], ink2_dot16(wv[wr], xp), acc[wr * NR + rr]);
+                    }
+                }
+            }
+        }
+    }
+    for (u32 i = 0u; i < WR * NR; ++i) {
+        out[i] = ink2_warp_sum(acc[i]);
+    }
+}
+
+// ---- 12a. One-row entries: a routed column per block row -------------------
+// A warp owns four weight rows: two (gate, up) pairs of W13, four output rows
+// of W2. `inter_dim` must be even and `out_dim` a multiple of four.
+// W13: grid (ceil(inter_dim / 8), rows * top_k, 1), block 128.
+// W2:  grid (ceil(out_dim / 16), rows * top_k, 1), block 128; one output row
+//      per routed column, which `moe_reduce_topk` then sums per token.
 
 extern "C" __global__ void kernel_inkling2_moe_nvfp4_w13_swiglu(
         const ink2_args_moe_w13 args,
@@ -1424,53 +1704,42 @@ extern "C" __global__ void kernel_inkling2_moe_nvfp4_w13_swiglu(
         const u32* expert_ids,
         const float* expert_weights,
         float* out) {
-    __shared__ float e4m3_lut[256];
-    ink2_fill_e4m3_lut(e4m3_lut, threadIdx.x);
-
     const u32 lane = threadIdx.x & 31u;
     const u32 sg = threadIdx.x >> 5u;
-    const u32 j = blockIdx.x * INK2_MV_SG + sg;
+    const u32 k = args.in_dim;
+    const u32 n = 2u * args.inter_dim;
+    const u64 w_row_bytes = u64(k / 2u);
+    const u64 s_row_bytes = u64(k / 16u);
+    const u32 j = 2u * (blockIdx.x * INK2_MV_SG + sg);
     const u32 col = blockIdx.y;
-    const u32 total_cols = args.rows * args.top_k;
-    if (j >= args.inter_dim || col >= total_cols) {
+    if (j >= args.inter_dim || col >= args.rows * args.top_k) {
         return;
     }
-    const u32 row = col / args.top_k;
     const u32 expert = expert_ids[col];
-    const float rw = expert_weights[col];
-    const float outer = w13_amax[expert] / w13_denom[0];
-
-    const u32 in_dim = args.in_dim;
-    const u32 two_inter = 2u * args.inter_dim;
-    const u64 w_row_bytes = u64(in_dim / 2u);
-    const u64 s_row_bytes = u64(in_dim / 16u);
-    const u64 e_w_base = u64(expert) * two_inter * w_row_bytes;
-    const u64 e_s_base = u64(expert) * two_inter * s_row_bytes;
-
-    const float* xr = x + u64(row) * in_dim;
-    const u32 g_row = 2u * j;
-    const u32 u_row = 2u * j + 1u;
-
-    const float g_val = ink2_nvfp4_row_dot_lut(
-        w13 + e_w_base + u64(g_row) * w_row_bytes,
-        w13_scale + e_s_base + u64(g_row) * s_row_bytes,
-        xr, e4m3_lut, in_dim, lane) * outer;
-    const float u_val = ink2_nvfp4_row_dot_lut(
-        w13 + e_w_base + u64(u_row) * w_row_bytes,
-        w13_scale + e_s_base + u64(u_row) * s_row_bytes,
-        xr, e4m3_lut, in_dim, lane) * outer;
-
+    const u32 n_r = 1u;
+    u32 c_ids[1] = {col};
+    u32 r_ids[1] = {col / args.top_k};
+    const u64 e_row = u64(expert) * n + 2u * j;
+    float v[4];
+    ink2_nvfp4_block<4u, 1u>(
+        w13 + e_row * w_row_bytes, w_row_bytes, w13_scale + e_row * s_row_bytes, s_row_bytes,
+        x, k, r_ids, n_r, lane, v);
     if (lane == 0u) {
-        const float act = ink2_softcap(g_val, args.gate_cap) *
-                          ink2_sigmoid(g_val) *
-                          ink2_softcap(u_val, args.up_cap) * rw;
-        out[u64(col) * args.inter_dim + j] = act;
+        const float outer = w13_amax[expert] / w13_denom[0];
+        for (u32 q = 0u; q < 2u; ++q) {
+            if (j + q >= args.inter_dim) {
+                break;
+            }
+            for (u32 rr = 0u; rr < n_r; ++rr) {
+                out[u64(c_ids[rr]) * args.inter_dim + j + q] = ink2_swiglu_capped(
+                    v[(2u * q) * 1u + rr] * outer, v[(2u * q + 1u) * 1u + rr] * outer,
+                    args.gate_cap, args.up_cap, expert_weights[c_ids[rr]]);
+            }
+        }
     }
 }
 
-// ---- 13. NVFP4 MoE W2 + Accum ----------------------------------------------
-
-extern "C" __global__ void kernel_inkling2_moe_nvfp4_w2_accum(
+extern "C" __global__ void kernel_inkling2_moe_nvfp4_w2_cols(
         const ink2_args_moe_w2 args,
         const float* act,
         const u8* w2,
@@ -1478,64 +1747,38 @@ extern "C" __global__ void kernel_inkling2_moe_nvfp4_w2_accum(
         const float* w2_amax,
         const float* w2_denom,
         const u32* expert_ids,
-        float* out) {
-    __shared__ float e4m3_lut[256];
-    ink2_fill_e4m3_lut(e4m3_lut, threadIdx.x);
-
+        float* slots_out) {
     const u32 lane = threadIdx.x & 31u;
     const u32 sg = threadIdx.x >> 5u;
-    const u32 o = blockIdx.x * INK2_MV_SG + sg;
-    const u32 row = blockIdx.y;
-    if (o >= args.out_dim || row >= args.rows) {
+    const u32 k = args.inter_dim;
+    const u32 n = args.out_dim;
+    const u64 w_row_bytes = u64(k / 2u);
+    const u64 s_row_bytes = u64(k / 16u);
+    const u32 o = 4u * (blockIdx.x * INK2_MV_SG + sg);
+    const u32 col = blockIdx.y;
+    if (o >= args.out_dim || col >= args.rows * args.top_k) {
         return;
     }
-    const u32 inter_dim = args.inter_dim;
-    const u64 w_row_bytes = u64(inter_dim / 2u);
-    const u64 s_row_bytes = u64(inter_dim / 16u);
-    const float denom = w2_denom[0];
-
-    float total = 0.0f;
-    for (u32 slot = 0u; slot < args.top_k; ++slot) {
-        const u32 col = row * args.top_k + slot;
-        const u32 expert = expert_ids[col];
-        const float outer = w2_amax[expert] / denom;
-        const u64 e_w_base = (u64(expert) * args.out_dim + o) * w_row_bytes;
-        const u64 e_s_base = (u64(expert) * args.out_dim + o) * s_row_bytes;
-        const float* ar = act + u64(col) * inter_dim;
-        total += ink2_nvfp4_row_dot_lut(w2 + e_w_base, w2_scale + e_s_base, ar, e4m3_lut, inter_dim, lane) * outer;
-    }
+    const u32 expert = expert_ids[col];
+    const u32 n_r = 1u;
+    u32 c_ids[1] = {col};
+    u32 r_ids[1] = {col};
+    const u64 e_row = u64(expert) * n + o;
+    float v[4];
+    ink2_nvfp4_block<4u, 1u>(
+        w2 + e_row * w_row_bytes, w_row_bytes, w2_scale + e_row * s_row_bytes, s_row_bytes,
+        act, k, r_ids, n_r, lane, v);
     if (lane == 0u) {
-        out[u64(row) * args.out_dim + o] = total;
-    }
-}
-
-// ---- 14. MXFP8 MoE W13 + Softcapped SwiGLU ---------------------------------
-
-__device__ __forceinline__ float ink2_mxfp8_row_dot_lut(
-        const u8* w_row,
-        const u8* s_row,
-        const float* x,
-        const float* e4m3_lut,
-        u32 in_dim,
-        u32 lane) {
-    float acc = 0.0f;
-    const u32 n_groups = in_dim / 32u;
-    for (u32 g = lane; g < n_groups; g += 32u) {
-        const float gs = ink2_ue8m0_to_f32(u32(s_row[g]));
-        const uchar4* wp4 = reinterpret_cast<const uchar4*>(w_row + g * 32u);
-        const float4* xp4 = reinterpret_cast<const float4*>(x + g * 32u);
-        float part = 0.0f;
-        for (u32 i = 0u; i < 8u; ++i) {
-            const uchar4 wv = wp4[i];
-            const float4 xv = xp4[i];
-            part += e4m3_lut[wv.x] * xv.x +
-                    e4m3_lut[wv.y] * xv.y +
-                    e4m3_lut[wv.z] * xv.z +
-                    e4m3_lut[wv.w] * xv.w;
+        const float outer = w2_amax[expert] / w2_denom[0];
+        for (u32 wr = 0u; wr < 4u; ++wr) {
+            if (o + wr >= args.out_dim) {
+                break;
+            }
+            for (u32 rr = 0u; rr < n_r; ++rr) {
+                slots_out[u64(c_ids[rr]) * args.out_dim + o + wr] = v[wr * 1u + rr] * outer;
+            }
         }
-        acc += gs * part;
     }
-    return ink2_warp_sum(acc);
 }
 
 extern "C" __global__ void kernel_inkling2_moe_mxfp8_w13_swiglu(
@@ -1546,125 +1789,140 @@ extern "C" __global__ void kernel_inkling2_moe_mxfp8_w13_swiglu(
         const u32* expert_ids,
         const float* expert_weights,
         float* out) {
-    __shared__ float e4m3_lut[256];
-    ink2_fill_e4m3_lut(e4m3_lut, threadIdx.x);
-
     const u32 lane = threadIdx.x & 31u;
     const u32 sg = threadIdx.x >> 5u;
-    const u32 j = blockIdx.x * INK2_MV_SG + sg;
+    const u32 k = args.in_dim;
+    const u32 n = 2u * args.inter_dim;
+    const u64 w_row_bytes = u64(k);
+    const u64 s_row_bytes = u64(k / 32u);
+    const u32 j = 2u * (blockIdx.x * INK2_MV_SG + sg);
     const u32 col = blockIdx.y;
-    const u32 total_cols = args.rows * args.top_k;
-    if (j >= args.inter_dim || col >= total_cols) {
+    if (j >= args.inter_dim || col >= args.rows * args.top_k) {
         return;
     }
-    const u32 row = col / args.top_k;
     const u32 expert = expert_ids[col];
-    const float rw = expert_weights[col];
-
-    const u32 in_dim = args.in_dim;
-    const u32 two_inter = 2u * args.inter_dim;
-    const u64 w_row_bytes = u64(in_dim);
-    const u64 s_row_bytes = u64(in_dim / 32u);
-    const u64 e_w_base = u64(expert) * two_inter * w_row_bytes;
-    const u64 e_s_base = u64(expert) * two_inter * s_row_bytes;
-
-    const float* xr = x + u64(row) * in_dim;
-    const u32 g_row = 2u * j;
-    const u32 u_row = 2u * j + 1u;
-
-    const float g_val = ink2_mxfp8_row_dot_lut(
-        w13 + e_w_base + u64(g_row) * w_row_bytes,
-        w13_scale + e_s_base + u64(g_row) * s_row_bytes,
-        xr, e4m3_lut, in_dim, lane);
-    const float u_val = ink2_mxfp8_row_dot_lut(
-        w13 + e_w_base + u64(u_row) * w_row_bytes,
-        w13_scale + e_s_base + u64(u_row) * s_row_bytes,
-        xr, e4m3_lut, in_dim, lane);
-
+    const u32 n_r = 1u;
+    u32 c_ids[1] = {col};
+    u32 r_ids[1] = {col / args.top_k};
+    const u64 e_row = u64(expert) * n + 2u * j;
+    float v[4];
+    ink2_mxfp8_block<4u, 1u>(
+        w13 + e_row * w_row_bytes, w_row_bytes, w13_scale + e_row * s_row_bytes, s_row_bytes,
+        x, k, r_ids, n_r, lane, v);
     if (lane == 0u) {
-        const float act = ink2_softcap(g_val, args.gate_cap) *
-                          ink2_sigmoid(g_val) *
-                          ink2_softcap(u_val, args.up_cap) * rw;
-        out[u64(col) * args.inter_dim + j] = act;
+        for (u32 q = 0u; q < 2u; ++q) {
+            if (j + q >= args.inter_dim) {
+                break;
+            }
+            for (u32 rr = 0u; rr < n_r; ++rr) {
+                out[u64(c_ids[rr]) * args.inter_dim + j + q] = ink2_swiglu_capped(
+                    v[(2u * q) * 1u + rr], v[(2u * q + 1u) * 1u + rr],
+                    args.gate_cap, args.up_cap, expert_weights[c_ids[rr]]);
+            }
+        }
     }
 }
 
-// ---- 15. MXFP8 MoE W2 + Accum ----------------------------------------------
-
-extern "C" __global__ void kernel_inkling2_moe_mxfp8_w2_accum(
+extern "C" __global__ void kernel_inkling2_moe_mxfp8_w2_cols(
         const ink2_args_moe_w2 args,
         const float* act,
         const u8* w2,
         const u8* w2_scale,
         const u32* expert_ids,
-        float* out) {
-    __shared__ float e4m3_lut[256];
-    ink2_fill_e4m3_lut(e4m3_lut, threadIdx.x);
-
+        float* slots_out) {
     const u32 lane = threadIdx.x & 31u;
     const u32 sg = threadIdx.x >> 5u;
-    const u32 o = blockIdx.x * INK2_MV_SG + sg;
-    const u32 row = blockIdx.y;
-    if (o >= args.out_dim || row >= args.rows) {
+    const u32 k = args.inter_dim;
+    const u32 n = args.out_dim;
+    const u64 w_row_bytes = u64(k);
+    const u64 s_row_bytes = u64(k / 32u);
+    const u32 o = 4u * (blockIdx.x * INK2_MV_SG + sg);
+    const u32 col = blockIdx.y;
+    if (o >= args.out_dim || col >= args.rows * args.top_k) {
         return;
     }
-    const u32 inter_dim = args.inter_dim;
-    const u64 w_row_bytes = u64(inter_dim);
-    const u64 s_row_bytes = u64(inter_dim / 32u);
-
-    float total = 0.0f;
-    for (u32 slot = 0u; slot < args.top_k; ++slot) {
-        const u32 col = row * args.top_k + slot;
-        const u32 expert = expert_ids[col];
-        const u64 e_w_base = (u64(expert) * args.out_dim + o) * w_row_bytes;
-        const u64 e_s_base = (u64(expert) * args.out_dim + o) * s_row_bytes;
-        const float* ar = act + u64(col) * inter_dim;
-        total += ink2_mxfp8_row_dot_lut(w2 + e_w_base, w2_scale + e_s_base, ar, e4m3_lut, inter_dim, lane);
-    }
+    const u32 expert = expert_ids[col];
+    const u32 n_r = 1u;
+    u32 c_ids[1] = {col};
+    u32 r_ids[1] = {col};
+    const u64 e_row = u64(expert) * n + o;
+    float v[4];
+    ink2_mxfp8_block<4u, 1u>(
+        w2 + e_row * w_row_bytes, w_row_bytes, w2_scale + e_row * s_row_bytes, s_row_bytes,
+        act, k, r_ids, n_r, lane, v);
     if (lane == 0u) {
-        out[u64(row) * args.out_dim + o] = total;
-    }
-}
-
-// ---- 15b. Token-Grouped 8-Row Batched MoE Prefill Kernels ------------------
-
-struct ink2_args_moe_bucket {
-    u32 rows;
-    u32 top_k;
-    u32 n_experts;
-};
-static_assert(sizeof(ink2_args_moe_bucket) == 12, "ink2_args_moe_bucket layout");
-
-extern "C" __global__ void kernel_inkling2_moe_bucket(
-        const ink2_args_moe_bucket args,
-        const u32* expert_ids,
-        u32* expert_counts,
-        u32* expert_cols) {
-    const u32 e = blockIdx.x;
-    const u32 tid = threadIdx.x;
-    if (e >= args.n_experts) {
-        return;
-    }
-    const u32 total = args.rows * args.top_k;
-    u32* dst = expert_cols + u64(e) * args.rows;
-    __shared__ u32 cnt;
-    if (tid == 0u) {
-        cnt = 0u;
-    }
-    __syncthreads();
-    for (u32 col = tid; col < total; col += 256u) {
-        if (expert_ids[col] == e) {
-            const u32 slot = atomicAdd(&cnt, 1u);
-            if (slot < args.rows) {
-                dst[slot] = col;
+        for (u32 wr = 0u; wr < 4u; ++wr) {
+            if (o + wr >= args.out_dim) {
+                break;
+            }
+            for (u32 rr = 0u; rr < n_r; ++rr) {
+                slots_out[u64(c_ids[rr]) * args.out_dim + o + wr] = v[wr * 1u + rr];
             }
         }
     }
+}
+
+// ---- 12b. Multi-row entries: an expert's weights streamed once per batch ---
+// `moe_plan` turns a pass's routing into work items, each one expert and up to
+// `batch` of its columns. `cols` is `[n_experts, rows]`, an expert's columns
+// ascending; `items` is `[1 + 2 * max_items]`: the item count, then
+// `(expert, first | count << 24)` per item. Blocks past the count return.
+// Grid: (1, 1, 1), block 256 (one thread an expert, at most 256 experts).
+
+struct ink2_args_moe_plan {
+    u32 rows;
+    u32 top_k;
+    u32 n_experts;
+    u32 batch;
+};
+static_assert(sizeof(ink2_args_moe_plan) == 16, "ink2_args_moe_plan layout");
+
+extern "C" __global__ void kernel_inkling2_moe_plan(
+        const ink2_args_moe_plan args,
+        const u32* expert_ids,
+        u32* cols,
+        u32* items) {
+    __shared__ u32 first[INK2_MAX_EXPERTS];
+    __shared__ u32 counts[INK2_MAX_EXPERTS];
+    const u32 tid = threadIdx.x;
+    const u32 E = args.n_experts < INK2_MAX_EXPERTS ? args.n_experts : INK2_MAX_EXPERTS;
+    const u32 total = args.rows * args.top_k;
+    u32 cnt = 0u;
+    if (tid < E) {
+        u32* dst = cols + u64(tid) * args.rows;
+        for (u32 col = 0u; col < total; ++col) {
+            if (expert_ids[col] == tid) {
+                dst[cnt] = col;
+                cnt += 1u;
+            }
+        }
+        counts[tid] = cnt;
+    }
     __syncthreads();
     if (tid == 0u) {
-        expert_counts[e] = cnt;
+        u32 run = 0u;
+        for (u32 e = 0u; e < E; ++e) {
+            first[e] = run;
+            run += (counts[e] + args.batch - 1u) / args.batch;
+        }
+        items[0] = run;
+    }
+    __syncthreads();
+    if (tid < E) {
+        const u32 n_items = (cnt + args.batch - 1u) / args.batch;
+        for (u32 b = 0u; b < n_items; ++b) {
+            const u32 idx = first[tid] + b;
+            const u32 base = b * args.batch;
+            const u32 left = cnt - base;
+            items[1u + 2u * idx] = tid;
+            items[2u + 2u * idx] = base | ((left < args.batch ? left : args.batch) << 24u);
+        }
     }
 }
+
+// A warp owns two weight rows against up to eight columns.
+// W13: grid (ceil(inter_dim / 4), max_items, 1), block 128.
+// W2:  grid (ceil(out_dim / 8), max_items, 1), block 128.
 
 extern "C" __global__ void kernel_inkling2_moe_nvfp4_w13_grouped(
         const ink2_args_moe_w13 args,
@@ -1674,88 +1932,44 @@ extern "C" __global__ void kernel_inkling2_moe_nvfp4_w13_grouped(
         const float* w13_amax,
         const float* w13_denom,
         const float* expert_weights,
-        const u32* expert_counts,
-        const u32* expert_cols,
+        const u32* cols,
+        const u32* items,
         float* out) {
     const u32 lane = threadIdx.x & 31u;
     const u32 sg = threadIdx.x >> 5u;
-    const u32 j = blockIdx.x * INK2_MV_SG + sg;
-    const u32 expert = blockIdx.y;
-    if (j >= args.inter_dim) return;
-    const u32 cnt = expert_counts[expert];
-    if (cnt == 0u) return;
-    const float outer = w13_amax[expert] / w13_denom[0];
-    const u32 in_dim = args.in_dim;
-    const u32 two_inter = 2u * args.inter_dim;
-    const u64 w_row_bytes = u64(in_dim / 2u);
-    const u64 s_row_bytes = u64(in_dim / 16u);
-    const u64 e_w_base = u64(expert) * two_inter * w_row_bytes;
-    const u64 e_s_base = u64(expert) * two_inter * s_row_bytes;
-    const u8* gw_row = w13 + e_w_base + u64(2u * j) * w_row_bytes;
-    const u8* gs_row = w13_scale + e_s_base + u64(2u * j) * s_row_bytes;
-    const u8* uw_row = w13 + e_w_base + u64(2u * j + 1u) * w_row_bytes;
-    const u8* us_row = w13_scale + e_s_base + u64(2u * j + 1u) * s_row_bytes;
-    const u32* cols = expert_cols + u64(expert) * args.rows;
-    const u32 n_groups = in_dim / 16u;
-
-    for (u32 base = 0u; base < cnt; base += 8u) {
-        const u32 n_r = (cnt - base < 8u) ? (cnt - base) : 8u;
-        u32 c_ids[8], r_ids[8];
-        for (u32 rr = 0u; rr < n_r; ++rr) {
-            const u32 col = cols[base + rr];
-            c_ids[rr] = col;
-            r_ids[rr] = col / args.top_k;
-        }
-        float g_acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        float u_acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        for (u32 g = lane; g < n_groups; g += 32u) {
-            const float gsc = ink2_e4m3_to_f32(u32(gs_row[g]));
-            const float usc = ink2_e4m3_to_f32(u32(us_row[g]));
-            const uchar4* gwp = reinterpret_cast<const uchar4*>(gw_row + g * 8u);
-            const uchar4* uwp = reinterpret_cast<const uchar4*>(uw_row + g * 8u);
-            const uchar4 gb0 = gwp[0], gb1 = gwp[1];
-            const uchar4 ub0 = uwp[0], ub1 = uwp[1];
-            const float gw[16] = {
-                INK2_E2M1_LUT[gb0.x & 0xFu] * gsc, INK2_E2M1_LUT[gb0.x >> 4u] * gsc,
-                INK2_E2M1_LUT[gb0.y & 0xFu] * gsc, INK2_E2M1_LUT[gb0.y >> 4u] * gsc,
-                INK2_E2M1_LUT[gb0.z & 0xFu] * gsc, INK2_E2M1_LUT[gb0.z >> 4u] * gsc,
-                INK2_E2M1_LUT[gb0.w & 0xFu] * gsc, INK2_E2M1_LUT[gb0.w >> 4u] * gsc,
-                INK2_E2M1_LUT[gb1.x & 0xFu] * gsc, INK2_E2M1_LUT[gb1.x >> 4u] * gsc,
-                INK2_E2M1_LUT[gb1.y & 0xFu] * gsc, INK2_E2M1_LUT[gb1.y >> 4u] * gsc,
-                INK2_E2M1_LUT[gb1.z & 0xFu] * gsc, INK2_E2M1_LUT[gb1.z >> 4u] * gsc,
-                INK2_E2M1_LUT[gb1.w & 0xFu] * gsc, INK2_E2M1_LUT[gb1.w >> 4u] * gsc
-            };
-            const float uw[16] = {
-                INK2_E2M1_LUT[ub0.x & 0xFu] * usc, INK2_E2M1_LUT[ub0.x >> 4u] * usc,
-                INK2_E2M1_LUT[ub0.y & 0xFu] * usc, INK2_E2M1_LUT[ub0.y >> 4u] * usc,
-                INK2_E2M1_LUT[ub0.z & 0xFu] * usc, INK2_E2M1_LUT[ub0.z >> 4u] * usc,
-                INK2_E2M1_LUT[ub0.w & 0xFu] * usc, INK2_E2M1_LUT[ub0.w >> 4u] * usc,
-                INK2_E2M1_LUT[ub1.x & 0xFu] * usc, INK2_E2M1_LUT[ub1.x >> 4u] * usc,
-                INK2_E2M1_LUT[ub1.y & 0xFu] * usc, INK2_E2M1_LUT[ub1.y >> 4u] * usc,
-                INK2_E2M1_LUT[ub1.z & 0xFu] * usc, INK2_E2M1_LUT[ub1.z >> 4u] * usc,
-                INK2_E2M1_LUT[ub1.w & 0xFu] * usc, INK2_E2M1_LUT[ub1.w >> 4u] * usc
-            };
-            for (u32 rr = 0u; rr < n_r; ++rr) {
-                const float4* xp = reinterpret_cast<const float4*>(x + u64(r_ids[rr]) * in_dim + g * 16u);
-                const float4 x0 = xp[0], x1 = xp[1], x2 = xp[2], x3 = xp[3];
-                g_acc[rr] += gw[0]*x0.x + gw[1]*x0.y + gw[2]*x0.z + gw[3]*x0.w +
-                             gw[4]*x1.x + gw[5]*x1.y + gw[6]*x1.z + gw[7]*x1.w +
-                             gw[8]*x2.x + gw[9]*x2.y + gw[10]*x2.z + gw[11]*x2.w +
-                             gw[12]*x3.x + gw[13]*x3.y + gw[14]*x3.z + gw[15]*x3.w;
-                u_acc[rr] += uw[0]*x0.x + uw[1]*x0.y + uw[2]*x0.z + uw[3]*x0.w +
-                             uw[4]*x1.x + uw[5]*x1.y + uw[6]*x1.z + uw[7]*x1.w +
-                             uw[8]*x2.x + uw[9]*x2.y + uw[10]*x2.z + uw[11]*x2.w +
-                             uw[12]*x3.x + uw[13]*x3.y + uw[14]*x3.z + uw[15]*x3.w;
+    const u32 k = args.in_dim;
+    const u32 n = 2u * args.inter_dim;
+    const u64 w_row_bytes = u64(k / 2u);
+    const u64 s_row_bytes = u64(k / 16u);
+    const u32 j = 1u * (blockIdx.x * INK2_MV_SG + sg);
+    if (j >= args.inter_dim || blockIdx.y >= items[0]) {
+        return;
+    }
+    const u32 expert = items[1u + 2u * blockIdx.y];
+    const u32 packed = items[2u + 2u * blockIdx.y];
+    const u32* ec = cols + u64(expert) * args.rows + (packed & 0xFFFFFFu);
+    const u32 n_r = packed >> 24u;
+    u32 c_ids[8];
+    u32 r_ids[8];
+    for (u32 rr = 0u; rr < 8u; ++rr) {
+        c_ids[rr] = rr < n_r ? ec[rr] : 0u;
+        r_ids[rr] = c_ids[rr] / args.top_k;
+    }
+    const u64 e_row = u64(expert) * n + 2u * j;
+    float v[16];
+    ink2_nvfp4_block<2u, 8u>(
+        w13 + e_row * w_row_bytes, w_row_bytes, w13_scale + e_row * s_row_bytes, s_row_bytes,
+        x, k, r_ids, n_r, lane, v);
+    if (lane == 0u) {
+        const float outer = w13_amax[expert] / w13_denom[0];
+        for (u32 q = 0u; q < 1u; ++q) {
+            if (j + q >= args.inter_dim) {
+                break;
             }
-        }
-        for (u32 rr = 0u; rr < n_r; ++rr) {
-            const float gv = ink2_warp_sum(g_acc[rr]) * outer;
-            const float uv = ink2_warp_sum(u_acc[rr]) * outer;
-            if (lane == 0u) {
-                const u32 col = c_ids[rr];
-                const float rw = expert_weights[col];
-                out[u64(col) * args.inter_dim + j] =
-                    ink2_softcap(gv, args.gate_cap) * ink2_sigmoid(gv) * ink2_softcap(uv, args.up_cap) * rw;
+            for (u32 rr = 0u; rr < n_r; ++rr) {
+                out[u64(c_ids[rr]) * args.inter_dim + j + q] = ink2_swiglu_capped(
+                    v[(2u * q) * 8u + rr] * outer, v[(2u * q + 1u) * 8u + rr] * outer,
+                    args.gate_cap, args.up_cap, expert_weights[c_ids[rr]]);
             }
         }
     }
@@ -1768,57 +1982,42 @@ extern "C" __global__ void kernel_inkling2_moe_nvfp4_w2_grouped(
         const u8* w2_scale,
         const float* w2_amax,
         const float* w2_denom,
-        const u32* expert_counts,
-        const u32* expert_cols,
+        const u32* cols,
+        const u32* items,
         float* slots_out) {
     const u32 lane = threadIdx.x & 31u;
     const u32 sg = threadIdx.x >> 5u;
-    const u32 o = blockIdx.x * INK2_MV_SG + sg;
-    const u32 expert = blockIdx.y;
-    if (o >= args.out_dim) return;
-    const u32 cnt = expert_counts[expert];
-    if (cnt == 0u) return;
-    const float outer = w2_amax[expert] / w2_denom[0];
-    const u32 inter_dim = args.inter_dim;
-    const u64 w_row_bytes = u64(inter_dim / 2u);
-    const u64 s_row_bytes = u64(inter_dim / 16u);
-    const u8* w_row = w2 + (u64(expert) * args.out_dim + o) * w_row_bytes;
-    const u8* s_row = w2_scale + (u64(expert) * args.out_dim + o) * s_row_bytes;
-    const u32* cols = expert_cols + u64(expert) * args.rows;
-    const u32 n_groups = inter_dim / 16u;
-
-    for (u32 base = 0u; base < cnt; base += 8u) {
-        const u32 n_r = (cnt - base < 8u) ? (cnt - base) : 8u;
-        u32 c_ids[8];
-        for (u32 rr = 0u; rr < n_r; ++rr) c_ids[rr] = cols[base + rr];
-        float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        for (u32 g = lane; g < n_groups; g += 32u) {
-            const float sc = ink2_e4m3_to_f32(u32(s_row[g]));
-            const uchar4* wp = reinterpret_cast<const uchar4*>(w_row + g * 8u);
-            const uchar4 b0 = wp[0], b1 = wp[1];
-            const float wv[16] = {
-                INK2_E2M1_LUT[b0.x & 0xFu] * sc, INK2_E2M1_LUT[b0.x >> 4u] * sc,
-                INK2_E2M1_LUT[b0.y & 0xFu] * sc, INK2_E2M1_LUT[b0.y >> 4u] * sc,
-                INK2_E2M1_LUT[b0.z & 0xFu] * sc, INK2_E2M1_LUT[b0.z >> 4u] * sc,
-                INK2_E2M1_LUT[b0.w & 0xFu] * sc, INK2_E2M1_LUT[b0.w >> 4u] * sc,
-                INK2_E2M1_LUT[b1.x & 0xFu] * sc, INK2_E2M1_LUT[b1.x >> 4u] * sc,
-                INK2_E2M1_LUT[b1.y & 0xFu] * sc, INK2_E2M1_LUT[b1.y >> 4u] * sc,
-                INK2_E2M1_LUT[b1.z & 0xFu] * sc, INK2_E2M1_LUT[b1.z >> 4u] * sc,
-                INK2_E2M1_LUT[b1.w & 0xFu] * sc, INK2_E2M1_LUT[b1.w >> 4u] * sc
-            };
-            for (u32 rr = 0u; rr < n_r; ++rr) {
-                const float4* ap = reinterpret_cast<const float4*>(act + u64(c_ids[rr]) * inter_dim + g * 16u);
-                const float4 a0 = ap[0], a1 = ap[1], a2 = ap[2], a3 = ap[3];
-                acc[rr] += wv[0]*a0.x + wv[1]*a0.y + wv[2]*a0.z + wv[3]*a0.w +
-                           wv[4]*a1.x + wv[5]*a1.y + wv[6]*a1.z + wv[7]*a1.w +
-                           wv[8]*a2.x + wv[9]*a2.y + wv[10]*a2.z + wv[11]*a2.w +
-                           wv[12]*a3.x + wv[13]*a3.y + wv[14]*a3.z + wv[15]*a3.w;
+    const u32 k = args.inter_dim;
+    const u32 n = args.out_dim;
+    const u64 w_row_bytes = u64(k / 2u);
+    const u64 s_row_bytes = u64(k / 16u);
+    const u32 o = 2u * (blockIdx.x * INK2_MV_SG + sg);
+    if (o >= args.out_dim || blockIdx.y >= items[0]) {
+        return;
+    }
+    const u32 expert = items[1u + 2u * blockIdx.y];
+    const u32 packed = items[2u + 2u * blockIdx.y];
+    const u32* ec = cols + u64(expert) * args.rows + (packed & 0xFFFFFFu);
+    const u32 n_r = packed >> 24u;
+    u32 c_ids[8];
+    u32 r_ids[8];
+    for (u32 rr = 0u; rr < 8u; ++rr) {
+        c_ids[rr] = rr < n_r ? ec[rr] : 0u;
+        r_ids[rr] = c_ids[rr];
+    }
+    const u64 e_row = u64(expert) * n + o;
+    float v[16];
+    ink2_nvfp4_block<2u, 8u>(
+        w2 + e_row * w_row_bytes, w_row_bytes, w2_scale + e_row * s_row_bytes, s_row_bytes,
+        act, k, r_ids, n_r, lane, v);
+    if (lane == 0u) {
+        const float outer = w2_amax[expert] / w2_denom[0];
+        for (u32 wr = 0u; wr < 2u; ++wr) {
+            if (o + wr >= args.out_dim) {
+                break;
             }
-        }
-        for (u32 rr = 0u; rr < n_r; ++rr) {
-            const float v = ink2_warp_sum(acc[rr]) * outer;
-            if (lane == 0u) {
-                slots_out[u64(c_ids[rr]) * args.out_dim + o] = v;
+            for (u32 rr = 0u; rr < n_r; ++rr) {
+                slots_out[u64(c_ids[rr]) * args.out_dim + o + wr] = v[wr * 8u + rr] * outer;
             }
         }
     }
@@ -1830,69 +2029,43 @@ extern "C" __global__ void kernel_inkling2_moe_mxfp8_w13_grouped(
         const u8* w13,
         const u8* w13_scale,
         const float* expert_weights,
-        const u32* expert_counts,
-        const u32* expert_cols,
+        const u32* cols,
+        const u32* items,
         float* out) {
     const u32 lane = threadIdx.x & 31u;
     const u32 sg = threadIdx.x >> 5u;
-    const u32 j = blockIdx.x * INK2_MV_SG + sg;
-    const u32 expert = blockIdx.y;
-    if (j >= args.inter_dim) return;
-    const u32 cnt = expert_counts[expert];
-    if (cnt == 0u) return;
-    const u32 in_dim = args.in_dim;
-    const u32 two_inter = 2u * args.inter_dim;
-    const u64 w_row_bytes = u64(in_dim);
-    const u64 s_row_bytes = u64(in_dim / 32u);
-    const u64 e_w_base = u64(expert) * two_inter * w_row_bytes;
-    const u64 e_s_base = u64(expert) * two_inter * s_row_bytes;
-    const u8* gw_row = w13 + e_w_base + u64(2u * j) * w_row_bytes;
-    const u8* gs_row = w13_scale + e_s_base + u64(2u * j) * s_row_bytes;
-    const u8* uw_row = w13 + e_w_base + u64(2u * j + 1u) * w_row_bytes;
-    const u8* us_row = w13_scale + e_s_base + u64(2u * j + 1u) * s_row_bytes;
-    const u32* cols = expert_cols + u64(expert) * args.rows;
-    const u32 n_groups = in_dim / 32u;
-
-    for (u32 base = 0u; base < cnt; base += 8u) {
-        const u32 n_r = (cnt - base < 8u) ? (cnt - base) : 8u;
-        u32 c_ids[8], r_ids[8];
-        for (u32 rr = 0u; rr < n_r; ++rr) {
-            const u32 col = cols[base + rr];
-            c_ids[rr] = col;
-            r_ids[rr] = col / args.top_k;
-        }
-        float g_acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        float u_acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        for (u32 g = lane; g < n_groups; g += 32u) {
-            const float gsc = ink2_ue8m0_to_f32(u32(gs_row[g]));
-            const float usc = ink2_ue8m0_to_f32(u32(us_row[g]));
-            const uchar4* gwp = reinterpret_cast<const uchar4*>(gw_row + g * 32u);
-            const uchar4* uwp = reinterpret_cast<const uchar4*>(uw_row + g * 32u);
-            for (u32 i = 0u; i < 8u; ++i) {
-                const uchar4 gv4 = gwp[i], uv4 = uwp[i];
-                const float g0 = ink2_e4m3_to_f32(gv4.x) * gsc;
-                const float g1 = ink2_e4m3_to_f32(gv4.y) * gsc;
-                const float g2 = ink2_e4m3_to_f32(gv4.z) * gsc;
-                const float g3 = ink2_e4m3_to_f32(gv4.w) * gsc;
-                const float u0 = ink2_e4m3_to_f32(uv4.x) * usc;
-                const float u1 = ink2_e4m3_to_f32(uv4.y) * usc;
-                const float u2 = ink2_e4m3_to_f32(uv4.z) * usc;
-                const float u3 = ink2_e4m3_to_f32(uv4.w) * usc;
-                for (u32 rr = 0u; rr < n_r; ++rr) {
-                    const float4 xv = *reinterpret_cast<const float4*>(x + u64(r_ids[rr]) * in_dim + g * 32u + i * 4u);
-                    g_acc[rr] += g0 * xv.x + g1 * xv.y + g2 * xv.z + g3 * xv.w;
-                    u_acc[rr] += u0 * xv.x + u1 * xv.y + u2 * xv.z + u3 * xv.w;
-                }
+    const u32 k = args.in_dim;
+    const u32 n = 2u * args.inter_dim;
+    const u64 w_row_bytes = u64(k);
+    const u64 s_row_bytes = u64(k / 32u);
+    const u32 j = 1u * (blockIdx.x * INK2_MV_SG + sg);
+    if (j >= args.inter_dim || blockIdx.y >= items[0]) {
+        return;
+    }
+    const u32 expert = items[1u + 2u * blockIdx.y];
+    const u32 packed = items[2u + 2u * blockIdx.y];
+    const u32* ec = cols + u64(expert) * args.rows + (packed & 0xFFFFFFu);
+    const u32 n_r = packed >> 24u;
+    u32 c_ids[8];
+    u32 r_ids[8];
+    for (u32 rr = 0u; rr < 8u; ++rr) {
+        c_ids[rr] = rr < n_r ? ec[rr] : 0u;
+        r_ids[rr] = c_ids[rr] / args.top_k;
+    }
+    const u64 e_row = u64(expert) * n + 2u * j;
+    float v[16];
+    ink2_mxfp8_block<2u, 8u>(
+        w13 + e_row * w_row_bytes, w_row_bytes, w13_scale + e_row * s_row_bytes, s_row_bytes,
+        x, k, r_ids, n_r, lane, v);
+    if (lane == 0u) {
+        for (u32 q = 0u; q < 1u; ++q) {
+            if (j + q >= args.inter_dim) {
+                break;
             }
-        }
-        for (u32 rr = 0u; rr < n_r; ++rr) {
-            const float gv = ink2_warp_sum(g_acc[rr]);
-            const float uv = ink2_warp_sum(u_acc[rr]);
-            if (lane == 0u) {
-                const u32 col = c_ids[rr];
-                const float rw = expert_weights[col];
-                out[u64(col) * args.inter_dim + j] =
-                    ink2_softcap(gv, args.gate_cap) * ink2_sigmoid(gv) * ink2_softcap(uv, args.up_cap) * rw;
+            for (u32 rr = 0u; rr < n_r; ++rr) {
+                out[u64(c_ids[rr]) * args.inter_dim + j + q] = ink2_swiglu_capped(
+                    v[(2u * q) * 8u + rr], v[(2u * q + 1u) * 8u + rr],
+                    args.gate_cap, args.up_cap, expert_weights[c_ids[rr]]);
             }
         }
     }
@@ -1903,65 +2076,302 @@ extern "C" __global__ void kernel_inkling2_moe_mxfp8_w2_grouped(
         const float* act,
         const u8* w2,
         const u8* w2_scale,
-        const u32* expert_counts,
-        const u32* expert_cols,
+        const u32* cols,
+        const u32* items,
         float* slots_out) {
     const u32 lane = threadIdx.x & 31u;
     const u32 sg = threadIdx.x >> 5u;
-    const u32 o = blockIdx.x * INK2_MV_SG + sg;
-    const u32 expert = blockIdx.y;
-    if (o >= args.out_dim) return;
-    const u32 cnt = expert_counts[expert];
-    if (cnt == 0u) return;
-    const u32 inter_dim = args.inter_dim;
-    const u64 w_row_bytes = u64(inter_dim);
-    const u64 s_row_bytes = u64(inter_dim / 32u);
-    const u8* w_row = w2 + (u64(expert) * args.out_dim + o) * w_row_bytes;
-    const u8* s_row = w2_scale + (u64(expert) * args.out_dim + o) * s_row_bytes;
-    const u32* cols = expert_cols + u64(expert) * args.rows;
-    const u32 n_groups = inter_dim / 32u;
-
-    for (u32 base = 0u; base < cnt; base += 8u) {
-        const u32 n_r = (cnt - base < 8u) ? (cnt - base) : 8u;
-        u32 c_ids[8];
-        for (u32 rr = 0u; rr < n_r; ++rr) c_ids[rr] = cols[base + rr];
-        float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        for (u32 g = lane; g < n_groups; g += 32u) {
-            const float sc = ink2_ue8m0_to_f32(u32(s_row[g]));
-            const uchar4* wp = reinterpret_cast<const uchar4*>(w_row + g * 32u);
-            for (u32 i = 0u; i < 8u; ++i) {
-                const uchar4 wv = wp[i];
-                const float w0 = ink2_e4m3_to_f32(wv.x) * sc;
-                const float w1 = ink2_e4m3_to_f32(wv.y) * sc;
-                const float w2v = ink2_e4m3_to_f32(wv.z) * sc;
-                const float w3 = ink2_e4m3_to_f32(wv.w) * sc;
-                for (u32 rr = 0u; rr < n_r; ++rr) {
-                    const float4 av = *reinterpret_cast<const float4*>(act + u64(c_ids[rr]) * inter_dim + g * 32u + i * 4u);
-                    acc[rr] += w0 * av.x + w1 * av.y + w2v * av.z + w3 * av.w;
-                }
+    const u32 k = args.inter_dim;
+    const u32 n = args.out_dim;
+    const u64 w_row_bytes = u64(k);
+    const u64 s_row_bytes = u64(k / 32u);
+    const u32 o = 2u * (blockIdx.x * INK2_MV_SG + sg);
+    if (o >= args.out_dim || blockIdx.y >= items[0]) {
+        return;
+    }
+    const u32 expert = items[1u + 2u * blockIdx.y];
+    const u32 packed = items[2u + 2u * blockIdx.y];
+    const u32* ec = cols + u64(expert) * args.rows + (packed & 0xFFFFFFu);
+    const u32 n_r = packed >> 24u;
+    u32 c_ids[8];
+    u32 r_ids[8];
+    for (u32 rr = 0u; rr < 8u; ++rr) {
+        c_ids[rr] = rr < n_r ? ec[rr] : 0u;
+        r_ids[rr] = c_ids[rr];
+    }
+    const u64 e_row = u64(expert) * n + o;
+    float v[16];
+    ink2_mxfp8_block<2u, 8u>(
+        w2 + e_row * w_row_bytes, w_row_bytes, w2_scale + e_row * s_row_bytes, s_row_bytes,
+        act, k, r_ids, n_r, lane, v);
+    if (lane == 0u) {
+        for (u32 wr = 0u; wr < 2u; ++wr) {
+            if (o + wr >= args.out_dim) {
+                break;
             }
-        }
-        for (u32 rr = 0u; rr < n_r; ++rr) {
-            const float v = ink2_warp_sum(acc[rr]);
-            if (lane == 0u) {
-                slots_out[u64(c_ids[rr]) * args.out_dim + o] = v;
+            for (u32 rr = 0u; rr < n_r; ++rr) {
+                slots_out[u64(c_ids[rr]) * args.out_dim + o + wr] = v[wr * 8u + rr];
             }
         }
     }
 }
 
+// ---- 12c. Tiled entries: work items of up to 64 columns ---------------------
+// The Metal twin multiplies a 64-column by 64-weight-row tile on simdgroup
+// matrices. This twin keeps the tile's contract - the same plan, grid and
+// bindings - and walks it with the batched body: a warp owns 16 of the tile's
+// weight rows and takes them two at a time against the item's columns eight at
+// a time. It has not been tuned on a device.
+// W13: grid (ceil(2 * inter_dim / 64), max_items, 1), block 128.
+// W2:  grid (ceil(out_dim / 64), max_items, 1), block 128.
+
+extern "C" __global__ void kernel_inkling2_moe_nvfp4_w13_tile(
+        const ink2_args_moe_w13 args,
+        const float* x,
+        const u8* w13,
+        const u8* w13_scale,
+        const float* w13_amax,
+        const float* w13_denom,
+        const float* expert_weights,
+        const u32* cols,
+        const u32* items,
+        float* out) {
+    const u32 lane = threadIdx.x & 31u;
+    const u32 sg = threadIdx.x >> 5u;
+    const u32 k = args.in_dim;
+    const u32 n = 2u * args.inter_dim;
+    const u64 w_row_bytes = u64(k / 2u);
+    const u64 s_row_bytes = u64(k / 16u);
+    const u32 n0 = blockIdx.x * 64u;
+    if (n0 >= n || blockIdx.y >= items[0]) {
+        return;
+    }
+    const u32 expert = items[1u + 2u * blockIdx.y];
+    const u32 packed = items[2u + 2u * blockIdx.y];
+    const u32* ec = cols + u64(expert) * args.rows + (packed & 0xFFFFFFu);
+    const u32 m = packed >> 24u;
+    const float outer = w13_amax[expert] / w13_denom[0];
+    for (u32 pair = 0u; pair < 8u; ++pair) {
+        const u32 row0 = n0 + sg * 16u + pair * 2u;
+        if (row0 >= n) {
+            break;
+        }
+        const u32 j = row0 / 2u;
+        const u64 e_row = u64(expert) * n + row0;
+        for (u32 base = 0u; base < m; base += 8u) {
+            const u32 n_r = (m - base) < 8u ? (m - base) : 8u;
+            u32 c_ids[8];
+            u32 r_ids[8];
+            for (u32 rr = 0u; rr < 8u; ++rr) {
+                c_ids[rr] = rr < n_r ? ec[base + rr] : 0u;
+                r_ids[rr] = c_ids[rr] / args.top_k;
+            }
+            float v[16];
+            ink2_nvfp4_block<2u, 8u>(
+                w13 + e_row * w_row_bytes, w_row_bytes, w13_scale + e_row * s_row_bytes, s_row_bytes,
+                x, k, r_ids, n_r, lane, v);
+            if (lane == 0u) {
+                for (u32 q = 0u; q < 1u; ++q) {
+                    if (j + q >= args.inter_dim) {
+                        break;
+                    }
+                    for (u32 rr = 0u; rr < n_r; ++rr) {
+                        out[u64(c_ids[rr]) * args.inter_dim + j + q] = ink2_swiglu_capped(
+                            v[(2u * q) * 8u + rr] * outer, v[(2u * q + 1u) * 8u + rr] * outer,
+                            args.gate_cap, args.up_cap, expert_weights[c_ids[rr]]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void kernel_inkling2_moe_nvfp4_w2_tile(
+        const ink2_args_moe_w2 args,
+        const float* act,
+        const u8* w2,
+        const u8* w2_scale,
+        const float* w2_amax,
+        const float* w2_denom,
+        const u32* cols,
+        const u32* items,
+        float* slots_out) {
+    const u32 lane = threadIdx.x & 31u;
+    const u32 sg = threadIdx.x >> 5u;
+    const u32 k = args.inter_dim;
+    const u32 n = args.out_dim;
+    const u64 w_row_bytes = u64(k / 2u);
+    const u64 s_row_bytes = u64(k / 16u);
+    const u32 n0 = blockIdx.x * 64u;
+    if (n0 >= n || blockIdx.y >= items[0]) {
+        return;
+    }
+    const u32 expert = items[1u + 2u * blockIdx.y];
+    const u32 packed = items[2u + 2u * blockIdx.y];
+    const u32* ec = cols + u64(expert) * args.rows + (packed & 0xFFFFFFu);
+    const u32 m = packed >> 24u;
+    const float outer = w2_amax[expert] / w2_denom[0];
+    for (u32 pair = 0u; pair < 8u; ++pair) {
+        const u32 row0 = n0 + sg * 16u + pair * 2u;
+        if (row0 >= n) {
+            break;
+        }
+        const u32 o = row0;
+        const u64 e_row = u64(expert) * n + row0;
+        for (u32 base = 0u; base < m; base += 8u) {
+            const u32 n_r = (m - base) < 8u ? (m - base) : 8u;
+            u32 c_ids[8];
+            u32 r_ids[8];
+            for (u32 rr = 0u; rr < 8u; ++rr) {
+                c_ids[rr] = rr < n_r ? ec[base + rr] : 0u;
+                r_ids[rr] = c_ids[rr];
+            }
+            float v[16];
+            ink2_nvfp4_block<2u, 8u>(
+                w2 + e_row * w_row_bytes, w_row_bytes, w2_scale + e_row * s_row_bytes, s_row_bytes,
+                act, k, r_ids, n_r, lane, v);
+            if (lane == 0u) {
+                for (u32 wr = 0u; wr < 2u; ++wr) {
+                    if (o + wr >= args.out_dim) {
+                        break;
+                    }
+                    for (u32 rr = 0u; rr < n_r; ++rr) {
+                        slots_out[u64(c_ids[rr]) * args.out_dim + o + wr] = v[wr * 8u + rr] * outer;
+                    }
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void kernel_inkling2_moe_mxfp8_w13_tile(
+        const ink2_args_moe_w13 args,
+        const float* x,
+        const u8* w13,
+        const u8* w13_scale,
+        const float* expert_weights,
+        const u32* cols,
+        const u32* items,
+        float* out) {
+    const u32 lane = threadIdx.x & 31u;
+    const u32 sg = threadIdx.x >> 5u;
+    const u32 k = args.in_dim;
+    const u32 n = 2u * args.inter_dim;
+    const u64 w_row_bytes = u64(k);
+    const u64 s_row_bytes = u64(k / 32u);
+    const u32 n0 = blockIdx.x * 64u;
+    if (n0 >= n || blockIdx.y >= items[0]) {
+        return;
+    }
+    const u32 expert = items[1u + 2u * blockIdx.y];
+    const u32 packed = items[2u + 2u * blockIdx.y];
+    const u32* ec = cols + u64(expert) * args.rows + (packed & 0xFFFFFFu);
+    const u32 m = packed >> 24u;
+    for (u32 pair = 0u; pair < 8u; ++pair) {
+        const u32 row0 = n0 + sg * 16u + pair * 2u;
+        if (row0 >= n) {
+            break;
+        }
+        const u32 j = row0 / 2u;
+        const u64 e_row = u64(expert) * n + row0;
+        for (u32 base = 0u; base < m; base += 8u) {
+            const u32 n_r = (m - base) < 8u ? (m - base) : 8u;
+            u32 c_ids[8];
+            u32 r_ids[8];
+            for (u32 rr = 0u; rr < 8u; ++rr) {
+                c_ids[rr] = rr < n_r ? ec[base + rr] : 0u;
+                r_ids[rr] = c_ids[rr] / args.top_k;
+            }
+            float v[16];
+            ink2_mxfp8_block<2u, 8u>(
+                w13 + e_row * w_row_bytes, w_row_bytes, w13_scale + e_row * s_row_bytes, s_row_bytes,
+                x, k, r_ids, n_r, lane, v);
+            if (lane == 0u) {
+                for (u32 q = 0u; q < 1u; ++q) {
+                    if (j + q >= args.inter_dim) {
+                        break;
+                    }
+                    for (u32 rr = 0u; rr < n_r; ++rr) {
+                        out[u64(c_ids[rr]) * args.inter_dim + j + q] = ink2_swiglu_capped(
+                            v[(2u * q) * 8u + rr], v[(2u * q + 1u) * 8u + rr],
+                            args.gate_cap, args.up_cap, expert_weights[c_ids[rr]]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void kernel_inkling2_moe_mxfp8_w2_tile(
+        const ink2_args_moe_w2 args,
+        const float* act,
+        const u8* w2,
+        const u8* w2_scale,
+        const u32* cols,
+        const u32* items,
+        float* slots_out) {
+    const u32 lane = threadIdx.x & 31u;
+    const u32 sg = threadIdx.x >> 5u;
+    const u32 k = args.inter_dim;
+    const u32 n = args.out_dim;
+    const u64 w_row_bytes = u64(k);
+    const u64 s_row_bytes = u64(k / 32u);
+    const u32 n0 = blockIdx.x * 64u;
+    if (n0 >= n || blockIdx.y >= items[0]) {
+        return;
+    }
+    const u32 expert = items[1u + 2u * blockIdx.y];
+    const u32 packed = items[2u + 2u * blockIdx.y];
+    const u32* ec = cols + u64(expert) * args.rows + (packed & 0xFFFFFFu);
+    const u32 m = packed >> 24u;
+    for (u32 pair = 0u; pair < 8u; ++pair) {
+        const u32 row0 = n0 + sg * 16u + pair * 2u;
+        if (row0 >= n) {
+            break;
+        }
+        const u32 o = row0;
+        const u64 e_row = u64(expert) * n + row0;
+        for (u32 base = 0u; base < m; base += 8u) {
+            const u32 n_r = (m - base) < 8u ? (m - base) : 8u;
+            u32 c_ids[8];
+            u32 r_ids[8];
+            for (u32 rr = 0u; rr < 8u; ++rr) {
+                c_ids[rr] = rr < n_r ? ec[base + rr] : 0u;
+                r_ids[rr] = c_ids[rr];
+            }
+            float v[16];
+            ink2_mxfp8_block<2u, 8u>(
+                w2 + e_row * w_row_bytes, w_row_bytes, w2_scale + e_row * s_row_bytes, s_row_bytes,
+                act, k, r_ids, n_r, lane, v);
+            if (lane == 0u) {
+                for (u32 wr = 0u; wr < 2u; ++wr) {
+                    if (o + wr >= args.out_dim) {
+                        break;
+                    }
+                    for (u32 rr = 0u; rr < n_r; ++rr) {
+                        slots_out[u64(c_ids[rr]) * args.out_dim + o + wr] = v[wr * 8u + rr];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Sums a row's `top_k` slots in slot order.
 extern "C" __global__ void kernel_inkling2_moe_reduce_topk(
         const ink2_args_moe_w2 args,
         const float* slots_in,
         float* out) {
     const u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
     const u32 total = args.rows * args.out_dim;
-    if (tid >= total) return;
+    if (tid >= total) {
+        return;
+    }
     const u32 row = tid / args.out_dim;
     const u32 o = tid % args.out_dim;
     float acc = 0.0f;
     for (u32 s = 0u; s < args.top_k; ++s) {
-        acc += slots_in[u64(row * args.top_k + s) * args.out_dim + o];
+        acc = acc + slots_in[u64(row * args.top_k + s) * args.out_dim + o];
     }
     out[tid] = acc;
 }
@@ -2390,6 +2800,33 @@ extern "C" __global__ void kernel_inkling2_mtp_block_attn(
     }
 
     out[(u64(row) * args.n_head + h) * D + tid] = acc / l_sum;
+}
+
+// Stores `rows` f32 rows as halves at their positions' slots of a context
+// cache (a ring of `kv_cap` slots on a sliding-window layer).
+// Grid: one thread an element, block 256.
+struct ink2_args_mtp_store {
+    u32 rows;
+    u32 width;
+    u32 pos0;
+    u32 kv_cap;
+    u32 is_swa;
+};
+static_assert(sizeof(ink2_args_mtp_store) == 20, "ink2_args_mtp_store layout");
+
+extern "C" __global__ void kernel_inkling2_mtp_store_f16(
+        const ink2_args_mtp_store args,
+        const float* src,
+        __half* cache) {
+    const u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= args.rows * args.width) {
+        return;
+    }
+    const u32 row = tid / args.width;
+    const u32 c = tid - row * args.width;
+    const u32 pos = args.pos0 + row;
+    const u32 slot = args.is_swa != 0u ? (pos % args.kv_cap) : pos;
+    cache[u64(slot) * args.width + c] = __float2half(src[tid]);
 }
 
 extern "C" __global__ void kernel_inkling2_mtp_swiglu_mul(
