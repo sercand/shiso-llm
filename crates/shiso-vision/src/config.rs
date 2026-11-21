@@ -416,6 +416,32 @@ impl PreprocessSpec {
             resample: Resample::CatmullRom,
         }
     }
+
+    /// Inkling-2's preprocessing spec: 20×20 native patches, 2×2 spatial merge
+    /// (40×40 pixels per image token), `[-1, 1]` normalization.
+    #[must_use]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "the geometry constants are checked against the accepted range at compile time"
+    )]
+    pub fn inkling2() -> Self {
+        const PATCH: usize = 20;
+        const TEMPORAL: usize = 1;
+        const MERGE: usize = 2;
+        const {
+            assert!(PATCH > 0 && PATCH <= MAX_GEOMETRY_FIELD);
+            assert!(TEMPORAL > 0 && TEMPORAL <= MAX_GEOMETRY_FIELD);
+            assert!(MERGE > 0 && MERGE <= MAX_GEOMETRY_FIELD);
+        }
+        Self {
+            geometry: PatchGeometry::new(PATCH, TEMPORAL, MERGE)
+                .expect("Inkling-2 geometry constants are valid"),
+            resize: ResizeRule::GridUnit,
+            mean: HALF,
+            std: HALF,
+            resample: Resample::CatmullRom,
+        }
+    }
 }
 
 /// What one image is allowed to cost.

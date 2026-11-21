@@ -1,0 +1,17 @@
+# The Inkling-2 family's kernel pack, module `inkling2`.
+#
+# One translation unit (`inkling2.cu`): BF16 projections and norms, block
+# attention residuals, rank-64 loop message controllers, static and dynamic
+# short causal convolutions, relative-bias + per-query sink attention, top-k
+# sigmoid routing, and NVFP4 / MXFP8 routed MoE experts with interleaved
+# softcapped SwiGLU. The Metal twin is `kernels/metal/inkling2/inkling2.metal`.
+
+[build]
+sources = ["inkling2.cu"]
+
+base_flags = ["-O3", "-g", "-lineinfo"]
+
+arch = ["compute_80"]
+
+[modules]
+inkling2 = "inkling2"

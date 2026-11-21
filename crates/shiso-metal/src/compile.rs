@@ -418,6 +418,13 @@ pub(crate) const SOURCES: &[(&str, &str)] = &[
         "splat/splat.metal",
         include_str!("../../../kernels/metal/splat/splat.metal"),
     ),
+    // --- Inkling-2 kernel set (looped MoE, NVFP4/MXFP8 experts, relative-bias
+    // sink attention, block attention residuals, short convolutions); appended,
+    // nothing above this line changed. Self-contained: no header of its own.
+    (
+        "inkling2/inkling2.metal",
+        include_str!("../../../kernels/metal/inkling2/inkling2.metal"),
+    ),
 ];
 
 /// Concatenates every source into the one translation unit the device compiles.
