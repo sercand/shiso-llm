@@ -4739,7 +4739,7 @@ async fn child_key_lifecycle_and_permissions() {
     let cfg = backend_toml("b1", &mock.uri(), "k")
         + "[[models]]\nname = \"public-a\"\n[[models.targets]]\nbackend = \"b1\"\n"
         + "[[models]]\nname = \"public-b\"\n[[models.targets]]\nbackend = \"b1\"\n"
-        + "[[models]]\nname = \"secret-m\"\nprivate = true\n[[models.targets]]\nbackend = \"b1\"\n";
+        + "[[models]]\nname = \"secret-m\"\naliases = [\"secret-alias\"]\nprivate = true\n[[models.targets]]\nbackend = \"b1\"\n";
     let router = TestRouter::start(&cfg).await;
 
     // A regular key without can_create_children gets 403 on POST /v1/keys.
@@ -4810,6 +4810,35 @@ async fn child_key_lifecycle_and_permissions() {
     assert_eq!(resp.status(), 400);
     let err_body = resp.text().await.unwrap();
     assert!(err_body.contains("not a configured model"), "{err_body}");
+
+    // Requesting a private model's ALIAS must also return 400 "not a configured model"
+    // and never leak the canonical private model name.
+    let resp = router
+        .client
+        .post(router.url("/v1/keys"))
+        .bearer_auth(&parent_a_tok)
+        .json(&serde_json::json!({"name": "bad-priv-alias", "allowed_models": ["secret-alias"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let err_body = resp.text().await.unwrap();
+    assert!(err_body.contains("not a configured model"), "{err_body}");
+    assert!(!err_body.contains("secret-m"), "{err_body}");
+
+    // GET /v1/keys lists only parent-a's children.
+    let listed: serde_json::Value = router
+        .client
+        .get(router.url("/v1/keys"))
+        .bearer_auth(&parent_a_tok)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["id"], child_1_id);
 
     // Clearing allowed_models with null on PATCH resets to parent's ["public-a"], not null.
     let resp = router
@@ -5005,11 +5034,47 @@ async fn child_request_enforces_parent_state_and_rolls_up_usage() {
     assert_eq!(global_usage[0]["requests"], 1);
     assert!((global_usage[0]["cost"].as_f64().unwrap() - 1.0).abs() < 1e-9);
 
-    // Parent is now at its $1.00 limit via child spend -> next child call gets 429.
+    // Admin include_children=true includes child usage once; get_token exposes children + children_usage.
+    let (_, inc_usage) = router
+        .admin(
+            reqwest::Method::GET,
+            &format!("/admin/usage?group_by=model&token_id={parent_id}&include_children=true"),
+            None,
+        )
+        .await;
+    assert_eq!(inc_usage[0]["requests"], 1);
+    assert!((inc_usage[0]["cost"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    let (_, detail) = router
+        .admin(
+            reqwest::Method::GET,
+            &format!("/admin/tokens/{parent_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(detail["children"].as_array().unwrap().len(), 1);
+    assert!(
+        (detail["children_usage"]["all_time"]["cost"]
+            .as_f64()
+            .unwrap()
+            - 1.0)
+            .abs()
+            < 1e-9
+    );
+
+    // Parent is now at its $1.00 limit via child spend -> both child and direct parent calls get 429.
     let resp = router
         .client
         .post(router.url("/v1/chat/completions"))
         .bearer_auth(&child_tok)
+        .body(r#"{"model":"m1","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+    let resp = router
+        .client
+        .post(router.url("/v1/chat/completions"))
+        .bearer_auth(&parent_tok)
         .body(r#"{"model":"m1","messages":[]}"#)
         .send()
         .await

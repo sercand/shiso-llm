@@ -175,10 +175,17 @@ pub(crate) async fn proxy_request(desc: ProxyRequestDesc) -> Result<Response, Ap
 
     let mut row = LogRow::new(key.id.clone(), probe.model.clone(), path.clone());
     row.parent_token_id = key.parent_id.clone();
-    let parent = key
-        .parent_id
-        .as_deref()
-        .and_then(|pid| state.token_cache.get_by_id(pid));
+    // Fail closed if the parent was deleted or disabled between auth and here.
+    let parent = match key.parent_id.as_deref() {
+        Some(pid) => match state.token_cache.get_by_id(pid) {
+            Some(p) if !p.disabled => Some(p),
+            _ => {
+                let err = AppError::Forbidden("parent API key is disabled".into());
+                return Err(reject(&state, row, started, err, tracer.as_deref()));
+            }
+        },
+        None => None,
+    };
     if let Some(t) = &tracer {
         row.id = t.id().to_string();
     }

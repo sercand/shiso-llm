@@ -15,8 +15,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::admin::keys::{
-    blocking, some_option, usage_snapshot_json, validate_credit_limit, validate_model_list,
-    validate_name, validate_token_limit,
+    blocking, some_option, usage_snapshot_json, validate_credit_limit, validate_name,
+    validate_token_limit,
 };
 use crate::admin::logs::parse_rfc3339_ms;
 use crate::admin::usage::{Filters, Grouping, UsageBucket, query_usage, usage_windows};
@@ -85,32 +85,40 @@ fn require_top_level(caller: &KeyRecord) -> Result<(), AppError> {
 }
 
 /// Validates that every model in `models` is a canonical configured model AND
-/// is permitted for `caller`. For private models `caller` cannot access, returns
-/// `400 BadRequest` matching the unknown-model wording so private model names
-/// cannot be probed.
+/// is permitted for `caller`. For private models `caller` cannot access (even
+/// when referenced by alias), returns `400 BadRequest` matching the
+/// unknown-model wording so private model names cannot be probed.
 fn validate_child_models(
     state: &AppState,
     caller: &KeyRecord,
     models: &[String],
     field: &str,
 ) -> Result<(), AppError> {
-    validate_model_list(state, models, field)?;
     let routing = state.routing();
     for m in models {
-        let Some(route) = routing.routes.get(m) else {
-            return Err(AppError::BadRequest(format!(
-                "{field} entry {m:?} is not a configured model"
-            )));
-        };
-        if !caller.allows_model(&route.name, route.private) {
-            if route.private {
+        match routing.model_named(m) {
+            Some(def) if def.private && !caller.allows_model(&def.name, true) => {
                 return Err(AppError::BadRequest(format!(
                     "{field} entry {m:?} is not a configured model"
                 )));
             }
-            return Err(AppError::Forbidden(format!(
-                "{field} entry {m:?} is not allowed for the parent API key"
-            )));
+            Some(def) if def.name != *m => {
+                return Err(AppError::BadRequest(format!(
+                    "{field} entry {m:?} is an alias of model {:?} — list the model name",
+                    def.name
+                )));
+            }
+            Some(def) if !caller.allows_model(&def.name, def.private) => {
+                return Err(AppError::Forbidden(format!(
+                    "{field} entry {m:?} is not allowed for the parent API key"
+                )));
+            }
+            Some(_) => {}
+            None => {
+                return Err(AppError::BadRequest(format!(
+                    "{field} entry {m:?} is not a configured model"
+                )));
+            }
         }
     }
     Ok(())
@@ -363,12 +371,15 @@ pub(crate) async fn keys_usage(
 pub(crate) async fn keys_models(
     State(state): State<AppState>,
     Extension(caller): Extension<Arc<KeyRecord>>,
-) -> Json<Vec<serde_json::Value>> {
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let routing = state.routing();
-    let parent = caller
-        .parent_id
-        .as_deref()
-        .and_then(|pid| state.token_cache.get_by_id(pid));
+    let parent = match caller.parent_id.as_deref() {
+        Some(pid) => match state.token_cache.get_by_id(pid) {
+            Some(p) if !p.disabled => Some(p),
+            _ => return Err(AppError::Forbidden("parent API key is disabled".into())),
+        },
+        None => None,
+    };
     let mut allowed: Vec<_> = routing
         .models
         .iter()
@@ -390,5 +401,5 @@ pub(crate) async fn keys_models(
             })
         })
         .collect();
-    Json(items)
+    Ok(Json(items))
 }
