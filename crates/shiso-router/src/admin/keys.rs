@@ -139,8 +139,7 @@ pub(crate) async fn list_tokens(
             if record.parent_id.is_none() {
                 let cw = state.usage_tracker.children_snapshot(&record, now);
                 body["children_usage"] = usage_snapshot_json(cw);
-                body["children_count"] =
-                    json!(child_counts.get(&record.id).copied().unwrap_or(0));
+                body["children_count"] = json!(child_counts.get(&record.id).copied().unwrap_or(0));
             }
             body
         })

@@ -2701,7 +2701,7 @@ async fn admin_ui_is_served_without_auth() {
         "the embedded UI must not be heuristically cacheable across a redeploy"
     );
     let body = resp.text().await.unwrap();
-    assert!(body.contains("llm-router admin"));
+    assert!(body.contains("shiso router"));
 
     // /admin redirects to the page.
     let resp = router
@@ -5085,7 +5085,9 @@ async fn child_request_enforces_parent_state_and_rolls_up_usage() {
     );
     let usage: serde_json::Value = router
         .client
-        .get(router.url(&format!("/v1/keys/usage?group_by=model&token_id={child_id}")))
+        .get(router.url(&format!(
+            "/v1/keys/usage?group_by=model&token_id={child_id}"
+        )))
         .bearer_auth(&parent_tok)
         .send()
         .await

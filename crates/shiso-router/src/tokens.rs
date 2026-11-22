@@ -309,9 +309,8 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         let rows = {
-            let mut stmt = tx.prepare(
-                "SELECT id, token_hash FROM tokens WHERE id = ?1 OR parent_id = ?1",
-            )?;
+            let mut stmt =
+                tx.prepare("SELECT id, token_hash FROM tokens WHERE id = ?1 OR parent_id = ?1")?;
             let raw = stmt
                 .query_map([id], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -322,10 +321,7 @@ impl Db {
                 .collect::<Result<Vec<_>>>()?
         };
         if !rows.is_empty() {
-            tx.execute(
-                "DELETE FROM tokens WHERE id = ?1 OR parent_id = ?1",
-                [id],
-            )?;
+            tx.execute("DELETE FROM tokens WHERE id = ?1 OR parent_id = ?1", [id])?;
         }
         tx.commit()?;
         Ok(rows)
@@ -410,10 +406,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             "flex_models",
             "ALTER TABLE tokens ADD COLUMN flex_models TEXT",
         ),
-        (
-            "parent_id",
-            "ALTER TABLE tokens ADD COLUMN parent_id TEXT",
-        ),
+        ("parent_id", "ALTER TABLE tokens ADD COLUMN parent_id TEXT"),
         (
             "can_create_children",
             "ALTER TABLE tokens ADD COLUMN can_create_children INTEGER NOT NULL DEFAULT 0",
