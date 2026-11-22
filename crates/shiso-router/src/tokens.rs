@@ -40,8 +40,10 @@ pub fn synthetic_key_name(token_id: &str) -> Option<&'static str> {
 /// `x-service-tier` hint as it was forwarded; version 8 added private model
 /// routes (`models.private`), per-key forced-flex model lists
 /// (`tokens.flex_models`), and a separate Anthropic endpoint per backend
-/// (`backends.anthropic_base_url`).
-const SCHEMA_VERSION: i64 = 8;
+/// (`backends.anthropic_base_url`); version 9 added 1-level parent/child API
+/// keys (`tokens.parent_id`, `tokens.can_create_children`) and denormalized
+/// `request_logs.parent_token_id` so parent rollups survive child deletion.
+const SCHEMA_VERSION: i64 = 9;
 
 /// A client API key as stored — everything except the secret, which exists
 /// only as a SHA-256 hash. Records are immutable snapshots: admin updates
@@ -70,6 +72,10 @@ pub struct KeyRecord {
     /// Canonical models for which this key's requests are forced to the
     /// `flex` service tier, overriding whatever the client asked for.
     pub flex_models: Option<Vec<String>>,
+    /// Parent key identifier for child keys; `None` for top-level keys.
+    pub parent_id: Option<String>,
+    /// Whether this top-level key may create child keys via `/v1/keys`.
+    pub can_create_children: bool,
 }
 
 impl KeyRecord {
@@ -86,6 +92,8 @@ impl KeyRecord {
             token_limit_reset: ResetInterval::Never,
             allowed_models: None,
             flex_models: None,
+            parent_id: None,
+            can_create_children: false,
         }
     }
 
@@ -188,8 +196,9 @@ impl Db {
         conn.execute(
             "INSERT INTO tokens (id, name, token_hash, created_at, disabled,
                                  credit_limit, credit_limit_reset,
-                                 token_limit, token_limit_reset, allowed_models, flex_models)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                 token_limit, token_limit_reset, allowed_models, flex_models,
+                                 parent_id, can_create_children)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             rusqlite::params![
                 record.id,
                 record.name,
@@ -202,6 +211,8 @@ impl Db {
                 record.token_limit_reset.as_str(),
                 allowed_models_to_sql(&record.allowed_models)?,
                 flex_models_to_sql(&record.flex_models)?,
+                record.parent_id,
+                record.can_create_children,
             ],
         )?;
         Ok(())
@@ -215,6 +226,18 @@ impl Db {
         ))?;
         let rows = stmt
             .query_map([], record_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Lists all child keys belonging to `parent_id`.
+    pub fn list_children(&self, parent_id: &str) -> Result<Vec<KeyRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RECORD_COLUMNS} FROM tokens WHERE parent_id = ?1 ORDER BY created_at, id"
+        ))?;
+        let rows = stmt
+            .query_map([parent_id], record_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -249,7 +272,8 @@ impl Db {
             "UPDATE tokens SET name = ?2, disabled = ?3,
                     credit_limit = ?4, credit_limit_reset = ?5,
                     token_limit = ?6, token_limit_reset = ?7,
-                    allowed_models = ?8, flex_models = ?9
+                    allowed_models = ?8, flex_models = ?9,
+                    can_create_children = ?10
              WHERE id = ?1",
             rusqlite::params![
                 record.id,
@@ -261,6 +285,7 @@ impl Db {
                 record.token_limit_reset.as_str(),
                 allowed_models_to_sql(&record.allowed_models)?,
                 flex_models_to_sql(&record.flex_models)?,
+                record.can_create_children,
             ],
         )?;
         Ok(Some(hash))
@@ -275,6 +300,35 @@ impl Db {
         let Some(hash) = hash else { return Ok(None) };
         conn.execute("DELETE FROM tokens WHERE id = ?1", [id])?;
         Ok(Some(hash))
+    }
+
+    /// Deletes a key and any child keys referencing it as their parent,
+    /// returning every deleted `(id, token_hash)` pair so the caller can
+    /// evict them all from in-memory caches.
+    pub fn delete_cascade(&self, id: &str) -> Result<Vec<(String, [u8; 32])>> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let rows = {
+            let mut stmt = tx.prepare(
+                "SELECT id, token_hash FROM tokens WHERE id = ?1 OR parent_id = ?1",
+            )?;
+            let raw = stmt
+                .query_map([id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            raw.into_iter()
+                .map(|(k_id, hash)| Ok((k_id, decode_hash(&hash)?)))
+                .collect::<Result<Vec<_>>>()?
+        };
+        if !rows.is_empty() {
+            tx.execute(
+                "DELETE FROM tokens WHERE id = ?1 OR parent_id = ?1",
+                [id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(rows)
     }
 
     /// Loads all key hashes and records into memory.
@@ -295,7 +349,8 @@ impl Db {
 }
 
 const RECORD_COLUMNS: &str = "id, name, created_at, disabled, credit_limit, \
-     credit_limit_reset, token_limit, token_limit_reset, allowed_models, flex_models";
+     credit_limit_reset, token_limit, token_limit_reset, allowed_models, flex_models, \
+     parent_id, can_create_children";
 
 fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -309,17 +364,19 @@ fn migrate(conn: &Connection) -> Result<()> {
     // are actually missing, so this block is idempotent either way.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS tokens (
-            id                 TEXT PRIMARY KEY,
-            name               TEXT NOT NULL,
-            token_hash         TEXT NOT NULL UNIQUE,
-            created_at         TEXT NOT NULL,
-            disabled           INTEGER NOT NULL DEFAULT 0,
-            credit_limit       REAL,
-            credit_limit_reset TEXT NOT NULL DEFAULT 'never',
-            token_limit        INTEGER,
-            token_limit_reset  TEXT NOT NULL DEFAULT 'never',
-            allowed_models     TEXT,
-            flex_models        TEXT
+            id                  TEXT PRIMARY KEY,
+            name                TEXT NOT NULL,
+            token_hash          TEXT NOT NULL UNIQUE,
+            created_at          TEXT NOT NULL,
+            disabled            INTEGER NOT NULL DEFAULT 0,
+            credit_limit        REAL,
+            credit_limit_reset  TEXT NOT NULL DEFAULT 'never',
+            token_limit         INTEGER,
+            token_limit_reset   TEXT NOT NULL DEFAULT 'never',
+            allowed_models      TEXT,
+            flex_models         TEXT,
+            parent_id           TEXT,
+            can_create_children INTEGER NOT NULL DEFAULT 0
         );",
     )?;
 
@@ -353,11 +410,23 @@ fn migrate(conn: &Connection) -> Result<()> {
             "flex_models",
             "ALTER TABLE tokens ADD COLUMN flex_models TEXT",
         ),
+        (
+            "parent_id",
+            "ALTER TABLE tokens ADD COLUMN parent_id TEXT",
+        ),
+        (
+            "can_create_children",
+            "ALTER TABLE tokens ADD COLUMN can_create_children INTEGER NOT NULL DEFAULT 0",
+        ),
     ] {
         if !existing.contains(col) {
             conn.execute(ddl, [])?;
         }
     }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tokens_parent ON tokens(parent_id)",
+        [],
+    )?;
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS request_logs (
@@ -380,7 +449,8 @@ fn migrate(conn: &Connection) -> Result<()> {
             cost               REAL,
             finish_reason      TEXT,
             error              TEXT,
-            service_tier       TEXT
+            service_tier       TEXT,
+            parent_token_id    TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_logs_token_time ON request_logs(token_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_logs_created    ON request_logs(created_at);
@@ -510,9 +580,21 @@ fn migrate(conn: &Connection) -> Result<()> {
     // v2–v6 databases have request_logs without the service tier. Nullable
     // with no default, so rows written before the column existed read back
     // as "no tier stated", which is exactly what they were.
-    if !table_columns(conn, "request_logs")?.contains("service_tier") {
+    let log_cols = table_columns(conn, "request_logs")?;
+    if !log_cols.contains("service_tier") {
         conn.execute("ALTER TABLE request_logs ADD COLUMN service_tier TEXT", [])?;
     }
+    // v2–v8 databases have request_logs without parent_token_id.
+    if !log_cols.contains("parent_token_id") {
+        conn.execute(
+            "ALTER TABLE request_logs ADD COLUMN parent_token_id TEXT",
+            [],
+        )?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_logs_parent_time ON request_logs(parent_token_id, created_at)",
+        [],
+    )?;
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -612,43 +694,63 @@ fn record_from_offset_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::R
         token_limit_reset: parse_reset(offset + 7, row.get(offset + 7)?)?,
         allowed_models,
         flex_models,
+        parent_id: row.get(offset + 10)?,
+        can_create_children: row.get(offset + 11)?,
     })
 }
 
-/// In-memory map of valid token hashes to their key records; the hot path
-/// never touches SQLite. Loaded fully at startup and kept in sync by the
-/// admin handlers (single process, so cache and DB cannot drift).
+#[derive(Default, Debug)]
+struct CacheMaps {
+    by_hash: HashMap<[u8; 32], Arc<KeyRecord>>,
+    by_id: HashMap<String, Arc<KeyRecord>>,
+}
+
+/// In-memory map of valid token hashes (and key ids) to their key records;
+/// the hot path never touches SQLite. Loaded fully at startup and kept in
+/// sync by key-management handlers (single process, so cache and DB cannot drift).
 #[derive(Default, Debug)]
 pub struct TokenCache {
-    map: RwLock<HashMap<[u8; 32], Arc<KeyRecord>>>,
+    maps: RwLock<CacheMaps>,
 }
 
 impl TokenCache {
     /// Constructs a new token cache from existing entries.
     pub fn new(entries: Vec<([u8; 32], KeyRecord)>) -> Self {
+        let mut by_hash = HashMap::with_capacity(entries.len());
+        let mut by_id = HashMap::with_capacity(entries.len());
+        for (hash, rec) in entries {
+            let arc = Arc::new(rec);
+            by_id.insert(arc.id.clone(), Arc::clone(&arc));
+            by_hash.insert(hash, arc);
+        }
         TokenCache {
-            map: RwLock::new(
-                entries
-                    .into_iter()
-                    .map(|(hash, rec)| (hash, Arc::new(rec)))
-                    .collect(),
-            ),
+            maps: RwLock::new(CacheMaps { by_hash, by_id }),
         }
     }
 
     /// Lookups a key record by its SHA-256 token hash.
     pub fn get(&self, hash: &[u8; 32]) -> Option<Arc<KeyRecord>> {
-        self.map.read().unwrap().get(hash).cloned()
+        self.maps.read().unwrap().by_hash.get(hash).cloned()
+    }
+
+    /// Lookups a key record by its key id.
+    pub fn get_by_id(&self, id: &str) -> Option<Arc<KeyRecord>> {
+        self.maps.read().unwrap().by_id.get(id).cloned()
     }
 
     /// Inserts or replaces a key record in the cache.
     pub fn insert(&self, hash: [u8; 32], record: Arc<KeyRecord>) {
-        self.map.write().unwrap().insert(hash, record);
+        let mut maps = self.maps.write().unwrap();
+        maps.by_id.insert(record.id.clone(), Arc::clone(&record));
+        maps.by_hash.insert(hash, record);
     }
 
     /// Removes a token from the cache.
     pub fn remove(&self, hash: &[u8; 32]) {
-        self.map.write().unwrap().remove(hash);
+        let mut maps = self.maps.write().unwrap();
+        if let Some(rec) = maps.by_hash.remove(hash) {
+            maps.by_id.remove(&rec.id);
+        }
     }
 }
 
@@ -1108,5 +1210,134 @@ mod tests {
             })
             .unwrap();
         assert_eq!(groups, 0);
+    }
+
+    #[test]
+    fn parent_child_round_trip_and_list_children() {
+        let (_dir, db) = temp_db();
+        let mut parent = record("p1", "shiso-staging");
+        parent.can_create_children = true;
+        db.insert(&parent, &hash_token("ptok")).unwrap();
+
+        let mut c1 = record("c1", "agent-1");
+        c1.parent_id = Some("p1".into());
+        let mut c2 = record("c2", "agent-2");
+        c2.parent_id = Some("p1".into());
+        let other = record("o1", "other");
+        db.insert(&c1, &hash_token("c1tok")).unwrap();
+        db.insert(&c2, &hash_token("c2tok")).unwrap();
+        db.insert(&other, &hash_token("otok")).unwrap();
+
+        let got_parent = db.get("p1").unwrap().unwrap();
+        assert!(got_parent.can_create_children);
+        assert_eq!(got_parent.parent_id, None);
+
+        let children = db.list_children("p1").unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].id, "c1");
+        assert_eq!(children[0].parent_id.as_deref(), Some("p1"));
+        assert!(!children[0].can_create_children);
+        assert_eq!(children[1].id, "c2");
+
+        let mut updated_parent = got_parent;
+        updated_parent.can_create_children = false;
+        db.update(&updated_parent).unwrap();
+        assert!(!db.get("p1").unwrap().unwrap().can_create_children);
+    }
+
+    #[test]
+    fn delete_cascade_removes_parent_and_children() {
+        let (_dir, db) = temp_db();
+        let mut parent = record("p1", "parent");
+        parent.can_create_children = true;
+        let phash = hash_token("ptok");
+        db.insert(&parent, &phash).unwrap();
+
+        let mut c1 = record("c1", "child1");
+        c1.parent_id = Some("p1".into());
+        let c1hash = hash_token("c1tok");
+        let mut c2 = record("c2", "child2");
+        c2.parent_id = Some("p1".into());
+        let c2hash = hash_token("c2tok");
+        let other = record("o1", "other");
+        db.insert(&c1, &c1hash).unwrap();
+        db.insert(&c2, &c2hash).unwrap();
+        db.insert(&other, &hash_token("otok")).unwrap();
+
+        let deleted = db.delete_cascade("p1").unwrap();
+        assert_eq!(deleted.len(), 3);
+        let remaining = db.list().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "o1");
+
+        assert!(db.delete_cascade("missing").unwrap().is_empty());
+    }
+
+    #[test]
+    fn token_cache_by_id_tracks_insert_and_remove() {
+        let h1 = hash_token("tok1");
+        let h2 = hash_token("tok2");
+        let cache = TokenCache::new(vec![(h1, record("id1", "a"))]);
+        assert_eq!(cache.get_by_id("id1").unwrap().name, "a");
+        assert!(cache.get_by_id("id2").is_none());
+
+        cache.insert(h2, Arc::new(record("id2", "b")));
+        assert_eq!(cache.get_by_id("id2").unwrap().name, "b");
+
+        cache.remove(&h1);
+        assert!(cache.get(&h1).is_none());
+        assert!(cache.get_by_id("id1").is_none());
+        assert_eq!(cache.get_by_id("id2").unwrap().name, "b");
+    }
+
+    #[test]
+    fn v8_to_v9_migration_adds_parent_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let db = Db::open(&path).unwrap();
+            db.with_write(|conn| {
+                conn.execute(
+                    "INSERT INTO tokens (id, name, token_hash, created_at)
+                     VALUES ('pre', 'pre-key', '00', '2026-01-01T00:00:00Z')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO request_logs (id, created_at, token_id, model, path)
+                     VALUES ('log1', 1, 'pre', 'm', '/v1/chat/completions')",
+                    [],
+                )?;
+                conn.execute("DROP INDEX IF EXISTS idx_tokens_parent", [])?;
+                conn.execute("DROP INDEX IF EXISTS idx_logs_parent_time", [])?;
+                conn.execute("ALTER TABLE tokens DROP COLUMN parent_id", [])?;
+                conn.execute("ALTER TABLE tokens DROP COLUMN can_create_children", [])?;
+                conn.execute("ALTER TABLE request_logs DROP COLUMN parent_token_id", [])?;
+                conn.pragma_update(None, "user_version", 8i64)?;
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let version: i64 = db
+            .with_read(|conn| Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 9);
+
+        let rec = db.get("pre").unwrap().unwrap();
+        assert_eq!(rec.parent_id, None);
+        assert!(!rec.can_create_children);
+
+        let parent_token_id: Option<String> = db
+            .with_read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT parent_token_id FROM request_logs WHERE id = 'log1'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(parent_token_id, None);
     }
 }
