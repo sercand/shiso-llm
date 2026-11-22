@@ -77,6 +77,8 @@ pub(crate) struct LogContext {
     pub dialect: Dialect,
     /// The key that made the request, for limit accrual at finalize time.
     pub key: Arc<KeyRecord>,
+    /// Parent key when `key` is a child key, for rolled-up parent limit accrual.
+    pub parent: Option<Arc<KeyRecord>>,
     /// Set when the request asked for `X-Debug: trace`; body chunks and the
     /// stream summary are printed through it.
     pub trace: Option<Arc<Tracer>>,
@@ -801,7 +803,7 @@ impl<S> TeeStream<S> {
 
         sink.accrue(
             &ctx.key,
-            None,
+            ctx.parent.as_deref(),
             RequestUsage {
                 cost: ctx.row.cost.unwrap_or(0.0),
                 total_tokens: ctx.row.total_tokens.unwrap_or(0),

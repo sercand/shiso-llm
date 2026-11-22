@@ -19,10 +19,19 @@ pub(crate) async fn list_models(
     headers: HeaderMap,
 ) -> Json<serde_json::Value> {
     let routing = state.routing();
+    let parent = key
+        .parent_id
+        .as_deref()
+        .and_then(|pid| state.token_cache.get_by_id(pid));
     let mut names: Vec<&str> = routing
         .models
         .iter()
-        .filter(|m| key.allows_model(&m.name, m.private))
+        .filter(|m| {
+            key.allows_model(&m.name, m.private)
+                && parent
+                    .as_ref()
+                    .is_none_or(|p| p.allows_model(&m.name, m.private))
+        })
         .map(|m| m.name.as_str())
         .collect();
     names.sort_unstable();
