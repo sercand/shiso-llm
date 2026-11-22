@@ -20,6 +20,8 @@ pub(crate) mod balancer;
 pub mod catalog;
 /// Command line interface.
 pub mod cli;
+/// Client-authenticated child key management (`/v1/keys/*`).
+pub(crate) mod client_keys;
 /// Configuration file format and loading.
 pub mod config;
 /// Application error types.
@@ -86,6 +88,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/images", post(proxy::proxy_handler))
         .route("/3d/generations", post(proxy::proxy_handler))
         .route("/models", get(models_endpoint::list_models))
+        .route(
+            "/v1/keys",
+            post(client_keys::create_child_key).get(client_keys::list_child_keys),
+        )
+        .route("/v1/keys/usage", get(client_keys::keys_usage))
+        .route("/v1/keys/models", get(client_keys::keys_models))
+        .route(
+            "/v1/keys/{id}",
+            get(client_keys::get_child_key)
+                .patch(client_keys::update_child_key)
+                .delete(client_keys::delete_child_key),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_client_token,

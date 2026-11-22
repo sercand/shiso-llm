@@ -4732,3 +4732,477 @@ async fn a_key_can_force_flex_on_selected_models() {
     let body: serde_json::Value = serde_json::from_slice(&received[1].body).unwrap();
     assert_eq!(body["service_tier"], "priority");
 }
+
+#[tokio::test]
+async fn child_key_lifecycle_and_permissions() {
+    let mock = MockServer::start().await;
+    let cfg = backend_toml("b1", &mock.uri(), "k")
+        + "[[models]]\nname = \"public-a\"\n[[models.targets]]\nbackend = \"b1\"\n"
+        + "[[models]]\nname = \"public-b\"\n[[models.targets]]\nbackend = \"b1\"\n"
+        + "[[models]]\nname = \"secret-m\"\nprivate = true\n[[models.targets]]\nbackend = \"b1\"\n";
+    let router = TestRouter::start(&cfg).await;
+
+    // A regular key without can_create_children gets 403 on POST /v1/keys.
+    let (plain_tok, _) = router.create_token().await;
+    let resp = router
+        .client
+        .post(router.url("/v1/keys"))
+        .bearer_auth(&plain_tok)
+        .json(&serde_json::json!({"name": "nope"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // Create a parent key restricted to ["public-a"] with can_create_children = true.
+    let (status, parent_a) = router
+        .admin(
+            reqwest::Method::POST,
+            "/admin/tokens",
+            Some(serde_json::json!({
+                "name": "parent-a",
+                "allowed_models": ["public-a"],
+                "can_create_children": true,
+            })),
+        )
+        .await;
+    assert_eq!(status, 201, "{parent_a}");
+    let parent_a_id = parent_a["id"].as_str().unwrap().to_string();
+    let parent_a_tok = parent_a["token"].as_str().unwrap().to_string();
+
+    // Omitting allowed_models inherits parent's ["public-a"].
+    let resp = router
+        .client
+        .post(router.url("/v1/keys"))
+        .bearer_auth(&parent_a_tok)
+        .json(&serde_json::json!({"name": "child-1", "credit_limit": 5.0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let child_1: serde_json::Value = resp.json().await.unwrap();
+    let child_1_id = child_1["id"].as_str().unwrap().to_string();
+    let child_1_tok = child_1["token"].as_str().unwrap().to_string();
+    assert_eq!(child_1["parent_id"], parent_a_id);
+    assert_eq!(child_1["can_create_children"], false);
+    assert_eq!(child_1["allowed_models"], serde_json::json!(["public-a"]));
+
+    // Requesting a public model outside parent's allowlist -> 403.
+    let resp = router
+        .client
+        .post(router.url("/v1/keys"))
+        .bearer_auth(&parent_a_tok)
+        .json(&serde_json::json!({"name": "bad", "allowed_models": ["public-b"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // Requesting a private model parent cannot access -> 400 (no existence leak).
+    let resp = router
+        .client
+        .post(router.url("/v1/keys"))
+        .bearer_auth(&parent_a_tok)
+        .json(&serde_json::json!({"name": "bad-priv", "allowed_models": ["secret-m"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let err_body = resp.text().await.unwrap();
+    assert!(err_body.contains("not a configured model"), "{err_body}");
+
+    // Clearing allowed_models with null on PATCH resets to parent's ["public-a"], not null.
+    let resp = router
+        .client
+        .patch(router.url(&format!("/v1/keys/{child_1_id}")))
+        .bearer_auth(&parent_a_tok)
+        .json(&serde_json::json!({"allowed_models": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let patched: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(patched["allowed_models"], serde_json::json!(["public-a"]));
+
+    // Child key cannot create grandchildren -> 403.
+    let resp = router
+        .client
+        .post(router.url("/v1/keys"))
+        .bearer_auth(&child_1_tok)
+        .json(&serde_json::json!({"name": "grandchild"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // Admin cannot grant can_create_children to a child key -> 400.
+    let (status, _) = router
+        .admin(
+            reqwest::Method::PATCH,
+            &format!("/admin/tokens/{child_1_id}"),
+            Some(serde_json::json!({"can_create_children": true})),
+        )
+        .await;
+    assert_eq!(status, 400);
+
+    // Another parent key cannot see, patch, or delete parent-a's child (404).
+    let (_, parent_b) = router
+        .admin(
+            reqwest::Method::POST,
+            "/admin/tokens",
+            Some(serde_json::json!({"name": "parent-b", "can_create_children": true})),
+        )
+        .await;
+    let parent_b_tok = parent_b["token"].as_str().unwrap().to_string();
+    assert_eq!(
+        router
+            .client
+            .get(router.url(&format!("/v1/keys/{child_1_id}")))
+            .bearer_auth(&parent_b_tok)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    assert_eq!(
+        router
+            .client
+            .delete(router.url(&format!("/v1/keys/{child_1_id}")))
+            .bearer_auth(&parent_b_tok)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+
+    // Revoking can_create_children on parent-a blocks POST /v1/keys (403)
+    // while GET/PATCH/DELETE on existing child still succeed.
+    let (status, _) = router
+        .admin(
+            reqwest::Method::PATCH,
+            &format!("/admin/tokens/{parent_a_id}"),
+            Some(serde_json::json!({"can_create_children": false})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        router
+            .client
+            .post(router.url("/v1/keys"))
+            .bearer_auth(&parent_a_tok)
+            .json(&serde_json::json!({"name": "after-revoke"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        router
+            .client
+            .get(router.url(&format!("/v1/keys/{child_1_id}")))
+            .bearer_auth(&parent_a_tok)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        router
+            .client
+            .delete(router.url(&format!("/v1/keys/{child_1_id}")))
+            .bearer_auth(&parent_a_tok)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+}
+
+#[tokio::test]
+async fn child_request_enforces_parent_state_and_rolls_up_usage() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-1",
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 0, "total_tokens": 1_000_000}
+        })))
+        .mount(&mock)
+        .await;
+
+    let cfg = backend_toml("b1", &mock.uri(), "k")
+        + "[[models]]\nname = \"m1\"\n[models.pricing]\ninput_per_mtok = 1.0\noutput_per_mtok = 2.0\n[[models.targets]]\nbackend = \"b1\"\n"
+        + "[[models]]\nname = \"m2\"\n[[models.targets]]\nbackend = \"b1\"\n";
+    let router = TestRouter::start(&cfg).await;
+
+    // Parent with $1.00 credit limit and can_create_children = true.
+    let (_, parent) = router
+        .admin(
+            reqwest::Method::POST,
+            "/admin/tokens",
+            Some(serde_json::json!({
+                "name": "shiso-staging",
+                "credit_limit": 1.0,
+                "credit_limit_reset": "daily",
+                "can_create_children": true,
+            })),
+        )
+        .await;
+    let parent_id = parent["id"].as_str().unwrap().to_string();
+    let parent_tok = parent["token"].as_str().unwrap().to_string();
+
+    let child: serde_json::Value = router
+        .client
+        .post(router.url("/v1/keys"))
+        .bearer_auth(&parent_tok)
+        .json(&serde_json::json!({"name": "agent-1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let child_id = child["id"].as_str().unwrap().to_string();
+    let child_tok = child["token"].as_str().unwrap().to_string();
+
+    // Child makes one $1.00 request.
+    let resp = router
+        .client
+        .post(router.url("/v1/chat/completions"))
+        .bearer_auth(&child_tok)
+        .body(r#"{"model":"m1","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await.unwrap();
+    router.wait_for_logs(1).await;
+
+    // Admin list shows parent direct = 0, children_usage = 1.0, children_count = 1.
+    let (_, tokens) = router
+        .admin(reqwest::Method::GET, "/admin/tokens", None)
+        .await;
+    let p_row = tokens
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == parent_id)
+        .unwrap();
+    assert_eq!(p_row["children_count"], 1);
+    assert!((p_row["usage"]["window_cost"].as_f64().unwrap() - 0.0).abs() < 1e-9);
+    assert!((p_row["children_usage"]["window_cost"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+
+    // Global usage counts the request once (no double counting).
+    let (_, global_usage) = router
+        .admin(reqwest::Method::GET, "/admin/usage?group_by=model", None)
+        .await;
+    assert_eq!(global_usage[0]["requests"], 1);
+    assert!((global_usage[0]["cost"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+
+    // Parent is now at its $1.00 limit via child spend -> next child call gets 429.
+    let resp = router
+        .client
+        .post(router.url("/v1/chat/completions"))
+        .bearer_auth(&child_tok)
+        .body(r#"{"model":"m1","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+
+    // Raise parent limit to $10; verify parent disable blocks child with 403.
+    router
+        .admin(
+            reqwest::Method::PATCH,
+            &format!("/admin/tokens/{parent_id}"),
+            Some(serde_json::json!({"credit_limit": 10.0, "disabled": true})),
+        )
+        .await;
+    let resp = router
+        .client
+        .post(router.url("/v1/chat/completions"))
+        .bearer_auth(&child_tok)
+        .body(r#"{"model":"m1","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // Re-enable parent and restrict parent to ["m2"] -> child cannot call m1 or see m1 in /v1/models.
+    router
+        .admin(
+            reqwest::Method::PATCH,
+            &format!("/admin/tokens/{parent_id}"),
+            Some(serde_json::json!({"disabled": false, "allowed_models": ["m2"]})),
+        )
+        .await;
+    let resp = router
+        .client
+        .post(router.url("/v1/chat/completions"))
+        .bearer_auth(&child_tok)
+        .body(r#"{"model":"m1","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    let models: serde_json::Value = router
+        .client
+        .get(router.url("/v1/models"))
+        .bearer_auth(&child_tok)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<_> = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["m2"]);
+
+    // Delete child key -> parent can still query the deleted child's usage via /v1/keys/usage
+    // and parent's children_usage still reflects the $1.00 spend.
+    assert_eq!(
+        router
+            .client
+            .delete(router.url(&format!("/v1/keys/{child_id}")))
+            .bearer_auth(&parent_tok)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    let usage: serde_json::Value = router
+        .client
+        .get(router.url(&format!("/v1/keys/usage?group_by=model&token_id={child_id}")))
+        .bearer_auth(&parent_tok)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(usage.as_array().unwrap().len(), 1);
+    assert_eq!(usage[0]["bucket"], "m1");
+    assert!((usage[0]["cost"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+
+    // Re-warm from SQLite (simulating restart) -> parent still sees $1.00 children spend.
+    let db = Db::open(&router.sqlite_path).unwrap();
+    let raw = format!(
+        "listen = \"127.0.0.1:0\"\nsqlite_path = {:?}\nadmin_token = \"test-admin-token\"\n",
+        router.sqlite_path.to_str().unwrap(),
+    );
+    let cfg_parsed: Config = toml::from_str(&raw).unwrap();
+    let (sink, _writer) = shiso_router::logging::start_writer(db.clone());
+    let restarted = AppState::from_config(&cfg_parsed, db, sink).unwrap();
+    let p_rec = restarted.token_cache.get_by_id(&parent_id).unwrap();
+    let csnap = restarted
+        .usage_tracker
+        .children_snapshot(&p_rec, time::OffsetDateTime::now_utc());
+    assert!((csnap.cost - 1.0).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn admin_delete_parent_cascades_to_children() {
+    let mock = MockServer::start().await;
+    let cfg = backend_toml("b1", &mock.uri(), "k")
+        + "[[models]]\nname = \"m1\"\n[[models.targets]]\nbackend = \"b1\"\n";
+    let router = TestRouter::start(&cfg).await;
+
+    let (_, parent) = router
+        .admin(
+            reqwest::Method::POST,
+            "/admin/tokens",
+            Some(serde_json::json!({"name": "parent", "can_create_children": true})),
+        )
+        .await;
+    let parent_id = parent["id"].as_str().unwrap().to_string();
+    let parent_tok = parent["token"].as_str().unwrap().to_string();
+
+    let c1: serde_json::Value = router
+        .client
+        .post(router.url("/v1/keys"))
+        .bearer_auth(&parent_tok)
+        .json(&serde_json::json!({"name": "c1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let c2: serde_json::Value = router
+        .client
+        .post(router.url("/v1/keys"))
+        .bearer_auth(&parent_tok)
+        .json(&serde_json::json!({"name": "c2"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let (status, _) = router
+        .admin(
+            reqwest::Method::DELETE,
+            &format!("/admin/tokens/{parent_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    for tok in [c1["token"].as_str().unwrap(), c2["token"].as_str().unwrap()] {
+        let resp = router
+            .client
+            .get(router.url("/v1/models"))
+            .bearer_auth(tok)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    let (_, tokens) = router
+        .admin(reqwest::Method::GET, "/admin/tokens", None)
+        .await;
+    assert!(tokens.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn client_keys_models_returns_allowed_models_with_aliases_and_pricing() {
+    let mock = MockServer::start().await;
+    let cfg = backend_toml("b1", &mock.uri(), "k")
+        + "[[models]]\nname = \"m1\"\naliases = [\"m1-fast\"]\n[models.pricing]\ninput_per_mtok = 1.5\noutput_per_mtok = 3.0\ncached_input_per_mtok = 0.25\n[[models.targets]]\nbackend = \"b1\"\n"
+        + "[[models]]\nname = \"secret\"\nprivate = true\n[[models.targets]]\nbackend = \"b1\"\n";
+    let router = TestRouter::start(&cfg).await;
+
+    let (tok, _) = router.create_token().await;
+    let resp = router
+        .client
+        .get(router.url("/v1/keys/models"))
+        .bearer_auth(&tok)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let models: serde_json::Value = resp.json().await.unwrap();
+    let arr = models.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "m1");
+    assert_eq!(arr[0]["aliases"], serde_json::json!(["m1-fast"]));
+    assert_eq!(arr[0]["pricing"]["input_per_mtok"], 1.5);
+    assert_eq!(arr[0]["pricing"]["output_per_mtok"], 3.0);
+    assert_eq!(arr[0]["pricing"]["cached_input_per_mtok"], 0.25);
+    assert!(arr[0].get("targets").is_none());
+}
