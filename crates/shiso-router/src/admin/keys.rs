@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -7,7 +8,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
 use crate::error::AppError;
-use crate::limits::ResetInterval;
+use crate::limits::{ResetInterval, UsageSnapshot};
 use crate::state::AppState;
 use crate::tokens::{KeyRecord, generate_token, hash_token};
 
@@ -29,6 +30,8 @@ pub(crate) struct CreateTokenRequest {
     pub allowed_models: Option<Vec<String>>,
     #[serde(default)]
     pub flex_models: Option<Vec<String>>,
+    #[serde(default)]
+    pub can_create_children: bool,
 }
 
 /// PATCH body: absent field = leave unchanged, `null` = clear (for the
@@ -52,6 +55,7 @@ pub(crate) struct UpdateTokenRequest {
     pub allowed_models: Option<Option<Vec<String>>>,
     #[serde(deserialize_with = "some_option")]
     pub flex_models: Option<Option<Vec<String>>>,
+    pub can_create_children: Option<bool>,
 }
 
 #[expect(
@@ -59,12 +63,21 @@ pub(crate) struct UpdateTokenRequest {
     reason = "outer None is absent field, inner None is explicit null"
 )]
 /// Distinguishes an absent field (outer None) from an explicit null (inner None).
-fn some_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn some_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
     Ok(Some(Option::<T>::deserialize(d)?))
+}
+
+pub(crate) fn usage_snapshot_json(w: UsageSnapshot) -> serde_json::Value {
+    json!({
+        "window_cost": w.cost,
+        "window_tokens": w.tokens,
+        "window_prompt_tokens": w.prompt_tokens,
+        "window_completion_tokens": w.completion_tokens,
+    })
 }
 
 pub(crate) async fn create_token(
@@ -90,6 +103,7 @@ pub(crate) async fn create_token(
     record.token_limit_reset = req.token_limit_reset.unwrap_or_default();
     record.allowed_models = req.allowed_models;
     record.flex_models = req.flex_models;
+    record.can_create_children = req.can_create_children;
 
     let db = state.db.clone();
     let record_clone = record.clone();
@@ -109,18 +123,25 @@ pub(crate) async fn list_tokens(
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let db = state.db.clone();
     let tokens = blocking(move || db.list()).await?;
+    let mut child_counts: HashMap<String, usize> = HashMap::new();
+    for t in &tokens {
+        if let Some(pid) = &t.parent_id {
+            *child_counts.entry(pid.clone()).or_default() += 1;
+        }
+    }
     let now = time::OffsetDateTime::now_utc();
     let items = tokens
         .into_iter()
         .map(|record| {
             let w = state.usage_tracker.snapshot(&record, now);
             let mut body = serde_json::to_value(&record).expect("KeyRecord serializes");
-            body["usage"] = json!({
-                "window_cost": w.cost,
-                "window_tokens": w.tokens,
-                "window_prompt_tokens": w.prompt_tokens,
-                "window_completion_tokens": w.completion_tokens,
-            });
+            body["usage"] = usage_snapshot_json(w);
+            if record.parent_id.is_none() {
+                let cw = state.usage_tracker.children_snapshot(&record, now);
+                body["children_usage"] = usage_snapshot_json(cw);
+                body["children_count"] =
+                    json!(child_counts.get(&record.id).copied().unwrap_or(0));
+            }
             body
         })
         .collect();
@@ -134,12 +155,28 @@ pub(crate) async fn get_token(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let db = state.db.clone();
+    let tracker = Arc::clone(&state.usage_tracker);
     let detail = blocking(move || {
         let Some(record) = db.get(&id)? else {
             return Ok(None);
         };
         let mut body = serde_json::to_value(&record).expect("KeyRecord serializes");
         body["usage"] = usage_windows(&db, &Filters::for_token(&id))?;
+        if record.parent_id.is_none() {
+            body["children_usage"] = usage_windows(&db, &Filters::for_parent(&id))?;
+            let now = time::OffsetDateTime::now_utc();
+            let children: Vec<serde_json::Value> = db
+                .list_children(&id)?
+                .into_iter()
+                .map(|c| {
+                    let w = tracker.snapshot(&c, now);
+                    let mut cbody = serde_json::to_value(&c).expect("KeyRecord serializes");
+                    cbody["usage"] = usage_snapshot_json(w);
+                    cbody
+                })
+                .collect();
+            body["children"] = json!(children);
+        }
         Ok(Some(body))
     })
     .await?
@@ -191,6 +228,14 @@ pub(crate) async fn update_token(
         }
         record.flex_models = models;
     }
+    if let Some(can_create) = req.can_create_children {
+        if can_create && record.parent_id.is_some() {
+            return Err(AppError::BadRequest(
+                "child keys cannot create child keys".into(),
+            ));
+        }
+        record.can_create_children = can_create;
+    }
 
     let limits_changed = record.credit_limit != before.credit_limit
         || record.credit_limit_reset != before.credit_limit_reset
@@ -223,16 +268,16 @@ pub(crate) async fn delete_token(
 ) -> Result<StatusCode, AppError> {
     let db = state.db.clone();
     let id_clone = id.clone();
-    let removed = blocking(move || db.delete(&id_clone)).await?;
+    let removed = blocking(move || db.delete_cascade(&id_clone)).await?;
 
-    match removed {
-        Some(hash) => {
-            state.token_cache.remove(&hash);
-            state.usage_tracker.remove(&id);
-            Ok(StatusCode::NO_CONTENT)
-        }
-        None => Err(AppError::NotFound),
+    if removed.is_empty() {
+        return Err(AppError::NotFound);
     }
+    for (del_id, hash) in removed {
+        state.token_cache.remove(&hash);
+        state.usage_tracker.remove(&del_id);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(crate) async fn blocking<T, F>(f: F) -> Result<T, AppError>
@@ -246,7 +291,7 @@ where
         .map_err(|e| AppError::Internal(e.to_string()))
 }
 
-fn validate_name(name: &str) -> Result<String, AppError> {
+pub(crate) fn validate_name(name: &str) -> Result<String, AppError> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err(AppError::BadRequest("token name must not be empty".into()));
@@ -254,7 +299,7 @@ fn validate_name(name: &str) -> Result<String, AppError> {
     Ok(name)
 }
 
-fn validate_credit_limit(limit: Option<f64>) -> Result<(), AppError> {
+pub(crate) fn validate_credit_limit(limit: Option<f64>) -> Result<(), AppError> {
     if let Some(v) = limit
         && (!v.is_finite() || v < 0.0)
     {
@@ -265,7 +310,7 @@ fn validate_credit_limit(limit: Option<f64>) -> Result<(), AppError> {
     Ok(())
 }
 
-fn validate_token_limit(limit: Option<i64>) -> Result<(), AppError> {
+pub(crate) fn validate_token_limit(limit: Option<i64>) -> Result<(), AppError> {
     if let Some(v) = limit
         && v < 0
     {
@@ -281,7 +326,11 @@ fn validate_token_limit(limit: Option<i64>) -> Result<(), AppError> {
 /// silently never force flex). Aliases are rejected for the same reason:
 /// the proxy matches these lists against the canonical name an alias
 /// resolves to, so an aliased entry would never match anything.
-fn validate_model_list(state: &AppState, models: &[String], field: &str) -> Result<(), AppError> {
+pub(crate) fn validate_model_list(
+    state: &AppState,
+    models: &[String],
+    field: &str,
+) -> Result<(), AppError> {
     let routing = state.routing();
     for m in models {
         match routing.model_named(m) {

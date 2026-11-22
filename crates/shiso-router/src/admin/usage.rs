@@ -16,6 +16,7 @@ pub(crate) struct UsageQuery {
     /// `day` (default) | `model` | `token` | `backend`.
     pub group_by: Option<String>,
     pub token_id: Option<String>,
+    pub include_children: Option<bool>,
     pub model: Option<String>,
     pub backend: Option<String>,
     pub since: Option<String>,
@@ -47,6 +48,15 @@ impl RangeQuery {
 #[derive(Default, Clone)]
 pub(crate) struct Filters {
     pub token_id: Option<String>,
+    /// When `true` alongside `token_id`, matches both direct rows
+    /// (`token_id = ?`) and child rows (`parent_token_id = ?`).
+    pub include_children: bool,
+    /// Matches only child rows whose `parent_token_id` equals this id.
+    pub parent_token_id: Option<String>,
+    /// Tenant scope for `/v1/keys/usage`: matches `(l.token_id = ? OR l.parent_token_id = ?)`,
+    /// independent of `token_id` so filtering by a specific `token_id` can never
+    /// escape the caller's ownership boundary.
+    pub scope_parent_id: Option<String>,
     pub model: Option<String>,
     pub backend: Option<String>,
     pub since: Option<i64>,
@@ -57,6 +67,13 @@ impl Filters {
     pub(crate) fn for_token(id: &str) -> Self {
         Filters {
             token_id: Some(id.to_string()),
+            ..Filters::default()
+        }
+    }
+
+    pub(crate) fn for_parent(id: &str) -> Self {
+        Filters {
+            parent_token_id: Some(id.to_string()),
             ..Filters::default()
         }
     }
@@ -78,8 +95,23 @@ impl Filters {
     fn push_clauses(&self, sql: &mut String, params: &mut Vec<rusqlite::types::Value>) {
         use rusqlite::types::Value;
         if let Some(t) = &self.token_id {
-            sql.push_str(" AND l.token_id = ?");
-            params.push(t.clone().into());
+            if self.include_children {
+                sql.push_str(" AND (l.token_id = ? OR l.parent_token_id = ?)");
+                params.push(t.clone().into());
+                params.push(t.clone().into());
+            } else {
+                sql.push_str(" AND l.token_id = ?");
+                params.push(t.clone().into());
+            }
+        }
+        if let Some(p) = &self.parent_token_id {
+            sql.push_str(" AND l.parent_token_id = ?");
+            params.push(p.clone().into());
+        }
+        if let Some(s) = &self.scope_parent_id {
+            sql.push_str(" AND (l.token_id = ? OR l.parent_token_id = ?)");
+            params.push(s.clone().into());
+            params.push(s.clone().into());
         }
         if let Some(m) = &self.model {
             sql.push_str(" AND l.model = ?");
@@ -104,37 +136,37 @@ impl Filters {
 /// for a human-readable label (only opaque ids need one), and whether the
 /// natural order is chronological rather than biggest-spender-first.
 #[derive(Clone, Copy)]
-struct Grouping {
+pub(crate) struct Grouping {
     expr: &'static str,
     label: Option<&'static str>,
     chronological: bool,
 }
 
 impl Grouping {
-    const DAY: Grouping = Grouping {
+    pub(crate) const DAY: Grouping = Grouping {
         expr: "date(l.created_at/1000, 'unixepoch')",
         label: None,
         chronological: true,
     };
-    const MODEL: Grouping = Grouping {
+    pub(crate) const MODEL: Grouping = Grouping {
         expr: "l.model",
         label: None,
         chronological: false,
     };
-    const BACKEND: Grouping = Grouping {
+    pub(crate) const BACKEND: Grouping = Grouping {
         expr: "l.backend",
         label: None,
         chronological: false,
     };
     /// Token ids are opaque, so the key name is joined in as the label. It
     /// is null once the key is deleted — logs outlive keys.
-    const TOKEN: Grouping = Grouping {
+    pub(crate) const TOKEN: Grouping = Grouping {
         expr: "l.token_id",
         label: Some("MAX(t.name)"),
         chronological: false,
     };
 
-    fn parse(name: &str) -> Result<Grouping, AppError> {
+    pub(crate) fn parse(name: &str) -> Result<Grouping, AppError> {
         match name {
             "day" => Ok(Self::DAY),
             "model" => Ok(Self::MODEL),
@@ -175,6 +207,9 @@ pub(crate) async fn usage_summary(
     let group = Grouping::parse(q.group_by.as_deref().unwrap_or("day"))?;
     let filters = Filters {
         token_id: q.token_id,
+        include_children: q.include_children.unwrap_or(false),
+        parent_token_id: None,
+        scope_parent_id: None,
         model: q.model,
         backend: q.backend,
         since: q.since.as_deref().map(parse_rfc3339_ms).transpose()?,
@@ -250,7 +285,11 @@ const SUM_COLUMNS: &str = "COUNT(*), \
      COALESCE(SUM(l.cached_tokens), 0), COALESCE(SUM(l.total_tokens), 0), \
      COALESCE(SUM(l.cost), 0.0), AVG(l.ttfb_ms), AVG(l.duration_ms)";
 
-fn query_usage(db: &Db, group: Grouping, f: &Filters) -> anyhow::Result<Vec<UsageBucket>> {
+pub(crate) fn query_usage(
+    db: &Db,
+    group: Grouping,
+    f: &Filters,
+) -> anyhow::Result<Vec<UsageBucket>> {
     let join = if group.label.is_some() {
         " LEFT JOIN tokens t ON t.id = l.token_id"
     } else {
@@ -361,4 +400,92 @@ fn window_summary(db: &Db, f: &Filters) -> anyhow::Result<WindowSummary> {
         })?;
         Ok(row)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_filters_separate_direct_children_and_combined_without_double_counting() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let ts = 1_700_000_000_000i64;
+        db.with_write(|conn| {
+            conn.execute(
+                "INSERT INTO request_logs (id, created_at, token_id, parent_token_id, model, path,
+                                           status, total_tokens, cost)
+                 VALUES ('r1', ?1, 'p1', NULL, 'm1', '/v1/chat/completions', 200, 100, 0.10)",
+                [ts],
+            )?;
+            conn.execute(
+                "INSERT INTO request_logs (id, created_at, token_id, parent_token_id, model, path,
+                                           status, total_tokens, cost)
+                 VALUES ('r2', ?1, 'c1', 'p1', 'm1', '/v1/chat/completions', 200, 250, 0.25)",
+                [ts],
+            )?;
+            conn.execute(
+                "INSERT INTO request_logs (id, created_at, token_id, parent_token_id, model, path,
+                                           status, total_tokens, cost)
+                 VALUES ('r3', ?1, 'other', NULL, 'm1', '/v1/chat/completions', 200, 50, 0.05)",
+                [ts],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Global: each row counted once (100 + 250 + 50 = 400).
+        let global = query_usage(&db, Grouping::MODEL, &Filters::default()).unwrap();
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].total_tokens, 400);
+        assert!((global[0].cost - 0.40).abs() < 1e-12);
+
+        // Parent direct only: 100.
+        let direct = query_usage(&db, Grouping::MODEL, &Filters::for_token("p1")).unwrap();
+        assert_eq!(direct[0].total_tokens, 100);
+
+        // Parent children only: 250.
+        let children = query_usage(&db, Grouping::MODEL, &Filters::for_parent("p1")).unwrap();
+        assert_eq!(children[0].total_tokens, 250);
+
+        // Parent + include_children: 100 + 250 = 350 (no double counting).
+        let combined = query_usage(
+            &db,
+            Grouping::MODEL,
+            &Filters {
+                token_id: Some("p1".into()),
+                include_children: true,
+                ..Filters::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(combined[0].total_tokens, 350);
+
+        // Scoped query for another tenant's token returns empty.
+        let cross_tenant = query_usage(
+            &db,
+            Grouping::MODEL,
+            &Filters {
+                token_id: Some("other".into()),
+                scope_parent_id: Some("p1".into()),
+                ..Filters::default()
+            },
+        )
+        .unwrap();
+        assert!(cross_tenant.is_empty());
+
+        // Scoped query for own child returns child's rows.
+        let own_child = query_usage(
+            &db,
+            Grouping::MODEL,
+            &Filters {
+                token_id: Some("c1".into()),
+                scope_parent_id: Some("p1".into()),
+                ..Filters::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(own_child.len(), 1);
+        assert_eq!(own_child[0].total_tokens, 250);
+    }
 }
