@@ -801,6 +801,7 @@ impl<S> TeeStream<S> {
 
         sink.accrue(
             &ctx.key,
+            None,
             RequestUsage {
                 cost: ctx.row.cost.unwrap_or(0.0),
                 total_tokens: ctx.row.total_tokens.unwrap_or(0),

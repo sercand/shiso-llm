@@ -113,10 +113,11 @@ impl LogSink {
         }
     }
 
-    /// Accrues token usage synchronously against key limits.
-    pub fn accrue(&self, record: &KeyRecord, usage: RequestUsage) {
+    /// Accrues token usage synchronously against key limits (and the parent's
+    /// children window when `parent` is `Some`).
+    pub fn accrue(&self, record: &KeyRecord, parent: Option<&KeyRecord>, usage: RequestUsage) {
         self.usage
-            .accrue(record, usage, time::OffsetDateTime::now_utc());
+            .accrue(record, parent, usage, time::OffsetDateTime::now_utc());
     }
 
     /// Returns a reference to the active usage tracker.

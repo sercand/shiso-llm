@@ -1221,8 +1221,10 @@ mod tests {
 
         let mut c1 = record("c1", "agent-1");
         c1.parent_id = Some("p1".into());
+        c1.created_at = "2026-01-01T00:00:01Z".into();
         let mut c2 = record("c2", "agent-2");
         c2.parent_id = Some("p1".into());
+        c2.created_at = "2026-01-01T00:00:02Z".into();
         let other = record("o1", "other");
         db.insert(&c1, &hash_token("c1tok")).unwrap();
         db.insert(&c2, &hash_token("c2tok")).unwrap();

@@ -115,6 +115,10 @@ struct KeyUsage {
     /// Separate windows: the two limits may reset on different intervals.
     credit: Mutex<Window>,
     tokens: Mutex<Window>,
+    /// Rolled-up usage of all child keys owned by this key, rolled on this
+    /// parent key's own reset intervals.
+    children_credit: Mutex<Window>,
+    children_tokens: Mutex<Window>,
 }
 
 /// Current-window usage per key, kept in memory so the request hot path
@@ -141,25 +145,42 @@ impl UsageTracker {
     }
 
     /// Hot-path admission check; rejects with 429 insufficient_quota when
-    /// a configured limit is already exhausted in the current window.
+    /// a configured limit is already exhausted in the current window
+    /// (including rolled-up child usage for parent keys).
     pub fn check(&self, record: &KeyRecord, now: time::OffsetDateTime) -> Result<(), AppError> {
         if !record.has_limits() {
             return Ok(());
         }
         let usage = self.entry(&record.id);
         if let Some(limit) = record.credit_limit {
-            let mut w = usage.credit.lock().unwrap();
-            roll(&mut w, record.credit_limit_reset, now);
-            if w.cost >= limit {
+            let direct_cost = {
+                let mut w = usage.credit.lock().unwrap();
+                roll(&mut w, record.credit_limit_reset, now);
+                w.cost
+            };
+            let child_cost = {
+                let mut cw = usage.children_credit.lock().unwrap();
+                roll(&mut cw, record.credit_limit_reset, now);
+                cw.cost
+            };
+            if direct_cost + child_cost >= limit {
                 return Err(AppError::QuotaExceeded(format!(
                     "credit limit of ${limit} reached for this API key"
                 )));
             }
         }
         if let Some(limit) = record.token_limit {
-            let mut w = usage.tokens.lock().unwrap();
-            roll(&mut w, record.token_limit_reset, now);
-            if w.tokens >= limit {
+            let direct_tokens = {
+                let mut w = usage.tokens.lock().unwrap();
+                roll(&mut w, record.token_limit_reset, now);
+                w.tokens
+            };
+            let child_tokens = {
+                let mut cw = usage.children_tokens.lock().unwrap();
+                roll(&mut cw, record.token_limit_reset, now);
+                cw.tokens
+            };
+            if direct_tokens + child_tokens >= limit {
                 return Err(AppError::QuotaExceeded(format!(
                     "token limit of {limit} tokens reached for this API key"
                 )));
@@ -168,8 +189,16 @@ impl UsageTracker {
         Ok(())
     }
 
-    /// Adds one finished request's usage to the key's current windows.
-    pub fn accrue(&self, record: &KeyRecord, usage: RequestUsage, now: time::OffsetDateTime) {
+    /// Adds one finished request's usage to the key's current windows, and
+    /// when `parent` is `Some`, also accrues it into the parent's separate
+    /// children windows using the parent's reset intervals.
+    pub fn accrue(
+        &self,
+        record: &KeyRecord,
+        parent: Option<&KeyRecord>,
+        usage: RequestUsage,
+        now: time::OffsetDateTime,
+    ) {
         if usage.is_empty() {
             return;
         }
@@ -186,9 +215,24 @@ impl UsageTracker {
             w.prompt += usage.prompt_tokens;
             w.completion += usage.completion_tokens;
         }
+        if let Some(p) = parent {
+            let parent_entry = self.entry(&p.id);
+            {
+                let mut w = parent_entry.children_credit.lock().unwrap();
+                roll(&mut w, p.credit_limit_reset, now);
+                w.cost += usage.cost;
+            }
+            {
+                let mut w = parent_entry.children_tokens.lock().unwrap();
+                roll(&mut w, p.token_limit_reset, now);
+                w.tokens += usage.total_tokens;
+                w.prompt += usage.prompt_tokens;
+                w.completion += usage.completion_tokens;
+            }
+        }
     }
 
-    /// Current-window usage for display, rolling first.
+    /// Current-window direct usage for display, rolling first.
     pub fn snapshot(&self, record: &KeyRecord, now: time::OffsetDateTime) -> UsageSnapshot {
         let entry = self.entry(&record.id);
         let cost = {
@@ -197,6 +241,28 @@ impl UsageTracker {
             w.cost
         };
         let mut w = entry.tokens.lock().unwrap();
+        roll(&mut w, record.token_limit_reset, now);
+        UsageSnapshot {
+            cost,
+            tokens: w.tokens,
+            prompt_tokens: w.prompt,
+            completion_tokens: w.completion,
+        }
+    }
+
+    /// Current-window rolled-up child usage for a parent key, rolling first.
+    pub fn children_snapshot(
+        &self,
+        record: &KeyRecord,
+        now: time::OffsetDateTime,
+    ) -> UsageSnapshot {
+        let entry = self.entry(&record.id);
+        let cost = {
+            let mut w = entry.children_credit.lock().unwrap();
+            roll(&mut w, record.credit_limit_reset, now);
+            w.cost
+        };
+        let mut w = entry.children_tokens.lock().unwrap();
         roll(&mut w, record.token_limit_reset, now);
         UsageSnapshot {
             cost,
@@ -235,6 +301,26 @@ impl UsageTracker {
             prompt: token_sums.prompt_tokens,
             completion: token_sums.completion_tokens,
         };
+        if record.parent_id.is_none() {
+            let child_credit_sums = children_sums_since(db, &record.id, credit_start)?;
+            let child_token_sums = if token_start == credit_start {
+                child_credit_sums
+            } else {
+                children_sums_since(db, &record.id, token_start)?
+            };
+            *entry.children_credit.lock().unwrap() = Window {
+                start_ms: credit_start,
+                cost: child_credit_sums.cost,
+                ..Window::default()
+            };
+            *entry.children_tokens.lock().unwrap() = Window {
+                start_ms: token_start,
+                cost: 0.0,
+                tokens: child_token_sums.total_tokens,
+                prompt: child_token_sums.prompt_tokens,
+                completion: child_token_sums.completion_tokens,
+            };
+        }
         Ok(())
     }
 
@@ -262,6 +348,26 @@ fn sums_since(db: &Db, token_id: &str, since_ms: i64) -> anyhow::Result<RequestU
                     COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0)
              FROM request_logs WHERE token_id = ?1 AND created_at >= ?2",
             rusqlite::params![token_id, since_ms],
+            |row| {
+                Ok(RequestUsage {
+                    cost: row.get(0)?,
+                    total_tokens: row.get(1)?,
+                    prompt_tokens: row.get(2)?,
+                    completion_tokens: row.get(3)?,
+                })
+            },
+        )?;
+        Ok(row)
+    })
+}
+
+fn children_sums_since(db: &Db, parent_id: &str, since_ms: i64) -> anyhow::Result<RequestUsage> {
+    db.with_read(|conn| {
+        let row = conn.query_row(
+            "SELECT COALESCE(SUM(cost), 0.0), COALESCE(SUM(total_tokens), 0),
+                    COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0)
+             FROM request_logs WHERE parent_token_id = ?1 AND created_at >= ?2",
+            rusqlite::params![parent_id, since_ms],
             |row| {
                 Ok(RequestUsage {
                     cost: row.get(0)?,
@@ -373,7 +479,7 @@ mod tests {
         let tracker = UsageTracker::new();
         let rec = KeyRecord::new("k".into());
         let now = at("2026-07-19T10:00:00Z");
-        tracker.accrue(&rec, usage(1e9, i64::MAX / 2), now);
+        tracker.accrue(&rec, None, usage(1e9, i64::MAX / 2), now);
         assert!(tracker.check(&rec, now).is_ok());
     }
 
@@ -384,7 +490,7 @@ mod tests {
         let now = at("2026-07-19T10:00:00Z");
         assert!(tracker.check(&rec, now).is_ok());
         // Overshoot is allowed on accrual; the next check rejects.
-        tracker.accrue(&rec, usage(0.015, 100), now);
+        tracker.accrue(&rec, None, usage(0.015, 100), now);
         let err = tracker.check(&rec, now).unwrap_err();
         assert!(matches!(err, AppError::QuotaExceeded(_)));
         // Still rejected later the same day...
@@ -398,7 +504,7 @@ mod tests {
         let tracker = UsageTracker::new();
         let rec = limited_key(Some(100.0), Some(50));
         let now = at("2026-07-19T10:00:00Z");
-        tracker.accrue(&rec, usage(0.0, 60), now);
+        tracker.accrue(&rec, None, usage(0.0, 60), now);
         assert!(matches!(
             tracker.check(&rec, now),
             Err(AppError::QuotaExceeded(_))
@@ -421,10 +527,10 @@ mod tests {
     fn accrual_in_old_window_after_rollover_starts_fresh() {
         let tracker = UsageTracker::new();
         let rec = limited_key(Some(1.0), None);
-        tracker.accrue(&rec, usage(0.9, 0), at("2026-07-19T10:00:00Z"));
+        tracker.accrue(&rec, None, usage(0.9, 0), at("2026-07-19T10:00:00Z"));
         // Accruing on a later day rolls the window first: the new day
         // starts from zero, not 0.9.
-        tracker.accrue(&rec, usage(0.2, 0), at("2026-07-20T10:00:00Z"));
+        tracker.accrue(&rec, None, usage(0.2, 0), at("2026-07-20T10:00:00Z"));
         let w = tracker.snapshot(&rec, at("2026-07-20T11:00:00Z"));
         assert!((w.cost - 0.2).abs() < 1e-12);
         assert!(tracker.check(&rec, at("2026-07-20T11:00:00Z")).is_ok());
@@ -499,5 +605,95 @@ mod tests {
             window_start_ms(ResetInterval::Monthly, at("2028-02-29T12:00:00Z")),
             ms("2028-02-01T00:00:00Z")
         );
+    }
+
+    #[test]
+    fn child_accrual_rolls_into_parent_and_enforces_parent_limit() {
+        let tracker = UsageTracker::new();
+        let mut parent = KeyRecord::new("parent".into());
+        parent.id = "p1".into();
+        parent.credit_limit = Some(1.0);
+        parent.credit_limit_reset = ResetInterval::Daily;
+        let mut child = KeyRecord::new("child".into());
+        child.id = "c1".into();
+        child.parent_id = Some("p1".into());
+
+        let now = at("2026-07-19T10:00:00Z");
+        tracker.accrue(&parent, None, usage(0.40, 100), now);
+        tracker.accrue(&child, Some(&parent), usage(0.65, 200), now);
+
+        let ps = tracker.snapshot(&parent, now);
+        let pcs = tracker.children_snapshot(&parent, now);
+        let cs = tracker.snapshot(&child, now);
+        assert!((ps.cost - 0.40).abs() < 1e-12);
+        assert!((pcs.cost - 0.65).abs() < 1e-12);
+        assert_eq!(pcs.tokens, 200);
+        assert!((cs.cost - 0.65).abs() < 1e-12);
+
+        assert!(matches!(
+            tracker.check(&parent, now),
+            Err(AppError::QuotaExceeded(_))
+        ));
+        assert!(tracker.check(&parent, at("2026-07-20T00:00:00Z")).is_ok());
+    }
+
+    #[test]
+    fn warm_key_loads_children_sums_even_after_child_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let now = at("2026-07-19T12:00:00Z");
+        db.with_write(|conn| {
+            conn.execute(
+                "INSERT INTO request_logs (id, created_at, token_id, parent_token_id, model, path,
+                                           cost, total_tokens, prompt_tokens, completion_tokens)
+                 VALUES ('r1', ?1, 'p1', NULL, 'm', '/v1/chat/completions', 0.30, 100, 80, 20)",
+                rusqlite::params![ms("2026-07-19T01:00:00Z")],
+            )?;
+            conn.execute(
+                "INSERT INTO request_logs (id, created_at, token_id, parent_token_id, model, path,
+                                           cost, total_tokens, prompt_tokens, completion_tokens)
+                 VALUES ('r2', ?1, 'deleted-child', 'p1', 'm', '/v1/chat/completions', 0.80, 250, 200, 50)",
+                rusqlite::params![ms("2026-07-19T02:00:00Z")],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let mut parent = KeyRecord::new("parent".into());
+        parent.id = "p1".into();
+        parent.credit_limit = Some(1.0);
+        parent.credit_limit_reset = ResetInterval::Daily;
+
+        let tracker = UsageTracker::new();
+        tracker.warm_key(&db, &parent, now).unwrap();
+
+        let ps = tracker.snapshot(&parent, now);
+        let pcs = tracker.children_snapshot(&parent, now);
+        assert!((ps.cost - 0.30).abs() < 1e-12);
+        assert_eq!(ps.tokens, 100);
+        assert!((pcs.cost - 0.80).abs() < 1e-12);
+        assert_eq!(pcs.tokens, 250);
+        assert!(matches!(
+            tracker.check(&parent, now),
+            Err(AppError::QuotaExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn removing_child_does_not_clear_parent_children_usage() {
+        let tracker = UsageTracker::new();
+        let mut parent = KeyRecord::new("parent".into());
+        parent.id = "p1".into();
+        let mut child = KeyRecord::new("child".into());
+        child.id = "c1".into();
+        child.parent_id = Some("p1".into());
+
+        let now = at("2026-07-19T10:00:00Z");
+        tracker.accrue(&child, Some(&parent), usage(0.50, 120), now);
+        tracker.remove(&child.id);
+
+        let pcs = tracker.children_snapshot(&parent, now);
+        assert!((pcs.cost - 0.50).abs() < 1e-12);
+        assert_eq!(pcs.tokens, 120);
     }
 }
