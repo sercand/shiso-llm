@@ -5,6 +5,7 @@ use axum::http::HeaderMap;
 use axum::{Extension, Json};
 use serde_json::json;
 
+use crate::error::AppError;
 use crate::state::AppState;
 use crate::tokens::KeyRecord;
 
@@ -17,19 +18,31 @@ pub(crate) async fn list_models(
     State(state): State<AppState>,
     Extension(key): Extension<Arc<KeyRecord>>,
     headers: HeaderMap,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, AppError> {
     let routing = state.routing();
+    let parent = match key.parent_id.as_deref() {
+        Some(pid) => match state.token_cache.get_by_id(pid) {
+            Some(p) if !p.disabled => Some(p),
+            _ => return Err(AppError::Forbidden("parent API key is disabled".into())),
+        },
+        None => None,
+    };
     let mut names: Vec<&str> = routing
         .models
         .iter()
-        .filter(|m| key.allows_model(&m.name, m.private))
+        .filter(|m| {
+            key.allows_model(&m.name, m.private)
+                && parent
+                    .as_ref()
+                    .is_none_or(|p| p.allows_model(&m.name, m.private))
+        })
         .map(|m| m.name.as_str())
         .collect();
     names.sort_unstable();
-    Json(models_response(
+    Ok(Json(models_response(
         &names,
         headers.contains_key("anthropic-version"),
-    ))
+    )))
 }
 
 /// The catalog stores no creation time, so both shapes advertise the epoch

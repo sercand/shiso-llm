@@ -5,12 +5,12 @@
 mod active;
 mod backends;
 mod groups;
-mod keys;
-mod logs;
+pub(crate) mod keys;
+pub(crate) mod logs;
 mod models;
 mod playground;
 mod ui;
-mod usage;
+pub(crate) mod usage;
 
 pub(crate) use active::list_active;
 pub(crate) use backends::{

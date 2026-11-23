@@ -56,6 +56,9 @@ pub struct LogRow {
     /// `proxy::service_tier` — `None` for ordinary traffic (no header, or
     /// the `auto`/`default` tiers).
     pub service_tier: Option<String>,
+    /// Parent API key identifier when the request was authenticated by a
+    /// child key; `None` for top-level keys.
+    pub parent_token_id: Option<String>,
 }
 
 impl LogRow {
@@ -82,6 +85,7 @@ impl LogRow {
             finish_reason: None,
             error: None,
             service_tier: None,
+            parent_token_id: None,
         }
     }
 }
@@ -109,10 +113,11 @@ impl LogSink {
         }
     }
 
-    /// Accrues token usage synchronously against key limits.
-    pub fn accrue(&self, record: &KeyRecord, usage: RequestUsage) {
+    /// Accrues token usage synchronously against key limits (and the parent's
+    /// children window when `parent` is `Some`).
+    pub fn accrue(&self, record: &KeyRecord, parent: Option<&KeyRecord>, usage: RequestUsage) {
         self.usage
-            .accrue(record, usage, time::OffsetDateTime::now_utc());
+            .accrue(record, parent, usage, time::OffsetDateTime::now_utc());
     }
 
     /// Returns a reference to the active usage tracker.
@@ -161,9 +166,9 @@ fn insert_batch(db: &Db, rows: &[LogRow]) -> Result<()> {
                     path, status, streamed, ttfb_ms, duration_ms,
                     prompt_tokens, completion_tokens, cached_tokens,
                     cache_write_tokens, total_tokens, cost, finish_reason, error,
-                    service_tier
+                    service_tier, parent_token_id
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                           ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                           ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             )?;
             for row in rows {
                 stmt.execute(rusqlite::params![
@@ -187,6 +192,7 @@ fn insert_batch(db: &Db, rows: &[LogRow]) -> Result<()> {
                     row.finish_reason,
                     row.error,
                     row.service_tier,
+                    row.parent_token_id,
                 ])?;
             }
         }
@@ -221,6 +227,7 @@ mod tests {
             finish_reason: Some("stop".into()),
             error: None,
             service_tier: Some("flex".into()),
+            parent_token_id: Some("parent-1".into()),
         }
     }
 
@@ -241,17 +248,18 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 2);
-        let (status, cached, tier): (Option<u16>, Option<i64>, Option<String>) = db
+        let (status, cached, tier, parent): (Option<u16>, Option<i64>, Option<String>, Option<String>) = db
             .with_read(|conn| {
                 Ok(conn.query_row(
-                    "SELECT status, cached_tokens, service_tier FROM request_logs WHERE id = 'a'",
+                    "SELECT status, cached_tokens, service_tier, parent_token_id FROM request_logs WHERE id = 'a'",
                     [],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )?)
             })
             .unwrap();
         assert_eq!(status, Some(200));
         assert_eq!(cached, Some(20));
         assert_eq!(tier.as_deref(), Some("flex"));
+        assert_eq!(parent.as_deref(), Some("parent-1"));
     }
 }

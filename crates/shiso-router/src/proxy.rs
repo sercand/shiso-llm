@@ -174,6 +174,18 @@ pub(crate) async fn proxy_request(desc: ProxyRequestDesc) -> Result<Response, Ap
     })?;
 
     let mut row = LogRow::new(key.id.clone(), probe.model.clone(), path.clone());
+    row.parent_token_id = key.parent_id.clone();
+    // Fail closed if the parent was deleted or disabled between auth and here.
+    let parent = match key.parent_id.as_deref() {
+        Some(pid) => match state.token_cache.get_by_id(pid) {
+            Some(p) if !p.disabled => Some(p),
+            _ => {
+                let err = AppError::Forbidden("parent API key is disabled".into());
+                return Err(reject(&state, row, started, err, tracer.as_deref()));
+            }
+        },
+        None => None,
+    };
     if let Some(t) = &tracer {
         row.id = t.id().to_string();
     }
@@ -198,7 +210,8 @@ pub(crate) async fn proxy_request(desc: ProxyRequestDesc) -> Result<Response, Ap
     // The effective tier is the operator's choice when this key forces flex
     // for this model, and the client's hint otherwise. Recording it after
     // alias resolution means the log matches the canonical model.
-    let force_flex = key.forces_flex(model);
+    let force_flex =
+        key.forces_flex(model) || parent.as_ref().is_some_and(|p| p.forces_flex(model));
     row.service_tier = if force_flex {
         Some("flex".to_string())
     } else {
@@ -222,7 +235,11 @@ pub(crate) async fn proxy_request(desc: ProxyRequestDesc) -> Result<Response, Ap
     // tee, which holds it for the life of the response.
     let active = state.active.register(&row, &key.name);
 
-    if !key.allows_model(model, route.private) {
+    let model_allowed = key.allows_model(model, route.private)
+        && parent
+            .as_ref()
+            .is_none_or(|p| p.allows_model(model, route.private));
+    if !model_allowed {
         // A private model the key does not name must be indistinguishable
         // from an unknown one: a 403 would confirm that it exists.
         let err = if route.private {
@@ -236,9 +253,12 @@ pub(crate) async fn proxy_request(desc: ProxyRequestDesc) -> Result<Response, Ap
         return Err(reject(&state, row, started, err, tracer.as_deref()));
     }
 
-    if let Err(err) = state
-        .usage_tracker
-        .check(&key, time::OffsetDateTime::now_utc())
+    let now = time::OffsetDateTime::now_utc();
+    if let Err(err) = state.usage_tracker.check(&key, now) {
+        return Err(reject(&state, row, started, err, tracer.as_deref()));
+    }
+    if let Some(p) = &parent
+        && let Err(err) = state.usage_tracker.check(p, now)
     {
         return Err(reject(&state, row, started, err, tracer.as_deref()));
     }
@@ -465,6 +485,7 @@ pub(crate) async fn proxy_request(desc: ProxyRequestDesc) -> Result<Response, Ap
                     model,
                     attempt_notes,
                     key,
+                    parent,
                     trace: tracer,
                     slot,
                     active,
@@ -499,6 +520,7 @@ pub(crate) async fn proxy_request(desc: ProxyRequestDesc) -> Result<Response, Ap
             model,
             attempt_notes,
             key,
+            parent,
             trace: tracer,
             slot,
             active,
@@ -546,6 +568,7 @@ struct RelayDesc<'a> {
     model: &'a str,
     attempt_notes: Vec<String>,
     key: Arc<KeyRecord>,
+    parent: Option<Arc<KeyRecord>>,
     trace: Option<Arc<Tracer>>,
     slot: SlotGuard,
     active: ActiveGuard,
@@ -563,6 +586,7 @@ fn relay(desc: RelayDesc<'_>) -> Response {
         model,
         attempt_notes,
         key,
+        parent,
         trace,
         slot,
         active,
@@ -579,6 +603,7 @@ fn relay(desc: RelayDesc<'_>) -> Response {
         pricing: target.pricing,
         dialect,
         key,
+        parent,
         trace,
         // From here the slot's lifetime is the stream's: the tee releases
         // it on completion, error, or client disconnect alike. The registry

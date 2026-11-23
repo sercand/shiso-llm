@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>llm-router admin</title>
+<title>shiso router</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
   // Shiso design tokens as Tailwind colors. Opacity modifiers (bg-card/60) mix toward transparent.
@@ -404,7 +404,14 @@ a.s-card:hover, a.s-card:focus-visible { box-shadow: var(--shiso-shadow), 0 0 0 
 <!-- Login overlay -->
 <div id="login" class="hidden fixed inset-0 z-50 bg-canvas flex items-center justify-center">
   <form id="login-form" class="s-card w-80 space-y-4">
-    <h1 class="s-h3">llm-router admin</h1>
+    <h1 class="s-h3 flex items-center gap-2">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" class="h-6 w-6 flex-none" role="img" aria-label="shiso">
+        <path d="M12 52C12 29 29 12 52 12C52 35 35 52 12 52Z" fill="var(--shiso-primary)" fill-opacity=".28"/>
+        <path d="M12 52C12 29 29 12 52 12C52 35 35 52 12 52Z" fill="none" stroke="var(--shiso-primary)" stroke-width="3.4" stroke-linejoin="round"/>
+        <path d="M52 12C38 19 25 31 9 55" fill="none" stroke="var(--shiso-primary)" stroke-width="3.4" stroke-linecap="round"/>
+      </svg>
+      <span>router</span>
+    </h1>
     <p class="text-sm text-ink-2">Enter the admin token from your router config.</p>
     <input id="login-token" type="password" placeholder="admin token" autocomplete="current-password"
       class="s-input w-full">
@@ -417,7 +424,14 @@ a.s-card:hover, a.s-card:focus-visible { box-shadow: var(--shiso-shadow), 0 0 0 
 <div id="app" class="hidden mx-auto max-w-6xl px-4 pb-16">
   <nav class="flex items-center justify-between py-5">
     <div class="flex items-center gap-8">
-      <span class="s-h3">llm-router</span>
+      <a href="#/keys" class="flex items-center gap-2 text-ink no-underline hover:no-underline">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" class="h-6 w-6 flex-none" role="img" aria-label="shiso">
+          <path d="M12 52C12 29 29 12 52 12C52 35 35 52 12 52Z" fill="var(--shiso-primary)" fill-opacity=".28"/>
+          <path d="M12 52C12 29 29 12 52 12C52 35 35 52 12 52Z" fill="none" stroke="var(--shiso-primary)" stroke-width="3.4" stroke-linejoin="round"/>
+          <path d="M52 12C38 19 25 31 9 55" fill="none" stroke="var(--shiso-primary)" stroke-width="3.4" stroke-linecap="round"/>
+        </svg>
+        <span class="s-h3">router</span>
+      </a>
       <div class="s-seg">
         <a href="#/keys" data-tab="keys" class="tab">API Keys</a>
         <a href="#/analytics" data-tab="analytics" class="tab">Analytics</a>
@@ -641,16 +655,35 @@ const SEGMENTS = [
   { key: "output", name: "Output", fill: OUT_FILL, text: OUT_TEXT, dot: OUT_DOT },
 ];
 
-const stackTotal = p => SEGMENTS.reduce((n, s) => n + p[s.key], 0);
+const HIDDEN_SERIES = new Set();
+const CHART_STORE = new Map();
+let CHART_SEQ = 0;
+
+function toggleSeries(key) {
+  if (HIDDEN_SERIES.has(key)) HIDDEN_SERIES.delete(key);
+  else HIDDEN_SERIES.add(key);
+  for (const el of $$("[data-usage-chart]")) {
+    const id = el.dataset.usageChart;
+    const rows = CHART_STORE.get(id);
+    if (rows) el.innerHTML = renderUsageChartInner(rows);
+  }
+}
+
+const visibleSegments = () => SEGMENTS.filter(s => !HIDDEN_SERIES.has(s.key));
+const stackTotal = p => visibleSegments().reduce((n, s) => n + p[s.key], 0);
+const fullTotal = p => SEGMENTS.reduce((n, s) => n + p[s.key], 0);
 
 // Hand-rolled SVG chart: one stacked bar per day. Segments carry a 2px
 // surface gap so the boundaries read without relying on hue alone, and a
 // transparent full-height rect per column carries the tooltip so thin bars
 // stay hoverable.
 function stackedBarChart(points) {
-  const max = Math.max(...points.map(stackTotal));
-  if (!points.length || max <= 0) {
-    return `<div class="flex h-40 items-center justify-center text-sm text-ink-2">no usage yet</div>`;
+  const vis = visibleSegments();
+  const max = Math.max(0, ...points.map(stackTotal));
+  if (!points.length || !vis.length || max <= 0) {
+    return `<div class="flex h-40 items-center justify-center text-sm text-ink-2">${
+      !vis.length ? "all series hidden" : "no usage yet"
+    }</div>`;
   }
   const W = 900, H = 160, PAD = 4, GAP = 2;
   const bw = Math.max(4, Math.floor(W / points.length) - 3);
@@ -662,7 +695,7 @@ function stackedBarChart(points) {
     // baseline; empty segments are skipped so they cost no gap.
     let acc = 0;
     const drawn = [];
-    for (const seg of SEGMENTS) {
+    for (const seg of vis) {
       if (p[seg.key] <= 0) continue;
       const bottom = scale(acc);
       acc += p[seg.key];
@@ -677,7 +710,7 @@ function stackedBarChart(points) {
     const input = p.cached + p.input;
     const tip = SEGMENTS.map(seg => `${seg.name}: ${fmtInt(p[seg.key])}`
       + (seg.key === "cached" && input > 0 ? ` (${pct(p.cached, input).toFixed(0)}% of input)` : "")).join("\n");
-    return `<g><title>${esc(`${p.label}\n${tip}\nTotal: ${fmtInt(stackTotal(p))} tok\nCost: ${fmtCost(p.cost)}`)}</title>
+    return `<g><title>${esc(`${p.label}\n${tip}\nTotal: ${fmtInt(fullTotal(p))} tok\nCost: ${fmtCost(p.cost)}`)}</title>
       <rect x="${x}" y="0" width="${bw}" height="${H}" class="fill-transparent hover:fill-fill/40"></rect>
       ${rects}
     </g>`;
@@ -703,13 +736,7 @@ function rangePicker() {
   </div>`;
 }
 
-/// Daily token usage over the selected range, split cached input vs the
-/// uncached remainder vs output. `prompt_tokens` includes the cached subset
-/// (see logging.rs), so the remainder is the subtraction — clamped at zero
-/// in case a provider ever reports a cached count above its own prompt
-/// total. Spend rides along in the header and tooltips so the cost view
-/// isn't lost.
-function usageChart(rows) {
+function renderUsageChartInner(rows) {
   const points = rangeDayBuckets(rows).map(({ day, row }) => {
     const prompt = row ? row.prompt_tokens || 0 : 0;
     const cached = Math.min(prompt, row ? row.cached_tokens || 0 : 0);
@@ -723,21 +750,40 @@ function usageChart(rows) {
   });
   const totals = Object.fromEntries(SEGMENTS.map(s => [s.key, sumBy(points, p => p[s.key])]));
   const cost = sumBy(points, p => p.cost);
-  const total = SEGMENTS.reduce((n, s) => n + totals[s.key], 0);
-  return card(`<div class="p-5">
+  const total = visibleSegments().reduce((n, s) => n + totals[s.key], 0);
+  return `<div class="p-5">
     <div class="flex flex-wrap items-baseline justify-between gap-2">
       <div class="flex items-center gap-3">
         <h2 class="text-sm font-medium text-ink-2">Tokens · last ${RANGE_DAYS} days</h2>
         ${rangePicker()}
       </div>
       <div class="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-xs">
-        ${SEGMENTS.map(s => `<span class="flex items-center gap-1.5 ${s.text}">${dot(s.dot)} ${s.name} ${fmtInt(totals[s.key])}</span>`).join("")}
+        ${SEGMENTS.map(s => {
+          const hidden = HIDDEN_SERIES.has(s.key);
+          return `<button type="button" onclick="toggleSeries('${s.key}')" aria-pressed="${!hidden}"
+            title="Click to ${hidden ? "show" : "hide"} ${s.name}"
+            class="flex items-center gap-1.5 cursor-pointer bg-transparent border-0 p-0 font-inherit ${s.text} transition-opacity ${
+              hidden ? "opacity-40 line-through" : "hover:opacity-80"
+            }">${dot(s.dot)} ${s.name} ${fmtInt(totals[s.key])}</button>`;
+        }).join("")}
         <span class="s-h2">${fmtInt(total)} tok</span>
         ${cost > 0 ? `<span class="text-ink-2">${fmtCost(cost)}</span>` : ""}
       </div>
     </div>
     <div class="mt-4">${stackedBarChart(points)}</div>
-  </div>`);
+  </div>`;
+}
+
+/// Daily token usage over the selected range, split cached input vs the
+/// uncached remainder vs output. `prompt_tokens` includes the cached subset
+/// (see logging.rs), so the remainder is the subtraction — clamped at zero
+/// in case a provider ever reports a cached count above its own prompt
+/// total. Spend rides along in the header and tooltips so the cost view
+/// isn't lost.
+function usageChart(rows) {
+  const id = String(++CHART_SEQ);
+  CHART_STORE.set(id, rows);
+  return card(`<div data-usage-chart="${id}">${renderUsageChartInner(rows)}</div>`);
 }
 
 /// A share-of-total bar: its width is the row's share of the table's tokens,
@@ -813,7 +859,7 @@ function readKeyForm(form) {
   const checked = name => [...form.querySelectorAll(`input[name=${name}]:checked`)].map(c => c.value);
   const allowed = checked("allowed_models");
   const flex = checked("flex_models");
-  return {
+  const body = {
     name: form.name.value.trim(),
     credit_limit: num(form.credit_limit.value),
     credit_limit_reset: form.credit_limit_reset.value,
@@ -822,6 +868,11 @@ function readKeyForm(form) {
     allowed_models: allowed.length ? allowed : null,
     flex_models: flex.length ? flex : null,
   };
+  const canCreateEl = form.querySelector('input[name="can_create_children"]');
+  if (canCreateEl) {
+    body.can_create_children = canCreateEl.checked;
+  }
+  return body;
 }
 
 function keyFormFields(k = {}) {
@@ -829,6 +880,10 @@ function keyFormFields(k = {}) {
     <label class="s-label block">Name
       <input name="name" required value="${esc(k.name || "")}"
         class="s-input mt-1 w-full"></label>
+    ${!k.parent_id ? `<label class="s-check text-sm">
+      <input type="checkbox" name="can_create_children" ${k.can_create_children ? "checked" : ""}>
+      <span>Can create child keys</span>
+    </label>` : ""}
     <div class="grid grid-cols-2 gap-3">
       <label class="s-label block">Credit limit (USD)
         <input name="credit_limit" type="number" step="any" min="0" value="${k.credit_limit ?? ""}"
@@ -1567,33 +1622,87 @@ function paintTranscript() {
 
 // ---- keys list -------------------------------------------------------
 
-async function renderKeys() {
-  const [keys, usage] = await Promise.all([
-    api("/admin/tokens"),
-    api("/admin/usage?group_by=day&since=" + encodeURIComponent(sinceParam())),
-  ]);
-  const rows = keys.map(k => `
-    <tr class="cursor-pointer border-t border-line hover:bg-fill/50" onclick="location.hash='#/keys/${esc(k.id)}'">
+const EXPANDED_PARENTS = new Set();
+let LAST_KEYS = [];
+
+function toggleParentExpand(ev, id) {
+  ev.stopPropagation();
+  if (EXPANDED_PARENTS.has(id)) EXPANDED_PARENTS.delete(id);
+  else EXPANDED_PARENTS.add(id);
+  const tbody = $("#keys-tbody");
+  if (tbody) tbody.innerHTML = buildKeysRows(LAST_KEYS);
+}
+
+function renderKeyRow(k, children, isChild = false) {
+  const childCost = !isChild && k.children_usage ? (k.children_usage.window_cost || 0) : 0;
+  const childTok = !isChild && k.children_usage ? (k.children_usage.window_tokens || 0) : 0;
+  const childPrompt = !isChild && k.children_usage ? (k.children_usage.window_prompt_tokens || 0) : 0;
+  const childComp = !isChild && k.children_usage ? (k.children_usage.window_completion_tokens || 0) : 0;
+  const totalCost = k.usage.window_cost + childCost;
+  const totalTok = k.usage.window_tokens + childTok;
+  const totalPrompt = k.usage.window_prompt_tokens + childPrompt;
+  const totalComp = k.usage.window_completion_tokens + childComp;
+  const hasChildActivity = !isChild && (childCost > 0 || childTok > 0 || children.length > 0);
+  const expanded = !isChild && EXPANDED_PARENTS.has(k.id);
+
+  const row = `
+    <tr class="cursor-pointer border-t border-line hover:bg-fill/50 ${isChild ? "bg-fill/20" : ""}" onclick="location.hash='#/keys/${esc(k.id)}'">
       <td class="px-4 py-3">
-        <div class="font-medium text-ink">${esc(k.name)}</div>
-        <div class="text-xs text-ink-2">${fmtDate(k.created_at)}</div>
+        <div class="${isChild ? "pl-6" : ""}">
+          <div class="flex items-center gap-2">
+            ${isChild ? '<span class="text-ink-2 text-xs">↳</span>' : ""}
+            <span class="font-medium text-ink">${esc(k.name)}</span>
+            ${!isChild && k.can_create_children ? '<span class="s-pill s-pill--soft text-[11px]">parent</span>' : ""}
+            ${!isChild && children.length > 0 ? `<button type="button" onclick="toggleParentExpand(event, '${esc(k.id)}')"
+              class="s-btn s-btn--sm s-btn--ghost text-xs text-ink-2">${expanded ? "▾" : "▸"} ${children.length} ${children.length === 1 ? "child" : "children"}</button>` : ""}
+          </div>
+          <div class="text-xs text-ink-2">${fmtDate(k.created_at)}</div>
+        </div>
       </td>
       <td class="px-4 py-3">${k.disabled
         ? '<span class="s-pill s-pill--bad">Disabled</span>'
         : '<span class="s-pill s-pill--ok">Enabled</span>'}</td>
       <td class="px-4 py-3 text-sm">
-        <div>${fmtCost(k.usage.window_cost)}${k.credit_limit != null ? ` <span class="text-ink-2">/ ${fmtCost(k.credit_limit)}</span>` : ""}</div>
-        ${progressBar(k.usage.window_cost, k.credit_limit)}
+        <div>${fmtCost(totalCost)}${k.credit_limit != null ? ` <span class="text-ink-2">/ ${fmtCost(k.credit_limit)}</span>` : ""}</div>
+        ${hasChildActivity ? `<div class="text-[11px] text-ink-2">direct ${fmtCost(k.usage.window_cost)} · children ${fmtCost(childCost)}</div>` : ""}
+        ${progressBar(totalCost, k.credit_limit)}
       </td>
       <td class="px-4 py-3 text-sm">
-        <div>${fmtInt(k.usage.window_tokens)}${k.token_limit != null ? ` <span class="text-ink-2">/ ${fmtInt(k.token_limit)}</span>` : ""}</div>
-        ${inOutLine(k.usage.window_prompt_tokens, k.usage.window_completion_tokens)}
-        ${progressBar(k.usage.window_tokens, k.token_limit)}
+        <div>${fmtInt(totalTok)}${k.token_limit != null ? ` <span class="text-ink-2">/ ${fmtInt(k.token_limit)}</span>` : ""}</div>
+        ${inOutLine(totalPrompt, totalComp)}
+        ${hasChildActivity ? `<div class="text-[11px] text-ink-2">direct ${fmtInt(k.usage.window_tokens)} · children ${fmtInt(childTok)}</div>` : ""}
+        ${progressBar(totalTok, k.token_limit)}
       </td>
       <td class="px-4 py-3 text-sm text-ink-2">${k.allowed_models ? esc(k.allowed_models.join(", ")) : "all public models"}${
         k.flex_models ? `<div class="mt-1 text-xs text-warn">flex: ${esc(k.flex_models.join(", "))}</div>` : ""
       }</td>
-    </tr>`).join("");
+    </tr>`;
+
+  if (!expanded) return row;
+  return row + children.map(c => renderKeyRow(c, [], true)).join("");
+}
+
+function buildKeysRows(keys) {
+  const byParent = new Map();
+  const topLevel = [];
+  for (const k of keys) {
+    if (k.parent_id) {
+      if (!byParent.has(k.parent_id)) byParent.set(k.parent_id, []);
+      byParent.get(k.parent_id).push(k);
+    } else {
+      topLevel.push(k);
+    }
+  }
+  return topLevel.map(k => renderKeyRow(k, byParent.get(k.id) || [], false)).join("")
+    || '<tr><td colspan="5" class="px-4 py-8 text-center text-ink-2">No keys yet.</td></tr>';
+}
+
+async function renderKeys() {
+  const [keys, usage] = await Promise.all([
+    api("/admin/tokens"),
+    api("/admin/usage?group_by=day&since=" + encodeURIComponent(sinceParam())),
+  ]);
+  LAST_KEYS = keys;
 
   $("#view").innerHTML = `
     ${usageChart(usage)}
@@ -1607,7 +1716,7 @@ async function renderKeys() {
         <th class="px-4 py-3">Window spend</th><th class="px-4 py-3">Window tokens</th>
         <th class="px-4 py-3">Models</th>
       </tr></thead>
-      <tbody>${rows || '<tr><td colspan="5" class="px-4 py-8 text-center text-ink-2">No keys yet.</td></tr>'}</tbody>
+      <tbody id="keys-tbody">${buildKeysRows(keys)}</tbody>
     </table>`, "mt-3 overflow-x-auto")}`;
 }
 
@@ -1641,32 +1750,75 @@ function openCreateKey() {
 
 // ---- key detail ------------------------------------------------------
 
+function combinedStatCard(title, direct, children) {
+  if (!children || (!children.requests && !children.cost && !children.total_tokens)) {
+    return statCard(title, direct);
+  }
+  const merged = {
+    cost: (direct.cost || 0) + (children.cost || 0),
+    requests: (direct.requests || 0) + (children.requests || 0),
+    errors: (direct.errors || 0) + (children.errors || 0),
+    prompt_tokens: (direct.prompt_tokens || 0) + (children.prompt_tokens || 0),
+    completion_tokens: (direct.completion_tokens || 0) + (children.completion_tokens || 0),
+    avg_ttfb_ms: direct.avg_ttfb_ms ?? children.avg_ttfb_ms,
+  };
+  return card(`<div class="p-4">
+    <div class="text-xs text-ink-2">${title}</div>
+    <div class="s-h2 mt-1">${fmtCost(merged.cost)}</div>
+    <div class="text-[11px] text-ink-2">direct ${fmtCost(direct.cost)} · children ${fmtCost(children.cost)}</div>
+    <div class="mt-1 text-xs text-ink-2">${fmtInt(merged.requests)} reqs${
+      merged.errors ? ` · <span class="text-bad">${fmtInt(merged.errors)} err</span>` : ""}</div>
+    ${inOutLine(merged.prompt_tokens, merged.completion_tokens)}
+  </div>`);
+}
+
 async function renderKeyDetail(id) {
-  const [k, usage] = await Promise.all([
-    api("/admin/tokens/" + encodeURIComponent(id)),
-    api("/admin/usage?group_by=day&token_id=" + encodeURIComponent(id)
-      + "&since=" + encodeURIComponent(sinceParam())),
-  ]);
+  const k = await api("/admin/tokens/" + encodeURIComponent(id));
+  const includeChildren = !k.parent_id && ((k.children && k.children.length > 0) || (k.children_usage && k.children_usage.all_time && k.children_usage.all_time.requests > 0));
+  const usage = await api("/admin/usage?group_by=day&token_id=" + encodeURIComponent(id)
+    + (includeChildren ? "&include_children=true" : "")
+    + "&since=" + encodeURIComponent(sinceParam()));
+  const children = k.children || [];
+  const cu = k.children_usage || null;
+  const childRows = children.map(c => renderKeyRow(c, [], true)).join("");
+
   $("#view").innerHTML = `
-    <a href="#/keys" class="text-sm text-ink-2 hover:text-ink">&larr; API Keys</a>
+    <div class="flex items-center gap-3 text-sm text-ink-2">
+      <a href="#/keys" class="hover:text-ink">&larr; API Keys</a>
+      ${k.parent_id ? `<span>·</span><a href="#/keys/${esc(k.parent_id)}" class="hover:text-ink">Parent key</a>` : ""}
+    </div>
     <div class="mt-2 flex items-center gap-3">
       <h2 class="s-h2">${esc(k.name)}</h2>
       ${k.disabled
         ? '<span class="s-pill s-pill--bad">Disabled</span>'
         : '<span class="s-pill s-pill--ok">Enabled</span>'}
+      ${!k.parent_id && k.can_create_children ? '<span class="s-pill s-pill--soft">parent</span>' : ""}
       <a class="ml-auto text-sm" href="#/logs"
         onclick='setLogFilter(${esc(JSON.stringify({ token_id: k.id }))})'>View logs</a>
     </div>
     <div class="mt-1 text-xs text-ink-2">id: ${esc(k.id)} · created ${fmtDate(k.created_at)}</div>
 
     <div class="mt-5 grid grid-cols-2 gap-3 md:grid-cols-4">
-      ${statCard("Today", k.usage.today)}
-      ${statCard("This week", k.usage.this_week)}
-      ${statCard("This month", k.usage.this_month)}
-      ${statCard("All time", k.usage.all_time)}
+      ${combinedStatCard("Today", k.usage.today, cu?.today)}
+      ${combinedStatCard("This week", k.usage.this_week, cu?.this_week)}
+      ${combinedStatCard("This month", k.usage.this_month, cu?.this_month)}
+      ${combinedStatCard("All time", k.usage.all_time, cu?.all_time)}
     </div>
 
     <div class="mt-5">${usageChart(usage)}</div>
+
+    ${!k.parent_id && children.length > 0 ? `
+      <div class="mt-5">
+        <h3 class="s-h3 mb-3">Child keys (${children.length})</h3>
+        ${card(`<table class="s-table mt-0 w-full text-left">
+          <thead><tr class="text-xs text-ink-2">
+            <th class="px-4 py-3">Key</th><th class="px-4 py-3">Status</th>
+            <th class="px-4 py-3">Window spend</th><th class="px-4 py-3">Window tokens</th>
+            <th class="px-4 py-3">Models</th>
+          </tr></thead>
+          <tbody>${childRows}</tbody>
+        </table>`, "overflow-x-auto")}
+      </div>` : ""}
 
     <div class="mt-5 grid gap-5 md:grid-cols-2">
       ${card(`<form id="edit-form" class="space-y-3 p-5">
@@ -1688,8 +1840,12 @@ async function renderKeyDetail(id) {
         </div>
         <div class="border-t border-line pt-4">
           <h3 class="text-sm font-semibold text-bad">Delete key</h3>
-          <p class="mt-1 text-sm text-ink-2">Permanently delete this key. Request logs are kept. This cannot be undone.</p>
-          <button onclick="deleteKey('${esc(k.id)}', '${esc(k.name)}')"
+          <p class="mt-1 text-sm text-ink-2">${
+            children.length > 0
+              ? `Permanently delete this key and its ${children.length} child ${children.length === 1 ? "key" : "keys"}. Request logs are kept. This cannot be undone.`
+              : "Permanently delete this key. Request logs are kept. This cannot be undone."
+          }</p>
+          <button onclick="deleteKey('${esc(k.id)}', '${esc(k.name)}', ${children.length})"
             class="s-btn s-btn--danger mt-2">Delete</button>
         </div>
       </div>`)}
@@ -1715,8 +1871,11 @@ async function toggleKey(id, disabled) {
   } catch (err) { toast(err.message); }
 }
 
-async function deleteKey(id, name) {
-  if (!confirm(`Delete key "${name}"? This cannot be undone.`)) return;
+async function deleteKey(id, name, childCount = 0) {
+  const msg = childCount > 0
+    ? `Delete key "${name}" and its ${childCount} child ${childCount === 1 ? "key" : "keys"}? This cannot be undone.`
+    : `Delete key "${name}"? This cannot be undone.`;
+  if (!confirm(msg)) return;
   try {
     await api("/admin/tokens/" + encodeURIComponent(id), { method: "DELETE" });
     location.hash = "#/keys";

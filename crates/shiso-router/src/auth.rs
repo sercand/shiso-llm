@@ -45,6 +45,12 @@ pub(crate) async fn require_client_token(
     if record.disabled {
         return Err(AppError::Forbidden("API key is disabled".into()));
     }
+    if let Some(pid) = &record.parent_id {
+        match state.token_cache.get_by_id(pid) {
+            Some(parent) if !parent.disabled => {}
+            _ => return Err(AppError::Forbidden("parent API key is disabled".into())),
+        }
+    }
     request.extensions_mut().insert(record);
     Ok(next.run(request).await)
 }
