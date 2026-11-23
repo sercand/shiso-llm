@@ -1,6 +1,6 @@
 [workspace]
 # resolver 3 is the edition-2024 default and is MSRV-aware (stable since 1.84;
-# we pin 1.93). Do not downgrade to "2".
+# we pin 1.100). Do not downgrade to "2".
 resolver = "3"
 members = [
     "crates/shiso-core",
@@ -30,7 +30,7 @@ members = [
 [workspace.package]
 version = "0.2.4"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.100"
 license = "MIT"
 # Every crate is publish = false. `cargo deny check licenses` skips them through
 # `[licenses.private]` in deny.toml, not through the publish flag.

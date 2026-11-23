@@ -119,6 +119,13 @@ docker run --rm --gpus all -p 8090:8090 \
     --config /models/Qwen3.5-4B/config.json
 ```
 
+`shiso-registry` is included for maintenance work. Its `serve` subcommand binds
+`127.0.0.1` by design, so from Kubernetes it is reachable only from a sidecar
+in the same pod; the headless subcommands run through `kubectl exec` or
+`container run --entrypoint shiso-registry`. The runtime image is distroless
+and has no shell, so exec the binaries directly (`kubectl exec … -- shiso
+--version`).
+
 The runtime user is distroless' `nonroot` (uid `65532`), so a model directory
 or PVC mounted into the container must be readable by it; on Kubernetes set
 `fsGroup: 65532` for writable volumes. `NVIDIA_DRIVER_CAPABILITIES` already
