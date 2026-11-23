@@ -1,0 +1,15 @@
+# Build output and repository state that must not enter the build context.
+target
+.git
+.worktrees
+.claude
+.superpowers
+
+# Fixtures and reports are large and no build step reads them.
+test-vectors
+reports
+docs/superpowers
+scripts/local
+
+__pycache__
+**/__pycache__

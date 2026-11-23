@@ -93,6 +93,38 @@ cargo build --release -p shiso-server --features metal --bin shiso
 SHISO_CUDA_COMPILE=1 cargo build --release -p shiso-server --features cuda --bin shiso
 ```
 
+### Container image
+
+`Dockerfile` builds a two-stage image. The CUDA `devel` image compiles the
+kernel tree to PTX and both `shiso` and `shiso-registry`; the runtime is
+distroless `cc` and carries only those binaries plus the cuBLAS shared objects.
+Nothing else from the toolkit, and no model weights, are in the image.
+
+```sh
+# arm64 (DGX Spark), built on the machine it runs on
+docker build -t shiso-cuda .
+# fixed-architecture kernel set instead of the manifests' compute_75 PTX
+docker build --build-arg SHISO_CUDA_ARCH=sm_121a -t shiso-cuda .
+```
+
+The image has no default subcommand, only `--help`. `serve` binds loopback by
+default, so publish a port and bind all interfaces explicitly:
+
+```sh
+docker run --rm --gpus all -p 8090:8090 \
+  -v ~/models:/models \
+  -v shiso-home:/home/nonroot/.shiso \
+  shiso-cuda serve --bind 0.0.0.0 \
+    --model /models/Qwen3.5-4B/Qwen3.5-4B-Q4_K_M.gguf \
+    --config /models/Qwen3.5-4B/config.json
+```
+
+The runtime user is distroless' `nonroot` (uid `65532`), so a model directory
+or PVC mounted into the container must be readable by it; on Kubernetes set
+`fsGroup: 65532` for writable volumes. `NVIDIA_DRIVER_CAPABILITIES` already
+includes `video`, which is what makes NVDEC available when the driver exposes
+`libnvcuvid`.
+
 ### Devices
 
 Every build also carries a CPU device (the `cpu` feature, on by default), so
