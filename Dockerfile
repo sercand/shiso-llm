@@ -60,6 +60,11 @@ COPY . .
 #
 # The target directory is a cache mount, so it is invisible to later layers:
 # the binaries are copied out inside the same RUN.
+#
+# cuBLAS is reached through cudarc. Only the pair plus libnvJitLink is shipped:
+# neither library has a DT_NEEDED on libnvJitLink, but cublasLt dlopens it for
+# its LTO path - the same reason Debian's libcublas package depends on
+# libnvjitlink - so a load-time check cannot see that it is needed.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     set -eux; \
@@ -106,4 +111,4 @@ COPY --from=builder /out/lib/ /usr/local/lib/
 ENTRYPOINT ["/usr/local/bin/shiso"]
 CMD ["--help"]
 
-EXPOSE 8090 8095
+EXPOSE 8090
