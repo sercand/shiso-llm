@@ -46,6 +46,7 @@ pub mod gdn;
 mod kv;
 pub mod launch;
 pub mod layers;
+pub mod logprobs;
 mod media_path;
 pub mod moe;
 pub mod moe_biased;

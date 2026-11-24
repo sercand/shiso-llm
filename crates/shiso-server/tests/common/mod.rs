@@ -681,6 +681,28 @@ impl FakeModel {
     }
 }
 
+/// Deterministic synthetic logits row for `FakeModel` prompt-logprobs tests:
+/// rank 1 is `(tok + 1) % vocab` (logit 5.0), rank 2 is `(tok + 2) % vocab`
+/// (logit 3.0), and every other vocabulary entry decreases monotonically.
+fn fake_prompt_logits_row(vocab: usize, tok: TokenId) -> Vec<f32> {
+    let base = usize::try_from(tok.get()).unwrap_or(0);
+    let r1 = (base + 1) % vocab;
+    let r2 = (base + 2) % vocab;
+    (0..vocab)
+        .map(|v| {
+            if v == r1 {
+                5.0
+            } else if v == r2 {
+                3.0
+            } else {
+                #[expect(clippy::cast_precision_loss, reason = "test vocab is small (<= 64)")]
+                let dec = -(v as f32) * 0.01;
+                dec
+            }
+        })
+        .collect()
+}
+
 impl Model for FakeModel {
     fn info(&self) -> &ModelInfo {
         &self.info
@@ -741,6 +763,49 @@ impl Model for FakeModel {
             .push(tokens.iter().map(|t| t.get()).collect());
         self.answer_prompt(session, tokens, 0)?;
         self.block(1)
+    }
+
+    fn prefill_chunk_logprobs(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        next_tokens: &[TokenId],
+        top_k: u32,
+        out: &mut Vec<shiso_core::PromptPositionLogprobs>,
+    ) -> CoreResult<()> {
+        if tokens.len() != next_tokens.len() {
+            return Err(CoreError::ShapeMismatch {
+                field: "prompt_logprobs next_tokens",
+                expected: tokens.len() as u64,
+                got: next_tokens.len() as u64,
+            });
+        }
+        self.prefill_chunk(session, tokens)?;
+        let vocab = self.info.vocab as usize;
+        for (&tok, &next) in tokens.iter().zip(next_tokens) {
+            let row = fake_prompt_logits_row(vocab, tok);
+            out.push(shiso_engine::logprobs::extract_prompt_position_logprobs(
+                &row, next, top_k,
+            ));
+        }
+        Ok(())
+    }
+
+    fn prefill_last_logprobs(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        top_k: u32,
+        out: &mut Vec<shiso_core::PromptPositionLogprobs>,
+    ) -> CoreResult<Logits<'_>> {
+        let vocab = self.info.vocab as usize;
+        for pair in tokens.windows(2) {
+            let row = fake_prompt_logits_row(vocab, pair[0]);
+            out.push(shiso_engine::logprobs::extract_prompt_position_logprobs(
+                &row, pair[1], top_k,
+            ));
+        }
+        self.prefill_last(session, tokens)
     }
 
     fn prefill_last_many(&mut self, runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
@@ -995,6 +1060,31 @@ impl Model for FakeCheckpointed {
     fn prefill_last(&mut self, session: SessionId, tokens: &[TokenId]) -> CoreResult<Logits<'_>> {
         *self.written.entry(session).or_insert(0) += tokens.len();
         self.inner.prefill_last(session, tokens)
+    }
+
+    fn prefill_chunk_logprobs(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        next_tokens: &[TokenId],
+        top_k: u32,
+        out: &mut Vec<shiso_core::PromptPositionLogprobs>,
+    ) -> CoreResult<()> {
+        *self.written.entry(session).or_insert(0) += tokens.len();
+        self.inner
+            .prefill_chunk_logprobs(session, tokens, next_tokens, top_k, out)
+    }
+
+    fn prefill_last_logprobs(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        top_k: u32,
+        out: &mut Vec<shiso_core::PromptPositionLogprobs>,
+    ) -> CoreResult<Logits<'_>> {
+        *self.written.entry(session).or_insert(0) += tokens.len();
+        self.inner
+            .prefill_last_logprobs(session, tokens, top_k, out)
     }
 
     fn prefill_last_many(&mut self, runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {

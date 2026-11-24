@@ -250,6 +250,7 @@ mod tests {
                 ..Usage::default()
             },
             logprobs: None,
+            prompt_logprobs: None,
             token_ids: Vec::new(),
         }
     }

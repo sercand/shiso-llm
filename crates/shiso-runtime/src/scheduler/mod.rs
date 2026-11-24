@@ -1181,7 +1181,7 @@ impl Coordinator {
     /// Stands a fresh sequence on a stored prefix, when there is one, and tells
     /// the model where its prompt's message boundaries are.
     fn try_resume(&mut self, slot: &mut SeqSlot) {
-        if !slot.checkpointable() {
+        if !slot.checkpointable() || slot.prompt_logprobs_k().is_some() {
             return;
         }
         let Self {
@@ -2027,46 +2027,83 @@ impl Coordinator {
         true
     }
 
+    /// Runs a non-final prompt quantum for `slot_idx`.
+    fn prefill_non_final(
+        &mut self,
+        slot_idx: usize,
+        session: SessionId,
+        prompt: &[TokenId],
+        window: &std::ops::Range<usize>,
+    ) {
+        let carries_media = self
+            .slots
+            .slots()
+            .get(slot_idx)
+            .is_some_and(|slot| slot.media().is_some());
+        if carries_media {
+            // Unreachable: the planner gives a media sequence its whole
+            // prompt in one quantum. Handled rather than asserted because
+            // the alternative to failing here is a second call that restarts
+            // the placeholder walk, and that is the failure that answers
+            // fluently about a rearranged picture instead of erroring.
+            let error = CoreError::Unsupported {
+                what: "a media prompt read in pieces",
+                backend: "scheduler",
+            };
+            self.fail_slot(slot_idx, &error, "a media prompt was split");
+            return;
+        }
+        let chunk = &prompt[window.clone()];
+        let covered = chunk.len();
+        let started = Instant::now();
+        let prompt_logprobs_k = self
+            .slots
+            .slots()
+            .get(slot_idx)
+            .and_then(SeqSlot::prompt_logprobs_k);
+        let res = if let Some(top_k) = prompt_logprobs_k {
+            let next_tokens = &prompt[(window.start + 1)..=window.end];
+            let Some(slot) = self.slots.get_mut(slot_idx) else {
+                return;
+            };
+            self.model.as_model_mut().prefill_chunk_logprobs(
+                session,
+                chunk,
+                next_tokens,
+                top_k,
+                slot.prompt_logprobs_raw_mut(),
+            )
+        } else {
+            self.model.as_model_mut().prefill_chunk(session, chunk)
+        };
+        if let Err(error) = res {
+            self.fail_slot(slot_idx, &error, "a prompt chunk could not be read");
+            return;
+        }
+        let decode_steps = self.decode_steps;
+        if let Some(slot) = self.slots.get_mut(slot_idx) {
+            slot.advance_prefill(covered);
+            slot.time_prefill(covered, started.elapsed(), decode_steps);
+        }
+        self.stats.prefilled(covered as u64);
+    }
+
     /// One bounded quantum of one sequence's prompt.
     fn prefill_step(&mut self, step: PrefillStep) {
         let Some(quantum) = self.ready_step(step) else {
             return;
         };
-        let (step, session, prompt) = (quantum.step, quantum.session, quantum.prompt);
-        let chunk = &prompt[quantum.window];
+        let (step, session, prompt, window) = (
+            quantum.step,
+            quantum.session,
+            quantum.prompt,
+            quantum.window,
+        );
+        let chunk = &prompt[window.clone()];
         let covered = chunk.len();
 
-        let carries_media = self
-            .slots
-            .slots()
-            .get(step.slot)
-            .is_some_and(|slot| slot.media().is_some());
-
         if !step.last {
-            if carries_media {
-                // Unreachable: the planner gives a media sequence its whole
-                // prompt in one quantum. Handled rather than asserted because
-                // the alternative to failing here is a second call that restarts
-                // the placeholder walk, and that is the failure that answers
-                // fluently about a rearranged picture instead of erroring.
-                let error = CoreError::Unsupported {
-                    what: "a media prompt read in pieces",
-                    backend: "scheduler",
-                };
-                self.fail_slot(step.slot, &error, "a media prompt was split");
-                return;
-            }
-            let started = Instant::now();
-            if let Err(error) = self.model.as_model_mut().prefill_chunk(session, chunk) {
-                self.fail_slot(step.slot, &error, "a prompt chunk could not be read");
-                return;
-            }
-            let decode_steps = self.decode_steps;
-            if let Some(slot) = self.slots.get_mut(step.slot) {
-                slot.advance_prefill(covered);
-                slot.time_prefill(covered, started.elapsed(), decode_steps);
-            }
-            self.stats.prefilled(covered as u64);
+            self.prefill_non_final(step.slot, session, &prompt, &window);
             return;
         }
         let started = Instant::now();
@@ -2081,27 +2118,48 @@ impl Coordinator {
                 ..
             } = self;
             let hidden = model.as_model_mut().info().hidden;
-            let media = slots.slots().get(step.slot).and_then(SeqSlot::media);
-            let read = match media {
-                None => model.as_model_mut().prefill_last(session, chunk),
-                Some(media) => {
-                    // The placeholder ids were resolved at boot, from the same
-                    // placement the renderer expanded the prompt with: they are
-                    // the ids the pad run is written in, and a second spelling
-                    // of them would be a second answer that can disagree with
-                    // the first.
-                    VisionPrefill::new(media.rows().view(), media.grids(), *pads, hidden).and_then(
-                        |prefill| {
-                            model
-                                .as_model_mut()
-                                .media_mut()
-                                .ok_or(CoreError::Unsupported {
-                                    what: "media in a prompt this checkpoint cannot splice",
-                                    backend: "scheduler",
-                                })?
-                                .prefill_media(session, chunk, &prefill)
-                        },
-                    )
+            let prompt_logprobs_k = slots
+                .slots()
+                .get(step.slot)
+                .and_then(SeqSlot::prompt_logprobs_k);
+            let has_media = slots
+                .slots()
+                .get(step.slot)
+                .is_some_and(|slot| slot.media().is_some());
+            let read = if let Some(top_k) = prompt_logprobs_k
+                && !has_media
+            {
+                let Some(slot) = slots.get_mut(step.slot) else {
+                    return;
+                };
+                model.as_model_mut().prefill_last_logprobs(
+                    session,
+                    chunk,
+                    top_k,
+                    slot.prompt_logprobs_raw_mut(),
+                )
+            } else {
+                let media = slots.slots().get(step.slot).and_then(SeqSlot::media);
+                match media {
+                    None => model.as_model_mut().prefill_last(session, chunk),
+                    Some(media) => {
+                        // The placeholder ids were resolved at boot, from the same
+                        // placement the renderer expanded the prompt with: they are
+                        // the ids the pad run is written in, and a second spelling
+                        // of them would be a second answer that can disagree with
+                        // the first.
+                        VisionPrefill::new(media.rows().view(), media.grids(), *pads, hidden)
+                            .and_then(|prefill| {
+                                model
+                                    .as_model_mut()
+                                    .media_mut()
+                                    .ok_or(CoreError::Unsupported {
+                                        what: "media in a prompt this checkpoint cannot splice",
+                                        backend: "scheduler",
+                                    })?
+                                    .prefill_media(session, chunk, &prefill)
+                            })
+                    }
                 }
             };
             let read = read.and_then(|logits| {
@@ -2135,7 +2193,13 @@ impl Coordinator {
             if slot.is_score() {
                 finish_scoring(row, scores, slot);
             } else {
-                start_decoding(row, scores, vocabulary.as_deref(), *stop, now, stats, slot);
+                if let Some(raw) = slot.take_prompt_logprobs() {
+                    let decoded = decode_prompt_logprobs(&raw, vocabulary.as_deref());
+                    send_all(stats, slot, vec![StreamEvent::PromptLogprobs(decoded)]);
+                }
+                if !slot.is_done() {
+                    start_decoding(row, scores, vocabulary.as_deref(), *stop, now, stats, slot);
+                }
             }
         }
     }
@@ -2619,6 +2683,42 @@ fn start_decoding(
     let token = slot.choose(fill(row, scores));
     let events = slot.accept(token, vocabulary, stop, now);
     send_all(stats, slot, events);
+}
+
+/// Converts raw per-position prompt log-probabilities into IR records with
+/// decoded token text and a leading `None` for prompt position 0.
+fn decode_prompt_logprobs(
+    raw: &[shiso_core::PromptPositionLogprobs],
+    vocabulary: Option<&Vocabulary>,
+) -> Vec<Option<Vec<shiso_ir::PromptLogprob>>> {
+    let mut cache: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(raw.len() + 1);
+    out.push(None);
+    for pos in raw {
+        let entries = pos
+            .entries
+            .iter()
+            .map(|entry| {
+                let id = entry.token.get();
+                let decoded_token = cache
+                    .entry(id)
+                    .or_insert_with(|| {
+                        vocabulary
+                            .and_then(|v| v.decode(&[entry.token]).ok())
+                            .unwrap_or_default()
+                    })
+                    .clone();
+                shiso_ir::PromptLogprob {
+                    token_id: id,
+                    decoded_token,
+                    logprob: entry.logprob,
+                    rank: entry.rank,
+                }
+            })
+            .collect();
+        out.push(Some(entries));
+    }
+    out
 }
 
 /// Reads the labels off a scoring prompt's last row and sends its answer.

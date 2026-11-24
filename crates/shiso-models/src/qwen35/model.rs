@@ -798,6 +798,29 @@ impl Model for Qwen35Model {
         self.stack.prefill_last(session, tokens)
     }
 
+    fn prefill_chunk_logprobs(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        next_tokens: &[TokenId],
+        top_k: u32,
+        out: &mut Vec<shiso_core::PromptPositionLogprobs>,
+    ) -> CoreResult<()> {
+        self.stack
+            .prefill_chunk_logprobs(session, tokens, next_tokens, top_k, out)
+    }
+
+    fn prefill_last_logprobs(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        top_k: u32,
+        out: &mut Vec<shiso_core::PromptPositionLogprobs>,
+    ) -> CoreResult<Logits<'_>> {
+        self.stack
+            .prefill_last_logprobs(session, tokens, top_k, out)
+    }
+
     // A decision request's questions share their opening - its text and its
     // pictures - and a checkpoint stands each sibling past it, leaving a few
     // dozen rows of question each. One pass over all of them reads the

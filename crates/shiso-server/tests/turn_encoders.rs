@@ -30,6 +30,7 @@ fn calls(n: usize, content: Vec<Block>, reasoning_tokens: u64) -> Response {
             ..Usage::default()
         },
         logprobs: None,
+        prompt_logprobs: None,
         token_ids: Vec::new(),
     }
 }

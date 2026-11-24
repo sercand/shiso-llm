@@ -171,6 +171,25 @@ pub struct PromptRun<'a> {
     pub tokens: &'a [TokenId],
 }
 
+/// One candidate token's log-probability and 1-based rank at a prompt position.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PromptLogprobEntry {
+    /// Vocabulary id of the candidate token.
+    pub token: TokenId,
+    /// Natural log-probability (`logit - logsumexp`) under the full vocabulary.
+    pub logprob: f32,
+    /// 1-based rank in the full vocabulary distribution (`1` is highest).
+    pub rank: u32,
+}
+
+/// Top-K plus actual-token log-probabilities for one prompt position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptPositionLogprobs {
+    /// Top-K entries sorted descending by log-probability, followed by the
+    /// actual prompt token at this position when it fell outside the top-K.
+    pub entries: Vec<PromptLogprobEntry>,
+}
+
 /// A `[rows, vocab]` block of single-precision logits on the device.
 ///
 /// Borrowed from the model that produced it, so the rows cannot be freed while
@@ -372,6 +391,55 @@ pub trait Model: Send + std::fmt::Debug {
     fn prefill_last_many(&mut self, _runs: &[PromptRun<'_>]) -> CoreResult<Logits<'_>> {
         Err(CoreError::Unsupported {
             what: NO_BATCHED_PROMPT_PASS,
+            backend: "model",
+        })
+    }
+
+    /// Advances a session by a non-final prompt chunk and appends per-position
+    /// top-`top_k` log-probabilities to `out`.
+    ///
+    /// `next_tokens` has the same length as `tokens`, where `next_tokens[i]` is
+    /// the prompt token immediately following `tokens[i]` (including across a
+    /// chunk boundary). Each position records the top `top_k` vocabulary tokens
+    /// plus `next_tokens[i]` if it fell outside the top `top_k`.
+    ///
+    /// # Errors
+    ///
+    /// The default is [`CoreError::Unsupported`] and reads nothing. Models that
+    /// support it return [`CoreError::ShapeMismatch`] when `tokens.len() !=
+    /// next_tokens.len()`, plus whatever [`Model::prefill_chunk`] reports.
+    fn prefill_chunk_logprobs(
+        &mut self,
+        _session: SessionId,
+        _tokens: &[TokenId],
+        _next_tokens: &[TokenId],
+        _top_k: u32,
+        _out: &mut Vec<PromptPositionLogprobs>,
+    ) -> CoreResult<()> {
+        Err(CoreError::Unsupported {
+            what: "prompt_logprobs",
+            backend: "model",
+        })
+    }
+
+    /// Advances a session by its final prompt chunk, appends per-position
+    /// top-`top_k` log-probabilities for `tokens[..tokens.len() - 1]` (against
+    /// `tokens[1..]`) to `out`, and returns the frontier logits row for the
+    /// last prompt token.
+    ///
+    /// # Errors
+    ///
+    /// The default is [`CoreError::Unsupported`] and reads nothing. Models that
+    /// support it return whatever [`Model::prefill_last`] reports.
+    fn prefill_last_logprobs(
+        &mut self,
+        _session: SessionId,
+        _tokens: &[TokenId],
+        _top_k: u32,
+        _out: &mut Vec<PromptPositionLogprobs>,
+    ) -> CoreResult<Logits<'_>> {
+        Err(CoreError::Unsupported {
+            what: "prompt_logprobs",
             backend: "model",
         })
     }

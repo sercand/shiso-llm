@@ -69,6 +69,9 @@ pub struct Request {
     pub logit_bias: Vec<(u32, f32)>,
     /// How many alternatives to report per generated token. `None` reports none.
     pub top_logprobs: Option<u8>,
+    /// How many top candidate log-probabilities to report per prompt position.
+    /// `None` reports no prompt log-probabilities.
+    pub prompt_logprobs: Option<u32>,
     /// Seed for reproducible sampling. `None` means fresh entropy, which is a
     /// decision the server makes rather than a zero this type could carry.
     pub seed: Option<u64>,
@@ -110,6 +113,7 @@ impl Request {
             repetition_detection: None,
             logit_bias: Vec::new(),
             top_logprobs: None,
+            prompt_logprobs: None,
             seed: None,
             timeout_secs: None,
             return_token_ids: false,

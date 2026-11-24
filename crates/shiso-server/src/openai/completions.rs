@@ -36,7 +36,7 @@ use crate::api::service_tier::{self, ServiceTier};
 use crate::api::sse::{Frame, FrameEncoder};
 use crate::api::{blocking, sse};
 use crate::error::AppError;
-use crate::openai::chat_encode::{encode_usage, finish_reason};
+use crate::openai::chat_encode::{encode_prompt_logprobs, encode_usage, finish_reason};
 use crate::openai::chat_wire::{StopField, StreamOptions};
 use crate::state::AppState;
 
@@ -107,6 +107,9 @@ pub struct CompletionBody {
     /// completion object has no field to echo it in.
     #[serde(default)]
     pub service_tier: Option<ServiceTier>,
+    /// How many top candidate log-probabilities to return per prompt position.
+    #[serde(default)]
+    pub prompt_logprobs: Option<u32>,
 }
 
 impl CompletionBody {
@@ -150,6 +153,13 @@ impl CompletionBody {
                 } else {
                     "unsupported_value"
                 },
+            ));
+        }
+        if self.prompt_logprobs.is_some() && self.stream.unwrap_or(false) {
+            return Err(AppError::bad_request(
+                "prompt_logprobs is not supported with stream: true",
+                Some("prompt_logprobs"),
+                "unsupported_value",
             ));
         }
         Ok(())
@@ -338,6 +348,7 @@ fn to_ir(body: &CompletionBody, model_id: &str) -> Request {
     request.service_class = body
         .service_tier
         .map_or(ServiceClass::Standard, ServiceTier::class);
+    request.prompt_logprobs = body.prompt_logprobs;
     request
 }
 
@@ -364,6 +375,12 @@ pub fn encode_completion(response: &shiso_ir::Response, options: &Options) -> Va
     choice.insert("text".to_owned(), json!(text));
     choice.insert("index".to_owned(), json!(0));
     choice.insert("logprobs".to_owned(), Value::Null);
+    if let Some(prompt_logprobs) = response.prompt_logprobs.as_deref() {
+        choice.insert(
+            "prompt_logprobs".to_owned(),
+            encode_prompt_logprobs(prompt_logprobs),
+        );
+    }
     choice.insert(
         "finish_reason".to_owned(),
         json!(finish_reason(&response.stop)),
@@ -541,6 +558,7 @@ mod tests {
                 ..Usage::default()
             },
             logprobs: None,
+            prompt_logprobs: None,
             token_ids: vec![1, 2, 3, 4],
         }
     }

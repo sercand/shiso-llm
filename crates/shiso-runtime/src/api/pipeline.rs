@@ -333,6 +333,13 @@ async fn queue(
         request.max_tokens.min(budget)
     };
 
+    if request.prompt_logprobs.is_some() && !media.is_empty() {
+        return Err(AppError::bad_request(
+            "prompt_logprobs is not supported on requests with media",
+            Some("prompt_logprobs"),
+            "unsupported_value",
+        ));
+    }
     // A request that will wait for a seat warms the page cache for the stored
     // prefix it will resume from, so its restore reads memory rather than the
     // drive. Only then: one admitted at once resumes straight away, usually from
@@ -340,6 +347,7 @@ async fn queue(
     let engine = state.engine()?;
     let seats = u64::try_from(engine.max_num_seqs()).unwrap_or(u64::MAX);
     if media.is_empty()
+        && request.prompt_logprobs.is_none()
         && state.sched.active() >= seats
         && let Some(prefetcher) = state.kv.as_ref().and_then(|kv| kv.prefetcher())
     {
@@ -352,6 +360,7 @@ async fn queue(
         .with_stop(Arc::from(request.stop.clone()))
         .with_media(Arc::from(media), Arc::from(digests))
         .with_service_class(request.service_class)
+        .with_prompt_logprobs(request.prompt_logprobs)
         .with_string_params(Arc::new(shiso_parsers::StringParams::from_schemas(
             request
                 .tools

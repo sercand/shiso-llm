@@ -411,6 +411,9 @@ pub struct ChatBody {
     /// How many alternatives per token.
     #[serde(default)]
     pub top_logprobs: Option<u8>,
+    /// How many top candidate log-probabilities to return per prompt position.
+    #[serde(default)]
+    pub prompt_logprobs: Option<u32>,
     /// Report the sampled ids beside the text.
     #[serde(default)]
     pub return_token_ids: Option<bool>,
@@ -490,6 +493,13 @@ impl ChatBody {
                 "top_logprobs must be between 0 and 20",
                 Some("top_logprobs"),
                 "invalid_request",
+            ));
+        }
+        if self.prompt_logprobs.is_some() && self.stream.unwrap_or(false) {
+            return Err(AppError::bad_request(
+                "prompt_logprobs is not supported with stream: true",
+                Some("prompt_logprobs"),
+                "unsupported_value",
             ));
         }
         Ok(())

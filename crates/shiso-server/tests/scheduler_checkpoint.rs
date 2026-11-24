@@ -301,3 +301,58 @@ async fn the_shutdown_sweep_runs_exactly_once_on_the_way_down() {
         "the turn's end was offered too: {saves:?}"
     );
 }
+
+/// A `prompt_logprobs` request bypasses prefix-cache resume and collects
+/// every position's top-K log-probabilities seamlessly across chunked prefill
+/// boundaries.
+#[tokio::test]
+async fn prompt_logprobs_bypasses_resume_and_collects_across_chunks() {
+    let cfg = SchedulerConfig {
+        solo_chunk: 2,
+        ..SchedulerConfig::new()
+    };
+    let (engine, join, audit) = common::checkpointed_engine_hitting(vec![10], cfg, None, Some(4));
+    let prompt: Vec<TokenId> = [1u32, 2, 3, 4, 20].into_iter().map(TokenId::new).collect();
+    let req = GenerateRequest::new(
+        Arc::from(prompt),
+        SamplingParams::neutral(),
+        Seed::new(0),
+        1,
+    )
+    .with_prompt_logprobs(Some(2));
+
+    let stream = engine
+        .generate(req)
+        .await
+        .expect("the engine accepts the request");
+    let response = shiso_server::api::blocking::collect_response(stream)
+        .await
+        .expect("the response completes");
+    drop(engine);
+    join.join()
+        .expect("the engine thread does not panic")
+        .expect("the loop exits cleanly");
+
+    assert_eq!(
+        audit.resumes.lock().len(),
+        0,
+        "prefix-cache resume must be bypassed when prompt_logprobs is requested"
+    );
+    assert_eq!(response.usage.cached_prompt_tokens, 0);
+
+    let plp = response
+        .prompt_logprobs
+        .expect("prompt_logprobs is present on the response");
+    assert_eq!(plp.len(), 5, "one entry per prompt token across all chunks");
+    assert!(plp[0].is_none(), "position 0 has no prior token");
+    // Position 2 was predicted by the last token of chunk 0 (token 2 -> top-1 is 3).
+    let pos2 = plp[2].as_ref().expect("position 2 present");
+    assert_eq!(pos2[0].token_id, 3);
+    assert_eq!(pos2[0].rank, 1);
+    // Position 4 was predicted in the final chunk (token 4 -> top-1 is 5, top-2 is 6, actual is 20).
+    let pos4 = plp[4].as_ref().expect("position 4 present");
+    assert_eq!(pos4.len(), 3);
+    assert_eq!(pos4[0].token_id, 5);
+    assert_eq!(pos4[1].token_id, 6);
+    assert_eq!(pos4[2].token_id, 20);
+}

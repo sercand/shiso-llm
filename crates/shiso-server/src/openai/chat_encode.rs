@@ -195,7 +195,37 @@ pub fn encode_response(response: &Response, options: &EncodeOptions) -> Value {
     if options.return_token_ids {
         out.insert("token_ids".to_owned(), json!(response.token_ids));
     }
+    if let Some(prompt_logprobs) = response.prompt_logprobs.as_deref() {
+        out.insert(
+            "prompt_logprobs".to_owned(),
+            encode_prompt_logprobs(prompt_logprobs),
+        );
+    }
     Value::Object(out)
+}
+
+/// Encodes per-position prompt log-probabilities in the OpenAI-compatible
+/// `[null, { "<token_id>": { "logprob", "rank", "decoded_token" } }, ...]` shape.
+#[must_use]
+pub(crate) fn encode_prompt_logprobs(positions: &[Option<Vec<shiso_ir::PromptLogprob>>]) -> Value {
+    let array = positions
+        .iter()
+        .map(|pos| match pos {
+            None => Value::Null,
+            Some(entries) => {
+                let mut map = Map::with_capacity(entries.len());
+                for entry in entries {
+                    let mut info = Map::with_capacity(3);
+                    info.insert("logprob".to_owned(), json!(entry.logprob));
+                    info.insert("rank".to_owned(), json!(entry.rank));
+                    info.insert("decoded_token".to_owned(), json!(entry.decoded_token));
+                    map.insert(entry.token_id.to_string(), Value::Object(info));
+                }
+                Value::Object(map)
+            }
+        })
+        .collect();
+    Value::Array(array)
 }
 
 #[cfg(test)]
@@ -227,6 +257,7 @@ mod tests {
                 ..Usage::default()
             },
             logprobs: None,
+            prompt_logprobs: None,
             token_ids: vec![1, 2, 3],
         }
     }

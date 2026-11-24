@@ -40,7 +40,7 @@
 
 use shiso_core::error::CoreResult;
 use shiso_core::ids::{Seed, SessionId, TokenId};
-use shiso_core::model::{DecodeStep, Logits, PromptRun, SamplingParams};
+use shiso_core::model::{DecodeStep, Logits, PromptPositionLogprobs, PromptRun, SamplingParams};
 use shiso_core::{
     Backend, DeviceView, LaunchSample, Model, ProfileRegion, ProfileReport, Profiler,
 };
@@ -131,6 +131,27 @@ const _: PrefillChunk = <dyn Model>::prefill_chunk;
 type PrefillLast =
     for<'m> fn(&'m mut (dyn Model + 'static), SessionId, &[TokenId]) -> CoreResult<Logits<'m>>;
 const _: PrefillLast = <dyn Model>::prefill_last;
+
+/// Non-final prompt chunk prefill collecting per-position prompt log-probabilities.
+type PrefillChunkLogprobs = fn(
+    &mut (dyn Model + 'static),
+    SessionId,
+    &[TokenId],
+    &[TokenId],
+    u32,
+    &mut Vec<PromptPositionLogprobs>,
+) -> CoreResult<()>;
+const _: PrefillChunkLogprobs = <dyn Model>::prefill_chunk_logprobs;
+
+/// Final prompt chunk prefill collecting per-position prompt log-probabilities.
+type PrefillLastLogprobs = for<'m> fn(
+    &'m mut (dyn Model + 'static),
+    SessionId,
+    &[TokenId],
+    u32,
+    &mut Vec<PromptPositionLogprobs>,
+) -> CoreResult<Logits<'m>>;
+const _: PrefillLastLogprobs = <dyn Model>::prefill_last_logprobs;
 
 /// A decode batch is a slice of steps, each one session plus one token - not a
 /// pair of parallel slices a caller could get out of step.

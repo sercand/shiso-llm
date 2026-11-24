@@ -741,6 +741,29 @@ impl Model for Gemma4Model {
         self.stack.prefill_last(session, tokens)
     }
 
+    fn prefill_chunk_logprobs(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        next_tokens: &[TokenId],
+        top_k: u32,
+        out: &mut Vec<shiso_core::PromptPositionLogprobs>,
+    ) -> CoreResult<()> {
+        self.stack
+            .prefill_chunk_logprobs(session, tokens, next_tokens, top_k, out)
+    }
+
+    fn prefill_last_logprobs(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        top_k: u32,
+        out: &mut Vec<shiso_core::PromptPositionLogprobs>,
+    ) -> CoreResult<Logits<'_>> {
+        self.stack
+            .prefill_last_logprobs(session, tokens, top_k, out)
+    }
+
     fn decode_batch(&mut self, steps: &[DecodeStep]) -> CoreResult<Logits<'_>> {
         self.stack.decode_batch(steps)
     }

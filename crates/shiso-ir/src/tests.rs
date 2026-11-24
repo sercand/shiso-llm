@@ -533,6 +533,7 @@ fn every_type_an_adapter_has_to_build_can_be_built_from_outside_this_crate() {
         stop: StopReason::EndTurn,
         usage: Usage::default(),
         logprobs: Some(logprobs),
+        prompt_logprobs: None,
         token_ids: Vec::new(),
     };
     assert_eq!(response.message.text(), "Paris");
