@@ -132,7 +132,9 @@ impl ImageGenerator for MockGenerator {
             width: job.width,
             height: job.height,
             prompt_tokens: 3,
+            image_input_tokens: 0,
             completion_tokens: 4,
+            transparent: false,
         })
     }
 }
@@ -160,6 +162,8 @@ fn picture() -> Generate {
         seed: Some(1),
         output_format: None,
         output_compression: None,
+        background: shiso_ir::image::Background::Auto,
+        quality: None,
     }
 }
 

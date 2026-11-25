@@ -371,7 +371,9 @@ impl ImageGenerator for Flux2KleinModel {
             width: job.width,
             height: job.height,
             prompt_tokens: t_txt as u32,
+            image_input_tokens: 0,
             completion_tokens: (t_img * steps) as u32,
+            transparent: false,
         })
     }
 }

@@ -74,6 +74,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/systemone", post(proxy::proxy_handler))
         .route("/v1/images/generations", post(proxy::proxy_handler))
         .route("/v1/images", post(proxy::proxy_handler))
+        .route("/v1/images/edits", post(proxy::proxy_handler))
         .route("/v1/3d/generations", post(proxy::proxy_handler))
         .route("/v1/models", get(models_endpoint::list_models))
         .route("/v1/v1/models", get(models_endpoint::list_models))
@@ -86,6 +87,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/systemone", post(proxy::proxy_handler))
         .route("/images/generations", post(proxy::proxy_handler))
         .route("/images", post(proxy::proxy_handler))
+        .route("/images/edits", post(proxy::proxy_handler))
         .route("/3d/generations", post(proxy::proxy_handler))
         .route("/models", get(models_endpoint::list_models))
         .route(

@@ -185,6 +185,16 @@ pub enum ImageGenError {
     /// Model checkpoint loading failure.
     #[error("model loading failure: {0}")]
     Checkpoint(String),
+    /// A transparent background was asked of a server that loaded no
+    /// background remover, and the model drew no cut-out of its own.
+    #[error(
+        "background: transparent needs a background remover, and this server has none \
+         (start it with --image-matte)"
+    )]
+    NoBackgroundRemover,
+    /// The background remover failed on the device.
+    #[error("background removal failed: {0}")]
+    BackgroundRemoval(String),
 }
 
 /// Reference image for image-to-image or multi-reference editing.
@@ -192,6 +202,24 @@ pub enum ImageGenError {
 pub struct InputReferenceImage {
     /// Raw image bytes (PNG, JPEG).
     pub bytes: Vec<u8>,
+}
+
+/// What a job asks of the finished picture's background.
+///
+/// The generator answers the pixels; the background is a post-processing
+/// decision, so a family that knows nothing of alpha still runs every job
+/// and the wrapper that holds the remover applies this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Background {
+    /// Whatever the model produced: its own alpha when it drew a cut-out,
+    /// opaque otherwise.
+    #[default]
+    Auto,
+    /// No transparency: any alpha is composited over white.
+    Opaque,
+    /// A cut-out: the model's own alpha when it drew one, else the
+    /// background remover's matte.
+    Transparent,
 }
 
 /// One image generation job to execute.
@@ -213,6 +241,8 @@ pub struct ImageGenerationJob {
     pub output_compression: Option<u32>,
     /// Optional reference images for image-to-image or editing.
     pub input_references: Vec<InputReferenceImage>,
+    /// What the finished picture's background must be.
+    pub background: Background,
 }
 
 impl ImageGenerationJob {
@@ -265,10 +295,17 @@ pub struct GeneratedImage {
     pub width: u32,
     /// Pixel height.
     pub height: u32,
-    /// Estimated prompt tokens consumed.
+    /// Text tokens of the prompt the model read.
     pub prompt_tokens: u32,
+    /// Tokens the reference images occupied in the model's input; zero for
+    /// text-to-image and for a family that cannot tell them apart.
+    pub image_input_tokens: u32,
     /// Completion tokens accounted (e.g. latent patches * steps).
     pub completion_tokens: u32,
+    /// Whether the encoded picture carries real transparency. Families
+    /// answer `false`; the background post-processing step that encodes the
+    /// final bytes sets the truth.
+    pub transparent: bool,
 }
 
 /// Progress event emitted during generation steps.
@@ -297,6 +334,13 @@ pub trait ImageGenerator: Send + Sync + fmt::Debug {
     /// request that can never run is refused without costing a queue slot.
     fn max_references(&self) -> usize {
         0
+    }
+
+    /// Whether a background remover stands behind this generator, so a
+    /// transparent background can be promised for any picture. A caller
+    /// checks it before queueing, as it does [`Self::max_references`].
+    fn removes_backgrounds(&self) -> bool {
+        false
     }
 
     /// The size an edit takes when its caller names none, given the

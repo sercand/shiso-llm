@@ -5273,3 +5273,47 @@ async fn client_keys_models_returns_allowed_models_with_aliases_and_pricing() {
     assert_eq!(arr[0]["pricing"]["cached_input_per_mtok"], 0.25);
     assert!(arr[0].get("targets").is_none());
 }
+
+/// An image model priced per picture alone round-trips through the admin
+/// API, and its image prices come back as written.
+#[tokio::test]
+async fn a_per_image_price_round_trips_through_the_admin_api() {
+    let a = echo_backend("from-a").await;
+    let router = TestRouter::start(&backend_toml("b1", &a.uri(), "k")).await;
+    let (status, body) = router
+        .admin(
+            reqwest::Method::POST,
+            "/admin/models",
+            Some(serde_json::json!({
+                "name": "qwen/qwen-image-2.1-turbo",
+                "pricing": {"per_image": 0.0184},
+                "targets": [{"backend": "b1"}]
+            })),
+        )
+        .await;
+    assert!(status == 200 || status == 201, "{status}: {body}");
+    let (status, model) = router
+        .admin(
+            reqwest::Method::GET,
+            "/admin/models/qwen%2Fqwen-image-2.1-turbo",
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{model}");
+    assert_eq!(model["pricing"]["per_image"], 0.0184, "{model}");
+    assert_eq!(model["pricing"]["input_per_mtok"], 0.0, "{model}");
+
+    let (status, _) = router
+        .admin(
+            reqwest::Method::POST,
+            "/admin/models",
+            Some(serde_json::json!({
+                "name": "half-priced",
+                "pricing": {"input_per_mtok": 5.0},
+                "targets": [{"backend": "b1"}]
+            })),
+        )
+        .await;
+    // Refused as the body's shape, the way a missing rate always was.
+    assert_eq!(status, 422, "a token price needs both rates");
+}

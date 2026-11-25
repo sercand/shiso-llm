@@ -657,7 +657,7 @@ fn the_decode_from_the_reference_latent_replays_the_reference_cloud() {
 #[ignore = "needs the splat checkpoint (SHISO_TEST_MODEL_IDOL), the idol fixtures and a Metal device"]
 fn the_background_remover_matches_the_reference_matte() {
     use crate::idol::birefnet::BiRefNet;
-    use crate::idol::preprocess::Matting;
+    use shiso_vision::matte::BackgroundRemover;
 
     let case = "background remover";
     let dir = need!(case, checkpoint("SHISO_TEST_MODEL_IDOL"));
@@ -697,6 +697,76 @@ fn the_background_remover_matches_the_reference_matte() {
         "{share} of the matte is off by more than one level"
     );
     assert!(worst <= 16, "a pixel is {worst} levels off");
+}
+
+/// The image route's remover, opened through the family-neutral door from
+/// the hub's `model.safetensors` layout: a dark disc on white is kept and the
+/// white around it cut away. Against the splat checkpoint's reference matte
+/// (other weights, so not a bound) it reports how far the two agree.
+#[test]
+#[ignore = "needs the dynamic remover (SHISO_TEST_MODEL_BIREFNET) and a Metal device"]
+fn birefnet_dynamic_mattes_a_subject() {
+    let case = "dynamic background remover";
+    let dir = need!(case, checkpoint("SHISO_TEST_MODEL_BIREFNET"));
+    let backend = need!(case, device());
+    let remover =
+        crate::matte_registry::open_background_remover(&dir, &backend).expect("the remover loads");
+    let side = 512u32;
+    let centre = f64::from(side) / 2.0;
+    let inside = |x: u32, y: u32| {
+        let (dx, dy) = (f64::from(x) - centre, f64::from(y) - centre);
+        (dx * dx + dy * dy).sqrt() < f64::from(side) / 4.0
+    };
+    let picture = image::RgbImage::from_fn(side, side, |x, y| {
+        if inside(x, y) {
+            image::Rgb([30, 60, 160])
+        } else {
+            image::Rgb([255, 255, 255])
+        }
+    });
+    let alpha = remover.alpha(&picture).expect("the remover runs");
+    assert_eq!(alpha.len(), picture.pixels().len());
+    let (mut disc, mut disc_kept, mut corners, mut corners_cut) = (0usize, 0usize, 0usize, 0usize);
+    for (i, a) in alpha.iter().enumerate() {
+        let (x, y) = (i as u32 % side, i as u32 / side);
+        if inside(x, y) {
+            disc += 1;
+            disc_kept += usize::from(*a >= 200);
+        } else if x.min(side - 1 - x) < 64 && y.min(side - 1 - y) < 64 {
+            corners += 1;
+            corners_cut += usize::from(*a <= 30);
+        }
+    }
+    let kept = disc_kept as f64 / disc as f64;
+    let cut = corners_cut as f64 / corners as f64;
+    #[expect(
+        clippy::print_stderr,
+        reason = "the measured matte is the case's report"
+    )]
+    {
+        eprintln!("dynamic matte: disc kept {kept:.3}, corners cut {cut:.3}");
+    }
+    assert!(kept >= 0.9, "only {kept} of the disc was kept");
+    assert!(cut >= 0.9, "only {cut} of the corners were cut away");
+
+    if let (Ok(png), Ok(reference)) = (fixture("matte_input.png"), fixture("matte_alpha.u8")) {
+        let rgb = image::open(&png).expect("the fixture picture").to_rgb8();
+        let alpha = remover.alpha(&rgb).expect("the remover runs");
+        let reference = std::fs::read(reference).expect("the reference matte");
+        let close = alpha
+            .iter()
+            .zip(&reference)
+            .filter(|(a, b)| a.abs_diff(**b) <= 16)
+            .count() as f64
+            / alpha.len() as f64;
+        #[expect(
+            clippy::print_stderr,
+            reason = "the agreement with the other weights is informational"
+        )]
+        {
+            eprintln!("dynamic vs splat weights on the fixture: {close:.3} within 16 levels");
+        }
+    }
 }
 
 /// The fused kernel against the GEMM path it replaces, on ragged, joint and

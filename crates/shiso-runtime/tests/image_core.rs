@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use shiso_core::ids::Seed;
-use shiso_ir::image::{Edit, Generate, Step, Usage};
+use shiso_ir::image::{Background, Edit, Generate, ProducedBackground, Quality, Step, Usage};
 use shiso_runtime::error::AppError;
 use shiso_runtime::image::{ImageService, ImageServiceDesc};
 use shiso_runtime::state::AppState;
@@ -23,9 +23,14 @@ const LIMITS: ImageLimits = ImageLimits {
 };
 
 /// A generator that records its jobs and reports one partial per step.
+///
+/// With `alternate`, every other picture it makes is a cut-out; with
+/// `remover`, it says a background remover is loaded.
 #[derive(Debug, Default)]
 struct Recording {
     jobs: Mutex<Vec<ImageGenerationJob>>,
+    alternate: bool,
+    remover: bool,
 }
 
 impl ImageGenerator for Recording {
@@ -41,6 +46,10 @@ impl ImageGenerator for Recording {
         2
     }
 
+    fn removes_backgrounds(&self) -> bool {
+        self.remover
+    }
+
     fn default_size_for_references(
         &self,
         _references: &[InputReferenceImage],
@@ -53,7 +62,11 @@ impl ImageGenerator for Recording {
         job: &ImageGenerationJob,
         progress: Option<&dyn Fn(ImageStepEvent)>,
     ) -> Result<GeneratedImage, ImageGenError> {
-        self.jobs.lock().expect("lock").push(job.clone());
+        let made = {
+            let mut jobs = self.jobs.lock().expect("lock");
+            jobs.push(job.clone());
+            jobs.len()
+        };
         if let Some(progress) = progress {
             for step in 0..job.steps {
                 progress(ImageStepEvent {
@@ -69,13 +82,19 @@ impl ImageGenerator for Recording {
             width: job.width,
             height: job.height,
             prompt_tokens: 1,
+            image_input_tokens: 3,
             completion_tokens: 10,
+            transparent: self.alternate && made % 2 == 1,
         })
     }
 }
 
 fn state() -> (AppState, Arc<Recording>) {
-    let generator = Arc::new(Recording::default());
+    state_with(Recording::default())
+}
+
+fn state_with(generator: Recording) -> (AppState, Arc<Recording>) {
+    let generator = Arc::new(generator);
     let boxed: Arc<dyn ImageGenerator> = generator.clone();
     let service = ImageService::start(ImageServiceDesc {
         generator: boxed,
@@ -100,6 +119,8 @@ fn prompt(text: &str) -> Generate {
         seed: None,
         output_format: None,
         output_compression: None,
+        background: Background::Auto,
+        quality: None,
     }
 }
 
@@ -126,11 +147,19 @@ async fn generate_makes_n_images_with_seed_plus_index_and_summed_usage() {
     assert_eq!(
         images.usage,
         Usage {
-            prompt_tokens: 2,
-            completion_tokens: 20
+            text_input_tokens: 2,
+            image_input_tokens: 6,
+            image_output_tokens: 20,
         }
     );
-    assert_eq!(images.usage.total_tokens(), 22);
+    assert_eq!(images.usage.total_tokens(), 28);
+    assert_eq!(images.output_format, "png");
+    assert_eq!(images.quality, None);
+    assert_eq!(images.background, ProducedBackground::Opaque);
+    assert_eq!(
+        (images.images[0].width, images.images[0].height),
+        (512, 512)
+    );
     let jobs = generator.jobs.lock().expect("lock").clone();
     let seeds: Vec<_> = jobs.iter().map(|job| job.seed).collect();
     assert_eq!(seeds, vec![Seed::new(40), Seed::new(41)]);
@@ -161,7 +190,7 @@ async fn generate_stream_steps_count_partials_across_images_and_skip_the_last_st
         .map(|step| match step {
             Step::Admitted => "admitted".to_owned(),
             Step::Partial { index, bytes } => format!("partial {index} {bytes:?}"),
-            Step::Completed { usage, .. } => format!("completed {}", usage.completion_tokens),
+            Step::Completed { usage, .. } => format!("completed {}", usage.image_output_tokens),
         })
         .collect();
     assert_eq!(
@@ -374,4 +403,73 @@ async fn an_operator_cap_lowers_the_reference_limit() {
         .await
         .expect_err("over the cap");
     assert!(bad_request_message(&error).contains("accepts at most 1"));
+}
+
+#[tokio::test]
+async fn transparent_jpeg_is_refused() {
+    let (state, _) = state_with(Recording {
+        remover: true,
+        ..Recording::default()
+    });
+    let request = Generate {
+        background: Background::Transparent,
+        output_format: Some("jpeg".to_owned()),
+        ..prompt("a cat")
+    };
+    let error = shiso_runtime::image::generate(&state, request)
+        .await
+        .expect_err("refused");
+    let message = bad_request_message(&error);
+    assert!(message.contains("png"), "{message}");
+    assert!(
+        matches!(&error, AppError::BadRequest { param: Some(p), .. } if p == "background"),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn transparent_without_remover_is_refused_in_preflight() {
+    let (state, generator) = state();
+    let request = Generate {
+        background: Background::Transparent,
+        ..prompt("a cat")
+    };
+    let error = shiso_runtime::image::preflight(&state, &request, &[]).expect_err("refused");
+    let message = bad_request_message(&error);
+    assert!(message.contains("--image-matte"), "{message}");
+    assert!(generator.jobs.lock().expect("lock").is_empty());
+    // With a remover loaded, the same request is accepted and the job asks
+    // for a transparent background.
+    let (state, generator) = state_with(Recording {
+        remover: true,
+        ..Recording::default()
+    });
+    shiso_runtime::image::generate(&state, request)
+        .await
+        .expect("generates");
+    let jobs = generator.jobs.lock().expect("lock").clone();
+    assert_eq!(
+        jobs[0].background,
+        shiso_vision::generator::Background::Transparent
+    );
+}
+
+#[tokio::test]
+async fn mixed_auto_pictures_report_transparent() {
+    let (state, _) = state_with(Recording {
+        alternate: true,
+        ..Recording::default()
+    });
+    let request = Generate {
+        n: Some(2),
+        quality: Some(Quality::High),
+        ..prompt("a cat")
+    };
+    let images = shiso_runtime::image::generate(&state, request)
+        .await
+        .expect("generates");
+    assert_eq!(images.background, ProducedBackground::Transparent);
+    assert_eq!(images.images[0].background, ProducedBackground::Transparent);
+    assert_eq!(images.images[1].background, ProducedBackground::Opaque);
+    assert_eq!(images.quality, Some(Quality::High));
 }

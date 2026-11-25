@@ -12,6 +12,7 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
+use shiso_vision::generator::Background;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -55,6 +56,7 @@ fn generate(generator: &Arc<dyn ImageGenerator>, seed: u64, label: &str) -> Vec<
         output_format: ImageOutputFormat::Png,
         output_compression: None,
         input_references: Vec::new(),
+        background: Background::Auto,
     };
     let began = Instant::now();
     let last = std::cell::Cell::new(began);

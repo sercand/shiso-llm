@@ -50,7 +50,7 @@ use shiso_kvstore::{CommitOpts, Frontier, KvCache, KvError, Lookup, PersistOutco
 use shiso_models::image_registry::{ImageFamily, ImageModelDesc};
 use shiso_server::tokenizer::{TokenizerError, Vocabulary};
 use shiso_vision::generator::{
-    GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageLimits,
+    Background, GeneratedImage, ImageGenError, ImageGenerationJob, ImageGenerator, ImageLimits,
     ImageOutputFormat, ImageStepEvent, InputReferenceImage,
 };
 use shiso_vision::splat::{
@@ -568,6 +568,7 @@ type JobFields = (
     ImageOutputFormat,
     Option<u32>,
     Vec<InputReferenceImage>,
+    Background,
 );
 fn image_generation_job_fields(job: ImageGenerationJob) -> JobFields {
     (
@@ -579,13 +580,14 @@ fn image_generation_job_fields(job: ImageGenerationJob) -> JobFields {
         job.output_format,
         job.output_compression,
         job.input_references,
+        job.background,
     )
 }
 const _: fn(ImageGenerationJob) -> JobFields = image_generation_job_fields;
 
 /// A finished generation read apart: encoded bytes with the MIME string and
 /// the pixel and token counts the wire response reports.
-type GeneratedImageFields = (Vec<u8>, &'static str, u32, u32, u32, u32);
+type GeneratedImageFields = (Vec<u8>, &'static str, u32, u32, u32, u32, u32, bool);
 fn generated_image_fields(image: GeneratedImage) -> GeneratedImageFields {
     (
         image.bytes,
@@ -593,10 +595,16 @@ fn generated_image_fields(image: GeneratedImage) -> GeneratedImageFields {
         image.width,
         image.height,
         image.prompt_tokens,
+        image.image_input_tokens,
         image.completion_tokens,
+        image.transparent,
     )
 }
 const _: fn(GeneratedImage) -> GeneratedImageFields = generated_image_fields;
+
+/// The background remover seam both the image and splat routes use stays
+/// object-safe: both hold it as a trait object.
+const _: Option<&dyn shiso_vision::matte::BackgroundRemover> = None;
 
 /// What the server hands the registry to open a checkpoint, read apart: the
 /// four component paths and the assets directory, then the residency policy
@@ -714,6 +722,11 @@ fn image_gen_error_variants(error: &ImageGenError) -> (u8, u32, u32) {
             let _: &String = msg;
             (6, 0, 0)
         }
+        ImageGenError::NoBackgroundRemover => (14, 0, 0),
+        ImageGenError::BackgroundRemoval(msg) => {
+            let _: &String = msg;
+            (15, 0, 0)
+        }
     }
 }
 const _: fn(&ImageGenError) -> (u8, u32, u32) = image_gen_error_variants;
@@ -723,7 +736,9 @@ const _: fn(&ImageGenError) -> (u8, u32, u32) = image_gen_error_variants;
 /// generation and for an edit), and the floor they check first. A drift in any
 /// of them stops here.
 mod image_core {
-    use shiso_ir::image::{Edit, Generate, Image, Images, Step, Usage};
+    use shiso_ir::image::{
+        Background, Edit, Generate, Image, Images, ProducedBackground, Quality, Step, Usage,
+    };
     use shiso_runtime::error::AppError;
     use shiso_runtime::image::{
         MAX_IMAGES_PER_REQUEST, MAX_STEPS_PER_IMAGE, edit, edit_stream, generate, generate_stream,
@@ -792,6 +807,8 @@ mod image_core {
         Option<u64>,
         Option<String>,
         Option<u32>,
+        Background,
+        Option<Quality>,
     );
     fn generate_fields(request: Generate) -> GenerateFields {
         (
@@ -803,6 +820,8 @@ mod image_core {
             request.seed,
             request.output_format,
             request.output_compression,
+            request.background,
+            request.quality,
         )
     }
     const _: fn(Generate) -> GenerateFields = generate_fields;
@@ -813,46 +832,72 @@ mod image_core {
     }
     const _: fn(Edit) -> EditFields = edit_fields;
 
-    type ImagesFields = (u64, Vec<Image>, Usage);
+    type ImagesFields = (
+        u64,
+        Vec<Image>,
+        Usage,
+        ProducedBackground,
+        String,
+        Option<Quality>,
+    );
     fn images_fields(images: Images) -> ImagesFields {
-        (images.created, images.images, images.usage)
+        (
+            images.created,
+            images.images,
+            images.usage,
+            images.background,
+            images.output_format,
+            images.quality,
+        )
     }
     const _: fn(Images) -> ImagesFields = images_fields;
 
-    fn image_fields(image: Image) -> (Vec<u8>, String) {
-        (image.bytes, image.media_type)
-    }
-    const _: fn(Image) -> (Vec<u8>, String) = image_fields;
-
-    fn usage_fields(usage: Usage) -> (u32, u32, u32) {
+    type ImageFields = (Vec<u8>, String, u32, u32, ProducedBackground);
+    fn image_fields(image: Image) -> ImageFields {
         (
-            usage.prompt_tokens,
-            usage.completion_tokens,
+            image.bytes,
+            image.media_type,
+            image.width,
+            image.height,
+            image.background,
+        )
+    }
+    const _: fn(Image) -> ImageFields = image_fields;
+
+    fn usage_fields(usage: Usage) -> (u32, u32, u32, u32, u32) {
+        (
+            usage.text_input_tokens,
+            usage.image_input_tokens,
+            usage.image_output_tokens,
+            usage.input_tokens(),
             usage.total_tokens(),
         )
     }
-    const _: fn(Usage) -> (u32, u32, u32) = usage_fields;
+    const _: fn(Usage) -> (u32, u32, u32, u32, u32) = usage_fields;
 
     /// The stream's three events and what each carries.
-    type StepFields = Option<(u32, Vec<u8>, u64, Image, Usage)>;
+    type StepFields = Option<(
+        u32,
+        Vec<u8>,
+        u64,
+        Option<(Image, Usage, String, Option<Quality>)>,
+    )>;
     fn step_fields(step: Step) -> StepFields {
         match step {
             Step::Admitted => None,
-            Step::Partial { index, bytes } => Some((
-                index,
-                bytes,
-                0,
-                Image {
-                    bytes: Vec::new(),
-                    media_type: String::new(),
-                },
-                Usage::default(),
-            )),
+            Step::Partial { index, bytes } => Some((index, bytes, 0, None)),
             Step::Completed {
                 created,
                 image,
                 usage,
-            } => Some((0, Vec::new(), created, image, usage)),
+                output_format,
+                quality,
+            } => Some((
+                0,
+                Vec::new(),
+                created,
+                Some((image, usage, output_format, quality)),
+            )),
         }
     }
     const _: fn(Step) -> StepFields = step_fields;
@@ -1466,7 +1511,7 @@ mod runtime_facade {
     use std::future::Future;
     use std::path::{Path, PathBuf};
 
-    use shiso_ir::image::{Edit, Generate, Images, Step};
+    use shiso_ir::image::{Background, Edit, Generate, Images, Step};
     use shiso_ir::{Request, Response, StreamEvent};
     use shiso_runtime::boot::EngineThread;
     use shiso_runtime::error::AppError;
@@ -1594,6 +1639,8 @@ mod runtime_facade {
             seed: None,
             output_format: None,
             output_compression: None,
+            background: Background::Auto,
+            quality: None,
         }
     }
     fn blank_edit() -> Edit {

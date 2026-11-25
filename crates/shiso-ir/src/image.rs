@@ -43,6 +43,54 @@ pub struct Generate {
     pub output_format: Option<String>,
     /// Compression level, between 1 and 100.
     pub output_compression: Option<u32>,
+    /// What the finished pictures' background must be.
+    pub background: Background,
+    /// The rendering quality the caller named. Echoed back; it changes
+    /// nothing about how a picture is made.
+    pub quality: Option<Quality>,
+}
+
+/// What a request asks of its pictures' background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Background {
+    /// The model decides: its own cut-out when it drew one, opaque
+    /// otherwise.
+    #[default]
+    Auto,
+    /// No transparency.
+    Opaque,
+    /// A cut-out, whatever the model drew. Needs png output.
+    Transparent,
+}
+
+/// What a picture's background turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProducedBackground {
+    /// Every pixel opaque.
+    Opaque,
+    /// A cut-out with real transparency.
+    Transparent,
+}
+
+/// A rendering quality a caller may name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quality {
+    /// `low`.
+    Low,
+    /// `medium`.
+    Medium,
+    /// `high`.
+    High,
+    /// `xhigh`.
+    Xhigh,
+    /// `max`.
+    Max,
+    /// `auto`.
+    Auto,
+    /// `standard`, the older models' spelling.
+    Standard,
+    /// `hd`, the older models' spelling.
+    Hd,
 }
 
 /// An image-edit request: a [`Generate`] and the pictures it edits from.
@@ -57,20 +105,32 @@ pub struct Edit {
     pub references: Vec<Vec<u8>>,
 }
 
-/// Token accounting across the pictures of one request.
+/// Token accounting across the pictures of one request, by class: the
+/// classes are priced apart, so they are counted apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Usage {
-    /// Prompt tokens, summed over the pictures.
-    pub prompt_tokens: u32,
-    /// Completion tokens, summed over the pictures.
-    pub completion_tokens: u32,
+    /// Text tokens of the prompt, summed over the pictures.
+    pub text_input_tokens: u32,
+    /// Tokens the reference pictures occupied in the model's input, summed
+    /// over the pictures.
+    pub image_input_tokens: u32,
+    /// Tokens of picture the model produced (latent cells times steps),
+    /// summed over the pictures.
+    pub image_output_tokens: u32,
 }
 
 impl Usage {
-    /// Prompt plus completion tokens, saturating.
+    /// Input tokens of both classes, saturating.
+    #[must_use]
+    pub const fn input_tokens(self) -> u32 {
+        self.text_input_tokens
+            .saturating_add(self.image_input_tokens)
+    }
+
+    /// Every token, saturating.
     #[must_use]
     pub const fn total_tokens(self) -> u32 {
-        self.prompt_tokens.saturating_add(self.completion_tokens)
+        self.input_tokens().saturating_add(self.image_output_tokens)
     }
 }
 
@@ -81,6 +141,12 @@ pub struct Image {
     pub bytes: Vec<u8>,
     /// Its MIME type.
     pub media_type: String,
+    /// Pixel width.
+    pub width: u32,
+    /// Pixel height.
+    pub height: u32,
+    /// Whether it carries real transparency.
+    pub background: ProducedBackground,
 }
 
 /// The pictures of a finished request.
@@ -92,6 +158,12 @@ pub struct Images {
     pub images: Vec<Image>,
     /// The request's token accounting.
     pub usage: Usage,
+    /// Transparent when any picture is.
+    pub background: ProducedBackground,
+    /// The encoding every picture is in: `png` or `jpeg`.
+    pub output_format: String,
+    /// The quality the caller named, echoed.
+    pub quality: Option<Quality>,
 }
 
 /// One event of a streamed request.
@@ -117,5 +189,9 @@ pub enum Step {
         image: Image,
         /// The request's running total, this picture included.
         usage: Usage,
+        /// The encoding the picture is in: `png` or `jpeg`.
+        output_format: String,
+        /// The quality the caller named, echoed.
+        quality: Option<Quality>,
     },
 }

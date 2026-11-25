@@ -960,12 +960,14 @@ impl ImageGenerator for Flux3KleinModel {
             width,
             height,
             prompt_tokens: u32::try_from(encoded.real).unwrap_or(u32::MAX),
+            image_input_tokens: 0,
             completion_tokens: u32::try_from(
                 (shape.height / PIXELS_PER_TOKEN)
                     * (shape.width / PIXELS_PER_TOKEN)
                     * job.steps as usize,
             )
             .unwrap_or(u32::MAX),
+            transparent: false,
         })
     }
 }

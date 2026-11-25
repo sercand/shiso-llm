@@ -7,6 +7,7 @@
 
 mod common;
 
+use shiso_vision::generator::Background;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -28,7 +29,9 @@ fn png_image(width: u32, height: u32) -> GeneratedImage {
         width,
         height,
         prompt_tokens: 10,
+        image_input_tokens: 0,
         completion_tokens: 1024,
+        transparent: false,
     }
 }
 
@@ -43,6 +46,7 @@ fn job(prompt: &str, steps: u32) -> ImageGenerationJob {
         output_format: ImageOutputFormat::Png,
         output_compression: None,
         input_references: Vec::new(),
+        background: Background::Auto,
     }
 }
 
@@ -73,7 +77,9 @@ impl ImageGenerator for MockGenerator {
             width: job.width,
             height: job.height,
             prompt_tokens: 10,
+            image_input_tokens: 0,
             completion_tokens: 1024,
+            transparent: false,
         })
     }
 }
@@ -189,6 +195,7 @@ async fn image_service_submits_and_completes_job() {
         output_format: ImageOutputFormat::Png,
         output_compression: None,
         input_references: Vec::new(),
+        background: Background::Auto,
     };
 
     let result = service.generate(job).await.expect("generates image");

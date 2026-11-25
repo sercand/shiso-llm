@@ -1,4 +1,5 @@
 use super::*;
+use crate::generator::Background;
 use crate::generator::ImageLimits;
 use shiso_core::ids::Seed;
 
@@ -46,6 +47,7 @@ fn job_dimension_validation() {
         output_format: ImageOutputFormat::Png,
         output_compression: None,
         input_references: Vec::new(),
+        background: Background::Auto,
     };
     assert!(job.validate(&LIMITS).is_ok());
 
@@ -58,6 +60,7 @@ fn job_dimension_validation() {
         output_format: ImageOutputFormat::Png,
         output_compression: None,
         input_references: Vec::new(),
+        background: Background::Auto,
     };
     assert!(matches!(
         invalid_job.validate(&LIMITS),
@@ -79,6 +82,7 @@ fn job_refuses_a_zero_step_count_as_invalid_input() {
         output_format: ImageOutputFormat::Png,
         output_compression: None,
         input_references: Vec::new(),
+        background: Background::Auto,
     };
     assert!(matches!(
         job.validate(&LIMITS),
@@ -96,6 +100,7 @@ fn job_of(width: u32, height: u32, steps: u32) -> ImageGenerationJob {
         output_format: ImageOutputFormat::Png,
         output_compression: None,
         input_references: Vec::new(),
+        background: Background::Auto,
     }
 }
 
@@ -148,4 +153,26 @@ fn memory_refusal_names_the_largest_side_or_says_none_fits() {
     let none = refusal(0);
     assert!(!none.contains("0x0"), "{none}");
     assert!(none.contains("no image size fits"), "{none}");
+}
+
+#[test]
+fn background_defaults_to_auto() {
+    assert_eq!(Background::default(), Background::Auto);
+}
+
+/// The remover seam is object-safe and hands back one alpha byte per pixel.
+#[test]
+fn a_background_remover_is_a_trait_object() {
+    #[derive(Debug)]
+    struct Half;
+    impl matte::BackgroundRemover for Half {
+        fn alpha(&self, rgb: &::image::RgbImage) -> Result<Vec<u8>, String> {
+            Ok(vec![128; rgb.pixels().len()])
+        }
+    }
+    let remover: Box<dyn matte::BackgroundRemover> = Box::new(Half);
+    let alpha = remover
+        .alpha(&::image::RgbImage::new(2, 3))
+        .expect("the fake remover answers");
+    assert_eq!(alpha, vec![128; 6]);
 }

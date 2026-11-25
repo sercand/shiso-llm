@@ -64,7 +64,16 @@ fn probe_body(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<(ModelProbe, Option<Range<usize>>), AppError> {
-    if Dialect::for_path(path) != Dialect::OpenAiTranscriptions {
+    // Transcriptions are always a form. An image edit is a form when its
+    // content type says so (the reference pictures ride as files) and JSON
+    // otherwise (they ride as data URLs); every other route is JSON.
+    let form_edit = path.ends_with("/v1/images/edits")
+        && headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(multipart::boundary)
+            .is_some();
+    if Dialect::for_path(path) != Dialect::OpenAiTranscriptions && !form_edit {
         let probe = serde_json::from_slice(body).map_err(|_| {
             AppError::BadRequest("request body must be JSON with a `model` field".into())
         })?;
@@ -709,6 +718,7 @@ fn canonical_path(path: &str) -> &str {
         // OpenRouter one) and `/v1/images` are the shorthands clients reach
         // for. All of them go upstream as the OpenAI path.
         "/images" | "/v1/images" | "/images/generations" => "/v1/images/generations",
+        "/images/edits" => "/v1/images/edits",
         // The 3D surface has one spelling upstream; the unprefixed form is
         // the convenience alias, as it is for every other endpoint here.
         "/3d/generations" => "/v1/3d/generations",
@@ -1233,6 +1243,8 @@ mod tests {
             assert_eq!(canonical_path(p), "/v1/images/generations");
         }
         assert_eq!(Dialect::for_path("/v1/images/generations"), Dialect::Images);
+        assert_eq!(Dialect::for_path("/v1/images/edits"), Dialect::Images);
+        assert_eq!(canonical_path("/images/edits"), "/v1/images/edits");
         assert_eq!(required_kind("/v1/images/generations"), BackendKind::Openai);
     }
 
@@ -1323,6 +1335,24 @@ mod tests {
         assert!(probe_body("/v1/audio/transcriptions", &headers, json).is_err());
         assert!(probe_body("/v1/audio/transcriptions", &HeaderMap::new(), FORM).is_err());
         assert!(probe_body("/v1/chat/completions", &headers, FORM).is_err());
+    }
+
+    /// The edit route takes either shape, as the image servers do: a form
+    /// when the content type says so, JSON otherwise.
+    #[test]
+    fn image_edits_probe_a_form_or_json() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("multipart/form-data; boundary=b"),
+        );
+        let (probe, span) = probe_body("/v1/images/edits", &headers, FORM).unwrap();
+        assert_eq!(probe.model, "alias");
+        assert_eq!(&FORM[span.unwrap()], b"alias");
+        let json = br#"{"model":"qwen","prompt":"x","images":[]}"#;
+        let (probe, span) = probe_body("/v1/images/edits", &HeaderMap::new(), json).unwrap();
+        assert_eq!(probe.model, "qwen");
+        assert!(span.is_none());
     }
 
     #[test]

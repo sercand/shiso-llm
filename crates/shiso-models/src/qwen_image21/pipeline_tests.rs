@@ -13,6 +13,7 @@
     reason = "the measured residency changes are the case's report"
 )]
 
+use shiso_vision::generator::Background;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -39,6 +40,7 @@ fn job_for(model: &QwenImage21Model, prompt: &str) -> ImageGenerationJob {
         output_format: ImageOutputFormat::Png,
         output_compression: None,
         input_references: Vec::new(),
+        background: Background::Auto,
     }
 }
 
@@ -313,6 +315,7 @@ fn reference_png() -> InputReferenceImage {
 fn edit_job(model: &QwenImage21Model, prompt: &str, references: usize) -> ImageGenerationJob {
     ImageGenerationJob {
         input_references: vec![reference_png(); references],
+        background: Background::Auto,
         ..job_for(model, prompt)
     }
 }

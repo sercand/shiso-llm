@@ -10,6 +10,7 @@
     reason = "the forge turns small counts into weight scales"
 )]
 
+use shiso_vision::generator::Background;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -263,6 +264,7 @@ pub(super) fn job(width: u32, height: u32, seed: u64) -> ImageGenerationJob {
         output_format: ImageOutputFormat::Png,
         output_compression: None,
         input_references: Vec::new(),
+        background: Background::Auto,
     }
 }
 

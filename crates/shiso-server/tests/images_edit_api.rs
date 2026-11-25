@@ -76,7 +76,9 @@ impl ImageGenerator for EditMock {
             width: job.width,
             height: job.height,
             prompt_tokens: 1,
+            image_input_tokens: 0,
             completion_tokens: 1,
+            transparent: false,
         })
     }
 }
@@ -299,4 +301,93 @@ async fn generations_stay_text_only_and_at_the_text_default_size() {
     let jobs = mock.jobs.lock().expect("lock").clone();
     assert!(jobs[0].input_references.is_empty());
     assert_eq!((jobs[0].width, jobs[0].height), (1024, 1024));
+}
+
+/// The whole answer as text, for a streamed edit.
+async fn send_text(
+    state: Arc<AppState>,
+    content_type: &str,
+    body: Vec<u8>,
+) -> (StatusCode, String) {
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/edits")
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .expect("builds"),
+        )
+        .await
+        .expect("the router answers");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the body reads");
+    (status, String::from_utf8(bytes.to_vec()).expect("text"))
+}
+
+#[tokio::test]
+async fn edit_stream_uses_image_edit_events() {
+    let (state, _mock) = state(10);
+    let pics = pictures(1);
+    let parts: Vec<(&str, &[u8])> = vec![
+        ("image", pics[0].as_slice()),
+        ("prompt", b"a hat"),
+        ("stream", b"true"),
+    ];
+    let (content_type, body) = multipart(&parts);
+    let (status, text) = send_text(state, &content_type, body).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(text.contains("event: image_edit.completed"), "{text}");
+    assert!(text.contains(r#""type":"image_edit.completed""#), "{text}");
+    assert!(!text.contains("image_generation."), "{text}");
+}
+
+#[tokio::test]
+async fn multipart_edit_reads_background_fields() {
+    let pics = pictures(1);
+    let (app, mock) = state(10);
+    let (status, body) = edit(
+        app,
+        &pics,
+        "image",
+        &[("prompt", "a hat"), ("background", "transparent")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["param"], "background", "{body}");
+    assert!(mock.jobs.lock().expect("lock").is_empty());
+
+    let (app, _) = state(10);
+    let (status, body) = edit(
+        app,
+        &pics,
+        "image",
+        &[("prompt", "a hat"), ("moderation", "strict")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["param"], "moderation", "{body}");
+
+    let (app, mock) = state(10);
+    let (status, body) = edit(
+        app,
+        &pics,
+        "image",
+        &[
+            ("prompt", "a hat"),
+            ("background", "opaque"),
+            ("quality", "low"),
+            ("moderation", "low"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["background"], "opaque", "{body}");
+    assert_eq!(body["quality"], "low", "{body}");
+    assert_eq!(
+        mock.jobs.lock().expect("lock")[0].background,
+        shiso_vision::generator::Background::Opaque
+    );
 }

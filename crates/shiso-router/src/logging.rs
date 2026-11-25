@@ -46,6 +46,8 @@ pub struct LogRow {
     pub cache_write_tokens: Option<i64>,
     /// Total token count.
     pub total_tokens: Option<i64>,
+    /// Images the response carried; `None` outside the image routes.
+    pub image_count: Option<i64>,
     /// Request cost in USD.
     pub cost: Option<f64>,
     /// Finish reason reported by upstream provider.
@@ -81,6 +83,7 @@ impl LogRow {
             cached_tokens: None,
             cache_write_tokens: None,
             total_tokens: None,
+            image_count: None,
             cost: None,
             finish_reason: None,
             error: None,
@@ -166,9 +169,9 @@ fn insert_batch(db: &Db, rows: &[LogRow]) -> Result<()> {
                     path, status, streamed, ttfb_ms, duration_ms,
                     prompt_tokens, completion_tokens, cached_tokens,
                     cache_write_tokens, total_tokens, cost, finish_reason, error,
-                    service_tier, parent_token_id
+                    service_tier, parent_token_id, image_count
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                           ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                           ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             )?;
             for row in rows {
                 stmt.execute(rusqlite::params![
@@ -193,6 +196,7 @@ fn insert_batch(db: &Db, rows: &[LogRow]) -> Result<()> {
                     row.error,
                     row.service_tier,
                     row.parent_token_id,
+                    row.image_count,
                 ])?;
             }
         }
@@ -223,6 +227,7 @@ mod tests {
             cached_tokens: Some(20),
             cache_write_tokens: None,
             total_tokens: Some(150),
+            image_count: None,
             cost: Some(0.001),
             finish_reason: Some("stop".into()),
             error: None,

@@ -13,7 +13,7 @@ use futures_util::Stream;
 use serde_json::Value;
 
 use crate::active::ActiveGuard;
-use crate::balancer::Pricing;
+use crate::balancer::{BilledUsage, Pricing};
 use crate::limits::RequestUsage;
 use crate::logging::{LogRow, LogSink};
 use crate::sched::SlotGuard;
@@ -59,7 +59,7 @@ impl Dialect {
             Dialect::OpenAiTranscriptions
         } else if path.ends_with("/v1/decisions") || path.ends_with("/v1/systemone") {
             Dialect::Scoring
-        } else if path.ends_with("/v1/images/generations") {
+        } else if path.ends_with("/v1/images/generations") || path.ends_with("/v1/images/edits") {
             Dialect::Images
         } else if path.ends_with("/v1/3d/generations") {
             Dialect::Splat
@@ -106,6 +106,12 @@ pub(crate) struct Usage {
     pub cached_tokens: Option<i64>,
     pub cache_write_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
+    /// Image input tokens, a subset of `prompt_tokens`, when reported.
+    pub image_input_tokens: Option<i64>,
+    /// Image output tokens, a subset of `completion_tokens`, when reported.
+    pub image_output_tokens: Option<i64>,
+    /// Images the response carried; `None` outside the image routes.
+    pub image_count: Option<i64>,
     pub finish_reason: Option<String>,
     pub error: Option<String>,
 }
@@ -173,6 +179,8 @@ struct Extracted {
     output_tokens: Option<i64>,
     cached_tokens: Option<i64>,
     cache_write_tokens: Option<i64>,
+    image_input_tokens: Option<i64>,
+    image_output_tokens: Option<i64>,
     finish_reason: Option<String>,
     body_error: Option<String>,
 }
@@ -182,6 +190,74 @@ pub(crate) struct UsageAccumulator {
     mode: Mode,
     ext: Extracted,
     saw_token: bool,
+    /// Counts the pictures of an image response; `None` on every other route.
+    images: Option<ImageCounter>,
+}
+
+/// Counts the pictures of an image response as its bytes pass, whatever the
+/// buffering mode keeps: a JSON body is mostly base64 and only its edges are
+/// kept, so the count cannot wait for a parse.
+///
+/// A blocking body carries each picture as a `"b64_json"` or a `"url"`
+/// string. Only string values count (an upstream that writes every optional
+/// field sends `"url": null` beside each `b64_json`), and the two keys are
+/// tallied apart and the larger taken, so one picture is never counted
+/// twice. A stream has one completed event per picture and previews that
+/// carry `b64_json` too, so it counts the completed events' `type` values.
+/// Patterns may straddle chunks, so the last bytes of each chunk are carried
+/// into the next and a match is counted only where it ends in new bytes.
+struct ImageCounter {
+    /// Alternative spellings of one thing to count, per tally.
+    tallies: &'static [&'static [&'static [u8]]],
+    carry: Vec<u8>,
+    counts: Vec<i64>,
+}
+
+impl ImageCounter {
+    const BODY: &'static [&'static [&'static [u8]]] = &[
+        &[b"\"b64_json\":\"", b"\"b64_json\": \""],
+        &[b"\"url\":\"", b"\"url\": \""],
+    ];
+    const STREAM: &'static [&'static [&'static [u8]]] =
+        &[&[b"image_generation.completed\"", b"image_edit.completed\""]];
+
+    fn new(is_sse: bool) -> Self {
+        let tallies = if is_sse { Self::STREAM } else { Self::BODY };
+        ImageCounter {
+            tallies,
+            carry: Vec::new(),
+            counts: vec![0; tallies.len()],
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        let longest = self
+            .tallies
+            .iter()
+            .flat_map(|t| t.iter())
+            .map(|p| p.len())
+            .max()
+            .unwrap_or(1);
+        let old = self.carry.len();
+        let mut window = std::mem::take(&mut self.carry);
+        window.extend_from_slice(chunk);
+        for (tally, count) in self.tallies.iter().zip(&mut self.counts) {
+            for pattern in *tally {
+                *count += window
+                    .windows(pattern.len())
+                    .enumerate()
+                    .filter(|(start, w)| w == pattern && start + pattern.len() > old)
+                    .count() as i64;
+            }
+        }
+        let keep = window.len().min(longest - 1);
+        self.carry = window[window.len() - keep..].to_vec();
+    }
+
+    /// The pictures counted: the largest tally.
+    fn count(&self) -> i64 {
+        self.counts.iter().copied().max().unwrap_or(0)
+    }
 }
 
 impl UsageAccumulator {
@@ -223,6 +299,8 @@ impl UsageAccumulator {
             mode,
             ext: Extracted::default(),
             saw_token,
+            images: (dialect == Dialect::Images && !content_encoded)
+                .then(|| ImageCounter::new(is_sse)),
         }
     }
 
@@ -233,6 +311,9 @@ impl UsageAccumulator {
     }
 
     pub(crate) fn push(&mut self, chunk: &[u8]) {
+        if let Some(images) = &mut self.images {
+            images.push(chunk);
+        }
         match &mut self.mode {
             Mode::Skip => {}
             Mode::Json { buf, truncated } => {
@@ -374,6 +455,9 @@ impl UsageAccumulator {
             cached_tokens: ext.cached_tokens,
             cache_write_tokens: ext.cache_write_tokens,
             total_tokens,
+            image_input_tokens: ext.image_input_tokens,
+            image_output_tokens: ext.image_output_tokens,
+            image_count: self.images.map(|images| images.count()),
             finish_reason: ext.finish_reason,
             error: ext.body_error,
         }
@@ -653,6 +737,14 @@ fn apply_openai_usage(ext: &mut Extracted, u: &Value) {
     {
         ext.cached_tokens = Some(n);
     }
+    // The image models split both sides by class; the classes are priced
+    // apart, so each subset is kept.
+    if let Some(n) = u["input_tokens_details"]["image_tokens"].as_i64() {
+        ext.image_input_tokens = Some(n);
+    }
+    if let Some(n) = u["output_tokens_details"]["image_tokens"].as_i64() {
+        ext.image_output_tokens = Some(n);
+    }
 }
 
 fn apply_anthropic_usage(ext: &mut Extracted, u: &Value) {
@@ -743,17 +835,23 @@ impl<S> TeeStream<S> {
         ctx.row.cached_tokens = usage.cached_tokens;
         ctx.row.cache_write_tokens = usage.cache_write_tokens;
         ctx.row.total_tokens = usage.total_tokens;
+        ctx.row.image_count = usage.image_count;
         ctx.row.finish_reason = usage.finish_reason;
-        ctx.row.cost = match (
-            &ctx.pricing,
-            usage.prompt_tokens.or(usage.completion_tokens),
-        ) {
-            (Some(p), Some(_)) => Some(p.cost_usd(
-                usage.prompt_tokens.unwrap_or(0),
-                usage.completion_tokens.unwrap_or(0),
-                usage.cached_tokens.unwrap_or(0),
-                usage.cache_write_tokens.unwrap_or(0),
-            )),
+        // A response that reported tokens or carried a picture has a cost; a
+        // per-image price bills a picture even from an upstream that reports
+        // no usage at all.
+        let billed = usage.prompt_tokens.or(usage.completion_tokens).is_some()
+            || usage.image_count.is_some_and(|n| n > 0);
+        ctx.row.cost = match (&ctx.pricing, billed) {
+            (Some(p), true) => Some(p.cost_usd(&BilledUsage {
+                prompt: usage.prompt_tokens.unwrap_or(0),
+                completion: usage.completion_tokens.unwrap_or(0),
+                cached: usage.cached_tokens.unwrap_or(0),
+                cache_write: usage.cache_write_tokens.unwrap_or(0),
+                image_input: usage.image_input_tokens.unwrap_or(0),
+                image_output: usage.image_output_tokens.unwrap_or(0),
+                images: usage.image_count.unwrap_or(0),
+            })),
             _ => None,
         };
 
@@ -1384,5 +1482,64 @@ mod tests {
             acc.saw_token(),
             "non-SSE response should immediately treat first chunk as token"
         );
+    }
+
+    /// Image token classes come out of the details objects.
+    #[test]
+    fn image_usage_details_are_read() {
+        let body = br#"{"created":1,"data":[{"b64_json":"QQ=="}],"usage":{"input_tokens":50,"input_tokens_details":{"text_tokens":10,"image_tokens":40},"output_tokens":4160,"output_tokens_details":{"image_tokens":4160,"text_tokens":0},"total_tokens":4210}}"#;
+        let usage = feed(Dialect::Images, false, &[body]);
+        assert_eq!(usage.prompt_tokens, Some(50));
+        assert_eq!(usage.image_input_tokens, Some(40));
+        assert_eq!(usage.completion_tokens, Some(4160));
+        assert_eq!(usage.image_output_tokens, Some(4160));
+        assert_eq!(usage.image_count, Some(1));
+    }
+
+    /// The image count survives a chunk boundary inside the key, and in a
+    /// body far past every buffer.
+    #[test]
+    fn image_count_survives_chunk_split() {
+        let b64 = "A".repeat(MAX_JSON_BUFFER + 1);
+        let body = format!(
+            r#"{{"created":1,"data":[{{"b64_json":"{b64}"}},{{"b64_json":"QQ=="}}],"usage":{{"input_tokens":1,"output_tokens":2}}}}"#
+        );
+        let second = body.rfind("b64_json").expect("the second key") + 3;
+        let (a, b) = body.as_bytes().split_at(second);
+        let usage = feed(Dialect::Images, false, &[a, b]);
+        assert_eq!(usage.image_count, Some(2));
+    }
+
+    /// A stream counts its completed frames, not its previews, and a stream
+    /// cut off after the first of two pictures counts one.
+    #[test]
+    fn image_count_counts_completed_frames_only() {
+        let partial = "event: image_generation.partial_image\ndata: {\"type\":\"image_generation.partial_image\",\"partial_image_index\":0,\"b64_json\":\"QQ==\"}\n\n";
+        let done = "event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"QQ==\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n\n";
+        let usage = feed(
+            Dialect::Images,
+            true,
+            &[partial.as_bytes(), done.as_bytes()],
+        );
+        assert_eq!(usage.image_count, Some(1));
+        let edit = "event: image_edit.completed\ndata: {\"type\": \"image_edit.completed\",\"b64_json\":\"QQ==\"}\n\n";
+        let (a, b) = edit.as_bytes().split_at(40);
+        let usage = feed(Dialect::Images, true, &[a, b, edit.as_bytes()]);
+        assert_eq!(usage.image_count, Some(2));
+        // Not an image route: nothing is counted.
+        let usage = feed(Dialect::OpenAiChat, false, &[br#"{"b64_json":"x"}"#]);
+        assert_eq!(usage.image_count, None);
+    }
+
+    /// An upstream that writes every optional field sends a null `url`
+    /// beside each picture's `b64_json`; that is one picture, not two.
+    #[test]
+    fn a_null_url_beside_b64_json_is_one_picture() {
+        let body = br#"{"created":1,"data":[{"url":null,"b64_json":"QQ==","revised_prompt":null},{"url": null, "b64_json": "Qg=="}],"usage":{"input_tokens":1,"output_tokens":2}}"#;
+        let usage = feed(Dialect::Images, false, &[body]);
+        assert_eq!(usage.image_count, Some(2));
+        let urls = br#"{"data":[{"url":"https://x/a.png"},{"url": "https://x/b.png"}]}"#;
+        let usage = feed(Dialect::Images, false, &[urls]);
+        assert_eq!(usage.image_count, Some(2));
     }
 }

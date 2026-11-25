@@ -24,20 +24,81 @@ pub enum BackendKind {
     Anthropic,
 }
 
-/// USD per 1M tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+/// A model's prices: USD per 1M tokens by class, and USD per generated
+/// image.
+///
+/// Text models are priced by token. Image models are priced either per
+/// picture (a flat price) or by token class, with picture input and output
+/// tokens at their own rates; both may be set and add up. The input and
+/// output rates may be left out only when a per-image price is given, so a
+/// token-priced model can never be half-priced by omission.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize, Serialize)]
+#[serde(try_from = "PricingCfgWire")]
 pub struct PricingCfg {
     /// USD per 1M prompt tokens.
     pub input_per_mtok: f64,
     /// USD per 1M completion tokens.
     pub output_per_mtok: f64,
     /// USD per 1M cached prompt tokens.
-    #[serde(default)]
     pub cached_input_per_mtok: Option<f64>,
     /// USD per 1M Anthropic cache write tokens.
-    #[serde(default)]
     pub cache_write_per_mtok: Option<f64>,
+    /// USD per generated image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_image: Option<f64>,
+    /// USD per 1M image input tokens; falls back to the input rate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_input_per_mtok: Option<f64>,
+    /// USD per 1M image output tokens; falls back to the output rate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_output_per_mtok: Option<f64>,
+}
+
+/// [`PricingCfg`] as written, before the rule that only a per-image price
+/// may stand without input and output rates.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PricingCfgWire {
+    #[serde(default)]
+    input_per_mtok: Option<f64>,
+    #[serde(default)]
+    output_per_mtok: Option<f64>,
+    #[serde(default)]
+    cached_input_per_mtok: Option<f64>,
+    #[serde(default)]
+    cache_write_per_mtok: Option<f64>,
+    #[serde(default)]
+    per_image: Option<f64>,
+    #[serde(default)]
+    image_input_per_mtok: Option<f64>,
+    #[serde(default)]
+    image_output_per_mtok: Option<f64>,
+}
+
+impl TryFrom<PricingCfgWire> for PricingCfg {
+    type Error = String;
+
+    fn try_from(w: PricingCfgWire) -> Result<Self, String> {
+        let (input_per_mtok, output_per_mtok) =
+            match (w.input_per_mtok, w.output_per_mtok, w.per_image) {
+                (Some(i), Some(o), _) => (i, o),
+                (None, None, Some(_)) => (0.0, 0.0),
+                _ => {
+                    return Err("pricing needs both input_per_mtok and output_per_mtok, \
+                                unless only per_image is set"
+                        .to_string());
+                }
+            };
+        Ok(PricingCfg {
+            input_per_mtok,
+            output_per_mtok,
+            cached_input_per_mtok: w.cached_input_per_mtok,
+            cache_write_per_mtok: w.cache_write_per_mtok,
+            per_image: w.per_image,
+            image_input_per_mtok: w.image_input_per_mtok,
+            image_output_per_mtok: w.image_output_per_mtok,
+        })
+    }
 }
 
 pub(crate) const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -555,6 +616,9 @@ pub(crate) fn validate_pricing(p: &PricingCfg, model: &str) -> Result<(), String
         ("output_per_mtok", Some(p.output_per_mtok)),
         ("cached_input_per_mtok", p.cached_input_per_mtok),
         ("cache_write_per_mtok", p.cache_write_per_mtok),
+        ("per_image", p.per_image),
+        ("image_input_per_mtok", p.image_input_per_mtok),
+        ("image_output_per_mtok", p.image_output_per_mtok),
     ] {
         if let Some(v) = value
             && (!v.is_finite() || v < 0.0)
@@ -1088,6 +1152,7 @@ mod tests {
                 output_per_mtok: 2.0,
                 cached_input_per_mtok: Some(0.5),
                 cache_write_per_mtok: None,
+                ..PricingCfg::default()
             }),
             qos_max_wait_ms: None,
             qos_background_max_wait_ms: None,
@@ -1151,6 +1216,7 @@ mod tests {
                 output_per_mtok: 0.0,
                 cached_input_per_mtok: None,
                 cache_write_per_mtok: None,
+                ..PricingCfg::default()
             }),
             fallback_only: false,
         });

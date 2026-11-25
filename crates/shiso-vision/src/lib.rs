@@ -72,6 +72,7 @@ mod ffmpeg;
 pub mod generator;
 mod image;
 mod item;
+pub mod matte;
 mod mp4;
 pub mod shard;
 pub mod splat;

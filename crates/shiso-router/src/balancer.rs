@@ -56,14 +56,34 @@ impl Backend {
     }
 }
 
-/// Effective per-target pricing with cache-rate fallbacks already applied,
-/// USD per 1M tokens.
+/// Effective per-target pricing with every fallback already applied: token
+/// rates in USD per 1M tokens, `per_image` in USD per image.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Pricing {
     pub input_per_mtok: f64,
     pub output_per_mtok: f64,
     pub cached_input_per_mtok: f64,
     pub cache_write_per_mtok: f64,
+    pub per_image: f64,
+    pub image_input_per_mtok: f64,
+    pub image_output_per_mtok: f64,
+}
+
+/// What one response used, as the cost arithmetic reads it.
+///
+/// `prompt` is every input token, cached and image ones included;
+/// `completion` every output token, image ones included. The other counts
+/// are subsets priced at their own rates. A response that reports no detail
+/// leaves those at zero and is billed exactly as before image classes existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BilledUsage {
+    pub prompt: i64,
+    pub completion: i64,
+    pub cached: i64,
+    pub cache_write: i64,
+    pub image_input: i64,
+    pub image_output: i64,
+    pub images: i64,
 }
 
 impl Pricing {
@@ -73,18 +93,27 @@ impl Pricing {
             output_per_mtok: cfg.output_per_mtok,
             cached_input_per_mtok: cfg.cached_input_per_mtok.unwrap_or(cfg.input_per_mtok),
             cache_write_per_mtok: cfg.cache_write_per_mtok.unwrap_or(cfg.input_per_mtok),
+            per_image: cfg.per_image.unwrap_or(0.0),
+            image_input_per_mtok: cfg.image_input_per_mtok.unwrap_or(cfg.input_per_mtok),
+            image_output_per_mtok: cfg.image_output_per_mtok.unwrap_or(cfg.output_per_mtok),
         }
     }
 
-    /// `prompt` is total input tokens including the cached portions;
-    /// `cached` (cache reads) and `cache_write` are billed at their own
-    /// rates, the remainder at the fresh-input rate.
-    pub fn cost_usd(&self, prompt: i64, completion: i64, cached: i64, cache_write: i64) -> f64 {
-        let fresh = (prompt - cached - cache_write).max(0);
-        fresh as f64 / 1e6 * self.input_per_mtok
-            + cached as f64 / 1e6 * self.cached_input_per_mtok
-            + cache_write as f64 / 1e6 * self.cache_write_per_mtok
-            + completion as f64 / 1e6 * self.output_per_mtok
+    /// Image input tokens come off the prompt first; cache reads and writes
+    /// come off the text that is left, and the remainder is fresh text. Image
+    /// output tokens come off the completion and the rest is text output.
+    pub fn cost_usd(&self, u: &BilledUsage) -> f64 {
+        let text_in = (u.prompt - u.image_input).max(0);
+        let fresh = (text_in - u.cached - u.cache_write).max(0);
+        let text_out = (u.completion - u.image_output).max(0);
+        let per_m = |n: i64, rate: f64| n as f64 / 1e6 * rate;
+        per_m(fresh, self.input_per_mtok)
+            + per_m(u.cached, self.cached_input_per_mtok)
+            + per_m(u.cache_write, self.cache_write_per_mtok)
+            + per_m(u.image_input.max(0), self.image_input_per_mtok)
+            + per_m(text_out, self.output_per_mtok)
+            + per_m(u.image_output.max(0), self.image_output_per_mtok)
+            + u.images.max(0) as f64 * self.per_image
     }
 }
 
@@ -266,15 +295,25 @@ mod tests {
             output_per_mtok: 10.0,
             cached_input_per_mtok: 0.5,
             cache_write_per_mtok: 2.5,
+            per_image: 0.0,
+            image_input_per_mtok: 2.0,
+            image_output_per_mtok: 10.0,
         };
         // 1M fresh input + 1M cached + 1M cache-write + 1M output.
-        let cost = p.cost_usd(3_000_000, 1_000_000, 1_000_000, 1_000_000);
+        let tokens = |prompt, completion, cached, cache_write| BilledUsage {
+            prompt,
+            completion,
+            cached,
+            cache_write,
+            ..BilledUsage::default()
+        };
+        let cost = p.cost_usd(&tokens(3_000_000, 1_000_000, 1_000_000, 1_000_000));
         assert!((cost - (2.0 + 0.5 + 2.5 + 10.0)).abs() < 1e-9);
         // No cache activity: everything at the fresh input rate.
-        let cost = p.cost_usd(1_000_000, 0, 0, 0);
+        let cost = p.cost_usd(&tokens(1_000_000, 0, 0, 0));
         assert!((cost - 2.0).abs() < 1e-9);
         // Defensive: cached counts exceeding prompt never go negative.
-        let cost = p.cost_usd(100, 0, 200, 0);
+        let cost = p.cost_usd(&tokens(100, 0, 200, 0));
         assert!(cost >= 0.0);
     }
 
@@ -285,6 +324,7 @@ mod tests {
             output_per_mtok: 15.0,
             cached_input_per_mtok: None,
             cache_write_per_mtok: None,
+            ..PricingCfg::default()
         });
         assert_eq!(p.cached_input_per_mtok, 3.0);
         assert_eq!(p.cache_write_per_mtok, 3.0);
@@ -293,6 +333,7 @@ mod tests {
             output_per_mtok: 15.0,
             cached_input_per_mtok: Some(0.3),
             cache_write_per_mtok: Some(3.75),
+            ..PricingCfg::default()
         });
         assert_eq!(p.cached_input_per_mtok, 0.3);
         assert_eq!(p.cache_write_per_mtok, 3.75);
@@ -512,5 +553,65 @@ mod tests {
         for w in picks.windows(2) {
             assert_ne!(w[0], w[1]);
         }
+    }
+
+    #[test]
+    fn cost_by_class() {
+        let p = Pricing::from_cfg(&PricingCfg {
+            input_per_mtok: 5.0,
+            output_per_mtok: 10.0,
+            cached_input_per_mtok: Some(2.0),
+            cache_write_per_mtok: None,
+            per_image: None,
+            image_input_per_mtok: Some(8.0),
+            image_output_per_mtok: Some(30.0),
+        });
+        let cost = p.cost_usd(&BilledUsage {
+            prompt: 1_000_000,
+            completion: 1_000_000,
+            cached: 100_000,
+            cache_write: 0,
+            image_input: 400_000,
+            image_output: 1_000_000,
+            images: 1,
+        });
+        // 0.5M fresh text at 5, 0.1M cached at 2, 0.4M image in at 8, 1M
+        // image out at 30, no text out.
+        assert!(
+            (cost - (0.5 * 5.0 + 0.1 * 2.0 + 0.4 * 8.0 + 30.0)).abs() < 1e-9,
+            "{cost}"
+        );
+    }
+
+    #[test]
+    fn image_rates_fall_back_to_input_and_output() {
+        let p = Pricing::from_cfg(&PricingCfg {
+            input_per_mtok: 5.0,
+            output_per_mtok: 30.0,
+            cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
+            per_image: None,
+            image_input_per_mtok: None,
+            image_output_per_mtok: None,
+        });
+        assert_eq!(p.image_input_per_mtok, 5.0);
+        assert_eq!(p.image_output_per_mtok, 30.0);
+    }
+
+    #[test]
+    fn per_image_only() {
+        let cfg: PricingCfg = serde_json::from_str(r#"{"per_image":0.0184}"#).expect("parses");
+        crate::catalog::validate_pricing(&cfg, "m").expect("a per-image price alone is a price");
+        let p = Pricing::from_cfg(&cfg);
+        let cost = p.cost_usd(&BilledUsage {
+            prompt: 65,
+            completion: 4175,
+            images: 2,
+            ..BilledUsage::default()
+        });
+        assert!((cost - 0.0368).abs() < 1e-12, "{cost}");
+        // Nothing priced, or half a token price, is refused as written.
+        assert!(serde_json::from_str::<PricingCfg>("{}").is_err());
+        assert!(serde_json::from_str::<PricingCfg>(r#"{"input_per_mtok":1}"#).is_err());
     }
 }

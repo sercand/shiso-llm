@@ -26,11 +26,11 @@ use shiso_core::DeviceBuffer;
 use shiso_vision::generator::ImageGenError;
 
 use super::nn::{Affine, bytes, host_lin, layer_norm, linear};
-use super::preprocess::Matting;
 use super::splat_ops::{DeformCall, ResizeCall, SplatOps, WindowAttnCall};
 use crate::diffusion::lin::Lin;
 use crate::diffusion::ops::{Conv2dCall, GemmCall, LinWeight, Ops, Scratch, SliceExt, WeightKind};
 use crate::diffusion::weights::StStore;
+use shiso_vision::matte::BackgroundRemover;
 
 /// The side the network reads.
 const SIDE: usize = 1024;
@@ -1044,7 +1044,7 @@ fn plane_f32(s: Shape) -> f32 {
     s.plane() as f32
 }
 
-impl Matting for BiRefNet {
+impl BackgroundRemover for BiRefNet {
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
