@@ -1889,6 +1889,9 @@ const PRICE_FIELDS = [
   ["output_per_mtok", "Output"],
   ["cached_input_per_mtok", "Cached input"],
   ["cache_write_per_mtok", "Cache write"],
+  ["per_image", "Per image"],
+  ["image_input_per_mtok", "Image input"],
+  ["image_output_per_mtok", "Image output"],
 ];
 
 function priceFields(prefix, p) {
@@ -1897,36 +1900,43 @@ function priceFields(prefix, p) {
       ${input(prefix + f, 'type="number" step="any" min="0" placeholder="—"', p && p[f] != null ? p[f] : "")}
     </label>`).join("")}
   </div>
-  <p class="mt-1 text-xs text-ink-2">USD per 1M tokens. Leave input+output blank for no pricing;
-    blank cache rates fall back to the input rate. Embedding models bill input only — set output to 0.</p>`;
+  <p class="mt-1 text-xs text-ink-2">Token rates are USD per 1M tokens; Per image is USD per generated image.
+    Leave everything blank for no pricing. Blank cache rates fall back to the input rate; blank image
+    rates fall back to input/output. Embedding models bill input only — set output to 0. An image model
+    priced per picture needs only Per image.</p>`;
 }
 
-/// Reads the four price inputs sharing a prefix. Returns null when the
-/// required pair is blank, and throws when only one of them is filled —
-/// half-priced models would silently mis-bill.
+/// Reads the price inputs sharing a prefix. Returns null when every one is
+/// blank, and throws when only one of input/output is filled without a
+/// per-image price — half-priced models would silently mis-bill.
 function readPricing(form, prefix, what) {
   const num = name => {
     const el = form.querySelector(`[name="${prefix}${name}"]`);
     const v = (el && el.value || "").trim();
     return v === "" ? null : Number(v);
   };
-  const inp = num("input_per_mtok"), out = num("output_per_mtok");
-  if (inp == null && out == null) return null;
-  if (inp == null || out == null) {
+  const all = Object.fromEntries(PRICE_FIELDS.map(([f]) => [f, num(f)]));
+  if (Object.values(all).every(v => v == null)) return null;
+  const inp = all.input_per_mtok, out = all.output_per_mtok;
+  if ((inp == null) !== (out == null)) {
     throw new Error(`${what}: input and output prices must both be set`);
   }
-  return {
-    input_per_mtok: inp,
-    output_per_mtok: out,
-    cached_input_per_mtok: num("cached_input_per_mtok"),
-    cache_write_per_mtok: num("cache_write_per_mtok"),
-  };
+  if (inp == null && all.per_image == null) {
+    throw new Error(`${what}: set input and output prices, or a per-image price`);
+  }
+  // Blank optional rates are left out, so the server's fallbacks apply.
+  return Object.fromEntries(Object.entries(all).filter(([, v]) => v != null));
 }
 
 function priceSummary(p) {
   if (!p) return '<span class="text-ink-2">unpriced</span>';
-  return `${fmtCost(p.input_per_mtok)} in / ${fmtCost(p.output_per_mtok)} out
-    <span class="text-ink-2">per 1M</span>`;
+  const tokens = p.input_per_mtok || p.output_per_mtok
+    ? `${fmtCost(p.input_per_mtok)} in / ${fmtCost(p.output_per_mtok)} out <span class="text-ink-2">per 1M</span>`
+    : "";
+  const image = p.per_image != null
+    ? `${fmtCost(p.per_image)} <span class="text-ink-2">/ image</span>`
+    : "";
+  return [tokens, image].filter(Boolean).join(" · ") || fmtCost(0);
 }
 
 /// Aliases shown under the model name — they route identically, so they
@@ -2610,7 +2620,8 @@ function logRowHtml(r) {
         <span class="${IN_TEXT}">${fmtInt(r.prompt_tokens)}</span>
         <span class="text-ink-2">→</span>
         <span class="${OUT_TEXT}">${fmtInt(r.completion_tokens)}</span>
-        ${r.cached_tokens ? `<span class="s-pill s-pill--soft ml-1">cached ${cacheRatio(r)}</span>` : ""}</td>
+        ${r.cached_tokens ? `<span class="s-pill s-pill--soft ml-1">cached ${cacheRatio(r)}</span>` : ""}
+        ${r.image_count ? `<span class="s-pill s-pill--soft ml-1">${fmtInt(r.image_count)} img</span>` : ""}</td>
       <td class="px-3 py-2.5 text-sm">${fmtCost(r.cost)}</td>
       <td class="px-3 py-2.5 text-sm text-ink-2">${r.duration_ms != null ? r.duration_ms + " ms" : "–"}</td>
       <td class="px-3 py-2.5 text-sm text-ink-2">${esc(r.finish_reason ?? "–")}</td>
@@ -2728,6 +2739,7 @@ async function openLog(id) {
       ${field("Cached tokens", r.cached_tokens ? `${fmtInt(r.cached_tokens)} <span class="text-ink-2">(${cacheRatio(r)} of input)</span>` : fmtInt(r.cached_tokens))}
       ${field("Cache write tokens", fmtInt(r.cache_write_tokens))}
       ${field("Total tokens", fmtInt(r.total_tokens))}
+      ${r.image_count != null ? field("Images", fmtInt(r.image_count)) : ""}
       ${field("Cost", fmtCost(r.cost))}
       ${field("Time to first byte", r.ttfb_ms != null ? r.ttfb_ms + " ms" : "–")}
       ${field("Duration", r.duration_ms != null ? r.duration_ms + " ms" : "–")}

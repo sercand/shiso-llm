@@ -39,7 +39,7 @@ use std::time::Instant;
 use shiso_core::backend::Backend;
 use shiso_core::error::{CoreError, CoreResult};
 use shiso_core::ids::{SessionId, TokenId};
-use shiso_core::model::{DecodeStep, Logits, PromptRun};
+use shiso_core::model::{DecodeStep, Logits, PromptPositionLogprobs, PromptRun};
 use shiso_core::{DType, DeviceView, GraphKey};
 use shiso_kvstore::{CacheStats, CommitOpts, KvCache, Reason};
 
@@ -147,6 +147,19 @@ pub(crate) struct Staging {
     /// The multimodal position streams and the splice map of the chunk in
     /// flight. Empty, and never written, for a request with no media.
     streams: Streams,
+    /// Host readback buffer for strip-wise prompt-logprobs projection
+    /// (`<= MAX_PROMPT_RUNS` logits rows).
+    strip_logits: Vec<u8>,
+    /// Reusable host `f32` row unpacked from `strip_logits` for top-K extraction.
+    strip_row: Vec<f32>,
+}
+
+/// Sink threading target tokens and output buffer through [`HybridStack::advance`]
+/// when prompt log-probabilities are requested.
+struct PromptLogprobsSink<'a> {
+    next_tokens: &'a [TokenId],
+    top_k: u32,
+    out: &'a mut Vec<PromptPositionLogprobs>,
 }
 
 /// A multimodal prefill part way through its chunks.
@@ -1423,6 +1436,7 @@ impl HybridStack {
         tokens: &[TokenId],
         with_logits: bool,
         media: Option<&VisionPrefill<'_>>,
+        mut logprobs: Option<PromptLogprobsSink<'_>>,
     ) -> CoreResult<u32> {
         if tokens.is_empty() {
             return Err(CoreError::ShapeMismatch {
@@ -1516,6 +1530,12 @@ impl HybridStack {
                     self.warm_draft(session, &gathered, start)?;
                 }
                 None => self.warm_draft(session, head, start)?,
+            }
+            if let Some(sink) = logprobs.as_mut() {
+                let count = sink.next_tokens.len().min(head.len());
+                let (targets, remaining) = sink.next_tokens.split_at(count);
+                sink.next_tokens = remaining;
+                self.extract_chunk_logprobs(targets, sink.top_k, sink.out)?;
             }
             last = n_tok.saturating_sub(1);
             let final_chunk = tail.is_empty();
@@ -2127,6 +2147,76 @@ impl HybridStack {
     ///
     /// A chunk wider than the scratch is split here rather than refused: the split
     /// is invisible in the result, because the recurrent state and the cache carry
+    /// Projects `targets.len()` normalized rows from the chunk that just ran
+    /// in strips of at most [`MAX_PROMPT_RUNS`], copies each strip to host, and
+    /// appends each row's top-`top_k` plus target log-probabilities to `out`.
+    fn extract_chunk_logprobs(
+        &mut self,
+        targets: &[TokenId],
+        top_k: u32,
+        out: &mut Vec<PromptPositionLogprobs>,
+    ) -> CoreResult<()> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let Self {
+            backend,
+            geometry,
+            resident,
+            staging,
+            ..
+        } = self;
+        let resident = resident.as_ref().ok_or(CoreError::Unsupported {
+            what: "a model whose device state teardown already released",
+            backend: "engine",
+        })?;
+        let vocab = usize::try_from(geometry.vocab).unwrap_or(0);
+        let row_bytes = logits_row_bytes(resident);
+        let row_bytes_usize = usize::try_from(row_bytes).unwrap_or(0);
+        let strip_cap = usize::try_from(MAX_PROMPT_RUNS).unwrap_or(16).max(1);
+        let max_strip = targets.len().min(strip_cap);
+        let need_bytes = row_bytes_usize.saturating_mul(max_strip);
+        if staging.strip_logits.len() < need_bytes {
+            staging.strip_logits.resize(need_bytes, 0);
+        }
+        if staging.strip_row.len() != vocab {
+            staging.strip_row.resize(vocab, 0.0);
+        }
+
+        let mut offset = 0usize;
+        while offset < targets.len() {
+            let count = (targets.len() - offset).min(strip_cap);
+            let offset_u32 = u32::try_from(offset).unwrap_or(u32::MAX);
+            let count_u32 = u32::try_from(count).unwrap_or(u32::MAX);
+            layers::logits_rows_slice(
+                backend.as_ref(),
+                &resident.weights,
+                geometry,
+                &resident.scratch,
+                offset_u32,
+                count_u32,
+            )?;
+            let strip_bytes = row_bytes.saturating_mul(u64::from(count_u32));
+            let strip_bytes_usize = row_bytes_usize.saturating_mul(count);
+            let view = resident.scratch.logits().slice(0, strip_bytes)?;
+            backend.copy_d2h(view, &mut staging.strip_logits[..strip_bytes_usize])?;
+            for (local_row, &target) in targets[offset..offset + count].iter().enumerate() {
+                let start = local_row * row_bytes_usize;
+                let bytes = &staging.strip_logits[start..start + row_bytes_usize];
+                for (dst, chunk) in staging.strip_row.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                    *dst = f32::from_le_bytes(*chunk);
+                }
+                out.push(crate::logprobs::extract_prompt_position_logprobs(
+                    &staging.strip_row,
+                    target,
+                    top_k,
+                ));
+            }
+            offset += count;
+        }
+        Ok(())
+    }
+
     /// the prefix across an internal boundary exactly as across a caller's.
     ///
     /// # Errors
@@ -2135,7 +2225,44 @@ impl HybridStack {
     /// chunk reaches past the context, and [`CoreError::Backend`] on a device
     /// failure.
     pub fn prefill_chunk(&mut self, session: SessionId, tokens: &[TokenId]) -> CoreResult<()> {
-        self.advance(session, tokens, false, None).map(|_last| ())
+        self.advance(session, tokens, false, None, None)
+            .map(|_last| ())
+    }
+
+    /// Advances a session by a non-final prompt chunk and appends per-position
+    /// top-`top_k` log-probabilities for `next_tokens` to `out`.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ShapeMismatch`] when `tokens.len() != next_tokens.len()`,
+    /// plus whatever [`HybridStack::prefill_chunk`] reports.
+    pub fn prefill_chunk_logprobs(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        next_tokens: &[TokenId],
+        top_k: u32,
+        out: &mut Vec<PromptPositionLogprobs>,
+    ) -> CoreResult<()> {
+        if tokens.len() != next_tokens.len() {
+            return Err(CoreError::ShapeMismatch {
+                field: "prompt_logprobs next_tokens",
+                expected: tokens.len() as u64,
+                got: next_tokens.len() as u64,
+            });
+        }
+        self.advance(
+            session,
+            tokens,
+            false,
+            None,
+            Some(PromptLogprobsSink {
+                next_tokens,
+                top_k,
+                out,
+            }),
+        )
+        .map(|_last| ())
     }
 
     /// Advances a session by a non-final prompt chunk that carries media.
@@ -2155,7 +2282,7 @@ impl HybridStack {
         tokens: &[TokenId],
         media: &VisionPrefill<'_>,
     ) -> CoreResult<()> {
-        self.advance(session, tokens, false, Some(media))
+        self.advance(session, tokens, false, Some(media), None)
             .map(|_last| ())
     }
 
@@ -2170,7 +2297,36 @@ impl HybridStack {
         session: SessionId,
         tokens: &[TokenId],
     ) -> CoreResult<Logits<'_>> {
-        self.advance(session, tokens, true, None)?;
+        self.advance(session, tokens, true, None, None)?;
+        self.prompt_logits()
+    }
+
+    /// Advances a session by its final prompt chunk, appends per-position
+    /// top-`top_k` log-probabilities for `tokens[..tokens.len() - 1]` to `out`,
+    /// and returns the last-token frontier row.
+    ///
+    /// # Errors
+    ///
+    /// As [`HybridStack::prefill_last`].
+    pub fn prefill_last_logprobs(
+        &mut self,
+        session: SessionId,
+        tokens: &[TokenId],
+        top_k: u32,
+        out: &mut Vec<PromptPositionLogprobs>,
+    ) -> CoreResult<Logits<'_>> {
+        let next_tokens = tokens.get(1..).unwrap_or(&[]);
+        self.advance(
+            session,
+            tokens,
+            true,
+            None,
+            Some(PromptLogprobsSink {
+                next_tokens,
+                top_k,
+                out,
+            }),
+        )?;
         self.prompt_logits()
     }
 
@@ -2193,7 +2349,7 @@ impl HybridStack {
         tokens: &[TokenId],
         media: &VisionPrefill<'_>,
     ) -> CoreResult<Logits<'_>> {
-        self.advance(session, tokens, true, Some(media))?;
+        self.advance(session, tokens, true, Some(media), None)?;
         self.prompt_logits()
     }
 

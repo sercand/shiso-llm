@@ -45,6 +45,12 @@ pub struct Response {
     pub usage: Usage,
     /// Per-token probabilities, when the caller asked for them.
     pub logprobs: Option<Logprobs>,
+    /// Per-position prompt log-probabilities, when the caller asked for them.
+    ///
+    /// Has length equal to the prompt token count: index `0` is `None` (no
+    /// prior token predicts position `0`), and index `t >= 1` holds the top-K
+    /// candidates plus the actual prompt token at position `t`.
+    pub prompt_logprobs: Option<Vec<Option<Vec<PromptLogprob>>>>,
     /// The sampled ids that produced the turn, when the caller asked for them.
     ///
     /// Empty otherwise, rather than optional: "the caller did not ask" and "the
@@ -178,4 +184,17 @@ pub struct Alternative {
     pub token: String,
     /// Its log-probability.
     pub logprob: f32,
+}
+
+/// One candidate token's log-probability at a prompt position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptLogprob {
+    /// Vocabulary id of the token.
+    pub token_id: u32,
+    /// Decoded token text.
+    pub decoded_token: String,
+    /// Natural log-probability under the full vocabulary.
+    pub logprob: f32,
+    /// 1-based rank in the vocabulary distribution (`1` is highest).
+    pub rank: u32,
 }

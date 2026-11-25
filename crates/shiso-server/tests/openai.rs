@@ -977,3 +977,119 @@ async fn an_unknown_tier_in_the_header_is_refused_on_every_openai_surface() {
         assert_eq!(answer["error"]["param"], "service_tier", "{path}: {answer}");
     }
 }
+
+/// `/v1/completions` with `prompt_logprobs` returns a vLLM-compatible array
+/// of length `prompt_len` on `choices[0].prompt_logprobs` with `null` at
+/// position 0 and `{ "<token_id>": { logprob, rank, decoded_token } }` maps
+/// for positions `1..prompt_len`.
+#[tokio::test]
+async fn completions_prompt_logprobs_returns_vllm_shape_for_token_ids() {
+    let state = state(vec![10]);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/completions",
+            &greedy(json!({
+                "prompt": [1, 2, 3, 20],
+                "max_tokens": 1,
+                "prompt_logprobs": 2,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let plp = body["choices"][0]["prompt_logprobs"]
+        .as_array()
+        .expect("choices[0].prompt_logprobs is an array");
+    assert_eq!(plp.len(), 4, "one entry per prompt token");
+    assert!(plp[0].is_null(), "position 0 has no prior token");
+
+    // Position 1 is predicted from token 1 (top-1 = 2, top-2 = 3; actual = 2 is in top-2).
+    let pos1 = plp[1].as_object().expect("position 1 is a map");
+    assert_eq!(
+        pos1.len(),
+        2,
+        "actual token 2 is already in top-2: {pos1:?}"
+    );
+    assert_eq!(pos1["2"]["rank"], 1);
+    assert_eq!(pos1["2"]["decoded_token"], "w2");
+    assert_eq!(pos1["3"]["rank"], 2);
+    assert_eq!(pos1["3"]["decoded_token"], "w3");
+    assert!(
+        pos1["2"]["logprob"].as_f64().expect("f64") > pos1["3"]["logprob"].as_f64().expect("f64")
+    );
+
+    // Position 3 is predicted from token 3 (top-1 = 4, top-2 = 5; actual = 20 is outside top-2).
+    let pos3 = plp[3].as_object().expect("position 3 is a map");
+    assert_eq!(
+        pos3.len(),
+        3,
+        "top-2 plus actual out-of-top-k token 20: {pos3:?}"
+    );
+    assert_eq!(pos3["4"]["rank"], 1);
+    assert_eq!(pos3["5"]["rank"], 2);
+    assert!(pos3.contains_key("20"), "actual prompt token 20 included");
+    assert_eq!(pos3["20"]["decoded_token"], "w20");
+    assert!(pos3["20"]["rank"].as_u64().expect("rank") > 2);
+}
+
+/// `/v1/chat/completions` places `prompt_logprobs` at the top level of the
+/// response object, matching vLLM's chat completions server.
+#[tokio::test]
+async fn chat_completions_prompt_logprobs_returns_top_level_array() {
+    let state = state(vec![10]);
+    let (status, body) = call(
+        &state,
+        post(
+            "/v1/chat/completions",
+            &greedy(json!({
+                "messages": [{"role": "user", "content": "w1 w2"}],
+                "max_tokens": 1,
+                "prompt_logprobs": 2,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let prompt_tokens = body["usage"]["prompt_tokens"]
+        .as_u64()
+        .expect("prompt_tokens");
+    let plp = body["prompt_logprobs"]
+        .as_array()
+        .expect("top-level prompt_logprobs is an array");
+    assert_eq!(plp.len() as u64, prompt_tokens);
+    assert!(plp[0].is_null());
+    for pos in &plp[1..] {
+        assert!(pos.is_object(), "position entry is a map: {pos}");
+    }
+}
+
+/// Streaming combined with `prompt_logprobs` is refused loudly on both surfaces.
+#[tokio::test]
+async fn streaming_with_prompt_logprobs_is_refused() {
+    let state = state(vec![10]);
+    for (path, body) in [
+        (
+            "/v1/completions",
+            json!({"prompt": [1, 2], "max_tokens": 1, "stream": true, "prompt_logprobs": 2}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({
+                "messages": [{"role": "user", "content": "w1"}],
+                "max_tokens": 1,
+                "stream": true,
+                "prompt_logprobs": 2,
+            }),
+        ),
+    ] {
+        let (status, answer) = call(&state, post(path, &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {answer}");
+        assert_eq!(
+            answer["error"]["param"], "prompt_logprobs",
+            "{path}: {answer}"
+        );
+    }
+}

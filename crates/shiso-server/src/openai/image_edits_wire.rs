@@ -189,6 +189,8 @@ impl EditRequest {
             size: text.get("size").cloned(),
             aspect_ratio: text.get("aspect_ratio").cloned(),
             quality: text.get("quality").cloned(),
+            background: text.get("background").cloned(),
+            moderation: text.get("moderation").cloned(),
             steps: number(&text, "steps")?,
             seed: number(&text, "seed")?,
             output_format: text.get("output_format").cloned(),
@@ -222,7 +224,7 @@ mod tests {
 
     fn ir(request: &EditRequest) -> Edit {
         Edit {
-            generate: request.request.to_ir(),
+            generate: request.request.to_ir().expect("converts"),
             references: request.references.clone(),
         }
     }
@@ -238,6 +240,8 @@ mod tests {
                 seed: None,
                 output_format: None,
                 output_compression: None,
+                background: shiso_ir::image::Background::Auto,
+                quality: None,
             },
             references,
         }

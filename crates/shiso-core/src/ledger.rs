@@ -550,10 +550,10 @@ impl MemLedger {
     /// turn a total into eighteen exabytes.
     pub fn release(&self, tag: MemTag, bytes: u64) {
         let slot = tag.index();
-        let _ = self.live[slot].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+        let _ = self.live[slot].try_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
             Some(live.saturating_sub(bytes))
         });
-        let _ = self.count[slot].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        let _ = self.count[slot].try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             Some(count.saturating_sub(1))
         });
     }

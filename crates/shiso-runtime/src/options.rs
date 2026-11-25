@@ -704,6 +704,13 @@ pub struct ServeOptions {
     /// Overrides where the locator would otherwise look.
     #[cfg_attr(feature = "clap", arg(long, env = "SHISO_IMAGE_TOKENIZER"))]
     pub image_tokenizer: Option<PathBuf>,
+    /// The background remover's weights: a `.safetensors` file, or a
+    /// directory holding `model.safetensors` or `birefnet.safetensors`.
+    /// Loaded beside `--image-model` so `background: transparent` can cut out
+    /// any picture; without it such a request is refused. Given with a
+    /// recipe, it replaces the recipe's.
+    #[cfg_attr(feature = "clap", arg(long, env = "SHISO_IMAGE_MATTE"))]
+    pub image_matte: Option<PathBuf>,
     /// Image requests that may wait in the queue beyond the one generating;
     /// the next is refused with a 503 a retry can fix.
     #[cfg_attr(
@@ -1154,6 +1161,7 @@ impl Default for ServeOptions {
             image_text_encoder: None,
             image_vae: None,
             image_tokenizer: None,
+            image_matte: None,
             image_max_queue: 16,
             splat_model: None,
             splat_model_id: None,

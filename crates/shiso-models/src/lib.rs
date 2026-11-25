@@ -16,6 +16,9 @@
 
 pub mod audio_ops;
 pub mod audio_registry;
+pub mod background;
+#[cfg(test)]
+mod background_tests;
 pub mod catalog;
 pub mod clef;
 pub(crate) mod diffusion;
@@ -31,6 +34,10 @@ mod image_registry_tests;
 pub mod inkling2;
 pub mod lfm2;
 pub mod llama;
+pub mod matte_registry;
+pub mod matted;
+#[cfg(test)]
+mod matted_tests;
 pub mod nemotron_asr;
 pub mod nemotron_diar;
 pub mod nemotron_h;

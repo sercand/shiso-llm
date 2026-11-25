@@ -457,7 +457,12 @@ fn validate_role_dependencies(variant: &Variant) -> Result<(), HubError> {
         });
     }
 
-    for role in [Role::ImageTextEncoder, Role::ImageVae, Role::ImageTokenizer] {
+    for role in [
+        Role::ImageTextEncoder,
+        Role::ImageVae,
+        Role::ImageTokenizer,
+        Role::ImageMatte,
+    ] {
         if roles.contains_key(&role) && !has_image {
             return Err(HubError::Validation {
                 reason: format!(

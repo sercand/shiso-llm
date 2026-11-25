@@ -3,6 +3,6 @@
 # applies. rustfmt + clippy ship with the channel, so the local gate never
 # depends on a separately-installed component.
 [toolchain]
-channel = "1.98.1"
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

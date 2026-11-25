@@ -31,7 +31,7 @@
 //! A size of `auto` is an omitted size.
 
 use shiso_core::ids::Seed;
-use shiso_ir::image::{Edit, Generate, Image, Images, Step, Usage};
+use shiso_ir::image::{Background, Edit, Generate, Image, Images, ProducedBackground, Step, Usage};
 use shiso_vision::generator::{
     GeneratedImage, ImageGenerationJob, ImageOutputFormat, ImageStepEvent, InputReferenceImage,
 };
@@ -78,6 +78,20 @@ pub fn validate(request: &Generate) -> Result<(), AppError> {
         return Err(AppError::bad_request(
             format!("steps must be between 1 and {MAX_STEPS_PER_IMAGE}"),
             Some("steps"),
+            "invalid_request",
+        ));
+    }
+    // Only png carries alpha. The format's spelling is judged later against
+    // the generator's own parser; this needs only to know it is not png.
+    if request.background == Background::Transparent
+        && request
+            .output_format
+            .as_deref()
+            .is_some_and(|format| !format.eq_ignore_ascii_case("png"))
+    {
+        return Err(AppError::bad_request(
+            "background: transparent needs output_format png: jpeg has no alpha channel",
+            Some("background"),
             "invalid_request",
         ));
     }
@@ -171,6 +185,11 @@ fn prepare<'a>(
 ) -> Result<(Plan, &'a ImageService), AppError> {
     let plan = Plan::from_request(request, state.image.as_ref())?;
     let service = state.image()?;
+    if plan.background == Background::Transparent && !service.has_matte() {
+        return Err(super::refuse(
+            shiso_vision::generator::ImageGenError::NoBackgroundRemover,
+        ));
+    }
     let plan = plan.with_references(references, service)?;
     Ok((plan, service))
 }
@@ -273,10 +292,21 @@ async fn run(
         add_usage(&mut usage, &generated);
         images.push(image_of(&generated));
     }
+    let background = if images
+        .iter()
+        .any(|image| image.background == ProducedBackground::Transparent)
+    {
+        ProducedBackground::Transparent
+    } else {
+        ProducedBackground::Opaque
+    };
     Ok(Images {
         created: crate::ids::unix_timestamp(),
         images,
         usage,
+        background,
+        output_format: plan.format_name().to_owned(),
+        quality: plan.quality,
     })
 }
 
@@ -339,6 +369,8 @@ async fn run_stream(
             created,
             image: image_of(&generated),
             usage,
+            output_format: plan.format_name().to_owned(),
+            quality: plan.quality,
         };
         if !sink(completed) {
             return Ok(());
@@ -375,9 +407,12 @@ fn forward_partial(
 }
 
 fn add_usage(usage: &mut Usage, image: &GeneratedImage) {
-    usage.prompt_tokens = usage.prompt_tokens.saturating_add(image.prompt_tokens);
-    usage.completion_tokens = usage
-        .completion_tokens
+    usage.text_input_tokens = usage.text_input_tokens.saturating_add(image.prompt_tokens);
+    usage.image_input_tokens = usage
+        .image_input_tokens
+        .saturating_add(image.image_input_tokens);
+    usage.image_output_tokens = usage
+        .image_output_tokens
         .saturating_add(image.completion_tokens);
 }
 
@@ -385,6 +420,13 @@ fn image_of(generated: &GeneratedImage) -> Image {
     Image {
         bytes: generated.bytes.clone(),
         media_type: generated.media_type.to_owned(),
+        width: generated.width,
+        height: generated.height,
+        background: if generated.transparent {
+            ProducedBackground::Transparent
+        } else {
+            ProducedBackground::Opaque
+        },
     }
 }
 
@@ -407,6 +449,10 @@ struct Plan {
     output_format: ImageOutputFormat,
     /// Compression, when the caller named one.
     output_compression: Option<u32>,
+    /// What every picture's background must be.
+    background: Background,
+    /// The quality the caller named, echoed in the answer.
+    quality: Option<shiso_ir::image::Quality>,
     /// How many images to generate, `1..=10`.
     n: usize,
     /// Whether the caller named a size (or an aspect ratio); an edit that
@@ -467,6 +513,8 @@ impl Plan {
             seed: request.seed.unwrap_or_else(crate::ids::entropy_u64),
             output_format: output_format.unwrap_or_default(),
             output_compression: request.output_compression,
+            background: request.background,
+            quality: request.quality,
             n: request.n.unwrap_or(1),
             size_named: size.is_some() || request.aspect_ratio.is_some(),
             references: Vec::new(),
@@ -519,6 +567,14 @@ impl Plan {
         Ok(self)
     }
 
+    /// The wire spelling of the encoding every picture is in.
+    const fn format_name(&self) -> &'static str {
+        match self.output_format {
+            ImageOutputFormat::Png => "png",
+            ImageOutputFormat::Jpeg => "jpeg",
+        }
+    }
+
     /// The job for image `index` of the request.
     fn job(&self, index: usize) -> ImageGenerationJob {
         let offset = u64::try_from(index).unwrap_or(u64::MAX);
@@ -531,6 +587,11 @@ impl Plan {
             output_format: self.output_format,
             output_compression: self.output_compression,
             input_references: self.references.clone(),
+            background: match self.background {
+                Background::Auto => shiso_vision::generator::Background::Auto,
+                Background::Opaque => shiso_vision::generator::Background::Opaque,
+                Background::Transparent => shiso_vision::generator::Background::Transparent,
+            },
         }
     }
 }
@@ -570,6 +631,8 @@ mod tests {
             seed: None,
             output_format: None,
             output_compression: None,
+            background: shiso_ir::image::Background::Auto,
+            quality: None,
         }
     }
 

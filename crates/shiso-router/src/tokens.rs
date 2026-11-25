@@ -42,8 +42,10 @@ pub fn synthetic_key_name(token_id: &str) -> Option<&'static str> {
 /// (`tokens.flex_models`), and a separate Anthropic endpoint per backend
 /// (`backends.anthropic_base_url`); version 9 added 1-level parent/child API
 /// keys (`tokens.parent_id`, `tokens.can_create_children`) and denormalized
-/// `request_logs.parent_token_id` so parent rollups survive child deletion.
-const SCHEMA_VERSION: i64 = 9;
+/// `request_logs.parent_token_id` so parent rollups survive child deletion;
+/// version 10 added `request_logs.image_count`, the pictures an image
+/// response carried, which a per-image price bills.
+const SCHEMA_VERSION: i64 = 10;
 
 /// A client API key as stored — everything except the secret, which exists
 /// only as a SHA-256 hash. Records are immutable snapshots: admin updates
@@ -443,7 +445,8 @@ fn migrate(conn: &Connection) -> Result<()> {
             finish_reason      TEXT,
             error              TEXT,
             service_tier       TEXT,
-            parent_token_id    TEXT
+            parent_token_id    TEXT,
+            image_count        INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_logs_token_time ON request_logs(token_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_logs_created    ON request_logs(created_at);
@@ -581,6 +584,15 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !log_cols.contains("parent_token_id") {
         conn.execute(
             "ALTER TABLE request_logs ADD COLUMN parent_token_id TEXT",
+            [],
+        )?;
+    }
+    // v2–v9 databases have request_logs without image_count. Nullable: rows
+    // written before it read back as "not an image response", which is what
+    // every one of them was billed as.
+    if !log_cols.contains("image_count") {
+        conn.execute(
+            "ALTER TABLE request_logs ADD COLUMN image_count INTEGER",
             [],
         )?;
     }
@@ -1318,7 +1330,6 @@ mod tests {
             .with_read(|conn| Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 9);
 
         let rec = db.get("pre").unwrap().unwrap();
         assert_eq!(rec.parent_id, None);
@@ -1334,5 +1345,37 @@ mod tests {
             })
             .unwrap();
         assert_eq!(parent_token_id, None);
+    }
+
+    #[test]
+    fn v9_to_v10_migration_adds_the_image_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let db = Db::open(&path).unwrap();
+            db.with_write(|conn| {
+                conn.execute(
+                    "INSERT INTO request_logs (id, created_at, token_id, model, path)
+                     VALUES ('log1', 1, 'pre', 'm', '/v1/images/generations')",
+                    [],
+                )?;
+                conn.execute("ALTER TABLE request_logs DROP COLUMN image_count", [])?;
+                conn.pragma_update(None, "user_version", 9i64)?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let count: Option<i64> = db
+            .with_read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT image_count FROM request_logs WHERE id = 'log1'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(count, None);
+        assert_eq!(SCHEMA_VERSION, 10);
     }
 }

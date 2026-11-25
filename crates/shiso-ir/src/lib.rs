@@ -61,7 +61,9 @@ mod tools;
 pub use embed::{EmbedEncoding, EmbedInput, EmbedRequest, EmbedResponse, EmbedUsage};
 pub use message::{Block, MediaKind, MediaSource, Message, Role, Thinking, ToolResult, ToolUse};
 pub use request::{Effort, Request, ResponseFormat, Sampling, ServiceClass, ThinkingDirective};
-pub use response::{Alternative, Logprobs, Response, StopReason, TokenLogprob, Usage};
+pub use response::{
+    Alternative, Logprobs, PromptLogprob, Response, StopReason, TokenLogprob, Usage,
+};
 pub use stream::{BlockDelta, BlockStart, EventStream, ResponseBuilder, StreamError, StreamEvent};
 pub use tools::{RepetitionDetection, ToolChoice, ToolDefinition};
 

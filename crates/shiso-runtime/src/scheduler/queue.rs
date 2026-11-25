@@ -180,6 +180,9 @@ pub struct GenerateRequest {
     /// Whether this generation runs beside standard work or only in its
     /// absence. See [`ServiceClass::Flex`] for what the scheduler does with it.
     pub service_class: ServiceClass,
+    /// How many top candidate log-probabilities to collect per prompt position.
+    /// `None` disables prompt log-probabilities.
+    pub prompt_logprobs: Option<u32>,
 }
 
 impl GenerateRequest {
@@ -203,6 +206,7 @@ impl GenerateRequest {
             string_params: Arc::default(),
             tool_scaffold: Arc::default(),
             service_class: ServiceClass::Standard,
+            prompt_logprobs: None,
         }
     }
 
@@ -252,6 +256,13 @@ impl GenerateRequest {
     #[must_use]
     pub const fn with_service_class(mut self, class: ServiceClass) -> Self {
         self.service_class = class;
+        self
+    }
+
+    /// The same generation, collecting per-position prompt log-probabilities.
+    #[must_use]
+    pub const fn with_prompt_logprobs(mut self, top_k: Option<u32>) -> Self {
+        self.prompt_logprobs = top_k;
         self
     }
 

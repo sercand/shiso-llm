@@ -114,6 +114,7 @@ pub fn to_ir(body: &ChatBody, model_id: &str) -> Result<Request, AppError> {
         .logprobs
         .unwrap_or(false)
         .then(|| body.top_logprobs.unwrap_or(0));
+    request.prompt_logprobs = body.prompt_logprobs;
     request.seed = body.seed;
     request.return_token_ids = body.return_token_ids.unwrap_or(false);
     request.service_class = body

@@ -362,6 +362,13 @@ impl ImageService {
         &self.model_id
     }
 
+    /// Whether a background remover is loaded, so `background: transparent`
+    /// can be answered for any picture.
+    #[must_use]
+    pub fn has_matte(&self) -> bool {
+        self.generator.removes_backgrounds()
+    }
+
     /// Queues a generation and waits for the image.
     ///
     /// # Errors
@@ -491,7 +498,13 @@ pub fn refuse(error: ImageGenError) -> AppError {
         ImageGenError::ReferenceImage(_) => {
             AppError::bad_request(message, Some("image"), "invalid_request")
         }
-        ImageGenError::Backend(_) | ImageGenError::Encoding(_) | ImageGenError::Checkpoint(_) => {
+        ImageGenError::NoBackgroundRemover => {
+            AppError::bad_request(message, Some("background"), "invalid_request")
+        }
+        ImageGenError::Backend(_)
+        | ImageGenError::Encoding(_)
+        | ImageGenError::Checkpoint(_)
+        | ImageGenError::BackgroundRemoval(_) => {
             AppError::internal("image generation failed", error)
         }
     }

@@ -7,6 +7,7 @@
 //! frame order - not the diffusion math, which needs a device and belongs to
 //! `shiso-models`.
 
+use shiso_vision::generator::Background;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -48,6 +49,7 @@ fn filler_job() -> ImageGenerationJob {
         output_format: ImageOutputFormat::Png,
         output_compression: None,
         input_references: Vec::new(),
+        background: Background::Auto,
     }
 }
 
@@ -125,7 +127,9 @@ impl ImageGenerator for RecordingGenerator {
             width: job.width,
             height: job.height,
             prompt_tokens: 10,
+            image_input_tokens: 0,
             completion_tokens: 1024,
+            transparent: false,
         })
     }
 }
@@ -164,7 +168,9 @@ impl ImageGenerator for FailingSecondGenerator {
             width: job.width,
             height: job.height,
             prompt_tokens: 10,
+            image_input_tokens: 0,
             completion_tokens: 1024,
+            transparent: false,
         })
     }
 }
@@ -214,7 +220,9 @@ impl ImageGenerator for GateGenerator {
             width: job.width,
             height: job.height,
             prompt_tokens: 10,
+            image_input_tokens: 0,
             completion_tokens: 1024,
+            transparent: false,
         })
     }
 }
@@ -658,8 +666,8 @@ async fn a_buffered_response_round_trips_the_image_and_accounts_usage() {
         png_bytes(),
         "the bytes come back exactly as generated"
     );
-    assert_eq!(body["usage"]["prompt_tokens"], 10);
-    assert_eq!(body["usage"]["completion_tokens"], 1024);
+    assert_eq!(body["usage"]["input_tokens"], 10);
+    assert_eq!(body["usage"]["output_tokens"], 1024);
     assert_eq!(body["usage"]["total_tokens"], 1034);
     // Anything after 2020: a zero here means the clock was never read.
     assert!(
@@ -1116,4 +1124,125 @@ async fn a_wire_grid_model_still_rounds_an_explicit_size() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let job = &log.recorded()[0];
     assert_eq!((job.width, job.height), (1008, 1008));
+}
+
+#[tokio::test]
+async fn background_and_formats_parse() {
+    let refused = |body: serde_json::Value, param: &'static str| async move {
+        let (state, log) = state_with_mock(false);
+        let (status, answer) = post_json(state, "/v1/images/generations", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+        assert_eq!(answer["error"]["param"], param, "{answer}");
+        assert!(log.jobs.lock().expect("lock").is_empty());
+        answer
+    };
+    let webp = refused(
+        json!({"prompt": "x", "output_format": "webp"}),
+        "output_format",
+    )
+    .await;
+    assert_eq!(
+        webp["error"]["message"],
+        "webp output is not supported; use png or jpeg"
+    );
+    refused(json!({"prompt": "x", "moderation": "strict"}), "moderation").await;
+    refused(json!({"prompt": "x", "quality": "ultra"}), "quality").await;
+    refused(json!({"prompt": "x", "background": "clear"}), "background").await;
+    refused(
+        json!({"prompt": "x", "background": "transparent", "output_format": "jpeg"}),
+        "background",
+    )
+    .await;
+
+    for (background, quality, moderation) in [
+        ("auto", "auto", "auto"),
+        ("opaque", "high", "low"),
+        ("auto", "standard", "auto"),
+        ("opaque", "hd", "low"),
+        ("auto", "xhigh", "auto"),
+        ("auto", "max", "auto"),
+        ("auto", "medium", "auto"),
+        ("auto", "low", "auto"),
+    ] {
+        let (state, _) = state_with_mock(false);
+        let (status, body) = post_json(
+            state,
+            "/v1/images/generations",
+            json!({"prompt": "x", "size": "512x512", "background": background,
+                   "quality": quality, "moderation": moderation}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{background} {quality}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn response_has_openai_shape() {
+    let (state, _) = state_with_mock(false);
+    let (status, body) = post_json(
+        state,
+        "/v1/images/generations",
+        json!({"prompt": "a red door", "size": "512x768"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["background"], "opaque");
+    assert_eq!(body["output_format"], "png");
+    assert_eq!(body["size"], "512x768");
+    assert!(body.get("quality").is_none(), "{body}");
+    let usage = &body["usage"];
+    assert_eq!(usage["input_tokens"], 10, "{body}");
+    assert_eq!(usage["input_tokens_details"]["text_tokens"], 10);
+    assert_eq!(usage["input_tokens_details"]["image_tokens"], 0);
+    assert_eq!(usage["output_tokens"], 1024);
+    assert_eq!(usage["output_tokens_details"]["image_tokens"], 1024);
+    assert_eq!(usage["output_tokens_details"]["text_tokens"], 0);
+    assert_eq!(usage["total_tokens"], 1034);
+    assert!(usage.get("prompt_tokens").is_none(), "{body}");
+
+    let (state, _) = state_with_mock(false);
+    let (_, body) = post_json(
+        state,
+        "/v1/images/generations",
+        json!({"prompt": "a red door", "size": "512x512", "quality": "high",
+               "output_format": "jpeg"}),
+    )
+    .await;
+    assert_eq!(body["quality"], "high", "{body}");
+    assert_eq!(body["output_format"], "jpeg", "{body}");
+}
+
+#[tokio::test]
+async fn transparent_without_remover_is_400_even_streaming() {
+    let (state, log) = state_with_mock(true);
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"prompt": "x", "background": "transparent", "stream": true}).to_string(),
+                ))
+                .expect("builds"),
+        )
+        .await
+        .expect("the router answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        content_type.starts_with("application/json"),
+        "{content_type}"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the body reads");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+    assert_eq!(body["error"]["param"], "background", "{body}");
+    assert!(log.jobs.lock().expect("lock").is_empty());
 }

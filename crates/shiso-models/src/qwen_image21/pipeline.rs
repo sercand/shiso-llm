@@ -1547,7 +1547,10 @@ impl ImageGenerator for QwenImage21Model {
             width: job.width,
             height: job.height,
             prompt_tokens: u32::try_from(kept).unwrap_or(u32::MAX),
+            image_input_tokens: u32::try_from(prompt.prefix_tokens().saturating_sub(kept))
+                .unwrap_or(u32::MAX),
             completion_tokens: u32::try_from(grid.cells() * steps).unwrap_or(u32::MAX),
+            transparent: false,
         })
     }
 }

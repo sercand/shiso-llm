@@ -1264,3 +1264,44 @@ fn a_splat_variant_needs_both_encoders_and_nothing_else() {
     let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
     assert!(err.to_string().contains("directory"), "{err}");
 }
+
+#[test]
+fn image_matte_role_parses_and_names_its_flag() {
+    assert_eq!("image_matte".parse::<Role>().unwrap(), Role::ImageMatte);
+    assert_eq!(Role::ImageMatte.as_str(), "image_matte");
+    assert_eq!(Role::ImageMatte.flag_name(), "--image-matte");
+}
+
+/// A background remover rides beside an image model, as a file or as its
+/// repository's directory, and is a part of no other model.
+#[test]
+fn image_matte_is_a_part_of_an_image_variant() {
+    let matte = || Component {
+        provider: Provider::HuggingFace,
+        repo: Some("shiso/test-matte".to_string()),
+        revision: Some(CommitSha::parse("3f1c2a9d8e7b6a5c4d3e2f1a0b9c8d7e6f5a4b3c").unwrap()),
+        entry: Some("model.safetensors".to_string()),
+        files: vec![FileEntry {
+            name: "model.safetensors".to_string(),
+            size: 10,
+            sha256: Sha256::parse(
+                "4b6f1e3a479a044b7d1be20042a969f6e01a88ccb21f37e19392e2d9b69b567a",
+            )
+            .unwrap(),
+            binds: None,
+        }],
+    };
+    let mut recipe = make_test_recipe();
+    let mut variant = image_variant();
+    variant.components.insert(Role::ImageMatte, matte());
+    variant.requirements.disk_bytes = 50;
+    recipe.variants = vec![variant];
+    validate_recipe(&recipe, ValidationMode::Strict).expect("a remover beside an image model");
+
+    let mut variant = make_test_recipe().variants.remove(0);
+    variant.components.insert(Role::ImageMatte, matte());
+    variant.requirements.disk_bytes += 10;
+    recipe.variants = vec![variant];
+    let err = validate_recipe(&recipe, ValidationMode::Strict).unwrap_err();
+    assert!(err.to_string().contains("requires 'image'"), "{err}");
+}

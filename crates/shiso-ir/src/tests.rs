@@ -533,6 +533,7 @@ fn every_type_an_adapter_has_to_build_can_be_built_from_outside_this_crate() {
         stop: StopReason::EndTurn,
         usage: Usage::default(),
         logprobs: Some(logprobs),
+        prompt_logprobs: None,
         token_ids: Vec::new(),
     };
     assert_eq!(response.message.text(), "Paris");
@@ -552,14 +553,18 @@ fn every_type_an_adapter_has_to_build_can_be_built_from_outside_this_crate() {
 fn image_usage_totals_saturate() {
     use crate::image::Usage;
     let usage = Usage {
-        prompt_tokens: 3,
-        completion_tokens: 4,
+        text_input_tokens: 3,
+        image_input_tokens: 2,
+        image_output_tokens: 4,
     };
-    assert_eq!(usage.total_tokens(), 7);
+    assert_eq!(usage.input_tokens(), 5);
+    assert_eq!(usage.total_tokens(), 9);
     let huge = Usage {
-        prompt_tokens: u32::MAX,
-        completion_tokens: 1,
+        text_input_tokens: u32::MAX,
+        image_input_tokens: 1,
+        image_output_tokens: 1,
     };
+    assert_eq!(huge.input_tokens(), u32::MAX);
     assert_eq!(huge.total_tokens(), u32::MAX);
     assert_eq!(Usage::default().total_tokens(), 0);
 }

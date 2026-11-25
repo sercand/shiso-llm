@@ -27,6 +27,7 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
+use shiso_vision::generator::Background;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -248,6 +249,7 @@ fn job(
         output_format: ImageOutputFormat::Png,
         output_compression: None,
         input_references: references,
+        background: Background::Auto,
     }
 }
 

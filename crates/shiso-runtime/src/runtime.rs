@@ -661,6 +661,8 @@ fn warm_up_image(limits: &shiso_vision::generator::ImageLimits) -> Generate {
         seed: Some(0),
         output_format: None,
         output_compression: None,
+        background: shiso_ir::image::Background::Auto,
+        quality: None,
     }
 }
 

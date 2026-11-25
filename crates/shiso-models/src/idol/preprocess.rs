@@ -16,6 +16,7 @@
 //! Both are observable in the output, so both are fixed here.
 
 use image::{Rgba, RgbaImage};
+use shiso_vision::matte::BackgroundRemover;
 
 /// The model's input side: every preprocessed picture is this square.
 pub const IMAGE_SIZE: u32 = 1024;
@@ -66,20 +67,6 @@ pub enum PreprocessError {
     },
 }
 
-/// Background removal, as the preprocessing stage needs it.
-///
-/// A seam rather than a concrete model so the stage can be tested without a
-/// device, and so the remover can be swapped or left out on a host that only
-/// ever sees cut-outs.
-pub trait Matting: Send + Sync + std::fmt::Debug {
-    /// The alpha channel for `rgb`, one byte per pixel in row-major order.
-    ///
-    /// # Errors
-    ///
-    /// A human-readable reason the remover could not run.
-    fn alpha(&self, rgb: &image::RgbImage) -> Result<Vec<u8>, String>;
-}
-
 /// What the encoders read: a 1024-square RGB image, background composited to
 /// black.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +107,7 @@ pub fn decode_rgba(bytes: &[u8]) -> Result<RgbaImage, PreprocessError> {
 pub fn preprocess(
     image: &[u8],
     crop_margin: f32,
-    matting: Option<&dyn Matting>,
+    matting: Option<&dyn BackgroundRemover>,
 ) -> Result<Preprocessed, PreprocessError> {
     let decoded = decode_rgba(image)?;
     let (width, height) = decoded.dimensions();
@@ -818,7 +805,7 @@ mod tests {
         }
     }
 
-    impl Matting for SquareMatte {
+    impl BackgroundRemover for SquareMatte {
         fn alpha(&self, rgb: &RgbImage) -> Result<Vec<u8>, String> {
             let (width, height) = rgb.dimensions();
             *self.seen.lock().expect("the matte's own lock") = Some((width, height));
@@ -880,7 +867,7 @@ mod tests {
     fn a_matte_of_the_wrong_length_is_refused() {
         #[derive(Debug)]
         struct Short;
-        impl Matting for Short {
+        impl BackgroundRemover for Short {
             fn alpha(&self, _rgb: &RgbImage) -> Result<Vec<u8>, String> {
                 Ok(vec![255; 4])
             }

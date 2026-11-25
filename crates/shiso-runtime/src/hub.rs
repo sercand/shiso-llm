@@ -1145,6 +1145,15 @@ fn fill_options_from_variant(
             Role::ImageTextEncoder => options.image_text_encoder = Some(target),
             Role::ImageVae => options.image_vae = Some(target),
             Role::ImageTokenizer => options.image_tokenizer = Some(target),
+            // An operator's own remover wins over the recipe's, as their
+            // generation config does: it changes no weight the image model
+            // reads, only how its pictures are cut out afterwards, so a recipe
+            // without one can be given one.
+            Role::ImageMatte => {
+                if options.image_matte.is_none() {
+                    options.image_matte = Some(target);
+                }
+            }
             Role::Splat => options.splat_model = Some(target),
             Role::SplatEncoder => options.splat_encoder = Some(target),
             Role::SplatVae => options.splat_vae = Some(target),

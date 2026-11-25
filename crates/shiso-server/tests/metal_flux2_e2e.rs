@@ -10,6 +10,7 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
+use shiso_vision::generator::Background;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -170,6 +171,7 @@ fn generate_once(
         output_format: format,
         output_compression: None,
         input_references: Vec::new(),
+        background: Background::Auto,
     };
 
     // The progress callback only reports wall-clock between steps; it does
@@ -298,6 +300,7 @@ async fn test_flux2_klein_metal_generation() {
                 output_format: ImageOutputFormat::Jpeg,
                 output_compression: None,
                 input_references: Vec::new(),
+                background: Background::Auto,
             };
             let gen_start = Instant::now();
             let result = generator

@@ -8,7 +8,7 @@ loosening the check that found it.
 
 ## Commands
 
-Run everything from the repository root so `rust-toolchain.toml` (1.98.1)
+Run everything from the repository root so `rust-toolchain.toml` (1.100.0)
 applies. Pass `--locked` because `Cargo.lock` is committed.
 
 ```sh

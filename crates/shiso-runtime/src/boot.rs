@@ -140,6 +140,15 @@ pub fn boot_image(args: &ServeOptions) -> Result<Option<image::ImageService>, Bo
     };
     let OpenedDevice { backend, kind } = open_device(args, Purpose::Image)?;
     let started = std::time::Instant::now();
+    // The remover shares the image device, so the room it will hold is left
+    // out of what the image model may plan its residency against.
+    let matte_bytes = args
+        .image_matte
+        .as_deref()
+        .map(shiso_models::matte_registry::resident_bytes)
+        .transpose()
+        .context("--image-matte")?
+        .unwrap_or(0);
     let desc = shiso_models::image_registry::ImageModelDesc {
         model_path: path.to_path_buf(),
         text_encoder_path: args.image_text_encoder.clone(),
@@ -147,7 +156,7 @@ pub fn boot_image(args: &ServeOptions) -> Result<Option<image::ImageService>, Bo
         tokenizer_path: args.image_tokenizer.clone(),
         assets_dir: args.image_assets_dir.clone(),
         residency: args.image_residency.into(),
-        reserve_bytes: args.image_reserve_bytes()?,
+        reserve_bytes: args.image_reserve_bytes()?.saturating_add(matte_bytes),
         draft_steps: args.image_draft_steps,
         host_share_per_mille: args.image_host_share.saturating_mul(10),
         final_reuse: args.image_final_reuse.map(|r| (r.start, r.end)),
@@ -157,6 +166,27 @@ pub fn boot_image(args: &ServeOptions) -> Result<Option<image::ImageService>, Bo
         shiso_models::image_registry::open_image_generator(&desc, &backend)
             .with_context(|| format!("loading image model at {}", path.display())),
     )?;
+    let remover = args
+        .image_matte
+        .as_deref()
+        .map(|matte| {
+            on_device(
+                kind,
+                shiso_models::matte_registry::open_background_remover(matte, &backend)
+                    .with_context(|| format!("loading background remover at {}", matte.display())),
+            )
+        })
+        .transpose()?;
+    if let Some(matte) = args.image_matte.as_deref() {
+        tracing::info!(
+            path = %matte.display(),
+            reserved_mb = matte_bytes >> 20,
+            "the background remover is resident"
+        );
+    }
+    let generator: Arc<dyn shiso_vision::generator::ImageGenerator> = Arc::new(
+        shiso_models::matted::MattedGenerator::new(generator, remover),
+    );
     // Every weight this process will read for generation is resident now, so
     // whatever the backend kept to make those imports fast can go.
     backend.finish_imports();

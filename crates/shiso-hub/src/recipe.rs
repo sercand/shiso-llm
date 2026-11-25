@@ -412,6 +412,10 @@ pub enum Role {
     /// prompt is split with, when no assets directory carries it. Names a
     /// file.
     ImageTokenizer,
+    /// Background remover weights (`--image-matte`): a file, or the
+    /// directory of the repository that ships them. Makes
+    /// `background: transparent` answerable for any picture.
+    ImageMatte,
     /// 3D splat model checkpoint directory (`--splat-model`).
     Splat,
     /// The splat model's image encoder directory (`--splat-encoder`).
@@ -456,6 +460,7 @@ impl Role {
             Self::ImageTextEncoder => "--image-text-encoder",
             Self::ImageVae => "--image-vae",
             Self::ImageTokenizer => "--image-tokenizer",
+            Self::ImageMatte => "--image-matte",
             Self::Splat => "--splat-model",
             Self::SplatEncoder => "--splat-encoder",
             Self::SplatVae => "--splat-vae",
@@ -481,6 +486,7 @@ impl Role {
             Self::ImageTextEncoder => "image_text_encoder",
             Self::ImageVae => "image_vae",
             Self::ImageTokenizer => "image_tokenizer",
+            Self::ImageMatte => "image_matte",
             Self::Splat => "splat",
             Self::SplatEncoder => "splat_encoder",
             Self::SplatVae => "splat_vae",
@@ -513,6 +519,7 @@ impl FromStr for Role {
             "image_text_encoder" => Ok(Self::ImageTextEncoder),
             "image_vae" => Ok(Self::ImageVae),
             "image_tokenizer" => Ok(Self::ImageTokenizer),
+            "image_matte" => Ok(Self::ImageMatte),
             "splat" => Ok(Self::Splat),
             "splat_encoder" => Ok(Self::SplatEncoder),
             "splat_vae" => Ok(Self::SplatVae),

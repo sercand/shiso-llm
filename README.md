@@ -93,6 +93,45 @@ cargo build --release -p shiso-server --features metal --bin shiso
 SHISO_CUDA_COMPILE=1 cargo build --release -p shiso-server --features cuda --bin shiso
 ```
 
+### Container image
+
+`Dockerfile` builds a two-stage image. The CUDA `devel` image compiles the
+kernel tree to PTX and both `shiso` and `shiso-registry`; the runtime is
+distroless `cc` and carries only those binaries plus the cuBLAS shared objects.
+Nothing else from the toolkit, and no model weights, are in the image.
+
+```sh
+# arm64 (DGX Spark), built on the machine it runs on
+docker build -t shiso-cuda .
+# fixed-architecture kernel set instead of the manifests' compute_75 PTX
+docker build --build-arg SHISO_CUDA_ARCH=sm_121a -t shiso-cuda .
+```
+
+The image has no default subcommand, only `--help`. `serve` binds loopback by
+default, so publish a port and bind all interfaces explicitly:
+
+```sh
+docker run --rm --gpus all -p 8090:8090 \
+  -v ~/models:/models \
+  -v shiso-home:/home/nonroot/.shiso \
+  shiso-cuda serve --bind 0.0.0.0 \
+    --model /models/Qwen3.5-4B/Qwen3.5-4B-Q4_K_M.gguf \
+    --config /models/Qwen3.5-4B/config.json
+```
+
+`shiso-registry` is included for maintenance work. Its `serve` subcommand binds
+`127.0.0.1` by design, so from Kubernetes it is reachable only from a sidecar
+in the same pod; the headless subcommands run through `kubectl exec` or
+`container run --entrypoint shiso-registry`. The runtime image is distroless
+and has no shell, so exec the binaries directly (`kubectl exec … -- shiso
+--version`).
+
+The runtime user is distroless' `nonroot` (uid `65532`), so a model directory
+or PVC mounted into the container must be readable by it; on Kubernetes set
+`fsGroup: 65532` for writable volumes. `NVIDIA_DRIVER_CAPABILITIES` already
+includes `video`, which is what makes NVDEC available when the driver exposes
+`libnvcuvid`.
+
 ### Devices
 
 Every build also carries a CPU device (the `cpu` feature, on by default), so
@@ -345,6 +384,7 @@ environment variable. The ones you are most likely to want:
 | `--image-text-encoder` | Text encoder weights path when it is split from `--image-model`; overrides where the locator would look |
 | `--image-vae` | VAE weights path when it is split from `--image-model`; overrides where the locator would look |
 | `--image-tokenizer` | Tokenizer path when it is split from `--image-model`; overrides where the locator would look |
+| `--image-matte` | Background remover weights (a `.safetensors` file, or a directory with `model.safetensors`, e.g. BiRefNet_dynamic) loaded beside `--image-model`, so `background: transparent` can cut out any picture; without it such a request is refused. Given with a recipe, it replaces the recipe's own |
 | `--image-max-upload-mb` | Largest image edit request body in MiB (default 64); only the edit routes take it |
 | `--image-max-queue` | Image requests that may wait in the queue beyond the one generating (default 16); the next is refused with a 503 a retry can fix |
 | `--image-default-steps` | Denoising steps a request that names none gets (default: the loaded model's own: 4 for FLUX.2-klein, 16 for FLUX.3 Klein; for Qwen-Image-2.1 the length of `model_index.json`'s `sample_sigmas`, fixed, when it ships them (8 for Turbo), else 40) |
@@ -376,8 +416,8 @@ Logging is controlled by `SHISO_LOG` (for example `SHISO_LOG=info,shiso_engine=d
 | `POST /v1/responses` | OpenAI Responses |
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/audio/transcriptions` | OpenAI Audio Transcriptions (also at `/audio/transcriptions`) |
-| `POST /v1/images/generations` | OpenAI Images (also at `/v1/images` and `/images`; serves FLUX.2-klein, the distilled FLUX.3 Klein and Qwen-Image-2.1 (Turbo, base, and fine-tunes in the same format; the schedule is the assets' `model_index.json` `sample_sigmas`, shifted by `scheduler/scheduler_config.json`); `b64_json` only) |
-| `POST /v1/images/edits` | OpenAI Image edits (also at `/images/edits`; FLUX.3 Klein and Qwen-Image-2.1; multipart `image`/`image[]` (up to 10, or `--image-max-references`) or JSON `images` with `data:` URLs, plus `prompt`, `size`, `seed`, `steps`, `output_format`, `output_compression`; `n` must be 1, no `mask`; `b64_json` only; body limit `--image-max-upload-mb`). Qwen-Image-2.1 edits need an install whose text-encoder file carries its vision tower and whose VAE file carries its encoder (the INT8 exports do); each reference is read at about 1024x1024 whatever its own size, an omitted `size` follows the last reference's aspect ratio at about one megapixel, and an edit that does not fit the device's memory is refused naming the references - a 24 GB M4 holds two. On that M4, one reference and 6 steps: 201 s at 1024x1024, 110 s at 768x768, 82 s at 512x512. Do not edit a picture with the seed and size it was generated with: the edit then starts from the noise behind its own reference and comes out harsh |
+| `POST /v1/images/generations` | OpenAI Images (also at `/v1/images` and `/images`; serves FLUX.2-klein, the distilled FLUX.3 Klein and Qwen-Image-2.1 (Turbo, base, and fine-tunes in the same format; the schedule is the assets' `model_index.json` `sample_sigmas`, shifted by `scheduler/scheduler_config.json`); `b64_json` only). `output_format` is `png` or `jpeg` (`webp` is refused). `background`: `auto` keeps the model's own cut-out when it draws one (Qwen-Image-2.1 does when the prompt asks in its RGBA template) and is opaque otherwise; `opaque` composites any alpha over white; `transparent` (png only, needs `--image-matte`) keeps the model's cut-out or else runs the background remover. `quality` is validated and echoed; `moderation` (`low`/`auto`) is validated and unused. The answer carries `background`, `output_format`, `quality`, `size` and `usage` split into `input_tokens_details` and `output_tokens_details`; streams emit `image_generation.*` events |
+| `POST /v1/images/edits` | OpenAI Image edits (also at `/images/edits`; FLUX.3 Klein and Qwen-Image-2.1; multipart `image`/`image[]` (up to 10, or `--image-max-references`) or JSON `images` with `data:` URLs, plus `prompt`, `size`, `seed`, `steps`, `output_format`, `output_compression`, `background`, `quality`, `moderation` (as on generations); streams emit `image_edit.*` events; `n` must be 1, no `mask`; `b64_json` only; body limit `--image-max-upload-mb`). Qwen-Image-2.1 edits need an install whose text-encoder file carries its vision tower and whose VAE file carries its encoder (the INT8 exports do); each reference is read at about 1024x1024 whatever its own size, an omitted `size` follows the last reference's aspect ratio at about one megapixel, and an edit that does not fit the device's memory is refused naming the references - a 24 GB M4 holds two. On that M4, one reference and 6 steps: 201 s at 1024x1024, 110 s at 768x768, 82 s at 512x512. Do not edit a picture with the seed and size it was generated with: the edit then starts from the noise behind its own reference and comes out harsh |
 | `POST /v1/3d/generations` | 3D Gaussian-splat generation: one image in, one splat file out, as `data[0].b64_ply` (a 3DGS `.ply`, the default) or, with `"output_format": "glb"`, `data[0].b64_glb` (a binary glTF whose Gaussians ride the `KHR_gaussian_splatting` extension, with `COLOR_0` so any other reader shows a point cloud); an `Accept: model/gltf-binary` (or `model/ply`) header picks the format too and answers with the file itself instead of JSON; `mode`, `seed`, `steps`, `cfg_strength`, `rescale_t`, `num_gaussians`, `crop_margin`, `refresh_every`, `stream`; requires a splat model (`--splat-model` with `--splat-encoder` and `--splat-vae`); a picture without transparency is cut out by the checkpoint's background remover |
 | `POST /v1/embeddings` | OpenAI and OpenRouter Embeddings (also at `/embeddings`; text, token-id and multimodal `content` inputs, `dimensions`, `encoding_format` `float` or `base64`, `input_type`) |
 | `GET /v1/models` | OpenAI Models |

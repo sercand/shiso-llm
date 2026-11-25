@@ -2620,11 +2620,29 @@ pub(crate) fn logits_rows(
     scratch: &Scratch,
     n: u32,
 ) -> CoreResult<()> {
+    logits_rows_slice(backend, weights, geometry, scratch, 0, n)
+}
+
+/// Projects `n` contiguous normalized rows starting at `offset` into logits
+/// rows `0 .. n`, in one call.
+///
+/// # Errors
+///
+/// As [`logits_row`].
+pub(crate) fn logits_rows_slice(
+    backend: &dyn Backend,
+    weights: &Weights,
+    geometry: &Geometry,
+    scratch: &Scratch,
+    offset: u32,
+    n: u32,
+) -> CoreResult<()> {
     let hidden = u64::from(geometry.hidden).saturating_mul(launch::F32_BYTES);
     let vocab = u64::from(geometry.vocab).saturating_mul(launch::F32_BYTES);
-    let src = scratch
-        .normed
-        .slice(0, u64::from(n).saturating_mul(hidden))?;
+    let src = scratch.normed.slice(
+        u64::from(offset).saturating_mul(hidden),
+        u64::from(n).saturating_mul(hidden),
+    )?;
     let dst = scratch
         .logits
         .slice(0, u64::from(n).saturating_mul(vocab))?;

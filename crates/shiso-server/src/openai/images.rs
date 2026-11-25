@@ -20,8 +20,16 @@
 //! # What the wire values become
 //!
 //! See [`shiso_runtime::image`]: the size grammar, `auto`, and the default
-//! step count. `quality`, `user` and `session_id` are accepted and unused,
-//! each for the reason spelled out on the wire field.
+//! step count. `quality` is echoed, `moderation`, `user` and `session_id` are
+//! accepted and unused, each for the reason spelled out on the wire field.
+//! `background` is the core's: see `shiso_models::matted` for what each value
+//! answers.
+//!
+//! # Event names
+//!
+//! The generation routes stream `image_generation.*` events and the edit
+//! route `image_edit.*`, as the published shape names them; the frames are
+//! otherwise the same.
 //!
 //! # Why a streamed request waits for admission
 //!
@@ -46,14 +54,15 @@ use axum::response::{IntoResponse as _, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures::StreamExt as _;
-use shiso_ir::image::{Edit, Generate, Image, Images, Step, Usage};
+use shiso_ir::image::{Edit, Generate, Image, Images, ProducedBackground, Quality, Step, Usage};
 use tokio::sync::mpsc;
 
 use crate::api::sse::Frame;
 use crate::error::{AppError, type_for_status};
 use crate::openai::images_wire::{
     ImageData, ImageGenCompletedEvent, ImageGenPartialImageEvent, ImageGenerationRequest,
-    ImageGenerationResponse, ImageGenerationUsage,
+    ImageGenerationResponse, ImageGenerationUsage, InputTokensDetails, OutputTokensDetails,
+    quality_name,
 };
 use crate::state::AppState;
 
@@ -84,7 +93,7 @@ async fn answer(state: &Arc<AppState>, body: &Bytes) -> Result<Response, AppErro
     // same reason, so the 503 is reserved for a well-formed request this
     // server could have run.
     parsed.validate()?;
-    let ir = parsed.to_ir();
+    let ir = parsed.to_ir()?;
     if parsed.stream.unwrap_or(false) {
         // Every refusal the core would make before it queues anything, ahead
         // of the task and of the debug lines, so a refused request spawns
@@ -108,7 +117,7 @@ pub(crate) async fn run_edit(
 ) -> Result<Response, AppError> {
     parsed.validate()?;
     let edit = Edit {
-        generate: parsed.to_ir(),
+        generate: parsed.to_ir()?,
         references,
     };
     if parsed.stream.unwrap_or(false) {
@@ -127,7 +136,13 @@ fn note_ignored(state: &AppState, parsed: &ImageGenerationRequest) {
     if let Some(quality) = parsed.quality.as_deref() {
         tracing::debug!(
             quality,
-            "quality is accepted and ignored: this server has one rendering path"
+            "quality is echoed and otherwise unused: this server has one rendering path"
+        );
+    }
+    if let Some(moderation) = parsed.moderation.as_deref() {
+        tracing::debug!(
+            moderation,
+            "moderation is accepted and unused: this server runs no content filter"
         );
     }
     if let Some(model) = parsed.model.as_deref()
@@ -147,10 +162,25 @@ enum Job {
     Edit(Edit),
 }
 
+impl Job {
+    /// The prefix of the route's stream event names.
+    const fn events(&self) -> &'static str {
+        match self {
+            Self::Generate(_) => "image_generation",
+            Self::Edit(_) => "image_edit",
+        }
+    }
+}
+
 /// The blocking answer: one JSON body for every image.
 fn buffered(images: Images) -> Response {
+    let size = images.images.first().map(size_of).unwrap_or_default();
     let body = ImageGenerationResponse {
         created: images.created,
+        background: background_name(images.background),
+        output_format: images.output_format,
+        quality: quality_echo(images.quality),
+        size,
         data: images
             .images
             .into_iter()
@@ -166,10 +196,38 @@ fn buffered(images: Images) -> Response {
 
 fn usage_wire(usage: Usage) -> ImageGenerationUsage {
     ImageGenerationUsage {
-        prompt_tokens: usage.prompt_tokens,
-        completion_tokens: usage.completion_tokens,
+        input_tokens: usage.input_tokens(),
+        input_tokens_details: InputTokensDetails {
+            text_tokens: usage.text_input_tokens,
+            image_tokens: usage.image_input_tokens,
+        },
+        output_tokens: usage.image_output_tokens,
+        output_tokens_details: OutputTokensDetails {
+            image_tokens: usage.image_output_tokens,
+            text_tokens: 0,
+        },
         total_tokens: usage.total_tokens(),
     }
+}
+
+/// A picture's dimensions as the wire spells them.
+fn size_of(image: &Image) -> String {
+    format!("{}x{}", image.width, image.height)
+}
+
+const fn background_name(background: ProducedBackground) -> &'static str {
+    match background {
+        ProducedBackground::Opaque => "opaque",
+        ProducedBackground::Transparent => "transparent",
+    }
+}
+
+/// The quality echo: the value the caller named, except `auto`, which names
+/// no quality to report.
+fn quality_echo(quality: Option<Quality>) -> Option<&'static str> {
+    quality
+        .filter(|quality| *quality != Quality::Auto)
+        .map(quality_name)
 }
 
 /// The streamed answer: frames from a task that runs the generations, after
@@ -222,15 +280,28 @@ async fn run_stream(
     // as a status code; after it, the 200 is spent and the failure has to
     // arrive as content.
     let mut streaming = false;
+    let events = job.events();
     let sink = |step: Step| {
         let event = match step {
             Step::Admitted => accepted_event(),
-            Step::Partial { index, bytes } => partial_frame(&bytes, index).into_event(),
+            Step::Partial { index, bytes } => partial_frame(events, &bytes, index).into_event(),
             Step::Completed {
                 created,
                 image,
                 usage,
-            } => completed_frame(created, &image, usage_wire(usage)).into_event(),
+                output_format,
+                quality,
+            } => completed_frame(
+                events,
+                created,
+                &image,
+                Completion {
+                    usage: usage_wire(usage),
+                    output_format,
+                    quality: quality_echo(quality),
+                },
+            )
+            .into_event(),
         };
         streaming = true;
         tx.send(Ok(event)).is_ok()
@@ -275,31 +346,57 @@ fn accepted_event() -> Event {
 /// Partials are always PNG previews regardless of the request's
 /// `output_format`: they are progress, not the product, and the completed
 /// frame is the one that honors the format.
-fn partial_frame(bytes: &[u8], index: u32) -> Frame {
+fn partial_frame(events: &'static str, bytes: &[u8], index: u32) -> Frame {
+    let name = if events == "image_edit" {
+        "image_edit.partial_image"
+    } else {
+        "image_generation.partial_image"
+    };
     let body = ImageGenPartialImageEvent {
-        r#type: "image_generation.partial_image",
+        r#type: name,
         partial_image_index: index,
         b64_json: BASE64_STANDARD.encode(bytes),
     };
     Frame::named(
-        "image_generation.partial_image",
+        name,
         serde_json::to_string(&body).expect("an event of strings and numbers always serializes"),
     )
+}
+
+/// What a completed frame says besides the picture.
+struct Completion {
+    usage: ImageGenerationUsage,
+    output_format: String,
+    quality: Option<&'static str>,
 }
 
 /// The completed-image frame for one finished image. Its `usage` is the
 /// request's running total, so the last frame of a multi-image stream carries
 /// the whole request's accounting.
-fn completed_frame(created: u64, image: &Image, usage: ImageGenerationUsage) -> Frame {
+fn completed_frame(
+    events: &'static str,
+    created: u64,
+    image: &Image,
+    completion: Completion,
+) -> Frame {
+    let name = if events == "image_edit" {
+        "image_edit.completed"
+    } else {
+        "image_generation.completed"
+    };
     let body = ImageGenCompletedEvent {
-        r#type: "image_generation.completed",
+        r#type: name,
         created,
         b64_json: BASE64_STANDARD.encode(&image.bytes),
         media_type: Some(image.media_type.clone()),
-        usage: Some(usage),
+        background: background_name(image.background),
+        output_format: completion.output_format,
+        quality: completion.quality,
+        size: size_of(image),
+        usage: Some(completion.usage),
     };
     Frame::named(
-        "image_generation.completed",
+        name,
         serde_json::to_string(&body).expect("an event of strings and numbers always serializes"),
     )
 }
@@ -334,28 +431,34 @@ struct StreamGone;
 
 #[cfg(test)]
 mod tests {
-    use shiso_ir::image::{Image, Images, Usage};
+    use shiso_ir::image::{Image, Images, ProducedBackground, Quality, Usage};
 
-    use super::{buffered, completed_frame, partial_frame, usage_wire};
+    use super::{Completion, buffered, completed_frame, partial_frame, usage_wire};
 
     fn png(bytes: &[u8]) -> Image {
         Image {
             bytes: bytes.to_vec(),
             media_type: "image/png".to_owned(),
+            width: 64,
+            height: 32,
+            background: ProducedBackground::Opaque,
         }
     }
 
-    /// The IR a core returns is spelled as the body this route has always
-    /// sent.
+    /// The IR a core returns is spelled as the image models' body.
     #[tokio::test]
     async fn images_are_spelled_as_the_buffered_body() {
         let response = buffered(Images {
             created: 5,
             images: vec![png(&[1, 2, 3]), png(&[4])],
             usage: Usage {
-                prompt_tokens: 2,
-                completion_tokens: u32::MAX,
+                text_input_tokens: 2,
+                image_input_tokens: 3,
+                image_output_tokens: u32::MAX,
             },
+            background: ProducedBackground::Transparent,
+            output_format: "png".to_owned(),
+            quality: Some(Quality::Auto),
         });
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -363,16 +466,20 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&bytes).expect("utf8"),
             concat!(
-                r#"{"created":5,"data":[{"b64_json":"AQID","media_type":"image/png"},"#,
+                r#"{"created":5,"background":"transparent","#,
+                r#""data":[{"b64_json":"AQID","media_type":"image/png"},"#,
                 r#"{"b64_json":"BA==","media_type":"image/png"}],"#,
-                r#""usage":{"prompt_tokens":2,"completion_tokens":4294967295,"total_tokens":4294967295}}"#
+                r#""output_format":"png","size":"64x32","#,
+                r#""usage":{"input_tokens":5,"input_tokens_details":{"text_tokens":2,"image_tokens":3},"#,
+                r#""output_tokens":4294967295,"output_tokens_details":{"image_tokens":4294967295,"text_tokens":0},"#,
+                r#""total_tokens":4294967295}}"#
             )
         );
     }
 
     #[test]
     fn steps_are_spelled_as_the_named_frames() {
-        let partial = partial_frame(&[1, 2, 3], 4);
+        let partial = partial_frame("image_generation", &[1, 2, 3], 4);
         assert_eq!(
             partial.name.as_deref(),
             Some("image_generation.partial_image")
@@ -382,19 +489,30 @@ mod tests {
             r#"{"type":"image_generation.partial_image","partial_image_index":4,"b64_json":"AQID"}"#
         );
         let usage = Usage {
-            prompt_tokens: 1,
-            completion_tokens: 10,
+            text_input_tokens: 1,
+            image_input_tokens: 0,
+            image_output_tokens: 10,
         };
-        let completed = completed_frame(7, &png(&[4]), usage_wire(usage));
-        assert_eq!(
-            completed.name.as_deref(),
-            Some("image_generation.completed")
+        let completed = completed_frame(
+            "image_edit",
+            7,
+            &png(&[4]),
+            Completion {
+                usage: usage_wire(usage),
+                output_format: "png".to_owned(),
+                quality: Some("high"),
+            },
         );
+        assert_eq!(completed.name.as_deref(), Some("image_edit.completed"));
         assert_eq!(
             completed.data,
             concat!(
-                r#"{"type":"image_generation.completed","created":7,"b64_json":"BA==","#,
-                r#""media_type":"image/png","usage":{"prompt_tokens":1,"completion_tokens":10,"total_tokens":11}}"#
+                r#"{"type":"image_edit.completed","created":7,"b64_json":"BA==","#,
+                r#""media_type":"image/png","background":"opaque","output_format":"png","#,
+                r#""quality":"high","size":"64x32","#,
+                r#""usage":{"input_tokens":1,"input_tokens_details":{"text_tokens":1,"image_tokens":0},"#,
+                r#""output_tokens":10,"output_tokens_details":{"image_tokens":10,"text_tokens":0},"#,
+                r#""total_tokens":11}}"#
             )
         );
     }

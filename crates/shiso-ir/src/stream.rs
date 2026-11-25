@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::message::{Block, Message, Role, Thinking, ToolUse};
-use crate::response::{Response, StopReason, Usage};
+use crate::response::{PromptLogprob, Response, StopReason, Usage};
 
 /// One event of a generated turn.
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +55,9 @@ pub enum StreamEvent {
         /// The block that closed.
         index: u32,
     },
+    /// Per-position prompt log-probabilities, delivered once prefill finishes
+    /// when the caller asked for them.
+    PromptLogprobs(Vec<Option<Vec<PromptLogprob>>>),
     /// The turn is complete.
     Stop {
         /// Why generation ended.
@@ -191,6 +194,7 @@ pub struct ResponseBuilder {
     head: Option<Head>,
     blocks: BTreeMap<u32, Partial>,
     token_ids: Vec<u32>,
+    prompt_logprobs: Option<Vec<Option<Vec<PromptLogprob>>>>,
     end: Option<(StopReason, Usage)>,
 }
 
@@ -292,6 +296,10 @@ impl ResponseBuilder {
                     return Err(StreamError::UnknownBlock { index });
                 }
             }
+            StreamEvent::PromptLogprobs(logprobs) => {
+                self.require_started("prompt logprobs")?;
+                self.prompt_logprobs = Some(logprobs);
+            }
             StreamEvent::Stop {
                 stop,
                 usage,
@@ -327,6 +335,7 @@ impl ResponseBuilder {
             stop,
             usage,
             logprobs: None,
+            prompt_logprobs: self.prompt_logprobs,
             token_ids: self.token_ids,
         })
     }

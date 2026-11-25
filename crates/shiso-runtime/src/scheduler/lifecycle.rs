@@ -306,6 +306,10 @@ pub(crate) struct SeqSlot {
     /// The scoring half, present only on a sequence that scores its prompt
     /// rather than generating from it.
     score: Option<ScoreJob>,
+    /// Top-K prompt log-probabilities requested for this sequence, if any.
+    prompt_logprobs_k: Option<u32>,
+    /// Per-position prompt log-probabilities accumulated across prefill chunks.
+    prompt_logprobs_raw: Vec<shiso_core::PromptPositionLogprobs>,
 }
 
 /// A keyed score's media, not yet encoded: the items, their digests, and
@@ -451,6 +455,8 @@ impl SeqSlot {
             spec: (0, 0, 0),
             spec_pos: SpecPositions::default(),
             score: None,
+            prompt_logprobs_k: request.prompt_logprobs,
+            prompt_logprobs_raw: Vec::new(),
         }
     }
 
@@ -563,6 +569,8 @@ impl SeqSlot {
                 missed_at: None,
                 reply: setup.score_reply,
             }),
+            prompt_logprobs_k: None,
+            prompt_logprobs_raw: Vec::new(),
         }
     }
 
@@ -700,6 +708,29 @@ impl SeqSlot {
     /// with nothing in the response to show for it.
     pub(crate) const fn checkpointable(&self) -> bool {
         !matches!(self.path_media, PathMedia::Unkeyed)
+    }
+
+    /// Top-K prompt log-probabilities requested for this sequence, if any.
+    pub(crate) const fn prompt_logprobs_k(&self) -> Option<u32> {
+        self.prompt_logprobs_k
+    }
+
+    /// Mutable buffer accumulating per-position prompt log-probabilities across
+    /// prefill chunks.
+    pub(crate) fn prompt_logprobs_raw_mut(
+        &mut self,
+    ) -> &mut Vec<shiso_core::PromptPositionLogprobs> {
+        &mut self.prompt_logprobs_raw
+    }
+
+    /// Takes the accumulated raw prompt log-probabilities once prefill finishes.
+    ///
+    /// Returns `None` when the sequence did not ask for prompt log-probabilities.
+    pub(crate) fn take_prompt_logprobs(
+        &mut self,
+    ) -> Option<Vec<shiso_core::PromptPositionLogprobs>> {
+        self.prompt_logprobs_k?;
+        Some(std::mem::take(&mut self.prompt_logprobs_raw))
     }
 
     /// Records one prefill call: `tokens` covered in `elapsed`, with the

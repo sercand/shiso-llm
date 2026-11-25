@@ -594,6 +594,8 @@ fn images_smoke() {
         seed: Some(1),
         output_format: None,
         output_compression: None,
+        background: shiso_ir::image::Background::Auto,
+        quality: None,
     };
     let images = futures::executor::block_on(runtime.images(picture)).expect("an image");
     say(&format!(

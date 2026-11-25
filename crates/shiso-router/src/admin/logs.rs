@@ -33,6 +33,8 @@ pub(crate) struct ApiLogRow {
     pub error: Option<String>,
     /// The client's `x-service-tier` hint; null for ordinary traffic.
     pub service_tier: Option<String>,
+    /// Images the response carried; null outside the image routes.
+    pub image_count: Option<i64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -106,7 +108,7 @@ pub(crate) async fn get_log(
 const LOG_SELECT: &str = "SELECT l.id, l.created_at, l.token_id, t.name, l.model, l.backend, \
      l.upstream_model, l.path, l.status, l.streamed, l.ttfb_ms, l.duration_ms, \
      l.prompt_tokens, l.completion_tokens, l.cached_tokens, l.cache_write_tokens, \
-     l.total_tokens, l.cost, l.finish_reason, l.error, l.service_tier \
+     l.total_tokens, l.cost, l.finish_reason, l.error, l.service_tier, l.image_count \
      FROM request_logs l LEFT JOIN tokens t ON t.id = l.token_id";
 
 fn query_logs(
@@ -200,6 +202,7 @@ fn api_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiLogRow> {
         finish_reason: row.get(18)?,
         error: row.get(19)?,
         service_tier: row.get(20)?,
+        image_count: row.get(21)?,
     })
 }
 

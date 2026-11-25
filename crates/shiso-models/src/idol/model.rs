@@ -34,9 +34,10 @@ use super::generator::{
 use super::glb::write_glb;
 use super::octree::CHILDREN;
 use super::ply::{GaussianCloud, write_ply};
-use super::preprocess::{IMAGE_SIZE, Matting, PreprocessError, preprocess};
+use super::preprocess::{IMAGE_SIZE, PreprocessError, preprocess};
 use crate::diffusion::ops::Ops;
 use crate::splat_registry::SplatModelDesc;
+use shiso_vision::matte::BackgroundRemover;
 
 /// The denoiser's joint sequence: 8192 latent tokens, 4101 conditioning rows
 /// and the camera. One step's `completion_tokens`, counted once per step even
@@ -144,7 +145,7 @@ pub struct IdolGenerator {
     denoiser: Box<dyn Denoiser>,
     octree: Box<dyn OctreeDecoder>,
     gaussian: Box<dyn GaussianDecoder>,
-    matte: Option<Box<dyn Matting>>,
+    matte: Option<Box<dyn BackgroundRemover>>,
     limits: SplatLimits,
 }
 
@@ -287,7 +288,7 @@ fn planar(image: &image::RgbImage) -> Vec<f32> {
 }
 
 /// Opens the background remover.
-fn open_matte(path: &Path, ops: &Arc<Ops>) -> Result<Box<dyn Matting>, ImageGenError> {
+fn open_matte(path: &Path, ops: &Arc<Ops>) -> Result<Box<dyn BackgroundRemover>, ImageGenError> {
     Ok(Box::new(super::birefnet::BiRefNet::load(
         path,
         Arc::clone(ops),
