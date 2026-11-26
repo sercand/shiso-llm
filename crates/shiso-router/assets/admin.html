@@ -1966,21 +1966,21 @@ function modelTypePill(type) {
 
 /// Aliases and clickable tag pills shown under the model name.
 function modelSubline(m) {
-  const aliases = m.aliases && m.aliases.length
-    ? `<span class="text-xs font-normal text-ink-2">also: ${m.aliases.map(esc).join(", ")}</span>`
+  const aliasText = m.aliases && m.aliases.length ? `also: ${m.aliases.join(", ")}` : "";
+  const aliases = aliasText
+    ? `<div class="mt-0.5 truncate text-xs font-normal text-ink-2" title="${esc(aliasText)}">${esc(aliasText)}</div>`
     : "";
   const tags = m.tags && m.tags.length
-    ? m.tags.map(tag => {
+    ? `<div class="mt-1 flex flex-wrap items-center gap-1">${m.tags.map(tag => {
         const active = MODEL_FILTER.tags.has(tag);
         const cls = active
           ? "s-pill bg-soft text-soft-ink cursor-pointer"
           : "s-pill cursor-pointer hover:bg-fill-hover";
         return `<button type="button" onclick='toggleModelTag(${esc(JSON.stringify(tag))})'
           class="${cls}">#${esc(tag)}</button>`;
-      }).join(" ")
+      }).join("")}</div>`
     : "";
-  if (!aliases && !tags) return "";
-  return `<div class="mt-1 flex flex-wrap items-center gap-1.5">${aliases}${tags}</div>`;
+  return aliases + tags;
 }
 
 function shortUrlLabel(raw) {
@@ -2132,12 +2132,18 @@ function updateModelsView() {
 
   const rows = filtered.map(m => `
     <tr class="border-t border-line">
-      <td class="px-4 py-3 font-medium">
-        <a class="" href="#/analytics/models/${encodeURIComponent(m.name)}"
-          title="Usage analytics">${esc(m.name)}</a>${modelTypePill(m.model_type)}${m.private
-            ? ' <span class="s-pill s-pill--warn">private</span>' : ""}${modelSubline(m)}</td>
+      <td class="max-w-sm px-4 py-3 font-medium">
+        <div class="max-w-sm">
+          <div class="flex flex-wrap items-center gap-1.5">
+            <a class="min-w-0 truncate" href="#/analytics/models/${encodeURIComponent(m.name)}"
+              title="${esc(m.name)} — usage analytics">${esc(m.name)}</a>${modelTypePill(m.model_type)}${m.private
+                ? '<span class="s-pill s-pill--warn">private</span>' : ""}
+          </div>
+          ${modelSubline(m)}
+        </div>
+      </td>
       <td class="px-4 py-3">${m.targets.map(targetChip).join("")}${qosBadge(m)}</td>
-      <td class="px-4 py-3 text-sm text-ink-2">${priceSummary(m.pricing, m.model_type)}</td>
+      <td class="px-4 py-3 text-sm text-ink-2 whitespace-nowrap">${priceSummary(m.pricing, m.model_type)}</td>
       <td class="px-4 py-3 text-right text-sm whitespace-nowrap">
         <button onclick='openModelForm(${esc(JSON.stringify(m.name))})' class="s-btn s-btn--ghost s-btn--sm">Edit</button>
         <button onclick='deleteModel(${esc(JSON.stringify(m.name))})' class="s-btn s-btn--ghost s-btn--sm ml-3 text-bad">Delete</button>
