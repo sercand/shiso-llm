@@ -8,7 +8,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
 
-use crate::catalog::{self, ModelDef, OnShedWithoutFallback, TargetDef};
+use crate::catalog::{self, ModelDef, ModelType, OnShedWithoutFallback, TargetDef};
 use crate::config::PricingCfg;
 use crate::error::AppError;
 use crate::state::AppState;
@@ -47,6 +47,10 @@ pub(crate) struct ModelBody {
     #[serde(default)]
     pub private: bool,
     #[serde(default)]
+    pub model_type: Option<ModelType>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
     pub pricing: Option<PricingCfg>,
     #[serde(default)]
     pub qos_max_wait_ms: Option<i64>,
@@ -64,6 +68,8 @@ pub(crate) async fn create_model(
     let def = ModelDef {
         name: def.name.trim().to_string(),
         aliases: trimmed(def.aliases),
+        tags: trimmed(def.tags),
+        targets: normalize_targets(def.targets),
         ..def
     };
     validate(&state, &def)?;
@@ -89,11 +95,13 @@ pub(crate) async fn replace_model(
         name,
         aliases: trimmed(body.aliases),
         private: body.private,
+        model_type: body.model_type,
+        tags: trimmed(body.tags),
         pricing: body.pricing,
         qos_max_wait_ms: body.qos_max_wait_ms,
         qos_background_max_wait_ms: body.qos_background_max_wait_ms,
         on_shed_without_fallback: body.on_shed_without_fallback,
-        targets: body.targets,
+        targets: normalize_targets(body.targets),
     };
     validate(&state, &def)?;
 
@@ -120,6 +128,19 @@ pub(crate) async fn delete_model(
 
 fn trimmed(values: Vec<String>) -> Vec<String> {
     values.into_iter().map(|v| v.trim().to_string()).collect()
+}
+
+fn normalize_targets(targets: Vec<TargetDef>) -> Vec<TargetDef> {
+    targets
+        .into_iter()
+        .map(|mut t| {
+            t.url = t
+                .url
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty());
+            t
+        })
+        .collect()
 }
 
 fn validate(state: &AppState, def: &ModelDef) -> Result<(), AppError> {

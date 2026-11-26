@@ -97,6 +97,10 @@ struct TestModelSeed {
     #[serde(default)]
     private: bool,
     #[serde(default)]
+    model_type: Option<shiso_router::catalog::ModelType>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
     pricing: Option<shiso_router::catalog::PricingCfg>,
     #[serde(default)]
     qos: Option<TestQosSeed>,
@@ -117,6 +121,8 @@ struct TestTargetSeed {
     backend: String,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
     #[serde(default = "default_weight")]
     weight: u32,
     #[serde(default)]
@@ -166,6 +172,8 @@ fn seed_test_db(db: &Db, config_body: &str) {
             name: m.name,
             aliases: m.aliases,
             private: m.private,
+            model_type: m.model_type,
+            tags: m.tags,
             pricing: m.pricing,
             qos_max_wait_ms: m.qos.as_ref().and_then(|q| q.max_wait_ms),
             qos_background_max_wait_ms: m.qos.as_ref().and_then(|q| q.background_max_wait_ms),
@@ -176,6 +184,7 @@ fn seed_test_db(db: &Db, config_body: &str) {
                 .map(|t| shiso_router::catalog::TargetDef {
                     backend: t.backend,
                     model: t.model,
+                    url: t.url,
                     weight: t.weight,
                     pricing: t.pricing,
                     fallback_only: t.fallback_only,
@@ -5316,4 +5325,155 @@ async fn a_per_image_price_round_trips_through_the_admin_api() {
         .await;
     // Refused as the body's shape, the way a missing rate always was.
     assert_eq!(status, 422, "a token price needs both rates");
+}
+
+#[tokio::test]
+async fn admin_model_metadata_and_target_url_round_trip() {
+    let mock = MockServer::start().await;
+    let router = TestRouter::start(&backend_toml("fal", &mock.uri(), "fal-key")).await;
+
+    let (status, created) = router
+        .admin(
+            reqwest::Method::POST,
+            "/admin/models",
+            Some(serde_json::json!({
+                "name": "flux-dev",
+                "model_type": "image-generation",
+                "tags": [" fal ", "fast"],
+                "targets": [{
+                    "backend": "fal",
+                    "url": format!("{}/fal-ai/flux/dev", mock.uri()),
+                }]
+            })),
+        )
+        .await;
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["model_type"], "image-generation");
+    assert_eq!(created["tags"], serde_json::json!(["fal", "fast"]));
+    assert_eq!(
+        created["targets"][0]["url"],
+        format!("{}/fal-ai/flux/dev", mock.uri())
+    );
+
+    // PUT replaces metadata and trims blank target URL to null.
+    let (status, updated) = router
+        .admin(
+            reqwest::Method::PUT,
+            "/admin/models/flux-dev",
+            Some(serde_json::json!({
+                "model_type": "3d-generation",
+                "tags": ["3d"],
+                "targets": [{
+                    "backend": "fal",
+                    "url": "   ",
+                }]
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{updated}");
+    assert_eq!(updated["model_type"], "3d-generation");
+    assert_eq!(updated["tags"], serde_json::json!(["3d"]));
+    assert!(updated["targets"][0]["url"].is_null());
+
+    // Invalid URL and duplicate tags are rejected with 400.
+    let (status, _) = router
+        .admin(
+            reqwest::Method::PUT,
+            "/admin/models/flux-dev",
+            Some(serde_json::json!({
+                "tags": ["dup", "dup"],
+                "targets": [{"backend": "fal"}]
+            })),
+        )
+        .await;
+    assert_eq!(status, 400);
+
+    let (status, _) = router
+        .admin(
+            reqwest::Method::PUT,
+            "/admin/models/flux-dev",
+            Some(serde_json::json!({
+                "targets": [{"backend": "fal", "url": "not-a-url"}]
+            })),
+        )
+        .await;
+    assert_eq!(status, 400);
+
+    // Client GET /v1/models stays strictly standard OpenAI shape (admin-only metadata).
+    let (tok, _) = router.create_token().await;
+    let resp = router
+        .client
+        .get(router.url("/v1/models"))
+        .bearer_auth(&tok)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let list: serde_json::Value = resp.json().await.unwrap();
+    let item = &list["data"][0];
+    assert_eq!(item["id"], "flux-dev");
+    assert!(item.get("tags").is_none());
+    assert!(item.get("model_type").is_none());
+}
+
+#[tokio::test]
+async fn target_url_override_posts_directly_to_verbatim_url() {
+    let base_mock = MockServer::start().await;
+    let override_mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/fal-ai/flux/dev"))
+        .and(header("authorization", "Bearer fal-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "created": 1,
+            "data": [{"url": "https://cdn.example/out.png"}]
+        })))
+        .expect(1)
+        .mount(&override_mock)
+        .await;
+
+    // Backend base_url points at base_mock; target.url points directly at
+    // override_mock's model-specific path (never appending /v1/images/generations).
+    let cfg = format!(
+        r#"
+[[backends]]
+name = "fal"
+kind = "openai"
+base_url = "{}"
+api_key = "fal-secret"
+
+[[models]]
+name = "flux-dev"
+model_type = "image-generation"
+tags = ["fal"]
+[[models.targets]]
+backend = "fal"
+url = "{}/fal-ai/flux/dev"
+"#,
+        base_mock.uri(),
+        override_mock.uri()
+    );
+    let router = TestRouter::start(&cfg).await;
+    let (tok, _) = router.create_token().await;
+
+    let resp = router
+        .client
+        .post(router.url("/v1/images/generations"))
+        .bearer_auth(&tok)
+        .json(&serde_json::json!({
+            "model": "flux-dev",
+            "prompt": "a tiny shiso leaf"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["data"][0]["url"], "https://cdn.example/out.png");
+
+    // Verify base_mock was never touched.
+    assert!(
+        base_mock.received_requests().await.unwrap().is_empty(),
+        "override URL must bypass backend base_url"
+    );
 }

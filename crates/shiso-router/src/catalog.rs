@@ -313,6 +313,65 @@ impl BackendDef {
     }
 }
 
+/// Modality or capability category of a model route, used for organization and
+/// filtering in the admin UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelType {
+    /// Large language model (chat, completions, responses).
+    Llm,
+    /// Vector embedding model.
+    Embedding,
+    /// Image generation or editing model.
+    ImageGeneration,
+    /// 3D asset generation model.
+    #[serde(rename = "3d-generation")]
+    ThreeDGeneration,
+    /// Automatic speech recognition / transcription model.
+    Asr,
+    /// Text-to-speech model.
+    Tts,
+    /// Video generation model.
+    VideoGeneration,
+    /// Reranking model.
+    Rerank,
+    /// Any other modality.
+    Other,
+}
+
+impl ModelType {
+    /// Returns the canonical kebab-case string representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelType::Llm => "llm",
+            ModelType::Embedding => "embedding",
+            ModelType::ImageGeneration => "image-generation",
+            ModelType::ThreeDGeneration => "3d-generation",
+            ModelType::Asr => "asr",
+            ModelType::Tts => "tts",
+            ModelType::VideoGeneration => "video-generation",
+            ModelType::Rerank => "rerank",
+            ModelType::Other => "other",
+        }
+    }
+
+    /// Parses a model type from its kebab-case string representation.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "llm" => Some(ModelType::Llm),
+            "embedding" => Some(ModelType::Embedding),
+            "image-generation" => Some(ModelType::ImageGeneration),
+            "3d-generation" => Some(ModelType::ThreeDGeneration),
+            "asr" => Some(ModelType::Asr),
+            "tts" => Some(ModelType::Tts),
+            "video-generation" => Some(ModelType::VideoGeneration),
+            "rerank" => Some(ModelType::Rerank),
+            "other" => Some(ModelType::Other),
+            _ => None,
+        }
+    }
+}
+
 /// One inbound model name and the weighted targets it fans out to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -330,6 +389,12 @@ pub struct ModelDef {
     /// the model is hidden from that key's `GET /v1/models`.
     #[serde(default)]
     pub private: bool,
+    /// Optional modality / capability category for admin organization.
+    #[serde(default)]
+    pub model_type: Option<ModelType>,
+    /// Free-form tags for filtering models in the admin UI.
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Default pricing for every target; targets may override.
     #[serde(default)]
     pub pricing: Option<PricingCfg>,
@@ -365,6 +430,12 @@ pub struct TargetDef {
     /// Model name to substitute when forwarding to this backend.
     #[serde(default)]
     pub model: Option<String>,
+    /// Full upstream URL override; when set, the router POSTs directly to
+    /// this URL verbatim instead of joining `backend.base_url` with the
+    /// inbound path (useful for providers like fal.io where each model has
+    /// its own endpoint URL).
+    #[serde(default)]
+    pub url: Option<String>,
     /// Selection weight for load balancing.
     #[serde(default = "default_weight")]
     pub weight: u32,
@@ -525,6 +596,16 @@ pub(crate) fn validate_model(m: &ModelDef, known_backends: &[String]) -> Result<
         }
         seen.push(a);
     }
+    let mut seen_tags: Vec<&str> = Vec::new();
+    for tag in &m.tags {
+        if tag.trim().is_empty() {
+            return Err(format!("model {:?}: tag must not be empty", m.name));
+        }
+        if seen_tags.contains(&tag.as_str()) {
+            return Err(format!("model {:?}: duplicate tag {tag:?}", m.name));
+        }
+        seen_tags.push(tag);
+    }
     if m.targets.is_empty() {
         return Err(format!(
             "model {:?}: at least one target is required",
@@ -540,6 +621,14 @@ pub(crate) fn validate_model(m: &ModelDef, known_backends: &[String]) -> Result<
                 "model {:?}: target references unknown backend {:?}",
                 m.name, t.backend
             ));
+        }
+        if let Some(url) = &t.url {
+            Url::parse(url).map_err(|e| {
+                format!(
+                    "model {:?}: target {:?} invalid url: {e}",
+                    m.name, t.backend
+                )
+            })?;
         }
         if t.weight == 0 {
             return Err(format!(
@@ -897,13 +986,15 @@ fn write_backend(conn: &Connection, def: &BackendDef) -> Result<()> {
 
 fn write_model(conn: &Connection, def: &ModelDef) -> Result<()> {
     conn.execute(
-        "INSERT INTO models (name, aliases, private, pricing, qos_max_wait_ms,
+        "INSERT INTO models (name, aliases, private, model_type, tags, pricing, qos_max_wait_ms,
                              qos_background_max_wait_ms, on_shed_without_fallback)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             def.name,
-            aliases_to_sql(&def.aliases)?,
+            string_list_to_sql(&def.aliases, "model aliases")?,
             def.private,
+            def.model_type.map(ModelType::as_str),
+            string_list_to_sql(&def.tags, "model tags")?,
             pricing_to_sql(&def.pricing)?,
             def.qos_max_wait_ms,
             def.qos_background_max_wait_ms,
@@ -912,14 +1003,15 @@ fn write_model(conn: &Connection, def: &ModelDef) -> Result<()> {
     )?;
     for (i, t) in def.targets.iter().enumerate() {
         conn.execute(
-            "INSERT INTO model_targets (model, position, backend, rename, weight, pricing,
+            "INSERT INTO model_targets (model, position, backend, rename, url, weight, pricing,
                                         fallback_only)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 def.name,
                 i as i64,
                 t.backend,
                 t.model,
+                t.url,
                 t.weight,
                 pricing_to_sql(&t.pricing)?,
                 t.fallback_only,
@@ -994,28 +1086,46 @@ fn read_backends(conn: &Connection) -> Result<Vec<BackendDef>> {
 
 fn read_models(conn: &Connection) -> Result<Vec<ModelDef>> {
     let mut stmt = conn.prepare(
-        "SELECT name, aliases, private, pricing, qos_max_wait_ms, qos_background_max_wait_ms,
-                on_shed_without_fallback
+        "SELECT name, aliases, private, model_type, tags, pricing, qos_max_wait_ms,
+                qos_background_max_wait_ms, on_shed_without_fallback
          FROM models ORDER BY name",
     )?;
     let mut models: Vec<ModelDef> = stmt
         .query_map([], |row| {
-            let on_shed: String = row.get(6)?;
+            let model_type = row
+                .get::<_, Option<String>>(3)?
+                .map(|raw| {
+                    ModelType::parse(&raw).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            format!("invalid model_type {raw:?}").into(),
+                        )
+                    })
+                })
+                .transpose()?;
+            let on_shed: String = row.get(8)?;
             let on_shed_without_fallback =
                 OnShedWithoutFallback::parse(&on_shed).ok_or_else(|| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        6,
+                        8,
                         rusqlite::types::Type::Text,
                         format!("invalid on_shed_without_fallback {on_shed:?}").into(),
                     )
                 })?;
             Ok(ModelDef {
                 name: row.get(0)?,
-                aliases: aliases_from_sql(row.get::<_, Option<String>>(1)?, 1)?,
+                aliases: string_list_from_sql(
+                    row.get::<_, Option<String>>(1)?,
+                    1,
+                    "model aliases",
+                )?,
                 private: row.get(2)?,
-                pricing: pricing_from_sql(row.get::<_, Option<String>>(3)?, 3)?,
-                qos_max_wait_ms: row.get(4)?,
-                qos_background_max_wait_ms: row.get(5)?,
+                model_type,
+                tags: string_list_from_sql(row.get::<_, Option<String>>(4)?, 4, "model tags")?,
+                pricing: pricing_from_sql(row.get::<_, Option<String>>(5)?, 5)?,
+                qos_max_wait_ms: row.get(6)?,
+                qos_background_max_wait_ms: row.get(7)?,
                 on_shed_without_fallback,
                 targets: Vec::new(),
             })
@@ -1024,7 +1134,7 @@ fn read_models(conn: &Connection) -> Result<Vec<ModelDef>> {
     drop(stmt);
 
     let mut stmt = conn.prepare(
-        "SELECT model, backend, rename, weight, pricing, fallback_only
+        "SELECT model, backend, rename, url, weight, pricing, fallback_only
          FROM model_targets ORDER BY model, position, id",
     )?;
     let targets = stmt
@@ -1034,9 +1144,10 @@ fn read_models(conn: &Connection) -> Result<Vec<ModelDef>> {
                 TargetDef {
                     backend: row.get(1)?,
                     model: row.get(2)?,
-                    weight: row.get(3)?,
-                    pricing: pricing_from_sql(row.get::<_, Option<String>>(4)?, 4)?,
-                    fallback_only: row.get(5)?,
+                    url: row.get(3)?,
+                    weight: row.get(4)?,
+                    pricing: pricing_from_sql(row.get::<_, Option<String>>(5)?, 5)?,
+                    fallback_only: row.get(6)?,
                 },
             ))
         })?
@@ -1049,24 +1160,28 @@ fn read_models(conn: &Connection) -> Result<Vec<ModelDef>> {
     Ok(models)
 }
 
-/// Stored as a JSON array; returns None for the common no-aliases case.
-fn aliases_to_sql(aliases: &[String]) -> Result<Option<String>> {
-    if aliases.is_empty() {
+/// Stored as a JSON array; returns None for the common empty-list case.
+fn string_list_to_sql(values: &[String], label: &str) -> Result<Option<String>> {
+    if values.is_empty() {
         return Ok(None);
     }
     Ok(Some(
-        serde_json::to_string(aliases).context("serializing model aliases")?,
+        serde_json::to_string(values).with_context(|| format!("serializing {label}"))?,
     ))
 }
 
-fn aliases_from_sql(raw: Option<String>, idx: usize) -> rusqlite::Result<Vec<String>> {
+fn string_list_from_sql(
+    raw: Option<String>,
+    idx: usize,
+    label: &str,
+) -> rusqlite::Result<Vec<String>> {
     match raw {
         None => Ok(Vec::new()),
         Some(json) => serde_json::from_str(&json).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(
                 idx,
                 rusqlite::types::Type::Text,
-                format!("invalid model aliases JSON: {e}").into(),
+                format!("invalid {label} JSON: {e}").into(),
             )
         }),
     }
@@ -1147,6 +1262,8 @@ mod tests {
             name: name.into(),
             aliases: Vec::new(),
             private: false,
+            model_type: None,
+            tags: Vec::new(),
             pricing: Some(PricingCfg {
                 input_per_mtok: 1.0,
                 output_per_mtok: 2.0,
@@ -1160,6 +1277,7 @@ mod tests {
             targets: vec![TargetDef {
                 backend: backend.into(),
                 model: Some("upstream-name".into()),
+                url: None,
                 weight: 3,
                 pricing: None,
                 fallback_only: false,
@@ -1210,6 +1328,7 @@ mod tests {
         m.targets.push(TargetDef {
             backend: "b".into(),
             model: None,
+            url: None,
             weight: 1,
             pricing: Some(PricingCfg {
                 input_per_mtok: 0.0,
@@ -1317,6 +1436,7 @@ mod tests {
         m.targets.push(TargetDef {
             backend: "embed".into(),
             model: None,
+            url: None,
             weight: 1,
             pricing: None,
             fallback_only: true,
@@ -1527,6 +1647,7 @@ mod tests {
         let fallback = |only: bool| TargetDef {
             backend: "remote".into(),
             model: None,
+            url: None,
             weight: 1,
             pricing: None,
             fallback_only: only,
@@ -1557,5 +1678,53 @@ mod tests {
             m.qos_background_max_wait_ms = bad;
             assert!(validate_model(&m, &known).is_err());
         }
+    }
+
+    #[test]
+    fn model_type_tags_and_target_url_round_trip() {
+        let (_dir, db) = temp_db();
+        insert_backend(&db, &backend("fal")).unwrap();
+        let mut m = model("flux-dev", "fal");
+        m.model_type = Some(ModelType::ImageGeneration);
+        m.tags = vec!["fal".into(), "fast".into()];
+        m.targets[0].url = Some("https://fal.run/fal-ai/flux/dev".into());
+        assert!(insert_model(&db, &m).unwrap());
+
+        let got = load_models(&db).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], m);
+
+        // Replacing clears optional metadata cleanly.
+        let mut cleared = m.clone();
+        cleared.model_type = None;
+        cleared.tags.clear();
+        cleared.targets[0].url = None;
+        assert!(replace_model(&db, &cleared).unwrap());
+        let got = load_models(&db).unwrap();
+        assert_eq!(got[0].model_type, None);
+        assert!(got[0].tags.is_empty());
+        assert_eq!(got[0].targets[0].url, None);
+    }
+
+    #[test]
+    fn validation_rejects_bad_tags_and_target_urls() {
+        let known = vec!["fal".to_string()];
+
+        let mut m = model("flux", "fal");
+        m.tags = vec!["fast".into(), "fal".into()];
+        m.targets[0].url = Some("https://fal.run/fal-ai/flux/dev".into());
+        assert!(validate_model(&m, &known).is_ok());
+
+        let mut empty_tag = model("flux", "fal");
+        empty_tag.tags = vec!["  ".into()];
+        assert!(validate_model(&empty_tag, &known).is_err());
+
+        let mut dup_tag = model("flux", "fal");
+        dup_tag.tags = vec!["fast".into(), "fast".into()];
+        assert!(validate_model(&dup_tag, &known).is_err());
+
+        let mut bad_url = model("flux", "fal");
+        bad_url.targets[0].url = Some("not-a-url".into());
+        assert!(validate_model(&bad_url, &known).is_err());
     }
 }

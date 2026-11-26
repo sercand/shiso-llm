@@ -1939,56 +1939,222 @@ function priceSummary(p) {
   return [tokens, image].filter(Boolean).join(" · ") || fmtCost(0);
 }
 
-/// Aliases shown under the model name — they route identically, so they
-/// are presented as extra names rather than as rows of their own.
-function aliasList(aliases) {
-  if (!aliases || !aliases.length) return "";
-  return `<div class="mt-0.5 text-xs font-normal text-ink-2">
-    also: ${aliases.map(esc).join(", ")}</div>`;
+const MODEL_TYPES = [
+  ["llm", "LLM"],
+  ["embedding", "Embedding"],
+  ["image-generation", "Image"],
+  ["3d-generation", "3D"],
+  ["asr", "ASR"],
+  ["tts", "TTS"],
+  ["video-generation", "Video"],
+  ["rerank", "Rerank"],
+  ["other", "Other"],
+];
+const MODEL_TYPE_LABEL = Object.fromEntries(MODEL_TYPES);
+const MODEL_FILTER = { query: "", type: "", tags: new Set() };
+
+function modelTypePill(type) {
+  if (!type) return "";
+  const label = MODEL_TYPE_LABEL[type] || type;
+  return ` <span class="s-pill bg-soft text-soft-ink">${esc(label)}</span>`;
+}
+
+/// Aliases and clickable tag pills shown under the model name.
+function modelSubline(m) {
+  const aliases = m.aliases && m.aliases.length
+    ? `<span class="text-xs font-normal text-ink-2">also: ${m.aliases.map(esc).join(", ")}</span>`
+    : "";
+  const tags = m.tags && m.tags.length
+    ? m.tags.map(tag => {
+        const active = MODEL_FILTER.tags.has(tag);
+        const cls = active
+          ? "s-pill bg-soft text-soft-ink cursor-pointer"
+          : "s-pill cursor-pointer hover:bg-fill-hover";
+        return `<button type="button" onclick='toggleModelTag(${esc(JSON.stringify(tag))})'
+          class="${cls}">#${esc(tag)}</button>`;
+      }).join(" ")
+    : "";
+  if (!aliases && !tags) return "";
+  return `<div class="mt-1 flex flex-wrap items-center gap-1.5">${aliases}${tags}</div>`;
+}
+
+function shortUrlLabel(raw) {
+  try {
+    const u = new URL(raw);
+    const p = u.pathname.replace(/\/+$/, "");
+    const tail = p.length > 28 ? "…" + p.slice(-27) : p;
+    return u.host + tail;
+  } catch {
+    return raw.length > 32 ? raw.slice(0, 31) + "…" : raw;
+  }
 }
 
 function targetChip(t) {
   const rename = t.model ? ` <span class="text-ink-2">→</span> ${esc(t.model)}` : "";
+  const urlTag = t.url
+    ? ` <span class="font-mono text-[11px] text-soft-ink" title="${esc(t.url)}">↗ ${esc(shortUrlLabel(t.url))}</span>`
+    : "";
   // A fallback target is off the normal rotation, so its weight is only
   // meaningful against the other fallbacks — show the role, not the weight.
   const role = t.fallback_only
     ? '<span class="text-warn"> fallback</span>'
     : `<span class="text-ink-2"> ×${t.weight}</span>`;
-  return `<span class="s-pill mr-1 inline-block">
-    ${esc(t.backend)}${rename}${role}</span>`;
+  return `<span class="s-pill mr-1 mb-1 inline-block">
+    ${esc(t.backend)}${rename}${urlTag}${role}</span>`;
 }
 
-/// The route's deadline policy, as one short cell.
-function qosSummary(m) {
-  if (m.qos_max_wait_ms == null && m.qos_background_max_wait_ms == null) {
-    return '<span class="text-ink-2">wait</span>';
-  }
+/// Inline deadline note shown under targets only when QoS is configured.
+function qosBadge(m) {
+  if (m.qos_max_wait_ms == null && m.qos_background_max_wait_ms == null) return "";
   const parts = [];
   if (m.qos_max_wait_ms != null) parts.push(`${m.qos_max_wait_ms} ms`);
-  if (m.qos_background_max_wait_ms != null) {
-    parts.push(`<span class="text-ink-2">bg ${m.qos_background_max_wait_ms} ms</span>`);
-  }
+  if (m.qos_background_max_wait_ms != null) parts.push(`bg ${m.qos_background_max_wait_ms} ms`);
   const noFallback = m.targets.some(t => t.fallback_only)
     ? "" : ` <span class="text-warn">(${esc(m.on_shed_without_fallback)}, no fallback)</span>`;
-  return parts.join(" / ") + noFallback;
+  return `<div class="mt-0.5 text-xs text-ink-2">deadline: ${parts.join(" / ")}${noFallback}</div>`;
 }
 
-async function renderModels() {
-  await loadCatalog();
-  const rows = CATALOG.map(m => `
+function matchesModelFilter(m) {
+  if (MODEL_FILTER.type === "__untyped__") {
+    if (m.model_type) return false;
+  } else if (MODEL_FILTER.type) {
+    if (m.model_type !== MODEL_FILTER.type) return false;
+  }
+  if (MODEL_FILTER.tags.size) {
+    const mtags = new Set(m.tags || []);
+    for (const tag of MODEL_FILTER.tags) {
+      if (!mtags.has(tag)) return false;
+    }
+  }
+  const q = MODEL_FILTER.query.trim().toLowerCase();
+  if (q) {
+    const hay = [
+      m.name,
+      m.model_type || "",
+      MODEL_TYPE_LABEL[m.model_type] || "",
+      ...(m.aliases || []),
+      ...(m.tags || []),
+      ...m.targets.flatMap(t => [t.backend, t.model || "", t.url || ""]),
+    ].join(" ").toLowerCase();
+    if (!hay.includes(q)) return false;
+  }
+  return true;
+}
+
+function setModelTypeFilter(type) {
+  MODEL_FILTER.type = MODEL_FILTER.type === type ? "" : type;
+  updateModelsView();
+}
+
+function toggleModelTag(tag) {
+  if (MODEL_FILTER.tags.has(tag)) MODEL_FILTER.tags.delete(tag);
+  else MODEL_FILTER.tags.add(tag);
+  updateModelsView();
+}
+
+function clearModelFilters() {
+  MODEL_FILTER.query = "";
+  MODEL_FILTER.type = "";
+  MODEL_FILTER.tags.clear();
+  const inp = $("#model-search");
+  if (inp) inp.value = "";
+  updateModelsView();
+}
+
+function renderModelsFilterPills() {
+  const typeCounts = new Map();
+  let untyped = 0;
+  const tagCounts = new Map();
+  for (const m of CATALOG) {
+    if (m.model_type) typeCounts.set(m.model_type, (typeCounts.get(m.model_type) || 0) + 1);
+    else untyped++;
+    for (const tag of m.tags || []) {
+      tagCounts.set(tag, (tagCounts.get(tag) || 0) + 1);
+    }
+  }
+
+  const pillCls = active => active
+    ? "s-pill bg-primary text-primary-ink cursor-pointer"
+    : "s-pill cursor-pointer hover:bg-fill-hover";
+
+  const typePills = [];
+  if (typeCounts.size > 0) {
+    typePills.push(`<button type="button" onclick='setModelTypeFilter("")'
+      class="${pillCls(!MODEL_FILTER.type)}">All (${CATALOG.length})</button>`);
+    for (const [val, label] of MODEL_TYPES) {
+      const n = typeCounts.get(val);
+      if (n) {
+        typePills.push(`<button type="button" onclick='setModelTypeFilter(${esc(JSON.stringify(val))})'
+          class="${pillCls(MODEL_FILTER.type === val)}">${esc(label)} (${n})</button>`);
+      }
+    }
+    if (untyped > 0) {
+      typePills.push(`<button type="button" onclick='setModelTypeFilter("__untyped__")'
+        class="${pillCls(MODEL_FILTER.type === "__untyped__")}">Untyped (${untyped})</button>`);
+    }
+  }
+
+  const sortedTags = [...tagCounts.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  const tagBar = sortedTags.length
+    ? `<div class="mt-2 flex flex-wrap items-center gap-1.5">
+        <span class="text-xs text-ink-2 mr-1">Tags:</span>
+        ${sortedTags.map(([tag, n]) => `<button type="button"
+          onclick='toggleModelTag(${esc(JSON.stringify(tag))})'
+          class="${pillCls(MODEL_FILTER.tags.has(tag))}">#${esc(tag)} <span class="opacity-70">${n}</span></button>`).join("")}
+      </div>`
+    : "";
+
+  return { typePills: typePills.join(" "), tagBar };
+}
+
+function updateModelsView() {
+  const filtered = CATALOG.filter(matchesModelFilter);
+  const hasFilter = !!(MODEL_FILTER.query.trim() || MODEL_FILTER.type || MODEL_FILTER.tags.size);
+  const { typePills, tagBar } = renderModelsFilterPills();
+
+  const pillsEl = $("#model-type-pills");
+  if (pillsEl) pillsEl.innerHTML = typePills;
+  const tagsEl = $("#model-tag-bar");
+  if (tagsEl) tagsEl.innerHTML = tagBar;
+
+  const statusEl = $("#model-filter-status");
+  if (statusEl) {
+    statusEl.innerHTML = hasFilter
+      ? `Showing ${filtered.length} of ${CATALOG.length} models
+         <button type="button" onclick="clearModelFilters()" class="ml-2 text-primary hover:underline">Clear filters</button>`
+      : "";
+  }
+
+  const rows = filtered.map(m => `
     <tr class="border-t border-line">
       <td class="px-4 py-3 font-medium">
         <a class="" href="#/analytics/models/${encodeURIComponent(m.name)}"
-          title="Usage analytics">${esc(m.name)}</a>${m.private
-            ? ' <span class="s-pill s-pill--warn">private</span>' : ""}${aliasList(m.aliases)}</td>
-      <td class="px-4 py-3">${m.targets.map(targetChip).join("")}</td>
+          title="Usage analytics">${esc(m.name)}</a>${modelTypePill(m.model_type)}${m.private
+            ? ' <span class="s-pill s-pill--warn">private</span>' : ""}${modelSubline(m)}</td>
+      <td class="px-4 py-3">${m.targets.map(targetChip).join("")}${qosBadge(m)}</td>
       <td class="px-4 py-3 text-sm text-ink-2">${priceSummary(m.pricing)}</td>
-      <td class="px-4 py-3 text-sm text-ink-2">${qosSummary(m)}</td>
       <td class="px-4 py-3 text-right text-sm whitespace-nowrap">
         <button onclick='openModelForm(${esc(JSON.stringify(m.name))})' class="s-btn s-btn--ghost s-btn--sm">Edit</button>
         <button onclick='deleteModel(${esc(JSON.stringify(m.name))})' class="s-btn s-btn--ghost s-btn--sm ml-3 text-bad">Delete</button>
       </td>
     </tr>`).join("");
+
+  const emptyMsg = CATALOG.length
+    ? "No models match the current filters."
+    : "No models yet.";
+  const tbody = $("#models-tbody");
+  if (tbody) {
+    tbody.innerHTML = rows || `<tr><td colspan="4" class="px-4 py-8 text-center text-ink-2">${emptyMsg}</td></tr>`;
+  }
+}
+
+async function renderModels() {
+  await loadCatalog();
+  // Drop any selected tags that no longer exist in the catalog.
+  const allTags = new Set(CATALOG.flatMap(m => m.tags || []));
+  for (const t of [...MODEL_FILTER.tags]) {
+    if (!allTags.has(t)) MODEL_FILTER.tags.delete(t);
+  }
 
   $("#view").innerHTML = `
     <div class="flex items-center justify-between">
@@ -2000,13 +2166,32 @@ async function renderModels() {
         class="s-btn s-btn--primary disabled:opacity-40">Add model</button>
     </div>
     ${BACKENDS.length ? "" : `<p class="mt-3 text-sm text-warn">Add a backend first — a model needs at least one target.</p>`}
+    ${CATALOG.length ? `<div class="mt-4">
+      <div class="flex flex-wrap items-center gap-2">
+        <input id="model-search" type="search" value="${esc(MODEL_FILTER.query)}"
+          placeholder="Search name, alias, tag, backend…"
+          class="s-input w-64">
+        <div id="model-type-pills" class="flex flex-wrap items-center gap-1.5"></div>
+      </div>
+      <div id="model-tag-bar"></div>
+      <div id="model-filter-status" class="mt-2 text-xs text-ink-2"></div>
+    </div>` : ""}
     ${card(`<table class="s-table w-full text-left">
       <thead><tr class="text-xs text-ink-2">
         <th class="px-4 py-3">Model</th><th class="px-4 py-3">Targets</th>
-        <th class="px-4 py-3">Pricing</th><th class="px-4 py-3">Deadline</th><th class="px-4 py-3"></th>
+        <th class="px-4 py-3">Pricing</th><th class="px-4 py-3"></th>
       </tr></thead>
-      <tbody>${rows || '<tr><td colspan="5" class="px-4 py-8 text-center text-ink-2">No models yet.</td></tr>'}</tbody>
-    </table>`, "mt-4 overflow-x-auto")}`;
+      <tbody id="models-tbody"></tbody>
+    </table>`, "mt-3 overflow-x-auto")}`;
+
+  const searchEl = $("#model-search");
+  if (searchEl) {
+    searchEl.addEventListener("input", e => {
+      MODEL_FILTER.query = e.target.value;
+      updateModelsView();
+    });
+  }
+  updateModelsView();
 }
 
 function targetRowHtml(t = {}) {
@@ -2023,6 +2208,8 @@ function targetRowHtml(t = {}) {
       <button type="button" title="Remove target" onclick="this.closest('.target-row').remove()"
         class="s-btn s-btn--ghost s-btn--sm mt-5 h-8">✕</button>
     </div>
+    <label class="s-label mt-2 block">URL override (optional)
+      ${input("t_url", 'type="url" placeholder="https://fal.run/fal-ai/flux/dev — POSTs directly here instead of backend base URL"', t.url || "")}</label>
     <label class="mt-2 flex items-center gap-2 text-xs text-ink-2">
       <input type="checkbox" name="t_fallback_only" class="accent-warn" ${t.fallback_only ? "checked" : ""}>
       Fallback only — skipped by normal routing, used when a request would miss its deadline</label>
@@ -2040,18 +2227,32 @@ function addTargetRow() {
 function openModelForm(name) {
   const m = name ? CATALOG.find(x => x.name === name) : null;
   const targets = m ? m.targets : [{}];
+  const typeOpts = [`<option value="">— none —</option>`,
+    ...MODEL_TYPES.map(([val, label]) =>
+      `<option value="${esc(val)}" ${m && m.model_type === val ? "selected" : ""}>${esc(label)} (${esc(val)})</option>`)
+  ].join("");
   openModal(`
     <h3 class="s-h3 mb-4">${m ? "Edit model" : "Add model"}</h3>
     <form id="model-form" class="space-y-4">
-      <label class="s-label block">Model name
-        ${input("name", `required ${m ? "readonly" : ""} placeholder="gpt-4o"`, m ? m.name : "")}
-        ${m ? '<span class="text-xs text-ink-2">Names are referenced by keys and logs and cannot be changed.</span>' : ""}
-      </label>
-      <label class="s-label block">Aliases (optional)
-        ${input("aliases", 'placeholder="gpt-4o-latest, gpt4o"', m && m.aliases ? m.aliases.join(", ") : "")}
-        <span class="text-xs text-ink-2">Comma-separated extra names clients may call. They route,
-          bill and log as the model name above.</span>
-      </label>
+      <div class="grid grid-cols-3 gap-3">
+        <label class="s-label col-span-2 block">Model name
+          ${input("name", `required ${m ? "readonly" : ""} placeholder="gpt-4o"`, m ? m.name : "")}
+          ${m ? '<span class="text-xs text-ink-2">Names are referenced by keys and logs and cannot be changed.</span>' : ""}
+        </label>
+        <label class="s-label block">Model type
+          <select name="model_type" class="s-select mt-1 w-full">${typeOpts}</select>
+        </label>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <label class="s-label block">Aliases (optional)
+          ${input("aliases", 'placeholder="gpt-4o-latest, gpt4o"', m && m.aliases ? m.aliases.join(", ") : "")}
+          <span class="text-xs text-ink-2">Comma-separated extra inbound names.</span>
+        </label>
+        <label class="s-label block">Tags (optional)
+          ${input("tags", 'placeholder="fast, fal, prod"', m && m.tags ? m.tags.join(", ") : "")}
+          <span class="text-xs text-ink-2">Comma-separated labels for filtering.</span>
+        </label>
+      </div>
       <label class="flex items-center gap-2 text-sm text-ink">
         <input type="checkbox" name="private" class="accent-warn" ${m && m.private ? "checked" : ""}>
         Private — only keys whose allowlist names this model can use it</label>
@@ -2101,6 +2302,7 @@ function openModelForm(name) {
       const targets = rows.map((row, i) => ({
         backend: $('[name=t_backend]', row).value,
         model: $('[name=t_model]', row).value.trim() || null,
+        url: $('[name=t_url]', row).value.trim() || null,
         weight: Number($('[name=t_weight]', row).value || 1),
         pricing: readPricing(row, "t_", `target ${i + 1}`),
         fallback_only: $('[name=t_fallback_only]', row).checked,
@@ -2110,6 +2312,8 @@ function openModelForm(name) {
       }
       const pricing = readPricing(form, "m_", "model pricing");
       const aliases = form.aliases.value.split(",").map(a => a.trim()).filter(Boolean);
+      const tags = form.tags.value.split(",").map(t => t.trim()).filter(Boolean);
+      const model_type = form.model_type.value || null;
       const ms = name => {
         const v = form[name].value.trim();
         return v === "" ? null : Number(v);
@@ -2119,12 +2323,13 @@ function openModelForm(name) {
         qos_background_max_wait_ms: ms("qos_background_max_wait_ms"),
         on_shed_without_fallback: form.on_shed_without_fallback.value,
       };
+      const payload = { aliases, private: form.private.checked, model_type, tags, pricing, targets, ...qos };
       if (m) {
         await api("/admin/models/" + encodeURIComponent(m.name),
-          { method: "PUT", body: JSON.stringify({ aliases, private: form.private.checked, pricing, targets, ...qos }) });
+          { method: "PUT", body: JSON.stringify(payload) });
       } else {
         await api("/admin/models",
-          { method: "POST", body: JSON.stringify({ name: form.name.value.trim(), aliases, private: form.private.checked, pricing, targets, ...qos }) });
+          { method: "POST", body: JSON.stringify({ name: form.name.value.trim(), ...payload }) });
       }
       closeModal();
       toast("Saved");

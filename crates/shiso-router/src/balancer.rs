@@ -123,6 +123,9 @@ pub struct Target {
     pub backend: Arc<Backend>,
     /// Model name to substitute into the request body when forwarding.
     pub rename: Option<String>,
+    /// Full upstream URL override; when set, POSTs go directly here verbatim
+    /// instead of joining `backend.base_url` with the inbound path.
+    pub url: Option<Url>,
     pub weight: u32,
     /// Effective pricing (target override or model default); `None` means
     /// cost is unknown and logged as null.
@@ -270,6 +273,7 @@ mod tests {
                 .map(|(i, (w, kinds))| Target {
                     backend: backend_of(&format!("b{i}"), kinds.clone()),
                     rename: None,
+                    url: None,
                     weight: *w,
                     pricing: None,
                     fallback_only: false,
@@ -487,6 +491,7 @@ mod tests {
                 .map(|(i, (w, kinds, fb))| Target {
                     backend: backend_of(&format!("b{i}"), kinds.clone()),
                     rename: None,
+                    url: None,
                     weight: *w,
                     pricing: None,
                     fallback_only: *fb,

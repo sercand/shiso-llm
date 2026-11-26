@@ -44,8 +44,10 @@ pub fn synthetic_key_name(token_id: &str) -> Option<&'static str> {
 /// keys (`tokens.parent_id`, `tokens.can_create_children`) and denormalized
 /// `request_logs.parent_token_id` so parent rollups survive child deletion;
 /// version 10 added `request_logs.image_count`, the pictures an image
-/// response carried, which a per-image price bills.
-const SCHEMA_VERSION: i64 = 10;
+/// response carried, which a per-image price bills; version 11 added model
+/// organization metadata (`models.model_type`, `models.tags`) and per-target
+/// full URL overrides (`model_targets.url`).
+const SCHEMA_VERSION: i64 = 11;
 
 /// A client API key as stored — everything except the secret, which exists
 /// only as a SHA-256 hash. Records are immutable snapshots: admin updates
@@ -482,6 +484,8 @@ fn migrate(conn: &Connection) -> Result<()> {
             name                    TEXT PRIMARY KEY,
             aliases                 TEXT,
             private                 INTEGER NOT NULL DEFAULT 0,
+            model_type              TEXT,
+            tags                    TEXT,
             pricing                 TEXT,
             qos_max_wait_ms         INTEGER,
             qos_background_max_wait_ms INTEGER,
@@ -493,6 +497,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             position      INTEGER NOT NULL,
             backend       TEXT NOT NULL,
             rename        TEXT,
+            url           TEXT,
             weight        INTEGER NOT NULL DEFAULT 1,
             pricing       TEXT,
             fallback_only INTEGER NOT NULL DEFAULT 0
@@ -560,17 +565,28 @@ fn migrate(conn: &Connection) -> Result<()> {
             "private",
             "ALTER TABLE models ADD COLUMN private INTEGER NOT NULL DEFAULT 0",
         ),
+        (
+            "model_type",
+            "ALTER TABLE models ADD COLUMN model_type TEXT",
+        ),
+        ("tags", "ALTER TABLE models ADD COLUMN tags TEXT"),
     ] {
         if !existing.contains(col) {
             conn.execute(ddl, [])?;
         }
     }
 
-    if !table_columns(conn, "model_targets")?.contains("fallback_only") {
-        conn.execute(
+    let target_cols = table_columns(conn, "model_targets")?;
+    for (col, ddl) in [
+        (
+            "fallback_only",
             "ALTER TABLE model_targets ADD COLUMN fallback_only INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
+        ),
+        ("url", "ALTER TABLE model_targets ADD COLUMN url TEXT"),
+    ] {
+        if !target_cols.contains(col) {
+            conn.execute(ddl, [])?;
+        }
     }
 
     // v2–v6 databases have request_logs without the service tier. Nullable
@@ -1376,6 +1392,68 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, None);
-        assert_eq!(SCHEMA_VERSION, 10);
+        let version: i64 = db
+            .with_read(|conn| Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v10_to_v11_migration_adds_model_metadata_and_target_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let db = Db::open(&path).unwrap();
+            db.with_write(|conn| {
+                conn.execute(
+                    "INSERT INTO models (name, private, on_shed_without_fallback)
+                     VALUES ('pre-model', 0, 'wait')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO model_targets (model, position, backend, weight, fallback_only)
+                     VALUES ('pre-model', 0, 'b1', 1, 0)",
+                    [],
+                )?;
+                conn.execute("ALTER TABLE models DROP COLUMN model_type", [])?;
+                conn.execute("ALTER TABLE models DROP COLUMN tags", [])?;
+                conn.execute("ALTER TABLE model_targets DROP COLUMN url", [])?;
+                conn.pragma_update(None, "user_version", 10i64)?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let (version, model_type, tags, url): (
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = db
+            .with_read(|conn| {
+                Ok((
+                    conn.query_row("PRAGMA user_version", [], |r| r.get(0))?,
+                    conn.query_row(
+                        "SELECT model_type FROM models WHERE name = 'pre-model'",
+                        [],
+                        |r| r.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT tags FROM models WHERE name = 'pre-model'",
+                        [],
+                        |r| r.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT url FROM model_targets WHERE model = 'pre-model'",
+                        [],
+                        |r| r.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(model_type, None);
+        assert_eq!(tags, None);
+        assert_eq!(url, None);
     }
 }
