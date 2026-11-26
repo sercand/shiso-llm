@@ -1018,6 +1018,8 @@ mod tests {
                 name: format!("m-{}", b.name),
                 aliases: Vec::new(),
                 private: false,
+                model_type: None,
+                tags: Vec::new(),
                 pricing: None,
                 qos_max_wait_ms: None,
                 qos_background_max_wait_ms: None,
@@ -1025,6 +1027,7 @@ mod tests {
                 targets: vec![TargetDef {
                     backend: b.name.clone(),
                     model: None,
+                    url: None,
                     weight: 1,
                     pricing: None,
                     fallback_only: false,
@@ -1051,6 +1054,8 @@ mod tests {
                 name: format!("m-{}", b.name),
                 aliases: Vec::new(),
                 private: false,
+                model_type: None,
+                tags: Vec::new(),
                 pricing: None,
                 qos_max_wait_ms: None,
                 qos_background_max_wait_ms: None,
@@ -1058,6 +1063,7 @@ mod tests {
                 targets: vec![TargetDef {
                     backend: b.name.clone(),
                     model: None,
+                    url: None,
                     weight: 1,
                     pricing: None,
                     fallback_only: false,

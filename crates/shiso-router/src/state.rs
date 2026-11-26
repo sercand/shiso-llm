@@ -107,9 +107,18 @@ impl Routing {
                         t.backend
                     )
                 })?;
+                let url = t
+                    .url
+                    .as_deref()
+                    .map(Url::parse)
+                    .transpose()
+                    .with_context(|| {
+                        format!("model {:?}: target {:?}: invalid url", m.name, t.backend)
+                    })?;
                 targets.push(Target {
                     backend: Arc::clone(backend),
                     rename: t.model.clone(),
+                    url,
                     weight: t.weight,
                     pricing: t.pricing.as_ref().map(Pricing::from_cfg).or(model_pricing),
                     fallback_only: t.fallback_only,
@@ -311,6 +320,8 @@ mod tests {
             name: name.into(),
             aliases: aliases.iter().map(|a| a.to_string()).collect(),
             private: false,
+            model_type: None,
+            tags: Vec::new(),
             pricing: None,
             qos_max_wait_ms: None,
             qos_background_max_wait_ms: None,
@@ -318,6 +329,7 @@ mod tests {
             targets: vec![TargetDef {
                 backend: "b".into(),
                 model: None,
+                url: None,
                 weight: 1,
                 pricing: None,
                 fallback_only: false,

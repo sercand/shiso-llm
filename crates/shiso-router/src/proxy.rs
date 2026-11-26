@@ -426,9 +426,12 @@ pub(crate) async fn proxy_request(desc: ProxyRequestDesc) -> Result<Response, Ap
             Err(e) => return Err(reject(&state, row, started, e, tracer.as_deref())),
         };
 
-        let url = match join_url(backend.base_url_for(kind), &path) {
-            Ok(u) => u,
-            Err(e) => return Err(reject(&state, row, started, e, tracer.as_deref())),
+        let url = match &target.url {
+            Some(u) => u.clone(),
+            None => match join_url(backend.base_url_for(kind), &path) {
+                Ok(u) => u,
+                Err(e) => return Err(reject(&state, row, started, e, tracer.as_deref())),
+            },
         };
         let out_headers = upstream_headers(&headers, backend, kind, force_flex);
         if let Some(t) = &tracer {
