@@ -92,7 +92,7 @@ use crate::qwen4exp::binding::{
 };
 use crate::qwen4exp::config::Qwen4ExpConfig;
 use crate::qwen4exp::gguf_experts::{self, GgufExperts};
-use crate::qwen4exp::{exl3, mlx};
+use crate::qwen4exp::{exl3, latent, latent_draft, latent_load, mlx};
 
 /// The formats a bound projection may be stored as.
 ///
@@ -167,6 +167,10 @@ pub struct Qwen4ExpModel {
     /// once the tensors are resident, and the checkpoint tier has to be able to
     /// say what width the rows it stores were produced at long afterwards.
     expert_gate: DType,
+    /// Whether the routed feed-forward is a latent pack's, which tags the
+    /// checkpoint tier's files differently
+    /// ([`crate::qwen4exp::QWEN4EXP_LATENT_MODEL_ID`]).
+    latent: bool,
 }
 
 impl Qwen4ExpModel {
@@ -270,12 +274,23 @@ impl Qwen4ExpModel {
         let expert_gate = binding
             .layers
             .first()
-            .map_or(binding.token_embd.dtype, |layer| layer.experts.gate.dtype);
+            .and_then(|layer| layer.experts.gate.as_ref())
+            .map_or(binding.token_embd.dtype, |gate| gate.dtype);
         let shape = config.shape();
         let (layers, experts) = (shape.n_layers(), shape.moe.experts);
         let source = Arc::new(GgufExperts::open(&file, layers, experts)?);
         let slots = gguf_slots(backend.as_ref(), &file, &source, experts, placement)?;
-        let mut weights = import(backend, &file, &binding, opts.pack_halves, slots.is_some())?;
+        let mut weights = import(
+            backend,
+            &file,
+            &binding,
+            opts.pack_halves,
+            if slots.is_some() {
+                Routed::Streamed
+            } else {
+                Routed::Resident
+            },
+        )?;
         // A block drafter drafts in a head's place, as on the trellis arm: the
         // sidecar is told apart by what it is, not by a second flag.
         let mut block = None;
@@ -354,6 +369,7 @@ impl Qwen4ExpModel {
             },
             stack,
             expert_gate,
+            latent: false,
         })
     }
 
@@ -414,6 +430,7 @@ impl Qwen4ExpModel {
             },
             stack,
             expert_gate,
+            latent: false,
         })
     }
 
@@ -488,6 +505,152 @@ impl Qwen4ExpModel {
         load: &StreamedLoad<'_>,
     ) -> CoreResult<Self> {
         Self::load_streamed(backend, dir, hf, opts, load, StreamedExport::ModeloptMixed)
+    }
+
+    /// Opens a latent pack ([`crate::qwen4exp::latent`]) and puts it on the
+    /// device: the skeleton's dense weights as stored, the pack's latent
+    /// projections, its routed records through the expert stream, and the
+    /// n-gram table from its own file.
+    ///
+    /// The pool is sized as [`Qwen4ExpModel::load_nvfp4`]'s is, with the
+    /// latent projections counted among the dense bytes that sit beside it.
+    /// With `load.draft` the pack's own head is read from its `mtp/` folder
+    /// (`latent_draft::open`) and held resident, its experts as `Q2_0`.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Unsupported`] for a device whose working set cannot hold
+    /// one layer's experts beside the dense weights; whatever
+    /// [`latent::LatentPack::open`], the skeleton's binding and imports, the
+    /// n-gram table's open and [`SparseStack::new`] report.
+    pub fn load_latent(
+        backend: &Arc<dyn Backend>,
+        dir: &Path,
+        hf: &shiso_core::config::HfConfig,
+        opts: SparseOptions,
+        load: &StreamedLoad<'_>,
+    ) -> CoreResult<Self> {
+        use crate::qwen4exp::config::{EXPERTS, N_LAYERS};
+        // Before any file is opened or byte moved: a device without the latent
+        // entries is refused here and not after the pool has been read; the
+        // pack's open refuses a width the prompt kernels cannot stride.
+        shiso_engine::sparse::capture::check_latent_kernels(backend.as_ref())?;
+        let pack = latent::LatentPack::open(dir)?;
+        let skeleton = dir.join(latent::SKELETON);
+        let config = Qwen4ExpConfig::from_hf(hf, &skeleton)?;
+        let file = GgufFile::open_shared(&skeleton).map_err(open_failure)?;
+        let binding = crate::qwen4exp::bind_skeleton(&file, &config)?;
+        let ngram = {
+            let _tag = ledger::scope(MemTag::WeightsEmbedding);
+            latent_load::open_ngram(backend, dir, &config, &opts)?
+        };
+        let projections = latent_load::LatentProjections::open(&pack)?;
+        let all = EXPERTS * N_LAYERS;
+        let sized = load.slots.is_none();
+        let slot_bytes = latent_load::slot_bytes(&pack);
+        let slots = if let Some(slots) = load.slots {
+            slots
+        } else {
+            let info = backend.memory_info();
+            let total = info.as_ref().map_or(u64::MAX, |info| info.total);
+            // What the machine can still give. A backend that shares its
+            // memory with the host and says how much of it is available is
+            // asked; one that does not is held to its free device memory,
+            // which on such a device is already the host's own estimate of
+            // what a new allocation can get. Without this a pool that fits
+            // the device's total is preloaded whole beside whatever else the
+            // machine is running, and the machine pays for it later.
+            let available = backend
+                .host_available()
+                .or(info.as_ref().map(|info| info.free));
+            let stored: u64 = file.tensors().iter().map(|desc| desc.bytes).sum();
+            // The projections are uploaded, not wrapped file pages, so they
+            // count once; the skeleton's wrapped pages count twice, as the
+            // other streamed exports' dense weights do.
+            // The draft head's experts and dense file are uploaded before the
+            // stack is built, out of the same device memory the pool fills.
+            let head = if load.draft {
+                latent_draft::resident_bytes(&dir.join("mtp"))?
+            } else {
+                0
+            };
+            let rest = stored
+                .saturating_mul(2)
+                .saturating_add(latent_load::projection_resident_bytes(&pack))
+                .saturating_add(head);
+            latent_load::pool_slots(&latent_load::PoolRoom {
+                total,
+                host_available: available,
+                rest,
+                reserve: load.reserve,
+                slot_bytes,
+                all,
+            })?
+        };
+        tracing::info!(slots, all, "routed expert pool of the latent pack");
+        let mut weights = import(
+            backend,
+            &file,
+            &binding,
+            opts.pack_halves,
+            Routed::Latent {
+                pack: &pack,
+                projections: &projections,
+            },
+        )?;
+        drop(binding);
+        drop(file);
+        if load.draft {
+            let rank = config.shape().count(shiso_engine::shape::LayerKind::Attn);
+            weights.draft = Some(latent_draft::open(backend, &dir.join("mtp"), rank)?);
+            if let Some(list) = load.counts {
+                narrow_draft_head(backend, &mut weights, list, config.shape().vocab)?;
+            }
+        }
+        // Opened and filled before the stack for the reason `load_streamed`
+        // gives: the stack's KV pool is sized to the free memory it sees.
+        let early = if slots >= all {
+            Some(latent_load::open_stream(
+                backend,
+                &pack,
+                slots,
+                opts.prefill_rows,
+            )?)
+        } else {
+            None
+        };
+        let free = headroom(backend.as_ref());
+        let mut stack =
+            SparseStack::new(backend, config.shape().clone(), weights, opts, Some(ngram))?;
+        let stream = if let Some(stream) = early {
+            stream
+        } else {
+            let slots = if sized {
+                beside_stack(backend.as_ref(), free, load.reserve, slots, slot_bytes)
+            } else {
+                slots
+            };
+            latent_load::open_stream(backend, &pack, slots, opts.prefill_rows)?
+        };
+        stack.attach_expert_stream(stream)?;
+        Ok(Self {
+            info: ModelInfo {
+                context_capacity: stack.context_capacity(),
+                vocab: config.shape().vocab,
+                hidden: config.shape().hidden,
+                n_layers: config.shape().n_layers(),
+                stop_tokens: StopTokens::new(&config.stop_tokens())?,
+            },
+            stack,
+            expert_gate: DType::Nvfp4Gs16,
+            latent: true,
+        })
+    }
+
+    /// Whether the routed feed-forward is a latent pack's.
+    #[must_use]
+    pub const fn is_latent(&self) -> bool {
+        self.latent
     }
 
     /// The body of the two streamed-expert exports, which differ only in the
@@ -606,6 +769,7 @@ impl Qwen4ExpModel {
             },
             stack,
             expert_gate: export.layout().experts,
+            latent: false,
         })
     }
 
@@ -687,6 +851,7 @@ impl Qwen4ExpModel {
             },
             stack,
             expert_gate,
+            latent: false,
         })
     }
 
@@ -1087,7 +1252,14 @@ fn import_draft(
             attn_mix: import_mix(backend, file, &binding.layer.attn_mix, pack)?,
             ffn_mix: import_mix(backend, file, &binding.layer.ffn_mix, pack)?,
             block: SparseBlock::Attn(import_attn(backend, file, roles)?),
-            experts: import_experts(backend, file, &binding.layer.experts, pack, false)?,
+            experts: import_experts(
+                backend,
+                file,
+                &binding.layer.experts,
+                pack,
+                Routed::Resident,
+                0,
+            )?,
             ngram: None,
             ordinal: rank,
         },
@@ -1144,12 +1316,12 @@ fn import(
     file: &GgufFile,
     binding: &ModelBinding<'_>,
     pack: bool,
-    streamed: bool,
+    routed: Routed<'_>,
 ) -> CoreResult<SparseWeights> {
     let mut gdn_rank = 0;
     let mut attn_rank = 0;
     let mut layers = Vec::with_capacity(binding.layers.len());
-    for layer in &binding.layers {
+    for (il, layer) in (0u32..).zip(&binding.layers) {
         let (block, ordinal) = match &layer.block {
             BlockRoles::Recurrent(roles) => {
                 let rank = gdn_rank;
@@ -1173,7 +1345,7 @@ fn import(
         drop(mix);
         let experts = {
             let _tag = ledger::scope(MemTag::WeightsExperts);
-            import_experts(backend, file, &layer.experts, pack, streamed)?
+            import_experts(backend, file, &layer.experts, pack, routed, il)?
         };
         let ngram = {
             let _tag = ledger::scope(MemTag::WeightsEmbedding);
@@ -1242,10 +1414,12 @@ fn identity_map(
     backend: &Arc<dyn Backend>,
     binding: &ModelBinding<'_>,
 ) -> CoreResult<DeviceBuffer> {
+    // The router's output is one logit per expert, whichever way the banks
+    // are stored.
     let experts = binding
         .layers
         .first()
-        .and_then(|layer| layer.experts.gate.shape.dims().get(2).copied())
+        .and_then(|layer| layer.experts.router.shape.dims().get(1).copied())
         .unwrap_or(1);
     let bytes: Vec<u8> = (0..u32::try_from(experts).unwrap_or(u32::MAX))
         .flat_map(u32::to_le_bytes)
@@ -1255,18 +1429,38 @@ fn identity_map(
     Ok(buffer)
 }
 
+/// Where a load puts one layer's routed banks.
+#[derive(Clone, Copy)]
+enum Routed<'a> {
+    /// Imported in place from the container.
+    Resident,
+    /// Described only; an expert stream reads them from the container.
+    Streamed,
+    /// Described only; a latent pack's stream and projections supply them.
+    Latent {
+        /// The pack's index files.
+        pack: &'a latent::LatentPack,
+        /// Its dense projections.
+        projections: &'a latent_load::LatentProjections,
+    },
+}
+
 /// Moves one routed feed-forward to the device.
 fn import_experts(
     backend: &Arc<dyn Backend>,
     file: &GgufFile,
     roles: &ExpertRoles<'_>,
     pack: bool,
-    streamed: bool,
+    routed: Routed<'_>,
+    layer: u32,
 ) -> CoreResult<ExpertBank> {
     // A streamed bank is described, not imported: the stream reads its
     // experts out of the file as the router picks them.
-    let bank = |view: &TensorView<'_>| -> CoreResult<Weight> {
-        if !streamed {
+    let bank = |view: &Option<TensorView<'_>>| -> CoreResult<Weight> {
+        let view = view.as_ref().ok_or_else(|| CoreError::ConfigMissing {
+            key: "the stacked routed banks of a container that holds none".to_owned(),
+        })?;
+        if matches!(routed, Routed::Resident) {
             return weight(backend, file, view);
         }
         let dims = view.shape.dims();
@@ -1278,15 +1472,39 @@ fn import_experts(
             shiso_core::buffer::alloc(backend, 16)?,
         ))
     };
+    let logits = projection(backend, file, &roles.router, pack)?;
+    let shared_router = projection(backend, file, &roles.shared_router, pack)?;
+    let shared_gate = weight(backend, file, &roles.shared_gate)?;
+    let shared_up = weight(backend, file, &roles.shared_up)?;
+    let shared_down = weight(backend, file, &roles.shared_down)?;
+    if let Routed::Latent {
+        pack: index,
+        projections,
+    } = routed
+    {
+        let banks = projections.attach(backend, index, layer)?;
+        return Ok(ExpertBank {
+            router: logits,
+            gate: banks.gate,
+            up: banks.up,
+            down: banks.down,
+            shared_router,
+            shared_gate,
+            shared_up,
+            shared_down,
+            latent: Some(banks.latent),
+        });
+    }
     Ok(ExpertBank {
-        router: projection(backend, file, &roles.router, pack)?,
+        router: logits,
         gate: bank(&roles.gate)?,
         up: bank(&roles.up)?,
         down: bank(&roles.down)?,
-        shared_router: projection(backend, file, &roles.shared_router, pack)?,
-        shared_gate: weight(backend, file, &roles.shared_gate)?,
-        shared_up: weight(backend, file, &roles.shared_up)?,
-        shared_down: weight(backend, file, &roles.shared_down)?,
+        shared_router,
+        shared_gate,
+        shared_up,
+        shared_down,
+        latent: None,
     })
 }
 
@@ -1442,12 +1660,19 @@ fn release(
     Ok(())
 }
 
-/// Imports one weight vector, which every format stores as plain `f32`.
+/// Imports one weight vector: plain `f32`, or half precision (the latent
+/// pack's skeleton stores its n-gram convolution kernel so, and any arm's
+/// vectors stored so take the same path), widened on the way in (exact, and a
+/// tensor of a few hundred kilobytes).
 fn vector(
     backend: &Arc<dyn Backend>,
     file: &GgufFile,
     view: &TensorView<'_>,
 ) -> CoreResult<DeviceBuffer> {
+    if view.dtype == DType::F16 {
+        let elements = view.shape.elements().map_err(open_failure)?;
+        return mlx::upload(backend, latent_load::widen_half(view.data, elements)?);
+    }
     if view.dtype != DType::F32 {
         return Err(CoreError::Unsupported {
             what: "a norm or bias vector stored as anything but single precision",

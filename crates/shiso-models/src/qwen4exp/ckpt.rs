@@ -40,6 +40,16 @@ use crate::qwen4exp::model::Qwen4ExpModel;
 /// this family have the same tag and a different digest.
 pub const QWEN4EXP_MODEL_ID: u8 = 6;
 
+/// The tag of a checkpoint written by the latent pack's loader.
+///
+/// The pack shares this family's geometry and its four-bit expert format, so
+/// the tag and the quantization width alone would let a key/value row written
+/// by another four-bit arm be restored into it: the pack's dense weights are
+/// `Q8_0` and its feed-forward runs through the latent projections, so the same
+/// prompt leaves different rows. A tag of its own is what the tier's key
+/// already hashes, so the two can never meet in one cache directory.
+pub const QWEN4EXP_LATENT_MODEL_ID: u8 = 12;
+
 /// Quantization width a checkpoint's key/value rows are stored under, read off
 /// the weights that produce them.
 ///
@@ -61,7 +71,12 @@ impl Qwen4ExpModel {
     /// How a checkpoint written by this loaded model is tagged.
     #[must_use]
     pub const fn ckpt_identity(&self) -> CkptIdentity {
-        CkptIdentity::new(QWEN4EXP_MODEL_ID, quant_bits_of(self.expert_gate_dtype()))
+        let id = if self.is_latent() {
+            QWEN4EXP_LATENT_MODEL_ID
+        } else {
+            QWEN4EXP_MODEL_ID
+        };
+        CkptIdentity::new(id, quant_bits_of(self.expert_gate_dtype()))
     }
 }
 
@@ -135,7 +150,7 @@ impl Checkpointed for Qwen4ExpModel {
 
 #[cfg(test)]
 mod tests {
-    use super::{QWEN4EXP_MODEL_ID, quant_bits_of};
+    use super::{QWEN4EXP_LATENT_MODEL_ID, QWEN4EXP_MODEL_ID, quant_bits_of};
     use shiso_core::DType;
 
     #[test]
@@ -157,6 +172,7 @@ mod tests {
         let ids = [
             crate::qwen35::QWEN35_MODEL_ID,
             QWEN4EXP_MODEL_ID,
+            QWEN4EXP_LATENT_MODEL_ID,
             crate::gemma4::GEMMA4_MODEL_ID,
             crate::qwen35moe::QWEN35MOE_MODEL_ID,
         ];

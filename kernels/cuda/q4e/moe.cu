@@ -478,6 +478,69 @@ extern "C" __global__ void q4e_moe_combine_kernel(
     }
 }
 
+/* The latent experts' combine: each token's routed outputs summed per group
+ * rather than per token, in the latent space the experts work in. Output
+ * `(t, g, i)` is the sum, over the token's slots `s` ascending whose expert
+ * `ids[t * n_used + s]` has label `g`, of `weights[col] * down[col * width + i]`
+ * with `col = t * n_used + s`, each term one fused multiply-add into the running
+ * sum (spelled `fmaf`, so a host restatement can match every bit). A group no
+ * slot lands in is zero. One thread
+ * owns one output element (`e = g * width + i` within the token's row block of
+ * `n_groups * width` elements) and walks the slots in order, so the sum has one
+ * fixed order whatever the launch looks like.
+ *
+ * Buffers: out (f32, `[n_tok * n_groups, width]`), down (f32, `[n_tok * n_used,
+ * width]`), weights (f32, one a column), ids (i32, one a column, the router's
+ * expert ids), labels (u32, one a expert), width, n_groups, n_used. Grid
+ * `(ceil(n_groups * width / 256), n_tok, 1)`, 256 threads: the token alone is
+ * on the y axis, which a grid caps at 65535 and a prompt chunk of 8192 rows
+ * times eight groups would pass. */
+extern "C" __global__ void q4e_latent_combine_kernel(
+        float *out, const float *down, const float *weights, const int *ids,
+        const uint32_t *labels, uint32_t width, uint32_t n_groups, uint32_t n_used) {
+    const uint32_t t = blockIdx.y;
+    const uint32_t span = n_groups * width;
+    for (uint32_t e_out = blockIdx.x * blockDim.x + threadIdx.x; e_out < span;
+         e_out += gridDim.x * blockDim.x) {
+        const uint32_t g = e_out / width;
+        const uint32_t i = e_out % width;
+        float acc = 0.0f;
+        for (uint32_t s = 0; s < n_used; s++) {
+            const uint64_t col = (uint64_t)t * n_used + s;
+            const int e = ids[col];
+            if (e >= 0 && labels[e] == g) {
+                acc = fmaf(weights[col], down[col * width + i], acc);
+            }
+        }
+        out[(uint64_t)t * span + e_out] = acc;
+    }
+}
+
+/* Which latent groups each block of step activation rows routes to:
+ * `masks[b]` gets bit `labels[e]` for every expert `e` routed by rows
+ * `8 * b .. 8 * b + 7` - the rows one block of a step projection carries
+ * (`Q4E_GS_COLS` in ggml.cu), whose latent entries skip the groups whose bit
+ * is clear. A slot the router left empty (a negative id) sets nothing.
+ *
+ * Buffers: masks (u32, one a block of eight rows), ids (i32, one a column,
+ * the router's expert ids), labels (u32, one an expert, each below 32),
+ * n_tok, n_used. Grid `(ceil(n_tok / 8), 1, 1)`, 32 threads: a lane takes
+ * the columns `lane, lane + 32, ...` of the block's `8 * n_used` and the
+ * warp ORs its lanes, which has no order to keep. */
+extern "C" __global__ void q4e_latent_groups_kernel(
+        uint32_t *masks, const int *ids, const uint32_t *labels, uint32_t n_tok,
+        uint32_t n_used) {
+    const uint32_t t0 = blockIdx.x * 8u;
+    const uint32_t cols = (min(t0 + 8u, n_tok) - t0) * n_used;
+    uint32_t m = 0u;
+    for (uint32_t c = threadIdx.x; c < cols; c += 32u) {
+        const int e = ids[(uint64_t)t0 * n_used + c];
+        if (e >= 0) m |= 1u << labels[e];
+    }
+    for (uint32_t off = 16u; off > 0u; off >>= 1) m |= __shfl_xor_sync(0xffffffffu, m, off);
+    if (threadIdx.x == 0u) masks[blockIdx.x] = m;
+}
+
 /* moe_out += shared_out * sigmoid(shared_logit) -- the shared expert carries a
  * single scalar gate per token, not a per-channel one. */
 extern "C" __global__ void q4e_shared_add_kernel(

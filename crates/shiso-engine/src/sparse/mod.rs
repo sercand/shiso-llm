@@ -54,6 +54,7 @@ pub mod indexer;
 pub mod inputs;
 pub mod island;
 pub mod kernels;
+pub mod latent;
 pub mod matmul;
 pub mod media;
 mod memory;
@@ -95,6 +96,6 @@ pub use stack::{
 pub use stream::{EXPERT_MATRICES, ExpertSource, ExpertStream, FetchPlan, StreamStats};
 pub use tap::{ResidualTap, TapPoint, TapRecord};
 pub use weights::{
-    ExpertBank, Indexer, NgramBlock, Recurrent, SparseAttn, SparseBlock, SparseLayer,
-    SparseWeights, StreamMix, Weight, WeightDesc,
+    ExpertBank, Indexer, LatentBank, LatentDesc, NgramBlock, Recurrent, SparseAttn, SparseBlock,
+    SparseLayer, SparseWeights, StreamMix, Weight, WeightDesc,
 };

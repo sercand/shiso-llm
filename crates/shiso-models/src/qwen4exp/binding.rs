@@ -49,12 +49,13 @@ pub struct MixRoles<'a> {
 pub struct ExpertRoles<'a> {
     /// The router's own projection.
     pub router: TensorView<'a>,
-    /// Every routed expert's gate projection, stacked.
-    pub gate: TensorView<'a>,
-    /// Every routed expert's up projection, stacked.
-    pub up: TensorView<'a>,
-    /// Every routed expert's down projection, stacked.
-    pub down: TensorView<'a>,
+    /// Every routed expert's gate projection, stacked; absent from a skeleton
+    /// binding ([`bind_skeleton`]), whose experts live outside the container.
+    pub gate: Option<TensorView<'a>>,
+    /// Every routed expert's up projection, stacked; absent as `gate` is.
+    pub up: Option<TensorView<'a>>,
+    /// Every routed expert's down projection, stacked; absent as `gate` is.
+    pub down: Option<TensorView<'a>>,
     /// The shared expert's scalar gate.
     pub shared_router: TensorView<'a>,
     /// The shared expert's gate projection.
@@ -286,12 +287,23 @@ fn recurrent(file: &GgufFile, il: u32) -> CoreResult<RecurrentRoles<'_>> {
 }
 
 /// The routed feed-forward at `il`.
-fn experts(file: &GgufFile, il: u32) -> CoreResult<ExpertRoles<'_>> {
+///
+/// `stacked` says whether the container holds the routed banks: a skeleton
+/// binding does not look for them, and everything else is required as ever.
+fn experts(file: &GgufFile, il: u32, stacked: bool) -> CoreResult<ExpertRoles<'_>> {
+    // Not a `Result<Option<_>>`: the stacked banks are all required or all
+    // left alone, and `then` keeps the two cases apart.
+    let find = |name: &str| require(file, &format!("blk.{il}.ffn_{name}_exps.weight"));
+    let (gate, up, down) = if stacked {
+        (Some(find("gate")?), Some(find("up")?), Some(find("down")?))
+    } else {
+        (None, None, None)
+    };
     Ok(ExpertRoles {
         router: require(file, &format!("blk.{il}.ffn_gate_inp.weight"))?,
-        gate: require(file, &format!("blk.{il}.ffn_gate_exps.weight"))?,
-        up: require(file, &format!("blk.{il}.ffn_up_exps.weight"))?,
-        down: require(file, &format!("blk.{il}.ffn_down_exps.weight"))?,
+        gate,
+        up,
+        down,
         shared_router: require(file, &format!("blk.{il}.ffn_gate_inp_shexp.weight"))?,
         shared_gate: require(file, &format!("blk.{il}.ffn_gate_shexp.weight"))?,
         shared_up: require(file, &format!("blk.{il}.ffn_up_shexp.weight"))?,
@@ -333,6 +345,29 @@ pub fn bind_qwen4exp<'f>(
     file: &'f GgufFile,
     config: &Qwen4ExpConfig,
 ) -> CoreResult<ModelBinding<'f>> {
+    bind(file, config, true)
+}
+
+/// Binds every tensor of a skeleton container: [`bind_qwen4exp`]'s set without
+/// the stacked routed banks, which a latent pack keeps in files of their own.
+/// The n-gram table is likewise optional here, as it is there.
+///
+/// # Errors
+///
+/// As [`bind_qwen4exp`], for every tensor but the routed banks.
+pub fn bind_skeleton<'f>(
+    file: &'f GgufFile,
+    config: &Qwen4ExpConfig,
+) -> CoreResult<ModelBinding<'f>> {
+    bind(file, config, false)
+}
+
+/// [`bind_qwen4exp`] with the routed banks required or not.
+fn bind<'f>(
+    file: &'f GgufFile,
+    config: &Qwen4ExpConfig,
+    stacked: bool,
+) -> CoreResult<ModelBinding<'f>> {
     let interval = config.full_attention_interval();
     let n_layers = config.shape().n_layers();
     let mut layers = Vec::with_capacity(n_layers as usize);
@@ -352,7 +387,7 @@ pub fn bind_qwen4exp<'f>(
             attn_mix: mix(file, il, "attn")?,
             ffn_mix: mix(file, il, "ffn")?,
             block,
-            experts: experts(file, il)?,
+            experts: experts(file, il, stacked)?,
             ngram: ngram_here,
         });
     }
@@ -433,7 +468,7 @@ pub(crate) fn bind_draft<'f>(
             attn_mix: mix(file, 0, "attn")?,
             ffn_mix: mix(file, 0, "ffn")?,
             block: BlockRoles::Attn(Box::new(attn(file, 0)?)),
-            experts: experts(file, 0)?,
+            experts: experts(file, 0, true)?,
             ngram: None,
         },
         output_mix: MixRoles {
@@ -484,7 +519,7 @@ fn bind_nextn<'f>(file: &'f GgufFile, config: &Qwen4ExpConfig) -> CoreResult<Dra
             attn_mix: mix(file, il, "attn")?,
             ffn_mix: mix(file, il, "ffn")?,
             block: BlockRoles::Attn(Box::new(attn(file, il)?)),
-            experts: experts(file, il)?,
+            experts: experts(file, il, true)?,
             ngram: None,
         },
         output_mix: MixRoles {
