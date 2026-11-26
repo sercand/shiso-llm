@@ -1885,55 +1885,60 @@ async function deleteKey(id, name, childCount = 0) {
 // ---- models ----------------------------------------------------------
 
 const PRICE_FIELDS = [
-  ["input_per_mtok", "Input"],
-  ["output_per_mtok", "Output"],
-  ["cached_input_per_mtok", "Cached input"],
-  ["cache_write_per_mtok", "Cache write"],
-  ["per_image", "Per image"],
-  ["image_input_per_mtok", "Image input"],
-  ["image_output_per_mtok", "Image output"],
+  ["input_per_mtok", "Input", false],
+  ["output_per_mtok", "Output", false],
+  ["cached_input_per_mtok", "Cached input", false],
+  ["cache_write_per_mtok", "Cache write", false],
+  ["per_image", "Per image", true],
+  ["image_input_per_mtok", "Image input", true],
+  ["image_output_per_mtok", "Image output", true],
 ];
 
-function priceFields(prefix, p) {
+const isImageModelType = type => type === "image-generation";
+
+function priceFields(prefix, p, showImage = false) {
   return `<div class="grid grid-cols-4 gap-2">
-    ${PRICE_FIELDS.map(([f, label]) => `<label class="s-label block">${label}
+    ${PRICE_FIELDS.map(([f, label, isImage]) => `<label class="s-label block${isImage ? " price-field-image" : ""}"${isImage && !showImage ? " hidden" : ""}>${label}
       ${input(prefix + f, 'type="number" step="any" min="0" placeholder="—"', p && p[f] != null ? p[f] : "")}
     </label>`).join("")}
   </div>
-  <p class="mt-1 text-xs text-ink-2">Token rates are USD per 1M tokens; Per image is USD per generated image.
-    Leave everything blank for no pricing. Blank cache rates fall back to the input rate; blank image
-    rates fall back to input/output. Embedding models bill input only — set output to 0. An image model
-    priced per picture needs only Per image.</p>`;
+  <p class="mt-1 text-xs text-ink-2">Token rates are USD per 1M tokens. Leave everything blank for no pricing.
+    Blank cache rates fall back to the input rate. Embedding models bill input only — set output to 0.<span class="price-field-image"${showImage ? "" : " hidden"}>
+    Per image is USD per generated image; blank image token rates fall back to input/output, and a model priced per picture needs only Per image.</span></p>`;
 }
 
-/// Reads the price inputs sharing a prefix. Returns null when every one is
-/// blank, and throws when only one of input/output is filled without a
-/// per-image price — half-priced models would silently mis-bill.
-function readPricing(form, prefix, what) {
+/// Reads the price inputs sharing a prefix. Returns null when every visible
+/// field is blank, and throws when only one of input/output is filled without
+/// a per-image price — half-priced models would silently mis-bill.
+function readPricing(form, prefix, what, includeImage = false) {
   const num = name => {
     const el = form.querySelector(`[name="${prefix}${name}"]`);
     const v = (el && el.value || "").trim();
     return v === "" ? null : Number(v);
   };
-  const all = Object.fromEntries(PRICE_FIELDS.map(([f]) => [f, num(f)]));
+  const all = Object.fromEntries(
+    PRICE_FIELDS.map(([f, , isImage]) => [f, isImage && !includeImage ? null : num(f)])
+  );
   if (Object.values(all).every(v => v == null)) return null;
   const inp = all.input_per_mtok, out = all.output_per_mtok;
   if ((inp == null) !== (out == null)) {
     throw new Error(`${what}: input and output prices must both be set`);
   }
   if (inp == null && all.per_image == null) {
-    throw new Error(`${what}: set input and output prices, or a per-image price`);
+    throw new Error(includeImage
+      ? `${what}: set input and output prices, or a per-image price`
+      : `${what}: set both input and output prices`);
   }
   // Blank optional rates are left out, so the server's fallbacks apply.
   return Object.fromEntries(Object.entries(all).filter(([, v]) => v != null));
 }
 
-function priceSummary(p) {
+function priceSummary(p, modelType) {
   if (!p) return '<span class="text-ink-2">unpriced</span>';
   const tokens = p.input_per_mtok || p.output_per_mtok
     ? `${fmtCost(p.input_per_mtok)} in / ${fmtCost(p.output_per_mtok)} out <span class="text-ink-2">per 1M</span>`
     : "";
-  const image = p.per_image != null
+  const image = isImageModelType(modelType) && p.per_image != null
     ? `${fmtCost(p.per_image)} <span class="text-ink-2">/ image</span>`
     : "";
   return [tokens, image].filter(Boolean).join(" · ") || fmtCost(0);
@@ -2132,7 +2137,7 @@ function updateModelsView() {
           title="Usage analytics">${esc(m.name)}</a>${modelTypePill(m.model_type)}${m.private
             ? ' <span class="s-pill s-pill--warn">private</span>' : ""}${modelSubline(m)}</td>
       <td class="px-4 py-3">${m.targets.map(targetChip).join("")}${qosBadge(m)}</td>
-      <td class="px-4 py-3 text-sm text-ink-2">${priceSummary(m.pricing)}</td>
+      <td class="px-4 py-3 text-sm text-ink-2">${priceSummary(m.pricing, m.model_type)}</td>
       <td class="px-4 py-3 text-right text-sm whitespace-nowrap">
         <button onclick='openModelForm(${esc(JSON.stringify(m.name))})' class="s-btn s-btn--ghost s-btn--sm">Edit</button>
         <button onclick='deleteModel(${esc(JSON.stringify(m.name))})' class="s-btn s-btn--ghost s-btn--sm ml-3 text-bad">Delete</button>
@@ -2194,7 +2199,7 @@ async function renderModels() {
   updateModelsView();
 }
 
-function targetRowHtml(t = {}) {
+function targetRowHtml(t = {}, showImage = false) {
   const opts = BACKENDS.map(b =>
     `<option value="${esc(b.name)}" ${t.backend === b.name ? "selected" : ""}>${esc(b.name)}</option>`).join("");
   return `<div class="s-inset target-row p-3">
@@ -2215,18 +2220,28 @@ function targetRowHtml(t = {}) {
       Fallback only — skipped by normal routing, used when a request would miss its deadline</label>
     <details class="mt-2" ${t.pricing ? "open" : ""}>
       <summary class="cursor-pointer text-xs text-ink-2">Pricing override</summary>
-      <div class="mt-2">${priceFields("t_", t.pricing)}</div>
+      <div class="mt-2">${priceFields("t_", t.pricing, showImage)}</div>
     </details>
   </div>`;
 }
 
+function syncImagePricingVisibility(form) {
+  const showImage = isImageModelType(form.model_type.value);
+  for (const el of $$(".price-field-image", form)) {
+    el.hidden = !showImage;
+  }
+}
+
 function addTargetRow() {
-  $("#targets").insertAdjacentHTML("beforeend", targetRowHtml());
+  const form = $("#model-form");
+  const showImage = form ? isImageModelType(form.model_type.value) : false;
+  $("#targets").insertAdjacentHTML("beforeend", targetRowHtml({}, showImage));
 }
 
 function openModelForm(name) {
   const m = name ? CATALOG.find(x => x.name === name) : null;
   const targets = m ? m.targets : [{}];
+  const showImage = isImageModelType(m && m.model_type);
   const typeOpts = [`<option value="">— none —</option>`,
     ...MODEL_TYPES.map(([val, label]) =>
       `<option value="${esc(val)}" ${m && m.model_type === val ? "selected" : ""}>${esc(label)} (${esc(val)})</option>`)
@@ -2258,7 +2273,7 @@ function openModelForm(name) {
         Private — only keys whose allowlist names this model can use it</label>
       <p class="-mt-2 text-xs text-ink-2">A key with no allowlist gets every public model, but never
         a private one. Private models are also hidden from that key's model list.</p>
-      <div class="text-sm">Default pricing${priceFields("m_", m && m.pricing)}</div>
+      <div class="text-sm">Default pricing${priceFields("m_", m && m.pricing, showImage)}</div>
       <details class="s-inset p-3"
         ${m && (m.qos_max_wait_ms != null || m.qos_background_max_wait_ms != null) ? "open" : ""}>
         <summary class="cursor-pointer text-sm text-ink">Deadlines (QoS)</summary>
@@ -2285,7 +2300,7 @@ function openModelForm(name) {
         <div class="flex items-center justify-between">Targets
           <button type="button" onclick="addTargetRow()" class="s-btn s-btn--sm">Add target</button>
         </div>
-        <div id="targets" class="mt-2 space-y-2">${targets.map(targetRowHtml).join("")}</div>
+        <div id="targets" class="mt-2 space-y-2">${targets.map(t => targetRowHtml(t, showImage)).join("")}</div>
       </div>
       <div class="flex justify-end gap-2 pt-1">
         <button type="button" onclick="closeModal()" class="s-btn s-btn--ghost">Cancel</button>
@@ -2293,10 +2308,15 @@ function openModelForm(name) {
       </div>
     </form>`, "max-w-2xl");
 
-  $("#model-form").addEventListener("submit", async e => {
+  const modelForm = $("#model-form");
+  modelForm.model_type.addEventListener("change", () => syncImagePricingVisibility(modelForm));
+
+  modelForm.addEventListener("submit", async e => {
     e.preventDefault();
     const form = e.target;
     try {
+      const model_type = form.model_type.value || null;
+      const includeImage = isImageModelType(model_type);
       const rows = $$(".target-row", form);
       if (!rows.length) throw new Error("a model needs at least one target");
       const targets = rows.map((row, i) => ({
@@ -2304,16 +2324,15 @@ function openModelForm(name) {
         model: $('[name=t_model]', row).value.trim() || null,
         url: $('[name=t_url]', row).value.trim() || null,
         weight: Number($('[name=t_weight]', row).value || 1),
-        pricing: readPricing(row, "t_", `target ${i + 1}`),
+        pricing: readPricing(row, "t_", `target ${i + 1}`, includeImage),
         fallback_only: $('[name=t_fallback_only]', row).checked,
       }));
       if (targets.every(t => t.fallback_only)) {
         throw new Error("at least one target must not be fallback-only");
       }
-      const pricing = readPricing(form, "m_", "model pricing");
+      const pricing = readPricing(form, "m_", "model pricing", includeImage);
       const aliases = form.aliases.value.split(",").map(a => a.trim()).filter(Boolean);
       const tags = form.tags.value.split(",").map(t => t.trim()).filter(Boolean);
-      const model_type = form.model_type.value || null;
       const ms = name => {
         const v = form[name].value.trim();
         return v === "" ? null : Number(v);
